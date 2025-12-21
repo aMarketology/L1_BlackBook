@@ -163,12 +163,16 @@ pub fn stats_route(
         })
 }
 
-/// GET /balance/{address} - Get balance for any address (public)
+/// GET /balance/{address} - Get L1 balance only (public)
 /// 
-/// Address handling:
-/// - L1_ prefix: Returns ONLY L1 balance (available funds)
-/// - L2_ prefix: Returns ONLY L2 balance (locked funds)
-/// - No prefix: Returns COMBINED balance (L1 + L2)
+/// LAYER 1 RESTRICTION:
+/// - ONLY accepts L1_ prefixed addresses
+/// - L2_ addresses: Rejected (query L2 server instead)
+/// - No prefix: Rejected (must specify L1_ explicitly)
+/// 
+/// This ensures proper layer separation:
+/// - L1 server = L1 balances only (real money)
+/// - L2 server = L2 balances only (gaming/betting)
 pub fn public_balance_route(
     blockchain: Arc<Mutex<EnhancedBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
@@ -180,28 +184,46 @@ pub fn public_balance_route(
         .and_then(move |address: String| {
             let blockchain = blockchain.clone();
             async move {
+                // LAYER 1 ONLY: Reject anything that's not L1_ prefixed
+                if !address.starts_with("L1_") {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Invalid address format",
+                        "message": if address.starts_with("L2_") {
+                            "L2 balances must be queried from L2 server"
+                        } else {
+                            "Address must start with L1_ prefix (43 chars total)"
+                        },
+                        "expected_format": "L1_<40_hex_chars>",
+                        "example": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
+                    })));
+                }
+                
+                // Validate address length (L1_ + 40 hex = 43 chars)
+                if address.len() != 43 {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Invalid address length",
+                        "message": "L1 address must be exactly 43 characters (L1_ + 40 hex)",
+                        "received_length": address.len()
+                    })));
+                }
+                
                 let (balance, layer) = match blockchain.lock() {
                     Ok(bc) => {
-                        // Determine which layer balance to return based on prefix
-                        if address.starts_with("L1_") {
-                            // L1 only: available balance (total - locked)
-                            let base_addr = strip_prefix(&address);
-                            let total = bc.get_balance(&base_addr);
-                            let locked = bc.get_locked_balance(&base_addr);
-                            let available = (total - locked).max(0.0);
-                            (available, "L1")
-                        } else if address.starts_with("L2_") {
-                            // L2 only: locked balance
-                            let base_addr = strip_prefix(&address);
-                            let locked = bc.get_locked_balance(&base_addr);
-                            (locked, "L2")
-                        } else {
-                            // No prefix: combined balance (L1 + L2)
-                            let total = bc.get_balance(&address);
-                            (total, "Combined")
-                        }
+                        // Strip L1_ prefix and query balance
+                        let base_addr = strip_prefix(&address);
+                        
+                        // Check both formats for backward compatibility:
+                        // 1. New format: just the hash (40 hex chars)
+                        // 2. Old format: L1_<hash> (full address as key)
+                        let balance = bc.get_balance(&base_addr).max(
+                            bc.get_balance(&address)
+                        );
+                        
+                        (balance, "L1")
                     },
-                    Err(_) => (0.0, "Error")  // Return 0 if lock poisoned
+                    Err(_) => (0.0, "Error")
                 };
                 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({

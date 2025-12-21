@@ -109,27 +109,20 @@ fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
     println!("   └─────────────────────────────────────────────────────────┘");
     
     // UNIFIED WALLET MODEL:
-    // - {address}_AVAILABLE: Funds available for L1 transfers
-    // - {address}_LOCKED: Funds locked (bridged to L2)
-    // - {address}_L2: Active L2 gaming balance
-    // - {address}: Total balance (for backward compat, = available + locked)
+    // Store balances using just the hash (without L1_/L2_ prefix)
+    // This allows the same balance to work with both L1_ and L2_ prefixes
     
-    // Alice's balances
-    bc.balances.insert(format!("{}_AVAILABLE", alice.address), alice.l1_available);
-    bc.balances.insert(format!("{}_LOCKED", alice.address), alice.l1_locked);
-    bc.balances.insert(format!("{}_L2", alice.address), alice.l2_balance);
-    bc.balances.insert(alice.address.clone(), alice.total_balance); // Total for backward compat
+    use crate::unified_wallet::strip_prefix;
     
-    // Bob's balances  
-    bc.balances.insert(format!("{}_AVAILABLE", bob.address), bob.l1_available);
-    bc.balances.insert(format!("{}_LOCKED", bob.address), bob.l1_locked);
-    bc.balances.insert(format!("{}_L2", bob.address), bob.l2_balance);
-    bc.balances.insert(bob.address.clone(), bob.total_balance); // Total for backward compat
+    // Alice's balances (strip L1_ prefix)
+    let alice_hash = strip_prefix(&alice.address);
+    bc.balances.insert(alice_hash.clone(), alice.total_balance);
+    
+    // Bob's balances (strip L1_ prefix)
+    let bob_hash = strip_prefix(&bob.address);
+    bc.balances.insert(bob_hash.clone(), bob.total_balance);
     
     // Dealer's balances (100,000 BB bankroll on L1)
-    // The Dealer uses the new address format: L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3
-    // We need to store it using just the hash (without L1_/L2_ prefix) so it works with both layers
-    use crate::unified_wallet::strip_prefix;
     let dealer_hash = strip_prefix(&dealer_address);
     bc.balances.insert(dealer_hash.clone(), 100000.0);  // 100k BB bankroll
     
