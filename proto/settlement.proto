@@ -1,19 +1,34 @@
 // ============================================================================
-// settlement.proto - L1↔L2 Settlement Protocol
+// settlement.proto - L1↔L2 Settlement Protocol (Production Ready)
 // ============================================================================
 //
 // The Bank (L1) ↔ Casino (L2) Communication Protocol
 //
-// MINDSET: 
-//   L1 = "The Bank" - Holds real money, validates signatures, final settlement
-//   L2 = "The Casino" - Runs the games, fronts bets instantly, requests reimbursement
+// ARCHITECTURE:
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  L1 (Bank/Vault)              │  L2 (Casino/Gaming)                    │
+// │  ─────────────────            │  ───────────────────                   │
+// │  • Holds real money           │  • Runs games instantly                │
+// │  • Ed25519 sig verification   │  • Dealer fronts bets                  │
+// │  • Final settlement           │  • Sub-second UX                       │
+// │  • gRPC server on :50051      │  • gRPC client to L1                   │
+// │                               │                                         │
+// │  Address: L1_<40hex>          │  Address: L2_<40hex>                   │
+// │  (same hash, different layer) │  (same hash, different layer)          │
+// └─────────────────────────────────────────────────────────────────────────┘
 //
-// When a user places a bet on L2:
-//   1. L2 (Casino) fronts the stake immediately for great UX
-//   2. L2 calls L1 (Bank) via gRPC to request reimbursement
-//   3. L1 verifies user has balance, debits their account
-//   4. L1 credits the Dealer's reimbursement pool
-//   5. When bet resolves, L2 reports outcome to L1 for final settlement
+// FLOW:
+// 1. User locks funds: L1 debits user, marks as "locked for L2"
+// 2. User bets on L2: Dealer fronts stake immediately (great UX)
+// 3. L2 requests reimbursement: L1 moves user's locked → Dealer
+// 4. Bet resolves: L2 tells L1 outcome, L1 settles Dealer↔User
+// 5. User withdraws: L1 unlocks remaining funds
+//
+// SECURITY:
+// - All requests signed with Ed25519 (public_key required)
+// - Domain separation: chain_id prevents L1/L2 replay attacks
+// - Nonces prevent replay within same chain
+// - Intent hashes bind bet parameters
 //
 // ============================================================================
 
@@ -21,117 +36,192 @@ syntax = "proto3";
 
 package blackbook.settlement;
 
+option go_package = "github.com/blackbook/settlement";
+
 // ============================================================================
-// SETTLEMENT SERVICE - The Bank's API
+// SETTLEMENT SERVICE - The Bank's gRPC API
 // ============================================================================
 
 service SettlementNode {
-  // Core settlement operations
+  // === Core Settlement Operations ===
   rpc ExecuteSettlement(SettlementRequest) returns (SettlementResponse);
   rpc RequestReimbursement(ReimbursementRequest) returns (ReimbursementResponse);
   
-  // Bridge operations (L1 ↔ L2 token movement)
+  // === Bridge Operations (L1 ↔ L2 Token Movement) ===
   rpc InitiateBridgeLock(BridgeLockRequest) returns (BridgeLockResponse);
   rpc ReleaseBridgeFunds(BridgeReleaseRequest) returns (BridgeReleaseResponse);
   rpc VerifySettlementProof(SettlementProofRequest) returns (SettlementProofResponse);
   
-  // Balance queries
+  // === Balance Queries ===
   rpc GetBalance(BalanceRequest) returns (BalanceResponse);
   rpc CheckSufficientBalance(SufficientBalanceRequest) returns (SufficientBalanceResponse);
   
-  // Health & Status
+  // === Signature Verification (L2 validates L1 signatures) ===
+  rpc VerifySignature(SignatureVerifyRequest) returns (SignatureVerifyResponse);
+  
+  // === Health & Status ===
   rpc HealthCheck(HealthRequest) returns (HealthResponse);
   rpc GetBlockHeight(BlockHeightRequest) returns (BlockHeightResponse);
 }
 
 // ============================================================================
-// SETTLEMENT MESSAGES
+// COMMON TYPES
 // ============================================================================
 
-// Request to execute a full settlement (bet resolution payout)
+// Standard error codes for all responses
+enum ErrorCode {
+  ERROR_NONE = 0;
+  ERROR_INSUFFICIENT_BALANCE = 1;
+  ERROR_INVALID_SIGNATURE = 2;
+  ERROR_INVALID_NONCE = 3;
+  ERROR_EXPIRED_REQUEST = 4;
+  ERROR_INVALID_ADDRESS = 5;
+  ERROR_LOCK_NOT_FOUND = 6;
+  ERROR_ALREADY_SETTLED = 7;
+  ERROR_UNAUTHORIZED = 8;
+  ERROR_INTERNAL = 99;
+}
+
+// Chain identifiers for domain separation
+enum ChainId {
+  CHAIN_UNKNOWN = 0;
+  CHAIN_L1 = 1;      // Layer 1 (Bank/Vault) - Real money
+  CHAIN_L2 = 2;      // Layer 2 (Casino/Gaming) - Fast bets
+}
+
+// ============================================================================
+// SETTLEMENT MESSAGES - Final bet resolution
+// ============================================================================
+
 message SettlementRequest {
-  string dealer_id = 1;          // Who fronted the bet (Dealer wallet)
-  string user_id = 2;            // Who placed the bet
-  uint64 amount = 3;             // Amount in smallest units (1 BB = 1_000_000)
-  bytes signature = 4;           // Ed25519 signature from L2
-  bytes intent_hash = 5;         // Hash of the original bet intent
-  uint64 nonce = 6;              // Replay protection
-  string bet_id = 7;             // Unique bet identifier
-  string market_id = 8;          // Market the bet was placed on
-  string outcome = 9;            // The resolved outcome (YES/NO/VOID)
-  uint64 payout_amount = 10;     // Amount to pay winner
-  string beneficiary = 11;       // Who receives the payout
-  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+  // Identity
+  string dealer_address = 1;     // L1_<40hex> or L2_<40hex>
+  string user_address = 2;       // User's L1 address
+  string beneficiary = 3;        // Who receives payout (winner)
+  
+  // Bet details
+  string bet_id = 4;             // Unique bet identifier
+  string market_id = 5;          // Market the bet was placed on
+  string outcome = 6;            // Resolved outcome (YES/NO/VOID)
+  
+  // Amounts (in microtokens: 1 BB = 1,000,000 µBB)
+  uint64 stake_amount = 7;       // Original stake
+  uint64 payout_amount = 8;      // Amount to pay winner
+  
+  // Cryptographic proof
+  string public_key = 10;        // Ed25519 public key (64 hex)
+  bytes signature = 11;          // Ed25519 signature
+  bytes intent_hash = 12;        // SHA256 of original bet intent
+  uint64 nonce = 13;             // Replay protection
+  uint64 timestamp = 14;         // Request timestamp (ms since epoch)
+  ChainId chain_id = 15;         // Domain separation
 }
 
 message SettlementResponse {
   bool success = 1;
-  string tx_hash = 2;            // L1 transaction hash
+  ErrorCode error_code = 2;
   string error_message = 3;
-  uint64 new_dealer_balance = 4;
-  uint64 new_user_balance = 5;
-  uint64 block_height = 6;       // L1 block where settlement was recorded
+  
+  // Transaction details
+  string tx_hash = 4;            // L1 transaction hash
+  uint64 block_height = 5;       // L1 block height
+  
+  // Updated balances (in microtokens)
+  uint64 dealer_balance = 6;
+  uint64 user_balance = 7;
+  uint64 beneficiary_balance = 8;
 }
 
 // ============================================================================
-// REIMBURSEMENT MESSAGES (Casino asks Bank to pay back fronted stake)
+// REIMBURSEMENT MESSAGES - Casino asks Bank to pay back fronted stake
 // ============================================================================
 
 message ReimbursementRequest {
-  string dealer_id = 1;          // Dealer requesting reimbursement
-  string user_id = 2;            // User whose balance to debit
-  uint64 amount = 3;             // Amount to reimburse
-  bytes signature = 4;           // Dealer's signature
-  string bet_id = 5;             // Reference to the bet
-  uint64 nonce = 6;
-  uint64 timestamp = 7;          // When the bet was placed
-  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+  // Identity
+  string dealer_address = 1;     // Dealer requesting reimbursement
+  string user_address = 2;       // User whose locked balance to debit
+  
+  // Bet reference
+  string bet_id = 3;             // Reference to the bet
+  uint64 amount = 4;             // Amount to reimburse (microtokens)
+  
+  // Cryptographic proof
+  string public_key = 10;        // Dealer's public key
+  bytes signature = 11;          // Dealer's signature
+  uint64 nonce = 12;
+  uint64 timestamp = 13;
+  ChainId chain_id = 14;
 }
 
 message ReimbursementResponse {
   bool success = 1;
-  string tx_hash = 2;
+  ErrorCode error_code = 2;
   string error_message = 3;
-  uint64 user_remaining_balance = 4;
-  uint64 dealer_credited = 5;
+  
+  string tx_hash = 4;
+  uint64 user_remaining_locked = 5;  // User's remaining locked balance
+  uint64 dealer_credited = 6;        // Amount credited to dealer
 }
 
 // ============================================================================
-// BRIDGE MESSAGES (L1 ↔ L2 Token Movement)
+// BRIDGE MESSAGES - L1 ↔ L2 Token Movement
 // ============================================================================
 
 message BridgeLockRequest {
-  string user_id = 1;            // User locking funds
-  uint64 amount = 2;             // Amount to lock
+  // Identity
+  string user_address = 1;       // User's L1 address (L1_<40hex>)
+  
+  // Lock details
+  uint64 amount = 2;             // Amount to lock (microtokens)
   string target_layer = 3;       // "L2" for deposits to L2
-  bytes signature = 4;           // User's signature
-  uint64 nonce = 5;
-  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+  
+  // Cryptographic proof
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 nonce = 12;
+  uint64 timestamp = 13;
+  ChainId chain_id = 14;
 }
 
 message BridgeLockResponse {
   bool success = 1;
-  string lock_id = 2;            // Unique lock identifier
+  ErrorCode error_code = 2;
   string error_message = 3;
-  uint64 locked_amount = 4;
-  uint64 expires_at = 5;         // Unix timestamp
+  
+  string lock_id = 4;            // Unique lock identifier
+  uint64 locked_amount = 5;      // Amount successfully locked
+  uint64 available_balance = 6;  // Remaining available balance
+  uint64 expires_at = 7;         // Lock expiry (unix timestamp)
 }
 
 message BridgeReleaseRequest {
-  string lock_id = 1;            // Lock to release
-  string beneficiary = 2;        // Who receives the funds
-  uint64 amount = 3;             // Amount to release
-  bytes l2_proof = 4;            // Proof from L2 (merkle proof or signature)
-  string market_id = 5;          // Optional: market context
-  string outcome = 6;            // Optional: outcome context
+  // Lock reference
+  string lock_id = 1;
+  string user_address = 2;
+  
+  // Release details
+  string beneficiary = 3;        // Who receives the unlocked funds
+  uint64 amount = 4;             // Amount to release (microtokens)
+  
+  // L2 proof (how L1 knows L2 approved this)
+  bytes l2_signature = 10;       // L2's signature on the release
+  string l2_public_key = 11;     // L2's public key
+  uint64 l2_block_height = 12;   // L2 block where this was approved
+  
+  // Optional context
+  string market_id = 20;
+  string outcome = 21;
 }
 
 message BridgeReleaseResponse {
   bool success = 1;
-  string tx_hash = 2;
+  ErrorCode error_code = 2;
   string error_message = 3;
-  uint64 released_amount = 4;
-  string recipient = 5;
+  
+  string tx_hash = 4;
+  uint64 released_amount = 5;
+  string recipient = 6;
+  uint64 recipient_new_balance = 7;
 }
 
 message SettlementProofRequest {
@@ -141,13 +231,33 @@ message SettlementProofRequest {
   string beneficiary = 4;
   uint64 amount = 5;
   bytes l2_signature = 6;
-  uint64 l2_block_height = 7;
+  string l2_public_key = 7;
+  uint64 l2_block_height = 8;
 }
 
 message SettlementProofResponse {
   bool valid = 1;
   bool release_authorized = 2;
-  string error_message = 3;
+  ErrorCode error_code = 3;
+  string error_message = 4;
+}
+
+// ============================================================================
+// SIGNATURE VERIFICATION - L2 validates user signatures against L1
+// ============================================================================
+
+message SignatureVerifyRequest {
+  string public_key = 1;         // Ed25519 public key (64 hex)
+  string message = 2;            // Original message that was signed
+  bytes signature = 3;           // Ed25519 signature (128 hex)
+  ChainId expected_chain = 4;    // Which chain the signature should be for
+}
+
+message SignatureVerifyResponse {
+  bool valid = 1;
+  string derived_address = 2;    // L1_<40hex> derived from public key
+  ErrorCode error_code = 3;
+  string error_message = 4;
 }
 
 // ============================================================================
@@ -155,19 +265,24 @@ message SettlementProofResponse {
 // ============================================================================
 
 message BalanceRequest {
-  string address = 1;
+  string address = 1;            // L1_<40hex> format required
 }
 
 message BalanceResponse {
   string address = 1;
-  uint64 balance = 2;            // Available balance
-  uint64 locked = 3;             // Locked in bridges
-  uint64 total = 4;              // balance + locked
+  uint64 available = 2;          // Available for transfers (microtokens)
+  uint64 locked = 3;             // Locked in bridges (microtokens)
+  uint64 total = 4;              // available + locked
+  
+  // Breakdown by purpose
+  uint64 locked_for_l2 = 5;      // Locked for L2 gaming
+  uint64 pending_settlement = 6; // In pending settlements
 }
 
 message SufficientBalanceRequest {
   string address = 1;
   uint64 required_amount = 2;
+  bool check_available_only = 3; // If true, only checks available (not locked)
 }
 
 message SufficientBalanceResponse {
@@ -180,9 +295,7 @@ message SufficientBalanceResponse {
 // HEALTH & STATUS MESSAGES
 // ============================================================================
 
-message HealthRequest {
-  // Empty - just checking if server is alive
-}
+message HealthRequest {}
 
 message HealthResponse {
   string status = 1;             // "healthy", "degraded", "unhealthy"
@@ -190,14 +303,16 @@ message HealthResponse {
   string version = 3;
   uint64 uptime_seconds = 4;
   uint32 pending_settlements = 5;
+  uint32 active_locks = 6;
+  uint64 total_locked_amount = 7;
 }
 
-message BlockHeightRequest {
-  // Empty
-}
+message BlockHeightRequest {}
 
 message BlockHeightResponse {
   uint64 height = 1;
   string blockhash = 2;
   uint64 timestamp = 3;
+  string previous_blockhash = 4;
 }
+

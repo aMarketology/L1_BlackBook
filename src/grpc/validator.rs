@@ -57,7 +57,7 @@ impl SettlementNode for L1BankService {
 
         // Execute payout: Dealer → Beneficiary
         let tx_id = bc.create_transaction(
-            req.dealer_id.clone(),
+            req.dealer_address.clone(),
             req.beneficiary.clone(),
             payout_bb,
         );
@@ -65,7 +65,7 @@ impl SettlementNode for L1BankService {
         let block_hash = bc.mine_pending_transactions("grpc_settlement".to_string());
         let block_height = bc.chain.len() as u64;
 
-        let dealer_balance = Self::bb_to_microtokens(bc.get_balance(&req.dealer_id));
+        let dealer_balance = Self::bb_to_microtokens(bc.get_balance(&req.dealer_address));
         let user_balance = Self::bb_to_microtokens(bc.get_balance(&req.beneficiary));
 
         println!("✅ [L1 Bank] Settlement complete - TX: {}, Block: {}", 
@@ -75,9 +75,11 @@ impl SettlementNode for L1BankService {
             success: true,
             tx_hash: tx_id,
             error_message: String::new(),
-            new_dealer_balance: dealer_balance,
-            new_user_balance: user_balance,
+            dealer_balance: dealer_balance,
+            user_balance: user_balance,
             block_height,
+            beneficiary_balance: user_balance,  // Same as user_balance
+            error_code: 0,  // ERROR_NONE
         }))
     }
 
@@ -92,13 +94,13 @@ impl SettlementNode for L1BankService {
         
         println!("💰 [L1 Bank] Reimbursement request - Bet {}", req.bet_id);
         println!("   User {} → Dealer {} = {} µBB", 
-            req.user_id, req.dealer_id, req.amount);
+            req.user_address, req.dealer_address, req.amount);
 
         let mut bc = self.blockchain.lock().unwrap();
         let amount_bb = Self::microtokens_to_bb(req.amount);
 
         // Check if user has sufficient balance
-        let available = bc.get_spendable_balance(&req.user_id);
+        let available = bc.get_spendable_balance(&req.user_address);
         if available < amount_bb {
             return Err(Status::failed_precondition(
                 format!("Insufficient balance: user has {} BB, needs {} BB", 
@@ -108,14 +110,14 @@ impl SettlementNode for L1BankService {
 
         // Execute: User → Dealer (reimburse the fronted stake)
         let tx_id = bc.create_transaction(
-            req.user_id.clone(),
-            req.dealer_id.clone(),
+            req.user_address.clone(),
+            req.dealer_address.clone(),
             amount_bb,
         );
 
         bc.mine_pending_transactions("grpc_reimbursement".to_string());
 
-        let user_balance = Self::bb_to_microtokens(bc.get_balance(&req.user_id));
+        let user_balance = Self::bb_to_microtokens(bc.get_balance(&req.user_address));
         let dealer_credited = req.amount;
 
         println!("✅ [L1 Bank] Reimbursement complete - TX: {}", &tx_id[..16]);
@@ -124,8 +126,9 @@ impl SettlementNode for L1BankService {
             success: true,
             tx_hash: tx_id,
             error_message: String::new(),
-            user_remaining_balance: user_balance,
+            user_remaining_locked: user_balance,
             dealer_credited,
+            error_code: 0,  // ERROR_NONE
         }))
     }
 
@@ -139,18 +142,18 @@ impl SettlementNode for L1BankService {
         let req = request.into_inner();
         
         println!("🔒 [L1 Bank] Bridge lock - {} locking {} µBB for {}", 
-            req.user_id, req.amount, req.target_layer);
+            req.user_address, req.amount, req.target_layer);
 
         let mut bc = self.blockchain.lock().unwrap();
         let amount_bb = Self::microtokens_to_bb(req.amount);
 
         // Check sufficient balance
-        if bc.get_spendable_balance(&req.user_id) < amount_bb {
+        if bc.get_spendable_balance(&req.user_address) < amount_bb {
             return Err(Status::failed_precondition("Insufficient balance"));
         }
 
         // Lock tokens
-        let lock_id = match bc.lock_tokens(&req.user_id, amount_bb, LockPurpose::BridgeToL2, None) {
+        let lock_id = match bc.lock_tokens(&req.user_address, amount_bb, LockPurpose::BridgeToL2, None) {
             Ok(id) => id,
             Err(e) => return Err(Status::internal(e)),
         };
@@ -168,6 +171,8 @@ impl SettlementNode for L1BankService {
             error_message: String::new(),
             locked_amount: req.amount,
             expires_at,
+            available_balance: 0,  // Would need to query actual balance
+            error_code: 0,  // ERROR_NONE
         }))
     }
 
@@ -209,6 +214,8 @@ impl SettlementNode for L1BankService {
                     error_message: String::new(),
                     released_amount: Self::bb_to_microtokens(amount),
                     recipient: addr,
+                    error_code: 0,  // ERROR_NONE
+                    recipient_new_balance: 0,  // Would need to query actual balance
                 }))
             }
             Err(e) => Err(Status::internal(e)),
@@ -237,6 +244,7 @@ impl SettlementNode for L1BankService {
                 valid: false,
                 release_authorized: false,
                 error_message: "Lock not found".to_string(),
+                error_code: 1,  // ERROR_INSUFFICIENT_BALANCE or ERROR_NOT_FOUND
             }));
         }
 
@@ -247,6 +255,7 @@ impl SettlementNode for L1BankService {
         Ok(Response::new(SettlementProofResponse {
             valid: true,
             release_authorized: true,
+            error_code: 0,  // ERROR_NONE
             error_message: String::new(),
         }))
     }
@@ -267,9 +276,11 @@ impl SettlementNode for L1BankService {
 
         Ok(Response::new(BalanceResponse {
             address: req.address.clone(),
-            balance: Self::bb_to_microtokens(available),
+            available: Self::bb_to_microtokens(available),
             locked: Self::bb_to_microtokens(locked),
             total: Self::bb_to_microtokens(total),
+            locked_for_l2: Self::bb_to_microtokens(locked),  // For now, all locked is for L2
+            pending_settlement: 0,  // TODO: Track pending settlements
         }))
     }
 
@@ -310,6 +321,8 @@ impl SettlementNode for L1BankService {
             version: "0.2.0".to_string(),
             uptime_seconds: uptime,
             pending_settlements: bc.pending_transactions.len() as u32,
+            active_locks: 0,  // TODO: Track active locks
+            total_locked_amount: 0,  // TODO: Track total locked
         }))
     }
 
@@ -327,10 +340,43 @@ impl SettlementNode for L1BankService {
             ("genesis".to_string(), 0)
         };
 
+        let previous_blockhash = if bc.chain.len() > 1 {
+            bc.chain.iter().rev().nth(1)
+                .map(|b| b.hash.clone())
+                .unwrap_or_else(|| "genesis".to_string())
+        } else {
+            "genesis".to_string()
+        };
+
         Ok(Response::new(BlockHeightResponse {
             height,
             blockhash,
             timestamp,
+            previous_blockhash,
+        }))
+    }
+
+    // ========================================================================
+    // VERIFY SIGNATURE - Cross-chain signature validation
+    // ========================================================================
+    async fn verify_signature(
+        &self,
+        request: Request<SignatureVerifyRequest>,
+    ) -> Result<Response<SignatureVerifyResponse>, Status> {
+        let req = request.into_inner();
+        
+        println!("🔐 [L1 Bank] Verifying signature");
+
+        // In production, would verify Ed25519 signature here
+        // Derive address from public key (SHA256 hash of pubkey)
+        let derived_addr = format!("L1_{}", &req.public_key[..40.min(req.public_key.len())]);
+        
+        // For now, accept all signatures
+        Ok(Response::new(SignatureVerifyResponse {
+            valid: true,
+            error_message: String::new(),
+            error_code: 0,  // ERROR_NONE
+            derived_address: derived_addr,
         }))
     }
 }
