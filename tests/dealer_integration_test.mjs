@@ -60,8 +60,8 @@ async function runTest() {
     await mint(dealer.address, 10000);
 
     // Refresh balances
-    await alice.sync();
-    await dealer.sync();
+    await alice.refresh();
+    await dealer.refresh();
     console.log(`\n💰 Alice Balance: ${alice.balance} BB`);
     console.log(`💰 Dealer Balance: ${dealer.balance} BB`);
 
@@ -88,8 +88,8 @@ async function runTest() {
     }
 
     // 6. Final Balances
-    await alice.sync();
-    await dealer.sync();
+    await alice.refresh();
+    await dealer.refresh();
     console.log('\n📊 FINAL BALANCES:');
     console.log(`   Alice:  ${alice.balance} BB`);
     console.log(`   Dealer: ${dealer.balance} BB`);

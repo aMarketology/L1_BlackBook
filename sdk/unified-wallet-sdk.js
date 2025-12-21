@@ -1089,44 +1089,8 @@ export class UnifiedWallet {
       // serverShare is NOT returned (stays on server)
     };
   }
-          public_key: keypair.publicKeyHex
-        })
-      });
-    } catch {
-      // L1 may not be running
-    }
-    
-    await wallet.refresh();
-    
-    // Create backup files
-    const cloudBackup = walletRecovery.createCloudBackupFile(
-      recoveryShares.cloudShare, 
-      address, 
-      email
-    );
-    const emailBackup = walletRecovery.createEmailBackupContent(
-      recoveryShares.emailShare,
-      address
-    );
-    
-    console.log('');
-    console.log('✅ WALLET CREATED WITH SSS RECOVERY');
-    console.log('═══════════════════════════════════════════════════════════');
-    console.log(`Address: ${address}`);
-    console.log('');
-    console.log('⚠️  SAVE YOUR RECOVERY PIN: ' + pin);
-    console.log('⚠️  Save cloudBackup to Google Drive/iCloud');
-    console.log('⚠️  Keep emailBackup email for emergency');
-    console.log('═══════════════════════════════════════════════════════════');
-    console.log('');
-    
-    return { 
-      wallet, 
-      mnemonic,
-      cloudBackup,
-      emailBackup,
-      serverShareStored: true
-    };
+
+  /**
   }
 
   /**
@@ -1294,7 +1258,6 @@ export class UnifiedWallet {
     };
     
     return new UnifiedWallet(walletData);
-      'In production, split the mnemonic directly in SSS shares.');
   }
 
   /**
@@ -2951,9 +2914,6 @@ async function verifyIntent(intent, checkBalance = true, endpoint = null) {
 export { ACCOUNTS };
 export const ALICE = ACCOUNTS.alice;
 export const BOB = ACCOUNTS.bob;
-
-// Export domain separation constants (MUST match Rust identity.rs)
-export { CHAIN_ID_L1, CHAIN_ID_L2 };
 
 // Export helper functions for advanced use
 export {

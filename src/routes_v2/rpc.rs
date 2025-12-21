@@ -164,24 +164,51 @@ pub fn stats_route(
 }
 
 /// GET /balance/{address} - Get balance for any address (public)
+/// 
+/// Address handling:
+/// - L1_ prefix: Returns ONLY L1 balance (available funds)
+/// - L2_ prefix: Returns ONLY L2 balance (locked funds)
+/// - No prefix: Returns COMBINED balance (L1 + L2)
 pub fn public_balance_route(
     blockchain: Arc<Mutex<EnhancedBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    use crate::unified_wallet::strip_prefix;
+    
     warp::path("balance")
         .and(warp::path::param::<String>())
         .and(warp::get())
         .and_then(move |address: String| {
             let blockchain = blockchain.clone();
             async move {
-                let balance = match blockchain.lock() {
-                    Ok(bc) => bc.get_balance(&address),
-                    Err(_) => 0.0  // Return 0 if lock poisoned
+                let (balance, layer) = match blockchain.lock() {
+                    Ok(bc) => {
+                        // Determine which layer balance to return based on prefix
+                        if address.starts_with("L1_") {
+                            // L1 only: available balance (total - locked)
+                            let base_addr = strip_prefix(&address);
+                            let total = bc.get_balance(&base_addr);
+                            let locked = bc.get_locked_balance(&base_addr);
+                            let available = (total - locked).max(0.0);
+                            (available, "L1")
+                        } else if address.starts_with("L2_") {
+                            // L2 only: locked balance
+                            let base_addr = strip_prefix(&address);
+                            let locked = bc.get_locked_balance(&base_addr);
+                            (locked, "L2")
+                        } else {
+                            // No prefix: combined balance (L1 + L2)
+                            let total = bc.get_balance(&address);
+                            (total, "Combined")
+                        }
+                    },
+                    Err(_) => (0.0, "Error")  // Return 0 if lock poisoned
                 };
                 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                     "success": true,
                     "address": address,
-                    "balance": balance
+                    "balance": balance,
+                    "layer": layer
                 })))
             }
         })

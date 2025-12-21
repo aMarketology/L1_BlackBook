@@ -81,25 +81,31 @@ fn load_blockchain() -> EnhancedBlockchain {
 }
 
 fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
-    // Seed Alice and Bob - full-featured test accounts with UNIFIED WALLET MODEL
+    // Seed Alice, Bob, and Dealer - full-featured test accounts with UNIFIED WALLET MODEL
     let alice = integration::unified_auth::get_alice_account();
     let bob = integration::unified_auth::get_bob_account();
+    let dealer_address = integration::unified_auth::get_dealer_address();
     
     println!("🧪 Seeding Full Test Accounts (UNIFIED WALLET MODEL):");
     println!("   ┌─────────────────────────────────────────────────────────┐");
-    println!("   │ ALICE                                                   │");
+    println!("   │ ALICE - Regular Bettor                                  │");
     println!("   │ Address: {} (L1 & L2)              │", alice.address);
     println!("   │ Total Balance: {:8} BB (what user sees)          │", alice.total_balance);
     println!("   │   ├─ L1 Available: {:6} BB                          │", alice.l1_available);
     println!("   │   ├─ L1 Locked:    {:6} BB (bridged to L2)          │", alice.l1_locked);
     println!("   │   └─ L2 Balance:   {:6} BB (for betting)            │", alice.l2_balance);
     println!("   ├─────────────────────────────────────────────────────────┤");
-    println!("   │ BOB                                                     │");
+    println!("   │ BOB - Regular Bettor                                    │");
     println!("   │ Address: {} (L1 & L2)              │", bob.address);
     println!("   │ Total Balance: {:8} BB (what user sees)          │", bob.total_balance);
     println!("   │   ├─ L1 Available: {:6} BB                          │", bob.l1_available);
     println!("   │   ├─ L1 Locked:    {:6} BB (bridged to L2)          │", bob.l1_locked);
     println!("   │   └─ L2 Balance:   {:6} BB (for betting)            │", bob.l2_balance);
+    println!("   ├─────────────────────────────────────────────────────────┤");
+    println!("   │ DEALER - House/Oracle (L2 Native)                      │");
+    println!("   │ Address: {}                     │", dealer_address);
+    println!("   │ L1 Bankroll: 100,000 BB (infinite liquidity)           │");
+    println!("   │ Role: Market operator, instant bet settlement           │");
     println!("   └─────────────────────────────────────────────────────────┘");
     
     // UNIFIED WALLET MODEL:
@@ -119,6 +125,18 @@ fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
     bc.balances.insert(format!("{}_LOCKED", bob.address), bob.l1_locked);
     bc.balances.insert(format!("{}_L2", bob.address), bob.l2_balance);
     bc.balances.insert(bob.address.clone(), bob.total_balance); // Total for backward compat
+    
+    // Dealer's balances (100,000 BB bankroll on L1)
+    // The Dealer uses the new address format: L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3
+    // We need to store it using just the hash (without L1_/L2_ prefix) so it works with both layers
+    use crate::unified_wallet::strip_prefix;
+    let dealer_hash = strip_prefix(&dealer_address);
+    bc.balances.insert(dealer_hash.clone(), 100000.0);  // 100k BB bankroll
+    
+    println!("\n✅ Test accounts initialized:");
+    println!("   • Alice:  10,000 BB (regular user)");
+    println!("   • Bob:     5,000 BB (regular user)");
+    println!("   • Dealer: 100,000 BB (house bankroll)");
 }
 
 fn save_blockchain(blockchain: &EnhancedBlockchain) {
