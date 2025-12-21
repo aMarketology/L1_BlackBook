@@ -1,0 +1,178 @@
+/**
+ * CFTC DCM Technical Requirements for BlackBook
+ * 
+ * ============================================================
+ * CORE PRINCIPLE 3: CONTRACTS NOT READILY MANIPULABLE
+ * ============================================================
+ * 
+ * Required Analysis (Appendix C):
+ * 1. Cash market analysis
+ * 2. Delivery/settlement specifications
+ * 3. Position limits rationale
+ * 4. Price discovery mechanism
+ * 
+ * BlackBook Needs:
+ * - [ ] Market manipulation detection system
+ * - [ ] Oracle integrity verification
+ * - [ ] Price feed redundancy (multiple oracles)
+ * - [ ] Settlement audit trail
+ */
+
+/**
+ * ============================================================
+ * CORE PRINCIPLE 4: PREVENTION OF MARKET DISRUPTION
+ * ============================================================
+ */
+const MARKET_SAFEGUARDS = {
+  // Circuit breakers
+  price_limits: {
+    daily_limit: 0.20,        // 20% max price movement
+    halt_threshold: 0.15,     // 15% triggers 5-min halt
+    resume_after: 300,        // 5 minutes
+  },
+  
+  // Position limits per user
+  position_limits: {
+    max_position_per_market: 100000,    // 100k BB ($1000)
+    max_position_all_markets: 1000000,  // 1M BB ($10k)
+    large_trader_threshold: 50000,      // Report if > 500 BB
+  },
+  
+  // Order rate limits
+  rate_limits: {
+    orders_per_second: 10,
+    orders_per_minute: 100,
+    cancel_ratio_max: 0.90,   // Max 90% cancel rate
+  },
+};
+
+/**
+ * ============================================================
+ * CORE PRINCIPLE 8: DAILY PUBLICATION OF TRADING INFO
+ * ============================================================
+ */
+const DAILY_REPORTS = {
+  required_fields: [
+    'market_id',
+    'opening_price',
+    'closing_price',
+    'high_price',
+    'low_price',
+    'settlement_price',
+    'volume',
+    'open_interest',
+    'number_of_trades',
+  ],
+  
+  publication_time: '17:00 ET',  // End of trading day
+  retention_period: '5 years',
+  public_access: true,
+};
+
+/**
+ * ============================================================
+ * CORE PRINCIPLE 18: RECORDKEEPING
+ * ============================================================
+ */
+const RECORDKEEPING = {
+  retention_period: 5 * 365 * 24 * 60 * 60,  // 5 years in seconds
+  
+  required_records: [
+    'all_orders',           // Every order submitted
+    'all_trades',           // Every executed trade
+    'all_positions',        // Position snapshots
+    'all_settlements',      // Settlement records
+    'all_communications',   // Customer communications
+    'audit_trail',          // Who did what when
+  ],
+  
+  format: 'immutable',      // Cannot be altered
+  access: 'CFTC on demand', // Must provide within 24 hours
+};
+
+/**
+ * ============================================================
+ * CORE PRINCIPLE 20: SYSTEM SAFEGUARDS
+ * ============================================================
+ */
+const SYSTEM_SAFEGUARDS = {
+  // Business Continuity
+  disaster_recovery: {
+    rto: 4 * 60 * 60,       // Recovery Time Objective: 4 hours
+    rpo: 1 * 60 * 60,       // Recovery Point Objective: 1 hour
+    backup_site: 'required',
+    annual_dr_test: true,
+  },
+  
+  // Cybersecurity
+  security: {
+    penetration_testing: 'annual',
+    vulnerability_scanning: 'continuous',
+    incident_response_plan: 'required',
+    encryption: 'AES-256 at rest, TLS 1.3 in transit',
+  },
+  
+  // Capacity
+  capacity: {
+    peak_load_testing: 'quarterly',
+    capacity_headroom: 2.0,  // 2x expected peak
+    latency_monitoring: 'real-time',
+  },
+};
+
+/**
+ * ============================================================
+ * CORE PRINCIPLE 21: FINANCIAL RESOURCES
+ * ============================================================
+ */
+const FINANCIAL_REQUIREMENTS = {
+  // Minimum capital
+  minimum_capital: 5000000,  // $5M minimum (estimate)
+  
+  // Must cover:
+  operating_expenses_coverage: 12,  // 12 months
+  default_fund: true,               // For clearing
+  insurance: 'E&O, Cyber, Fidelity',
+  
+  // Audited financials
+  audit_frequency: 'annual',
+  auditor: 'Big 4 or equivalent',
+
+
+# DCM Governance Requirements
+
+## Board of Directors
+
+### Composition (Core Principle 16, 17, 22)
+- Minimum 5 directors
+- At least 35% public/independent directors
+- No material conflicts of interest
+- Fitness standards (background checks)
+
+### Required Committees
+1. **Risk Committee** - Oversee market risk
+2. **Audit Committee** - Financial oversight
+3. **Regulatory Oversight Committee** - Compliance
+4. **Nominating Committee** - Board selection
+
+### Conflicts of Interest Policy
+- Annual disclosure by all officers/directors
+- Recusal procedures
+- No self-trading
+- Chinese walls between business units
+
+## Chief Compliance Officer (CCO)
+- Required position
+- Reports directly to board
+- Annual compliance report to CFTC
+- Cannot be removed without board approval
+
+## Rulebook
+Must include:
+- Trading rules
+- Membership rules
+- Disciplinary procedures
+- Dispute resolution procedures
+- Fee schedules
+- Position limit rules
+- Emergency procedures

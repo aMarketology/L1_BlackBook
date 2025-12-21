@@ -1,0 +1,28 @@
+{
+  "generated_at": "2025-12-20T22:14:43.451Z",
+  "format_version": 2,
+  "address_format": "L1/L2 + 40 hex chars (160-bit, SHA256 truncated)",
+  "note": "These are REAL cryptographic keys generated from BIP-39 mnemonics",
+  "alice": {
+    "name": "Alice",
+    "username": "alice_test",
+    "email": "alice@blackbook.test",
+    "mnemonic": "machine sword cause scrub simple damage program together spoon lock ball banana",
+    "public_key": "c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705",
+    "private_key": "18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24",
+    "l1_address": "L1BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+    "l2_address": "L2BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+    "derivation_path": "m/44'/1337'/0'/0'/0'"
+  },
+  "bob": {
+    "name": "Bob",
+    "username": "bob_test",
+    "email": "bob@blackbook.test",
+    "mnemonic": "base echo grape penalty hawk resemble obscure unusual throw paddle carpet elder",
+    "public_key": "582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a",
+    "private_key": "e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b",
+    "l1_address": "L1AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+    "l2_address": "L2AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+    "derivation_path": "m/44'/1337'/0'/0'/0'"
+  }
+}

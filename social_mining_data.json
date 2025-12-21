@@ -1,0 +1,164 @@
+{
+  "actions": [
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_0",
+      "target_user": null,
+      "timestamp": 1765857845,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_1",
+      "target_user": null,
+      "timestamp": 1765866920,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_2",
+      "target_user": null,
+      "timestamp": 1765867154,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_3",
+      "target_user": null,
+      "timestamp": 1765868172,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_4",
+      "target_user": null,
+      "timestamp": 1765954821,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_5",
+      "target_user": null,
+      "timestamp": 1766032038,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_6",
+      "target_user": null,
+      "timestamp": 1766032177,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_7",
+      "target_user": null,
+      "timestamp": 1766036243,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_8",
+      "target_user": null,
+      "timestamp": 1766036268,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_9",
+      "target_user": null,
+      "timestamp": 1766036431,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_10",
+      "target_user": null,
+      "timestamp": 1766036617,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_11",
+      "target_user": null,
+      "timestamp": 1766036862,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_12",
+      "target_user": null,
+      "timestamp": 1766036891,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_13",
+      "target_user": null,
+      "timestamp": 1766036908,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_14",
+      "target_user": null,
+      "timestamp": 1766036929,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_15",
+      "target_user": null,
+      "timestamp": 1766037132,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_16",
+      "target_user": null,
+      "timestamp": 1766037175,
+      "reward_amount": 10.0
+    },
+    {
+      "action_type": "Post",
+      "user_address": "L1ALICE000000001",
+      "post_id": "post_L1ALICE000000001_17",
+      "target_user": null,
+      "timestamp": 1766038128,
+      "reward_amount": 10.0
+    }
+  ],
+  "daily_limits": {
+    "L1ALICE000000001": {
+      "date": "day_20440",
+      "posts": 13,
+      "likes": 0,
+      "comments": 0,
+      "reposts": 0
+    }
+  },
+  "posts": {},
+  "user_earnings": {},
+  "total_posts": 0,
+  "total_likes": 0,
+  "total_comments": 0,
+  "total_rewards_distributed": 0.0,
+  "difficulty_adjustment": 1.0
+}

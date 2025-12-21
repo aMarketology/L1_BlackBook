@@ -1,0 +1,203 @@
+// ============================================================================
+// settlement.proto - L1↔L2 Settlement Protocol
+// ============================================================================
+//
+// The Bank (L1) ↔ Casino (L2) Communication Protocol
+//
+// MINDSET: 
+//   L1 = "The Bank" - Holds real money, validates signatures, final settlement
+//   L2 = "The Casino" - Runs the games, fronts bets instantly, requests reimbursement
+//
+// When a user places a bet on L2:
+//   1. L2 (Casino) fronts the stake immediately for great UX
+//   2. L2 calls L1 (Bank) via gRPC to request reimbursement
+//   3. L1 verifies user has balance, debits their account
+//   4. L1 credits the Dealer's reimbursement pool
+//   5. When bet resolves, L2 reports outcome to L1 for final settlement
+//
+// ============================================================================
+
+syntax = "proto3";
+
+package blackbook.settlement;
+
+// ============================================================================
+// SETTLEMENT SERVICE - The Bank's API
+// ============================================================================
+
+service SettlementNode {
+  // Core settlement operations
+  rpc ExecuteSettlement(SettlementRequest) returns (SettlementResponse);
+  rpc RequestReimbursement(ReimbursementRequest) returns (ReimbursementResponse);
+  
+  // Bridge operations (L1 ↔ L2 token movement)
+  rpc InitiateBridgeLock(BridgeLockRequest) returns (BridgeLockResponse);
+  rpc ReleaseBridgeFunds(BridgeReleaseRequest) returns (BridgeReleaseResponse);
+  rpc VerifySettlementProof(SettlementProofRequest) returns (SettlementProofResponse);
+  
+  // Balance queries
+  rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+  rpc CheckSufficientBalance(SufficientBalanceRequest) returns (SufficientBalanceResponse);
+  
+  // Health & Status
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+  rpc GetBlockHeight(BlockHeightRequest) returns (BlockHeightResponse);
+}
+
+// ============================================================================
+// SETTLEMENT MESSAGES
+// ============================================================================
+
+// Request to execute a full settlement (bet resolution payout)
+message SettlementRequest {
+  string dealer_id = 1;          // Who fronted the bet (Dealer wallet)
+  string user_id = 2;            // Who placed the bet
+  uint64 amount = 3;             // Amount in smallest units (1 BB = 1_000_000)
+  bytes signature = 4;           // Ed25519 signature from L2
+  bytes intent_hash = 5;         // Hash of the original bet intent
+  uint64 nonce = 6;              // Replay protection
+  string bet_id = 7;             // Unique bet identifier
+  string market_id = 8;          // Market the bet was placed on
+  string outcome = 9;            // The resolved outcome (YES/NO/VOID)
+  uint64 payout_amount = 10;     // Amount to pay winner
+  string beneficiary = 11;       // Who receives the payout
+  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+}
+
+message SettlementResponse {
+  bool success = 1;
+  string tx_hash = 2;            // L1 transaction hash
+  string error_message = 3;
+  uint64 new_dealer_balance = 4;
+  uint64 new_user_balance = 5;
+  uint64 block_height = 6;       // L1 block where settlement was recorded
+}
+
+// ============================================================================
+// REIMBURSEMENT MESSAGES (Casino asks Bank to pay back fronted stake)
+// ============================================================================
+
+message ReimbursementRequest {
+  string dealer_id = 1;          // Dealer requesting reimbursement
+  string user_id = 2;            // User whose balance to debit
+  uint64 amount = 3;             // Amount to reimburse
+  bytes signature = 4;           // Dealer's signature
+  string bet_id = 5;             // Reference to the bet
+  uint64 nonce = 6;
+  uint64 timestamp = 7;          // When the bet was placed
+  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+}
+
+message ReimbursementResponse {
+  bool success = 1;
+  string tx_hash = 2;
+  string error_message = 3;
+  uint64 user_remaining_balance = 4;
+  uint64 dealer_credited = 5;
+}
+
+// ============================================================================
+// BRIDGE MESSAGES (L1 ↔ L2 Token Movement)
+// ============================================================================
+
+message BridgeLockRequest {
+  string user_id = 1;            // User locking funds
+  uint64 amount = 2;             // Amount to lock
+  string target_layer = 3;       // "L2" for deposits to L2
+  bytes signature = 4;           // User's signature
+  uint64 nonce = 5;
+  uint32 chain_id = 20;          // Domain separation (0x01=L1, 0x02=L2)
+}
+
+message BridgeLockResponse {
+  bool success = 1;
+  string lock_id = 2;            // Unique lock identifier
+  string error_message = 3;
+  uint64 locked_amount = 4;
+  uint64 expires_at = 5;         // Unix timestamp
+}
+
+message BridgeReleaseRequest {
+  string lock_id = 1;            // Lock to release
+  string beneficiary = 2;        // Who receives the funds
+  uint64 amount = 3;             // Amount to release
+  bytes l2_proof = 4;            // Proof from L2 (merkle proof or signature)
+  string market_id = 5;          // Optional: market context
+  string outcome = 6;            // Optional: outcome context
+}
+
+message BridgeReleaseResponse {
+  bool success = 1;
+  string tx_hash = 2;
+  string error_message = 3;
+  uint64 released_amount = 4;
+  string recipient = 5;
+}
+
+message SettlementProofRequest {
+  string lock_id = 1;
+  string market_id = 2;
+  string outcome = 3;
+  string beneficiary = 4;
+  uint64 amount = 5;
+  bytes l2_signature = 6;
+  uint64 l2_block_height = 7;
+}
+
+message SettlementProofResponse {
+  bool valid = 1;
+  bool release_authorized = 2;
+  string error_message = 3;
+}
+
+// ============================================================================
+// BALANCE MESSAGES
+// ============================================================================
+
+message BalanceRequest {
+  string address = 1;
+}
+
+message BalanceResponse {
+  string address = 1;
+  uint64 balance = 2;            // Available balance
+  uint64 locked = 3;             // Locked in bridges
+  uint64 total = 4;              // balance + locked
+}
+
+message SufficientBalanceRequest {
+  string address = 1;
+  uint64 required_amount = 2;
+}
+
+message SufficientBalanceResponse {
+  bool sufficient = 1;
+  uint64 available = 2;
+  uint64 shortfall = 3;          // How much more is needed (0 if sufficient)
+}
+
+// ============================================================================
+// HEALTH & STATUS MESSAGES
+// ============================================================================
+
+message HealthRequest {
+  // Empty - just checking if server is alive
+}
+
+message HealthResponse {
+  string status = 1;             // "healthy", "degraded", "unhealthy"
+  uint64 block_height = 2;
+  string version = 3;
+  uint64 uptime_seconds = 4;
+  uint32 pending_settlements = 5;
+}
+
+message BlockHeightRequest {
+  // Empty
+}
+
+message BlockHeightResponse {
+  uint64 height = 1;
+  string blockhash = 2;
+  uint64 timestamp = 3;
+}
