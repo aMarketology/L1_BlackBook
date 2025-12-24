@@ -40,33 +40,95 @@ use once_cell::sync::Lazy;
 // NONCE DEDUPLICATION CACHE - Prevents replay attacks
 // ============================================================================
 
-/// Maximum number of nonces to track (100k entries ~= 4MB memory)
-const NONCE_CACHE_SIZE: usize = 100_000;
+/// Maximum number of nonces to track per time bucket
+/// Each bucket holds 50k entries, with 2 buckets (current + previous)
+/// Total: ~100k entries, but flood attacks only affect current bucket
+const NONCE_BUCKET_SIZE: usize = 50_000;
 
-/// Global LRU cache for nonce deduplication
-/// Key: "public_key:nonce", Value: timestamp when used
-static NONCE_CACHE: Lazy<Mutex<LruCache<String, u64>>> = Lazy::new(|| {
-    Mutex::new(LruCache::new(NonZeroUsize::new(NONCE_CACHE_SIZE).unwrap()))
+/// Time bucket duration in seconds (must be >= REQUEST_EXPIRY_SECS)
+/// We use 10 minutes so a nonce is valid for at least 5 minutes (expiry window)
+const NONCE_BUCKET_DURATION_SECS: u64 = 600;
+
+/// Nonce cache with time-bucketed storage
+/// This prevents cache flood attacks: attackers can only evict entries from the current bucket,
+/// but valid nonces from the previous bucket (still within 5-min expiry) are protected.
+struct NonceBucketCache {
+    /// Current time bucket
+    current_bucket: LruCache<String, u64>,
+    /// Previous time bucket (for nonces that span bucket boundaries)
+    previous_bucket: LruCache<String, u64>,
+    /// Start time of current bucket
+    current_bucket_start: u64,
+}
+
+impl NonceBucketCache {
+    fn new() -> Self {
+        Self {
+            current_bucket: LruCache::new(NonZeroUsize::new(NONCE_BUCKET_SIZE).unwrap()),
+            previous_bucket: LruCache::new(NonZeroUsize::new(NONCE_BUCKET_SIZE).unwrap()),
+            current_bucket_start: 0,
+        }
+    }
+    
+    /// Rotate buckets if we've entered a new time period
+    fn maybe_rotate(&mut self, now: u64) {
+        let bucket_start = (now / NONCE_BUCKET_DURATION_SECS) * NONCE_BUCKET_DURATION_SECS;
+        
+        if bucket_start > self.current_bucket_start {
+            // New bucket period - rotate
+            std::mem::swap(&mut self.current_bucket, &mut self.previous_bucket);
+            self.current_bucket.clear();
+            self.current_bucket_start = bucket_start;
+            println!("🔄 Nonce cache rotated to new bucket (start: {})", bucket_start);
+        }
+    }
+    
+    /// Check if nonce exists in either bucket
+    fn contains(&mut self, key: &str) -> Option<u64> {
+        // Check current bucket first (most likely)
+        if let Some(&ts) = self.current_bucket.get(key) {
+            return Some(ts);
+        }
+        // Check previous bucket (for nonces near bucket boundary)
+        if let Some(&ts) = self.previous_bucket.get(key) {
+            return Some(ts);
+        }
+        None
+    }
+    
+    /// Insert nonce into current bucket
+    fn insert(&mut self, key: String, timestamp: u64) {
+        self.current_bucket.put(key, timestamp);
+    }
+}
+
+/// Global time-bucketed nonce cache
+static NONCE_CACHE: Lazy<Mutex<NonceBucketCache>> = Lazy::new(|| {
+    Mutex::new(NonceBucketCache::new())
 });
 
 /// Check if a nonce has been used and mark it as used
 /// Returns Ok(()) if nonce is fresh, Err if replay attack detected
 fn check_and_mark_nonce(public_key: &str, nonce: &str, timestamp: u64) -> Result<(), String> {
     let cache_key = format!("{}:{}", public_key, nonce);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
     let mut cache = NONCE_CACHE.lock()
         .map_err(|_| "Nonce cache lock poisoned")?;
     
-    // Check if nonce was already used
-    if let Some(&used_at) = cache.get(&cache_key) {
+    // Rotate buckets if needed
+    cache.maybe_rotate(now);
+    
+    // Check if nonce was already used (in either bucket)
+    if let Some(used_at) = cache.contains(&cache_key) {
         return Err(format!(
             "Nonce replay attack detected: nonce '{}' was already used at timestamp {}",
             &nonce[..nonce.len().min(8)], used_at
         ));
     }
     
-    // Mark nonce as used
-    cache.put(cache_key, timestamp);
+    // Mark nonce as used in current bucket
+    cache.insert(cache_key, timestamp);
     
     Ok(())
 }
@@ -132,8 +194,14 @@ pub struct SignedRequest {
     #[serde(default = "default_chain_id")]
     pub chain_id: u8,
     
+    /// Request path (e.g., "/transfer", "/wallet/balance")
+    /// Prevents cross-endpoint replay attacks
+    /// If not provided, signature verification still works but is less secure
+    #[serde(default)]
+    pub request_path: Option<String>,
+    
     /// Ed25519 signature (128 hex chars)
-    /// Signs: chain_id + payload\ntimestamp\nnonce
+    /// Signs: chain_id + request_path + payload\ntimestamp\nnonce
     pub signature: String,
 }
 
@@ -145,6 +213,14 @@ fn default_chain_id() -> u8 {
 impl SignedRequest {
     /// Verify this request's signature with domain separation
     pub fn verify(&self) -> Result<String, String> {
+        self.verify_with_path(None)
+    }
+    
+    /// Verify this request's signature with domain separation and path binding
+    /// 
+    /// The `expected_path` parameter allows the server to enforce that the signature
+    /// was created for this specific endpoint, preventing cross-endpoint replay attacks.
+    pub fn verify_with_path(&self, expected_path: Option<&str>) -> Result<String, String> {
         // 1. Check timestamp freshness (5 min window)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let age = now.saturating_sub(self.timestamp);
@@ -157,12 +233,36 @@ impl SignedRequest {
             return Err(format!("Invalid chain_id: 0x{:02x}. Must be 0x01 (L1) or 0x02 (L2)", self.chain_id));
         }
         
-        // 3. Check for nonce replay attack (deduplication)
+        // 3. If server expects a specific path, verify it matches
+        if let Some(expected) = expected_path {
+            if let Some(ref signed_path) = self.request_path {
+                if signed_path != expected {
+                    return Err(format!(
+                        "Path mismatch: signature is for '{}' but request is to '{}'",
+                        signed_path, expected
+                    ));
+                }
+            }
+            // If request_path is None, we accept for backward compatibility
+            // but log a warning
+            else {
+                println!("⚠️  Request missing request_path field (backward compatibility mode)");
+            }
+        }
+        
+        // 4. Check for nonce replay attack (deduplication)
         check_and_mark_nonce(&self.public_key, &self.nonce, self.timestamp)?;
         
-        // 4. Reconstruct the signed message with DOMAIN SEPARATION
-        // Format: [chain_id][payload\ntimestamp\nnonce]
-        let payload_str = format!("{}\n{}\n{}", self.payload, self.timestamp, self.nonce);
+        // 5. Reconstruct the signed message with DOMAIN SEPARATION + PATH BINDING
+        // Format: [chain_id][request_path\n][payload\ntimestamp\nnonce]
+        let path_component = self.request_path.as_deref().unwrap_or("");
+        let payload_str = if path_component.is_empty() {
+            // Backward compatibility: no path in signature
+            format!("{}\n{}\n{}", self.payload, self.timestamp, self.nonce)
+        } else {
+            // New format: path included in signature
+            format!("{}\n{}\n{}\n{}", path_component, self.payload, self.timestamp, self.nonce)
+        };
         let mut signed_msg = Vec::new();
         signed_msg.push(self.chain_id);  // <--- CRITICAL: Domain separator
         signed_msg.extend_from_slice(payload_str.as_bytes());
@@ -575,6 +675,7 @@ pub fn create_signed_request(
         timestamp,
         nonce,
         chain_id,
+        request_path: None,  // No path binding in this helper (for backward compat)
         signature,
     })
 }
@@ -679,9 +780,10 @@ pub fn get_all_full_test_accounts() -> Vec<FullTestAccount> {
 // 3. NEVER committed to version control
 // ============================================================================
 
-/// Dealer's L2 wallet address (native to Layer 2)
+/// Dealer's L1 wallet address (for bankroll on Layer 1)
 /// Generated from BIP-39 mnemonic with derivation path m/44'/1337'/0'/0'/0'
-pub const DEALER_ADDRESS: &str = "L2_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
+/// Note: Dealer uses L1_ prefix for token custody, L2_ for betting operations
+pub const DEALER_ADDRESS: &str = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
 
 /// Dealer's PUBLIC KEY ONLY - the private key is NEVER stored in code
 /// This public key is used to verify Dealer signatures on market operations
@@ -798,10 +900,12 @@ mod tests {
         
         let request = SignedRequest {
             public_key: public.clone(),
-            wallet_address: Some(public),  // Add missing field
+            wallet_address: Some(public),
             payload: payload.to_string(),
             timestamp,
             nonce: nonce.to_string(),
+            chain_id: CHAIN_ID_L1,
+            request_path: None,
             signature,
         };
         

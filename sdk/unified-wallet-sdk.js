@@ -9,20 +9,41 @@
 // 4. Shamir's Secret Sharing (SSS) for MPC wallets (optional)
 // 5. L1/L2 address derivation (SHA256 of public key)
 // 6. Domain separation (prevents L1/L2 replay attacks)
+// 7. Path binding (prevents cross-endpoint replay attacks)
 //
 // Security Model:
 // ┌─────────────────────────────────────────────────────────────────────────┐
-// │  PASSWORD → ARGON2 → ENCRYPTION KEY → AES-GCM → ENCRYPTED BLOB         │
+// │  PASSWORD → ARGON2id → ENCRYPTION KEY → AES-GCM → ENCRYPTED BLOB       │
 // │                                                                         │
 // │  ENCRYPTED BLOB + PASSWORD → PRIVATE KEY → Ed25519 SIGNATURE           │
 // │                                                                         │
 // │  L1 ADDRESS = "L1_" + SHA256(public_key).slice(0, 40)                  │
 // │  L2 ADDRESS = "L2_" + SHA256(public_key).slice(0, 40)                  │
+// │                                                                         │
+// │  SIGNATURE = sign(chain_id + path + payload + timestamp + nonce)       │
 // └─────────────────────────────────────────────────────────────────────────┘
 
 import nacl from 'tweetnacl';
 import naclUtil from 'tweetnacl-util';
 import { createHash, randomBytes } from 'crypto';
+
+// ============================================================================
+// ARGON2 IMPORT - Use argon2-browser for browser compatibility
+// ============================================================================
+
+// Try to import argon2 (Node.js) or argon2-browser (browser)
+let argon2Module = null;
+try {
+  // For Node.js environments
+  argon2Module = await import('argon2');
+} catch {
+  try {
+    // For browser environments
+    argon2Module = await import('argon2-browser');
+  } catch {
+    console.warn('⚠️ Argon2 not available, falling back to PBKDF2 (LESS SECURE)');
+  }
+}
 
 // ============================================================================
 // CONSTANTS
@@ -40,6 +61,11 @@ export const AUTH_CONSTANT = "BLACKBOOK_AUTH_V1";
 export const WALLET_CONSTANT = "BLACKBOOK_WALLET_V1";
 
 export const REQUEST_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+
+// Argon2 parameters (MUST match server: unified_auth.rs)
+export const ARGON2_MEMORY_KIB = 65536;   // 64 MB
+export const ARGON2_ITERATIONS = 3;        // Time cost
+export const ARGON2_PARALLELISM = 4;       // Lanes
 
 // ============================================================================
 // TEST ACCOUNTS (Development Only)
@@ -89,20 +115,61 @@ export const ACCOUNTS = {
  * Derive encryption key from password using Argon2id
  * This is intentionally slow to prevent brute force attacks
  * 
+ * CRITICAL: Parameters MUST match server (unified_auth.rs):
+ * - Algorithm: Argon2id
+ * - Memory: 65536 KiB (64 MB)
+ * - Iterations: 3
+ * - Parallelism: 4
+ * - Output length: 32 bytes
+ * 
  * @param {string} password - User's password
  * @param {Buffer|string} salt - 32-byte salt (hex string or Buffer)
  * @param {string} domain - Domain constant (AUTH_CONSTANT or WALLET_CONSTANT)
  * @returns {Promise<Buffer>} - 32-byte encryption key
  */
 export async function deriveKey(password, salt, domain = WALLET_CONSTANT) {
-  // For browser compatibility, we'd use argon2-browser
-  // For Node.js, we use native crypto with PBKDF2 as fallback
-  
   const saltBuffer = typeof salt === 'string' ? Buffer.from(salt, 'hex') : salt;
   const domainedPassword = domain + password;
   
-  // TODO: Replace with argon2id in production
-  // For now using PBKDF2 as a placeholder
+  // Use Argon2id if available (matches server implementation)
+  if (argon2Module) {
+    try {
+      let result;
+      
+      // Handle different argon2 module interfaces
+      if (argon2Module.hash) {
+        // Node.js argon2 module
+        result = await argon2Module.hash(domainedPassword, {
+          salt: saltBuffer,
+          type: argon2Module.argon2id || 2,  // Argon2id
+          memoryCost: ARGON2_MEMORY_KIB,
+          timeCost: ARGON2_ITERATIONS,
+          parallelism: ARGON2_PARALLELISM,
+          hashLength: KEY_LENGTH,
+          raw: true
+        });
+        return Buffer.from(result);
+      } else if (argon2Module.default?.hash) {
+        // argon2-browser module
+        result = await argon2Module.default.hash({
+          pass: domainedPassword,
+          salt: saltBuffer,
+          type: argon2Module.default.ArgonType.Argon2id,
+          mem: ARGON2_MEMORY_KIB,
+          time: ARGON2_ITERATIONS,
+          parallelism: ARGON2_PARALLELISM,
+          hashLen: KEY_LENGTH
+        });
+        return Buffer.from(result.hash);
+      }
+    } catch (err) {
+      console.warn('⚠️ Argon2 failed, falling back to PBKDF2:', err.message);
+    }
+  }
+  
+  // Fallback to PBKDF2 if Argon2 is not available
+  // WARNING: This is less secure than Argon2id
+  console.warn('⚠️ Using PBKDF2 fallback - install argon2 for better security');
   const crypto = await import('crypto');
   return new Promise((resolve, reject) => {
     crypto.pbkdf2(domainedPassword, saltBuffer, 100000, KEY_LENGTH, 'sha256', (err, derivedKey) => {
@@ -434,20 +501,31 @@ export class UnifiedWallet {
   }
   
   /**
-   * Sign a request with domain separation
+   * Sign a request with domain separation AND path binding
    * @param {object} payload - Request payload
    * @param {number} chainId - CHAIN_ID_L1 or CHAIN_ID_L2
+   * @param {string} requestPath - API endpoint path (e.g., "/transfer", "/wallet/balance")
    * @returns {object} - Signed request
    */
-  signRequest(payload, chainId = CHAIN_ID_L1) {
+  signRequest(payload, chainId = CHAIN_ID_L1, requestPath = null) {
     const timestamp = Date.now();
     this.nonce++;
     
     const payloadStr = JSON.stringify(payload);
-    const message = `${this.publicKey}:${this.nonce}:${timestamp}:${payloadStr}`;
+    
+    // Build message with path binding (if provided)
+    // Format: [path\n]payload\ntimestamp\nnonce
+    let message;
+    if (requestPath) {
+      message = `${requestPath}\n${payloadStr}\n${timestamp}\n${this.nonce}`;
+    } else {
+      // Backward compatibility: no path
+      message = `${payloadStr}\n${timestamp}\n${this.nonce}`;
+    }
+    
     const signature = signMessage(this.privateKey, message, chainId);
     
-    return {
+    const result = {
       public_key: this.publicKey,
       wallet_address: chainId === CHAIN_ID_L1 ? this.l1Address : this.l2Address,
       nonce: this.nonce.toString(),
@@ -456,6 +534,13 @@ export class UnifiedWallet {
       payload: payloadStr,
       signature
     };
+    
+    // Include request_path if provided (recommended for security)
+    if (requestPath) {
+      result.request_path = requestPath;
+    }
+    
+    return result;
   }
   
   /**
@@ -498,7 +583,8 @@ export class UnifiedWallet {
       amount: amount
     };
     
-    const signedRequest = this.signRequest(payload, CHAIN_ID_L1);
+    // Sign with path binding for security
+    const signedRequest = this.signRequest(payload, CHAIN_ID_L1, '/transfer');
     
     const response = await fetch(`${l1Url}/transfer`, {
       method: 'POST',
@@ -507,6 +593,61 @@ export class UnifiedWallet {
     });
     
     return response.json();
+  }
+  
+  /**
+   * Register this wallet on the server
+   * @param {string} username - Username for registration
+   * @param {string} password - Password (used to encrypt vault)
+   * @param {string} email - Optional email
+   * @param {string} l1Url - L1 server URL
+   * @returns {Promise<object>} - Registration result
+   */
+  async register(username, password, email = null, l1Url = 'http://localhost:8080') {
+    // Create encrypted vault
+    const vault = await this.createVault(password);
+    vault.address = this.l1Address;
+    
+    const requestBody = {
+      username,
+      email: email || username,
+      encrypted_vault: vault,
+      public_key: this.publicKey
+    };
+    
+    const response = await fetch(`${l1Url}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestBody)
+    });
+    
+    return response.json();
+  }
+  
+  /**
+   * Load wallet from server using username and password
+   * @param {string} username - Username
+   * @param {string} password - Password to decrypt vault
+   * @param {string} l1Url - L1 server URL
+   * @returns {Promise<UnifiedWallet>} - Loaded wallet
+   */
+  static async fromServer(username, password, l1Url = 'http://localhost:8080') {
+    // 1. Fetch encrypted vault
+    const vaultResponse = await fetch(`${l1Url}/auth/vault/fetch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username })
+    });
+    
+    const vaultData = await vaultResponse.json();
+    if (!vaultData.success) {
+      throw new Error(vaultData.error || 'Failed to fetch vault');
+    }
+    
+    // 2. Decrypt vault to get private key
+    const privateKey = await unlockEncryptedBlob(vaultData.encrypted_vault, password);
+    
+    return new UnifiedWallet(privateKey);
   }
   
   /**

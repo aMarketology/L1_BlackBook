@@ -371,59 +371,17 @@ async fn main() {
     let like = routes_v2::social::like_post_route(blockchain.clone(), ss2);
     let social_stats = routes_v2::social::social_stats_route(ss3);
     
-    // Bridge routes (L1 ↔ L2)
+    // Bridge routes (L1 ↔ L2) - SIMPLIFIED
     let bridge_initiate = routes_v2::bridge::bridge_initiate_route(blockchain.clone(), bridge_state.clone());
     let bridge_status = routes_v2::bridge::bridge_status_route(bridge_state.clone());
     let bridge_pending = routes_v2::bridge::bridge_pending_route(bridge_state.clone());
     let bridge_stats = routes_v2::bridge::bridge_stats_route(bridge_state.clone());
-    let bridge_complete = routes_v2::bridge::bridge_complete_route(bridge_state.clone());
-    let verify_sig = routes_v2::bridge::verify_signature_route();
-    let relay = routes_v2::bridge::relay_action_route(blockchain.clone());
     
-    // L2 Integration routes (wallet lookup, nonces, settlements)
-    let wallet_by_user_id = routes_v2::bridge::wallet_by_user_id_route();
-    let nonce = routes_v2::bridge::nonce_route(bridge_state.clone(), blockchain.clone());
-    let settlement = routes_v2::bridge::settlement_route(bridge_state.clone(), blockchain.clone());
-    let get_settlement = routes_v2::bridge::get_settlement_route(bridge_state.clone());
-    
-    // Settlement verification and release routes (NEW: Proper Escrow)
-    let verify_settlement = routes_v2::bridge::verify_settlement_route(blockchain.clone(), bridge_state.clone());
-    let release_tokens = routes_v2::bridge::release_tokens_route(blockchain.clone(), bridge_state.clone());
-    
-    // L2 → L1 Bridge routes (Withdraw, Merkle Settlements)
-    let bridge_withdraw = routes_v2::bridge::withdraw_to_l1_route(blockchain.clone(), bridge_state.clone());
-    let settle_root = routes_v2::bridge::post_settlement_root_route(bridge_state.clone(), blockchain.clone());
-    let claim_settlement = routes_v2::bridge::claim_settlement_route(blockchain.clone(), bridge_state.clone());
-    let list_roots = routes_v2::bridge::list_settlement_roots_route(bridge_state.clone());
-    
-    // Optimistic Execution routes (L2 Session Management) - LEGACY
-    let session_start = routes_v2::bridge::start_session_route(blockchain.clone(), bridge_state.clone());
-    let session_status = routes_v2::bridge::session_status_route(blockchain.clone(), bridge_state.clone());
-    let session_settle = routes_v2::bridge::settle_session_route(blockchain.clone(), bridge_state.clone());
-    let session_list = routes_v2::bridge::list_sessions_route(bridge_state.clone());
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    // CREDIT LINE ROUTES (Casino Bank Model)
-    // ═══════════════════════════════════════════════════════════════════════
+    // CREDIT LINE ROUTES (Casino Bank Model) - CORE FUNCTIONALITY
     let credit_approve = routes_v2::bridge::credit_approve_route(blockchain.clone(), bridge_state.clone());
     let credit_draw = routes_v2::bridge::credit_draw_route(blockchain.clone(), bridge_state.clone());
     let credit_settle = routes_v2::bridge::credit_settle_route(blockchain.clone(), bridge_state.clone());
     let credit_status = routes_v2::bridge::credit_status_route(blockchain.clone(), bridge_state.clone());
-    
-    // Markets routes (L2 market/event initial liquidity)
-    let initial_liquidity = routes_v2::markets::initial_liquidity_route(blockchain.clone());
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    // UNIFIED WALLET: SESSION-BASED L2 INTEGRATION (THE RIGHT WAY)
-    // ═══════════════════════════════════════════════════════════════════════
-    // Only 3 endpoints needed:
-    // 1. start-session  → Lock bankroll ONCE
-    // 2. l1-balance     → Check real balance
-    // 3. settle-session → Apply NET P&L ONCE
-    // L2 handles all betting internally - NO per-bet L1 calls!
-    let unified_start_session = routes_v2::bridge::start_session_unified_route(blockchain.clone());
-    let unified_settle_session = routes_v2::bridge::settle_session_unified_route(blockchain.clone());
-    let l1_balance_for_l2 = routes_v2::bridge::l1_balance_for_l2_route(blockchain.clone());
     
     // Admin routes (OPEN ACCESS - DEVELOPMENT ONLY)
     let admin_mint = routes_v2::admin::mint_tokens_route(blockchain.clone());
@@ -491,51 +449,23 @@ async fn main() {
         .or(post)
         .or(like)
         .or(social_stats)
-        // Bridge routes
+        // ═══════════════════════════════════════════════════════════════
+        // BRIDGE ROUTES (Simplified - Core L1↔L2 bridge functionality)
+        // ═══════════════════════════════════════════════════════════════
         .or(bridge_initiate)
         .or(bridge_status)
         .or(bridge_pending)
         .or(bridge_stats)
-        .or(bridge_complete)
-        .or(verify_sig)
-        .or(relay)
-        // L2 Integration routes
-        .or(wallet_by_user_id)
-        .or(nonce)
-        .or(settlement)
-        .or(get_settlement)
-        // Settlement verification and release (Proper Escrow)
-        .or(verify_settlement)
-        .or(release_tokens)
-        // L2 → L1 Bridge (Withdraw, Merkle Settlements)
-        .or(bridge_withdraw)
-        .or(settle_root)
-        .or(claim_settlement)
-        .or(list_roots)
-        // Optimistic Execution (L2 Sessions) - LEGACY
-        .or(session_start)
-        .or(session_status)
-        .or(session_settle)
-        .or(session_list)
         // ═══════════════════════════════════════════════════════════════
-        // CREDIT LINE (Casino Bank Model) - THE NEW WAY
+        // CREDIT LINE (Casino Bank Model)
         // One-time approval, auto-draw, session settlement
         // ═══════════════════════════════════════════════════════════════
         .or(credit_approve)
         .or(credit_draw)
         .or(credit_settle)
         .or(credit_status)
-        // ═══════════════════════════════════════════════════════════════
-        // UNIFIED WALLET (SESSION-BASED) - THE RIGHT WAY
-        // Only 3 endpoints: start-session, l1-balance, settle-session
-        // ═══════════════════════════════════════════════════════════════
-        .or(unified_start_session)
-        .or(unified_settle_session)
-        .or(l1_balance_for_l2)
         // MPC routes (threshold signing)
         .or(mpc_routes)
-        // Markets routes (L2 initial liquidity)
-        .or(initial_liquidity)
         // Admin routes
         .or(admin_mint)
         // Protocol upgrade routes - TODO: Implement upgrade_manager

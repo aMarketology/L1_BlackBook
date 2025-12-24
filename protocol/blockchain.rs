@@ -427,32 +427,8 @@ impl EnhancedBlockchain {
             tx_type: TransactionType::Transfer,
         };
         
-        if from != "system" && from != "reward_system" && from != "signup_bonus" {
-            let from_balance = self.balances.get(&from).unwrap_or(&0.0);
-            if *from_balance >= amount {
-                if to == "burned_tokens" {
-                    self.balances.remove(&from);
-                } else {
-                    self.balances.insert(from.clone(), from_balance - amount);
-                }
-            } else {
-                return format!("Insufficient balance for {}", from);
-            }
-        }
-        
-        if to == "burned_tokens" {
-            println!("🔥 {} L1 tokens burned from deleted wallet {}", amount, from);
-        } else {
-            if from == "signup_bonus" {
-                self.balances.insert(to.clone(), amount);
-                println!("🎉 Signup bonus granted: {} -> {} L1 (Fresh wallet)", to, amount);
-            } else {
-                self.balances.entry(to.clone())
-                    .and_modify(|balance| *balance += amount)
-                    .or_insert(amount);
-            }
-        }
-        
+        // Balance changes now happen ONLY during mining, not here
+        // This fixes the double-deduction bug
         self.pending_transactions.push(transaction);
         
         println!("💰 Transaction created: {} -> {} ({} L1)", from, to, amount);

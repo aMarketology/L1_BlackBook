@@ -15,7 +15,6 @@ use warp::Filter;
 use serde::{Deserialize, Serialize};
 use crate::protocol::blockchain::{EnhancedBlockchain, LockPurpose};
 use crate::integration::unified_auth::SignedRequest;
-use crate::unified_wallet::strip_prefix;
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -150,12 +149,11 @@ pub fn bridge_initiate_route(
                     })));
                 }
 
-                // Lock tokens on L1 (strip L1_ prefix for internal address)
+                // Lock tokens on L1
                 let lock_id = {
                     let mut bc = lock_or_recover(&blockchain);
-                    let internal_address = strip_prefix(&wallet_address);
                     match bc.lock_tokens(
-                        &internal_address,
+                        &wallet_address,
                         payload.amount,
                         LockPurpose::BridgeToL2,
                         None,

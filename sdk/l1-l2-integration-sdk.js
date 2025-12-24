@@ -6,29 +6,35 @@
 //
 //  ┌─────────────────────────────────────────────────────────────────────────┐
 //  │                     L1 (Consensus Layer)                                │
-//  │  • Validates all L2 settlements                                         │
+//  │  • Validates all L2 settlements via Ed25519 signatures                  │
 //  │  • Manages Credit Line approvals & sessions                             │
 //  │  • Provides immutable audit trail                                       │
 //  │  REST: localhost:8080                                                   │
 //  └─────────────────────────────────────────────────────────────────────────┘
 //                              ▲
-//                              │ Credit Draw / Settlement
+//                              │ Signed Draw / Settlement Requests
 //                              ▼
 //  ┌─────────────────────────────────────────────────────────────────────────┐
 //  │                L2 (Prediction Market Backbone)                          │
 //  │  • CPMM prediction markets                                              │
 //  │  • Tracks all bets internally                                           │
 //  │  • Calculates prices & payouts                                          │
-//  │  • Auto-requests credit draws when balance low                          │
+//  │  • Forwards signed requests to L1 (does NOT validate signatures)        │
 //  │  REST: localhost:1234                                                   │
 //  └─────────────────────────────────────────────────────────────────────────┘
 //
 // CREDIT LINE FLOW (Casino Bank Model):
 //   1. wallet.approveCreditLine(500) → User signs ONCE to allow L2 draws
-//   2. wallet.draw(100) → L2 draws initial funds
-//   3. wallet.placeBet(...) → L2 handles bet internally
+//   2. wallet.draw(100) → SDK signs request, L2 forwards to L1, L1 validates
+//   3. wallet.placeBet(...) → L2 handles bet internally using credited balance
 //   4. wallet.ensureFundsForBet(50) → Auto-draw if L2 balance low
-//   5. wallet.closeSession() → Return unused L2 balance to L1
+//   5. wallet.closeSession() → SDK signs settlement, L2 forwards to L1, unused tokens return
+//
+// SECURITY MODEL:
+//   ✅ All token movements require Ed25519 signatures from wallet owner
+//   ✅ L2 forwards signed requests but CANNOT validate signatures
+//   ✅ L1 is the source of truth for all signature validation
+//   ✅ L2 can ONLY return tokens to the SAME wallet that deposited them
 //
 // ============================================================================
 

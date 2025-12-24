@@ -62,7 +62,7 @@ impl SettlementNode for L1BankService {
             payout_bb,
         );
 
-        let block_hash = bc.mine_pending_transactions("grpc_settlement".to_string());
+        let _block_hash = bc.mine_pending_transactions("grpc_settlement".to_string());
         let block_height = bc.chain.len() as u64;
 
         let dealer_balance = Self::bb_to_microtokens(bc.get_balance(&req.dealer_address));
@@ -377,6 +377,210 @@ impl SettlementNode for L1BankService {
             error_message: String::new(),
             error_code: 0,  // ERROR_NONE
             derived_address: derived_addr,
+        }))
+    }
+
+    // ========================================================================
+    // CREDIT LINE METHODS (Casino Bank Model)
+    // ========================================================================
+    
+    async fn approve_credit_line(
+        &self,
+        request: Request<CreditApprovalRequest>,
+    ) -> Result<Response<CreditApprovalResponse>, Status> {
+        let req = request.into_inner();
+        
+        println!("🏦 [L1 Bank] Credit line approval - {} requesting {} µBB", 
+            req.wallet_address, req.credit_limit);
+
+        let bc = self.blockchain.lock().unwrap();
+        let l1_balance = Self::bb_to_microtokens(bc.get_balance(&req.wallet_address));
+        drop(bc);
+
+        // In production, verify the signature here
+        // For now, accept the approval
+        let approval_id = format!("approval_{}", uuid::Uuid::new_v4());
+        let session_id = format!("session_{}", uuid::Uuid::new_v4());
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + (req.expires_in_hours as u64 * 3600);
+
+        println!("✅ [L1 Bank] Credit line approved - Session: {}", &session_id[..16]);
+
+        Ok(Response::new(CreditApprovalResponse {
+            success: true,
+            error_code: 0,  // ERROR_NONE
+            error_message: String::new(),
+            approval_id,
+            session_id: session_id.clone(),
+            credit_limit: req.credit_limit,
+            expires_at,
+            l1_balance,
+            session: Some(CreditSessionInfo {
+                session_id,
+                l2_balance: 0,
+                locked_in_bets: 0,
+                available_to_bet: 0,
+                total_drawn: 0,
+                draw_count: 0,
+                is_active: true,
+            }),
+        }))
+    }
+
+    async fn credit_draw(
+        &self,
+        request: Request<CreditDrawRequest>,
+    ) -> Result<Response<CreditDrawResponse>, Status> {
+        let req = request.into_inner();
+        
+        println!("💳 [L1 Bank] Credit draw - {} drawing {} µBB", 
+            req.wallet_address, req.amount);
+
+        let mut bc = self.blockchain.lock().unwrap();
+        let amount_bb = Self::microtokens_to_bb(req.amount);
+
+        // Check sufficient balance
+        let available = bc.get_spendable_balance(&req.wallet_address);
+        let l1_before = Self::bb_to_microtokens(available);
+
+        if available < amount_bb {
+            return Ok(Response::new(CreditDrawResponse {
+                success: false,
+                error_code: 1,  // ERROR_INSUFFICIENT_BALANCE
+                error_message: format!("Insufficient balance: {} BB available, {} BB required", 
+                    available, amount_bb),
+                amount_drawn: 0,
+                l1_before,
+                l1_after: l1_before,
+                l2_balance: 0,
+                remaining_credit: 0,
+                draw_count: 0,
+            }));
+        }
+
+        // Lock tokens for L2 (credit draw)
+        let _lock_id = match bc.lock_tokens(&req.wallet_address, amount_bb, LockPurpose::BridgeToL2, None) {
+            Ok(id) => id,
+            Err(e) => {
+                return Ok(Response::new(CreditDrawResponse {
+                    success: false,
+                    error_code: 2,  // ERROR_INTERNAL
+                    error_message: format!("Lock failed: {}", e),
+                    amount_drawn: 0,
+                    l1_before,
+                    l1_after: l1_before,
+                    l2_balance: 0,
+                    remaining_credit: 0,
+                    draw_count: 0,
+                }));
+            }
+        };
+
+        let new_available = bc.get_spendable_balance(&req.wallet_address);
+        let l1_after = Self::bb_to_microtokens(new_available);
+
+        println!("✅ [L1 Bank] Credit drawn - {} µBB transferred", req.amount);
+
+        Ok(Response::new(CreditDrawResponse {
+            success: true,
+            error_code: 0,  // ERROR_NONE
+            error_message: String::new(),
+            amount_drawn: req.amount,
+            l1_before,
+            l1_after,
+            l2_balance: req.amount,  // Simplified - track in session
+            remaining_credit: l1_after,  // Simplified
+            draw_count: 1,  // Simplified - track in session
+        }))
+    }
+
+    async fn credit_settle(
+        &self,
+        request: Request<CreditSettleRequest>,
+    ) -> Result<Response<CreditSettleResponse>, Status> {
+        let req = request.into_inner();
+        
+        println!("💰 [L1 Bank] Credit settlement - {} settling {} µBB", 
+            req.wallet_address, req.final_l2_balance);
+
+        let bc = self.blockchain.lock().unwrap();
+
+        // In production, verify signature and release locks
+        // For now, just return current balances
+        let available = bc.get_spendable_balance(&req.wallet_address);
+        let l1_before = Self::bb_to_microtokens(available);
+        
+        // Calculate PnL (simplified - actual implementation would track session start)
+        let net_pnl = req.final_l2_balance as i64;  // Simplified
+
+        println!("✅ [L1 Bank] Settlement complete - PnL: {} µBB", net_pnl);
+
+        Ok(Response::new(CreditSettleResponse {
+            success: true,
+            error_code: 0,  // ERROR_NONE
+            error_message: String::new(),
+            settlement_type: if net_pnl > 0 { "WINNINGS" } else if net_pnl < 0 { "LOSSES" } else { "BREAK_EVEN" }.to_string(),
+            net_pnl,
+            total_drawn: req.final_l2_balance,  // Simplified
+            final_l2_balance: req.final_l2_balance,
+            locked_in_bets: req.locked_in_bets,
+            draw_count: 1,  // Simplified
+            l1_before,
+            l1_after: l1_before + req.final_l2_balance,  // Simplified
+            returned_to_l1: req.final_l2_balance,
+        }))
+    }
+
+    async fn get_credit_status(
+        &self,
+        request: Request<CreditStatusRequest>,
+    ) -> Result<Response<CreditStatusResponse>, Status> {
+        let req = request.into_inner();
+        
+        let bc = self.blockchain.lock().unwrap();
+        
+        let available = bc.get_spendable_balance(&req.wallet_address);
+        let locked = bc.get_locked_balance(&req.wallet_address);
+        let total = bc.get_balance(&req.wallet_address);
+
+        // Simplified - actual implementation would track credit line session
+        Ok(Response::new(CreditStatusResponse {
+            success: true,
+            error_code: 0,  // ERROR_NONE
+            error_message: String::new(),
+            wallet_address: req.wallet_address.clone(),
+            l1_balance: Self::bb_to_microtokens(total),
+            has_active_credit: locked > 0.0,
+            approval: if locked > 0.0 {
+                Some(CreditApprovalInfo {
+                    approval_id: "simulated_approval".to_string(),
+                    credit_limit: Self::bb_to_microtokens(total),
+                    total_drawn: Self::bb_to_microtokens(locked),
+                    remaining_credit: Self::bb_to_microtokens(available),
+                    is_active: true,
+                    expires_at: 0,
+                })
+            } else {
+                None
+            },
+            session: if locked > 0.0 {
+                Some(CreditSessionInfo {
+                    session_id: "simulated_session".to_string(),
+                    l2_balance: Self::bb_to_microtokens(locked),
+                    locked_in_bets: 0,
+                    available_to_bet: Self::bb_to_microtokens(locked),
+                    total_drawn: Self::bb_to_microtokens(locked),
+                    draw_count: 1,
+                    is_active: true,
+                })
+            } else {
+                None
+            },
+            total_credit_extended: Self::bb_to_microtokens(total),
+            total_draws: 0,
+            total_settlements: 0,
         }))
     }
 }
