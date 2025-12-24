@@ -261,7 +261,21 @@ pub fn rpc_route(
                     // ============ Basic Chain Methods ============
                     "getBlockHeight" => {
                         let bc = lock_or_recover(&blockchain);
-                        serde_json::json!(bc.chain.len())
+                        let latest_block = bc.chain.last();
+                        match latest_block {
+                            Some(block) => serde_json::json!({
+                                "height": bc.chain.len(),
+                                "blockhash": block.hash.clone(),
+                                "slot": bc.current_slot,
+                                "timestamp": block.timestamp
+                            }),
+                            None => serde_json::json!({
+                                "height": 0,
+                                "blockhash": "",
+                                "slot": 0,
+                                "timestamp": 0
+                            })
+                        }
                     },
                     "getBalance" => {
                         let address = params.get(0)

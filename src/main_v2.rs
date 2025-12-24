@@ -81,55 +81,58 @@ fn load_blockchain() -> EnhancedBlockchain {
 }
 
 fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
-    // Seed Alice, Bob, and Dealer - full-featured test accounts with UNIFIED WALLET MODEL
+    // ========================================================================
+    // TEST ACCOUNT INITIALIZATION (Development Only)
+    // ========================================================================
+    // In production, these accounts would be funded via real transactions.
+    // For testing, we create "airdrop" transactions from Treasury.
+    
+    use crate::protocol::blockchain::TREASURY_ADDRESS;
+    use crate::unified_wallet::strip_prefix;
+    
     let alice = integration::unified_auth::get_alice_account();
     let bob = integration::unified_auth::get_bob_account();
     let dealer_address = integration::unified_auth::get_dealer_address();
     
-    println!("🧪 Seeding Full Test Accounts (UNIFIED WALLET MODEL):");
+    println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
     println!("   ┌─────────────────────────────────────────────────────────┐");
-    println!("   │ ALICE - Regular Bettor                                  │");
-    println!("   │ Address: {} (L1 & L2)              │", alice.address);
-    println!("   │ Total Balance: {:8} BB (what user sees)          │", alice.total_balance);
-    println!("   │   ├─ L1 Available: {:6} BB                          │", alice.l1_available);
-    println!("   │   ├─ L1 Locked:    {:6} BB (bridged to L2)          │", alice.l1_locked);
-    println!("   │   └─ L2 Balance:   {:6} BB (for betting)            │", alice.l2_balance);
-    println!("   ├─────────────────────────────────────────────────────────┤");
-    println!("   │ BOB - Regular Bettor                                    │");
-    println!("   │ Address: {} (L1 & L2)              │", bob.address);
-    println!("   │ Total Balance: {:8} BB (what user sees)          │", bob.total_balance);
-    println!("   │   ├─ L1 Available: {:6} BB                          │", bob.l1_available);
-    println!("   │   ├─ L1 Locked:    {:6} BB (bridged to L2)          │", bob.l1_locked);
-    println!("   │   └─ L2 Balance:   {:6} BB (for betting)            │", bob.l2_balance);
-    println!("   ├─────────────────────────────────────────────────────────┤");
-    println!("   │ DEALER - House/Oracle (L2 Native)                      │");
-    println!("   │ Address: {}                     │", dealer_address);
-    println!("   │ L1 Bankroll: 100,000 BB (infinite liquidity)           │");
-    println!("   │ Role: Market operator, instant bet settlement           │");
+    println!("   │ TREASURY → Test Account Airdrops                        │");
     println!("   └─────────────────────────────────────────────────────────┘");
     
-    // UNIFIED WALLET MODEL:
-    // Store balances using just the hash (without L1_/L2_ prefix)
-    // This allows the same balance to work with both L1_ and L2_ prefixes
-    
-    use crate::unified_wallet::strip_prefix;
-    
-    // Alice's balances (strip L1_ prefix)
+    // Fund test accounts via Treasury transfers (proper blockchain transactions)
     let alice_hash = strip_prefix(&alice.address);
-    bc.balances.insert(alice_hash.clone(), alice.total_balance);
-    
-    // Bob's balances (strip L1_ prefix)
     let bob_hash = strip_prefix(&bob.address);
-    bc.balances.insert(bob_hash.clone(), bob.total_balance);
-    
-    // Dealer's balances (100,000 BB bankroll on L1)
     let dealer_hash = strip_prefix(&dealer_address);
-    bc.balances.insert(dealer_hash.clone(), 100000.0);  // 100k BB bankroll
     
-    println!("\n✅ Test accounts initialized:");
-    println!("   • Alice:  10,000 BB (regular user)");
-    println!("   • Bob:     5,000 BB (regular user)");
-    println!("   • Dealer: 100,000 BB (house bankroll)");
+    // Create airdrop transactions from Treasury
+    let _ = bc.create_transaction(
+        TREASURY_ADDRESS.to_string(),
+        alice_hash.clone(),
+        alice.total_balance,
+    );
+    
+    let _ = bc.create_transaction(
+        TREASURY_ADDRESS.to_string(),
+        bob_hash.clone(),
+        bob.total_balance,
+    );
+    
+    let _ = bc.create_transaction(
+        TREASURY_ADDRESS.to_string(),
+        dealer_hash.clone(),
+        100000.0,  // 100k BB Dealer bankroll
+    );
+    
+    // Mine the airdrop transactions
+    bc.mine_pending_transactions("genesis_airdrop".to_string());
+    
+    println!("   💸 Alice:  {:>10} BB ← Treasury", alice.total_balance);
+    println!("   💸 Bob:    {:>10} BB ← Treasury", bob.total_balance);
+    println!("   💸 Dealer: {:>10} BB ← Treasury (House Bankroll)", 100000.0);
+    
+    let treasury_remaining = bc.get_balance(TREASURY_ADDRESS);
+    println!("\n   📊 Treasury Remaining: {:.0} BB", treasury_remaining);
+    println!("✅ Test accounts funded via Treasury transactions");
 }
 
 fn save_blockchain(blockchain: &EnhancedBlockchain) {
@@ -396,9 +399,16 @@ async fn main() {
     // Optimistic Execution routes (L2 Session Management) - LEGACY
     let session_start = routes_v2::bridge::start_session_route(blockchain.clone(), bridge_state.clone());
     let session_status = routes_v2::bridge::session_status_route(blockchain.clone(), bridge_state.clone());
-    let session_bet = routes_v2::bridge::record_bet_route(bridge_state.clone());
     let session_settle = routes_v2::bridge::settle_session_route(blockchain.clone(), bridge_state.clone());
     let session_list = routes_v2::bridge::list_sessions_route(bridge_state.clone());
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // CREDIT LINE ROUTES (Casino Bank Model)
+    // ═══════════════════════════════════════════════════════════════════════
+    let credit_approve = routes_v2::bridge::credit_approve_route(blockchain.clone(), bridge_state.clone());
+    let credit_draw = routes_v2::bridge::credit_draw_route(blockchain.clone(), bridge_state.clone());
+    let credit_settle = routes_v2::bridge::credit_settle_route(blockchain.clone(), bridge_state.clone());
+    let credit_status = routes_v2::bridge::credit_status_route(blockchain.clone(), bridge_state.clone());
     
     // Markets routes (L2 market/event initial liquidity)
     let initial_liquidity = routes_v2::markets::initial_liquidity_route(blockchain.clone());
@@ -505,9 +515,16 @@ async fn main() {
         // Optimistic Execution (L2 Sessions) - LEGACY
         .or(session_start)
         .or(session_status)
-        .or(session_bet)
         .or(session_settle)
         .or(session_list)
+        // ═══════════════════════════════════════════════════════════════
+        // CREDIT LINE (Casino Bank Model) - THE NEW WAY
+        // One-time approval, auto-draw, session settlement
+        // ═══════════════════════════════════════════════════════════════
+        .or(credit_approve)
+        .or(credit_draw)
+        .or(credit_settle)
+        .or(credit_status)
         // ═══════════════════════════════════════════════════════════════
         // UNIFIED WALLET (SESSION-BASED) - THE RIGHT WAY
         // Only 3 endpoints: start-session, l1-balance, settle-session

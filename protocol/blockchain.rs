@@ -36,6 +36,91 @@ const TURBINE_FANOUT: usize = 200;
 const TURBINE_LAYERS: usize = 3;
 
 // ============================================================================
+// GENESIS CONSTANTS - The Immutable Foundation
+// ============================================================================
+
+/// The Manifesto Hash - SHA256 of the BlackBook Protocol Manifesto V2
+/// This creates a deterministic, auditable starting point for the chain.
+/// Every node in the world will derive the same Genesis Hash from this.
+pub const MANIFESTO_SEED: &str = "BlackBook is a high-performance Layer 1 blockchain engineered to compete directly with Solana. We are building the Financial Layer for the Creator Economy. We are the bank your audience runs.";
+
+/// Fixed Genesis Timestamp (January 1, 2025 00:00:00 UTC)
+/// Using a fixed timestamp ensures deterministic block hashes.
+pub const GENESIS_TIMESTAMP: u64 = 1735689600;
+
+/// Genesis Hash (computed once, used for network discovery)
+/// All nodes must agree on this hash to be on the same chain.
+pub fn compute_genesis_hash() -> String {
+    let genesis_seed = format!("BlackBook_Genesis_v1_{}", 
+        format!("{:x}", Sha256::digest(MANIFESTO_SEED.as_bytes())));
+    format!("{:x}", Sha256::digest(genesis_seed.as_bytes()))
+}
+
+/// Treasury/Mint Authority Address - The origin of all tokens
+pub const TREASURY_ADDRESS: &str = "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1";
+
+/// Initial Total Supply (1 Billion BB tokens)
+pub const INITIAL_SUPPLY: f64 = 1_000_000_000.0;
+
+// ============================================================================
+// GOVERNANCE CONFIG - Chain Parameters (Upgradeable via Governance)
+// ============================================================================
+
+/// Governance configuration stored in a special genesis account
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceConfig {
+    /// Annual inflation rate (e.g., 0.05 = 5%)
+    pub inflation_rate: f64,
+    
+    /// Slots per epoch (e.g., 432,000 = ~2 days at 400ms slots)
+    pub slots_per_epoch: u64,
+    
+    /// Engagement reward weights (relative values)
+    pub engagement_weights: EngagementWeights,
+    
+    /// Minimum stake for validator participation
+    pub min_validator_stake: f64,
+    
+    /// Block time target in milliseconds
+    pub target_slot_time_ms: u64,
+    
+    /// Version for governance upgrades
+    pub config_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngagementWeights {
+    pub daily_checkin: f64,
+    pub quality_post: f64,
+    pub comment: f64,
+    pub like_given: f64,
+    pub like_received: f64,
+    pub referral: f64,
+    pub bet_placed: f64,
+}
+
+impl Default for GovernanceConfig {
+    fn default() -> Self {
+        Self {
+            inflation_rate: 0.05,           // 5% annual
+            slots_per_epoch: 432_000,       // ~2 days
+            engagement_weights: EngagementWeights {
+                daily_checkin: 1.0,
+                quality_post: 0.5,
+                comment: 0.1,
+                like_given: 0.01,
+                like_received: 0.05,
+                referral: 5.0,
+                bet_placed: 0.1,
+            },
+            min_validator_stake: 1000.0,
+            target_slot_time_ms: 400,
+            config_version: 1,
+        }
+    }
+}
+
+// ============================================================================
 // ACCOUNT STRUCTURE - Solana-style Account Model
 // ============================================================================
 //
@@ -263,20 +348,30 @@ impl EnhancedBlockchain {
     }
     
     fn create_genesis_block(&mut self) {
-        let genesis_seed = format!("layer1_genesis_v2_poh_{}", 
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
-        let poh_hash = format!("{:x}", Sha256::digest(genesis_seed.as_bytes()));
+        // ====================================================================
+        // DETERMINISTIC GENESIS - The Big Bang of BlackBook
+        // ====================================================================
+        // The Genesis Block is the immutable anchor of the entire blockchain.
+        // It MUST be deterministic so all nodes agree on the same starting state.
         
+        // 1. Compute the Genesis Hash from the Manifesto
+        let poh_hash = compute_genesis_hash();
+        
+        println!("🌱 Creating Deterministic Genesis Block...");
+        println!("   Manifesto Seed: \"{}...\"", &MANIFESTO_SEED[..60]);
+        println!("   Genesis Hash: {}", &poh_hash[..16]);
+        
+        // 2. Create the Genesis Block with FIXED timestamp
         let genesis_block = Block {
             index: 0,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            previous_hash: "0".to_string(),
+            timestamp: GENESIS_TIMESTAMP,  // Fixed: Jan 1, 2025
+            previous_hash: "0".repeat(64), // The void before creation
             hash: poh_hash.clone(),
             slot: 0,
             poh_hash: poh_hash.clone(),
             parent_slot: 0,
-            sequencer: "genesis".to_string(),
-            leader: "genesis".to_string(),
+            sequencer: "GENESIS_AUTHORITY".to_string(),
+            leader: "GENESIS_VALIDATOR".to_string(),
             financial_txs: Vec::new(),
             social_txs: Vec::new(),
             transactions: Vec::new(),
@@ -287,10 +382,31 @@ impl EnhancedBlockchain {
         self.chain.push(genesis_block);
         self.current_poh_hash = poh_hash.clone();
         
-        // Store genesis blockhash for transaction validation
-        self.add_recent_blockhash(0, poh_hash);
+        // 3. Initialize the Treasury Account (The Origin of All Value)
+        // This is the ONLY account that exists at genesis.
+        // All other accounts are created via transactions from Treasury.
+        self.balances.insert(TREASURY_ADDRESS.to_string(), INITIAL_SUPPLY);
         
-        println!("🌱 PoH Genesis block created (Slot 0)");
+        let treasury_account = Account::new(
+            "SYSTEM".to_string(),  // Owned by the system
+            (INITIAL_SUPPLY * LAMPORTS_PER_BB as f64) as u64,
+            0,  // Created at slot 0
+        );
+        self.accounts.insert(TREASURY_ADDRESS.to_string(), treasury_account);
+        
+        println!("   💰 Treasury initialized: {} BB", INITIAL_SUPPLY);
+        
+        // 4. Store Genesis Hash for Transaction Validation
+        self.add_recent_blockhash(0, poh_hash.clone());
+        
+        // 5. Store Governance Config as serialized data
+        let config = GovernanceConfig::default();
+        println!("   ⚙️  Governance Config v{}: inflation={}%, epoch={} slots",
+                 config.config_version, 
+                 config.inflation_rate * 100.0,
+                 config.slots_per_epoch);
+        
+        println!("✅ Genesis Block created (Slot 0, Hash: {}...)", &poh_hash[..16]);
     }
     
     pub fn create_transaction(&mut self, from: String, to: String, amount: f64) -> String {

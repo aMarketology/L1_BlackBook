@@ -1,0 +1,690 @@
+================================================================================
+PROTOBUF/gRPC IMPLEMENTATION PLAN - L1 ↔ L2
+================================================================================
+
+OBJECTIVE: Implement high-performance gRPC communication between L1 (Bank) and 
+L2 (Casino) using our settlement.proto definitions while maintaining existing
+REST API for SDK/frontend clients.
+
+TARGET ARCHITECTURE:
+┌──────────────┐  REST/JSON   ┌──────────────┐  gRPC      ┌──────────────┐
+│  Browser     │─────────────►│  L2 Server   │───────────►│  L1 Server   │
+│  (JS SDK)    │              │  (Rust)      │  Protobuf  │  (Rust)      │
+└──────────────┘              └──────────────┘            └──────────────┘
+                                     │
+                                     ▼
+                              Internal balance
+                              tracking, bets
+
+================================================================================
+PHASE 1: SETUP & CODE GENERATION
+================================================================================
+
+STEP 1.1: Add Rust Dependencies
+─────────────────────────────────────────────────────────────────────────────
+File: Cargo.toml
+
+[dependencies]
+tonic = "0.10"              # gRPC framework for Rust
+prost = "0.12"              # Protocol Buffers runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-stream = "0.1"        # For gRPC streaming
+
+[build-dependencies]
+tonic-build = "0.10"        # Protobuf → Rust code generator
+
+
+STEP 1.2: Create Build Script
+─────────────────────────────────────────────────────────────────────────────
+File: build.rs (NEW - create in project root)
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Compile settlement.proto into Rust code
+    tonic_build::configure()
+        .build_server(true)        // Generate server code (L1)
+        .build_client(true)        // Generate client code (L2)
+        .out_dir("src/generated")  // Output directory
+        .compile(
+            &["proto/settlement.proto"],
+            &["proto/"],           // Include path
+        )?;
+    
+    println!("cargo:rerun-if-changed=proto/settlement.proto");
+    Ok(())
+}
+
+Expected output after `cargo build`:
+  src/generated/
+  ├── blackbook.settlement.rs       # Generated Rust types
+  └── blackbook.settlement.grpc.rs  # Generated service traits
+
+
+STEP 1.3: Create Generated Code Module
+─────────────────────────────────────────────────────────────────────────────
+File: src/generated/mod.rs (NEW)
+
+// Re-export generated protobuf types
+pub mod settlement {
+    tonic::include_proto!("blackbook.settlement");
+}
+
+// Public API
+pub use settlement::*;
+
+
+STEP 1.4: Wire into Main Library
+─────────────────────────────────────────────────────────────────────────────
+File: src/lib.rs
+
+pub mod generated;  // Add this line
+
+// Existing modules...
+pub mod protocol;
+pub mod runtime;
+// etc.
+
+
+================================================================================
+PHASE 2: L1 SERVER IMPLEMENTATION (gRPC Service)
+================================================================================
+
+STEP 2.1: Implement gRPC Service for Credit Line Operations
+─────────────────────────────────────────────────────────────────────────────
+File: src/grpc/credit_service.rs (NEW)
+
+use std::sync::{Arc, Mutex};
+use tonic::{Request, Response, Status};
+use crate::generated::settlement::{
+    settlement_node_server::SettlementNode,
+    CreditApprovalRequest, CreditApprovalResponse,
+    CreditDrawRequest, CreditDrawResponse,
+    CreditSettleRequest, CreditSettleResponse,
+    CreditStatusRequest, CreditStatusResponse,
+};
+use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::routes_v2::bridge::BridgeState;
+
+pub struct CreditLineService {
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+}
+
+impl CreditLineService {
+    pub fn new(
+        blockchain: Arc<Mutex<EnhancedBlockchain>>,
+        bridge_state: Arc<Mutex<BridgeState>>,
+    ) -> Self {
+        Self { blockchain, bridge_state }
+    }
+}
+
+#[tonic::async_trait]
+impl SettlementNode for CreditLineService {
+    
+    // Approve Credit Line
+    async fn approve_credit_line(
+        &self,
+        request: Request<CreditApprovalRequest>,
+    ) -> Result<Response<CreditApprovalResponse>, Status> {
+        let req = request.into_inner();
+        
+        // Verify signature
+        let message = format!(
+            "APPROVE_CREDIT:{}:{}:{}",
+            req.wallet_address, req.credit_limit, req.nonce
+        );
+        
+        // TODO: Call verify_ed25519_signature()
+        // TODO: Check L1 balance >= credit_limit
+        // TODO: Create approval in bridge_state
+        
+        let response = CreditApprovalResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            approval_id: format!("credit_{}", req.nonce),
+            session_id: format!("session_{}", req.nonce),
+            credit_limit: req.credit_limit,
+            expires_at: req.timestamp + (req.expires_in_hours * 3600),
+            l1_balance: 1000000000, // TODO: Get from blockchain
+            session: None, // TODO: Build CreditSessionInfo
+        };
+        
+        Ok(Response::new(response))
+    }
+    
+    // Credit Draw
+    async fn credit_draw(
+        &self,
+        request: Request<CreditDrawRequest>,
+    ) -> Result<Response<CreditDrawResponse>, Status> {
+        let req = request.into_inner();
+        
+        // Verify signature
+        let message = format!(
+            "CREDIT_DRAW:{}:{}:{}:{}:{}",
+            req.wallet_address, req.session_id, req.amount,
+            req.timestamp, req.nonce
+        );
+        
+        // TODO: Verify Ed25519 signature
+        // TODO: Check credit limit
+        // TODO: Deduct from L1, credit to L2 session
+        
+        let response = CreditDrawResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            amount_drawn: req.amount,
+            l1_before: 1000000000,
+            l1_after: 1000000000 - req.amount,
+            l2_balance: req.amount,
+            remaining_credit: 500000000 - req.amount,
+            draw_count: 1,
+        };
+        
+        Ok(Response::new(response))
+    }
+    
+    // Credit Settle
+    async fn credit_settle(
+        &self,
+        request: Request<CreditSettleRequest>,
+    ) -> Result<Response<CreditSettleResponse>, Status> {
+        let req = request.into_inner();
+        
+        // Verify signature
+        let message = format!(
+            "CREDIT_SETTLE:{}:{}:{}:{}:{}",
+            req.session_id, req.wallet_address, req.final_l2_balance,
+            req.timestamp, req.nonce
+        );
+        
+        // SECURITY: Verify wallet_address matches session's original wallet
+        // TODO: Get session from bridge_state
+        // TODO: Verify req.wallet_address == session.wallet_address
+        // TODO: Calculate net PnL
+        // TODO: Return funds to L1
+        
+        let response = CreditSettleResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            settlement_type: "WINNINGS".to_string(),
+            net_pnl: 50000000, // 50 BB profit
+            total_drawn: 100000000,
+            final_l2_balance: req.final_l2_balance,
+            locked_in_bets: req.locked_in_bets,
+            draw_count: 2,
+            l1_before: 900000000,
+            l1_after: 900000000 + req.final_l2_balance,
+            returned_to_l1: req.final_l2_balance,
+        };
+        
+        Ok(Response::new(response))
+    }
+    
+    // Get Credit Status
+    async fn get_credit_status(
+        &self,
+        request: Request<CreditStatusRequest>,
+    ) -> Result<Response<CreditStatusResponse>, Status> {
+        let req = request.into_inner();
+        
+        // TODO: Look up approval and session in bridge_state
+        
+        let response = CreditStatusResponse {
+            success: true,
+            error_code: 0,
+            error_message: String::new(),
+            wallet_address: req.wallet_address,
+            l1_balance: 1000000000,
+            has_active_credit: true,
+            approval: None, // TODO: Build CreditApprovalInfo
+            session: None,  // TODO: Build CreditSessionInfo
+            total_credit_extended: 5000000000,
+            total_draws: 100,
+            total_settlements: 50,
+        };
+        
+        Ok(Response::new(response))
+    }
+    
+    // Stub implementations for other SettlementNode methods
+    async fn execute_settlement(&self, _req: Request<SettlementRequest>) -> Result<Response<SettlementResponse>, Status> {
+        Err(Status::unimplemented("Use credit line flow instead"))
+    }
+    
+    async fn request_reimbursement(&self, _req: Request<ReimbursementRequest>) -> Result<Response<ReimbursementResponse>, Status> {
+        Err(Status::unimplemented("Legacy flow"))
+    }
+    
+    // ... implement other methods as needed
+}
+
+
+STEP 2.2: Start gRPC Server in main_v2.rs
+─────────────────────────────────────────────────────────────────────────────
+File: src/main_v2.rs
+
+// Add import
+use crate::grpc::credit_service::CreditLineService;
+use crate::generated::settlement::settlement_node_server::SettlementNodeServer;
+
+// In main() function, replace the existing gRPC spawn with:
+
+// Start gRPC server on 50051 (L1↔L2 internal communication)
+let grpc_blockchain = blockchain.clone();
+let grpc_bridge_state = bridge_state.clone();
+
+tokio::spawn(async move {
+    let addr = "0.0.0.0:50051".parse().unwrap();
+    let service = CreditLineService::new(grpc_blockchain, grpc_bridge_state);
+    
+    println!("🌐 [L1 gRPC] Starting on {}", addr);
+    println!("   └─ Credit Line service ready for L2 connections");
+    
+    tonic::transport::Server::builder()
+        .add_service(SettlementNodeServer::new(service))
+        .serve(addr)
+        .await
+        .expect("gRPC server failed");
+});
+
+
+================================================================================
+PHASE 3: L2 CLIENT IMPLEMENTATION (gRPC Client)
+================================================================================
+
+STEP 3.1: Create L2 gRPC Client Wrapper
+─────────────────────────────────────────────────────────────────────────────
+File: l2_server/src/l1_client.rs (NEW - in your L2 repo)
+
+use tonic::transport::Channel;
+use crate::generated::settlement::{
+    settlement_node_client::SettlementNodeClient,
+    CreditDrawRequest, CreditDrawResponse,
+    CreditSettleRequest, CreditSettleResponse,
+};
+
+pub struct L1Client {
+    client: SettlementNodeClient<Channel>,
+}
+
+impl L1Client {
+    pub async fn connect(l1_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = SettlementNodeClient::connect(l1_url).await?;
+        Ok(Self { client })
+    }
+    
+    /// Request a credit draw from L1
+    pub async fn draw_credit(
+        &mut self,
+        wallet: &str,
+        session_id: &str,
+        amount: u64,
+        signature: Vec<u8>,
+        timestamp: u64,
+        nonce: String,
+    ) -> Result<CreditDrawResponse, Box<dyn std::error::Error>> {
+        let request = tonic::Request::new(CreditDrawRequest {
+            wallet_address: wallet.to_string(),
+            public_key: "...".to_string(), // TODO: Get from user
+            session_id: session_id.to_string(),
+            amount,
+            reason: "low_balance".to_string(),
+            signature,
+            timestamp,
+            nonce,
+        });
+        
+        let response = self.client.credit_draw(request).await?;
+        Ok(response.into_inner())
+    }
+    
+    /// Settle session with L1
+    pub async fn settle_session(
+        &mut self,
+        session_id: &str,
+        wallet: &str,
+        final_balance: u64,
+        locked_bets: u64,
+        signature: Vec<u8>,
+        timestamp: u64,
+        nonce: String,
+    ) -> Result<CreditSettleResponse, Box<dyn std::error::Error>> {
+        let request = tonic::Request::new(CreditSettleRequest {
+            session_id: session_id.to_string(),
+            wallet_address: wallet.to_string(),
+            public_key: "...".to_string(), // TODO: Get from user
+            final_l2_balance: final_balance,
+            locked_in_bets: locked_bets,
+            signature,
+            timestamp,
+            nonce,
+        });
+        
+        let response = self.client.credit_settle(request).await?;
+        Ok(response.into_inner())
+    }
+}
+
+
+STEP 3.2: L2 REST API Routes (Forward to L1 via gRPC)
+─────────────────────────────────────────────────────────────────────────────
+File: l2_server/src/routes/credit.rs (NEW - in your L2 repo)
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use warp::Filter;
+use crate::l1_client::L1Client;
+
+pub fn credit_routes(
+    l1_client: Arc<Mutex<L1Client>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    
+    // POST /l2/draw - User requests draw (with signature)
+    let draw = warp::path!("l2" / "draw")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then({
+            let l1 = l1_client.clone();
+            move |body: serde_json::Value| {
+                let l1 = l1.clone();
+                async move {
+                    // Extract signed request from body
+                    let wallet = body["wallet_address"].as_str().unwrap();
+                    let session_id = body["session_id"].as_str().unwrap();
+                    let amount = body["amount"].as_u64().unwrap();
+                    let signature = hex::decode(body["signature"].as_str().unwrap()).unwrap();
+                    let timestamp = body["timestamp"].as_u64().unwrap();
+                    let nonce = body["nonce"].as_str().unwrap().to_string();
+                    
+                    // Forward to L1 via gRPC
+                    let mut l1_client = l1.lock().await;
+                    match l1_client.draw_credit(wallet, session_id, amount, signature, timestamp, nonce).await {
+                        Ok(resp) => {
+                            // Update L2 balance tracking
+                            // l2_balances[wallet] += amount;
+                            
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": resp.success,
+                                "l2_balance": resp.l2_balance,
+                                "remaining_credit": resp.remaining_credit,
+                            })))
+                        }
+                        Err(e) => {
+                            Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": e.to_string()
+                            })))
+                        }
+                    }
+                }
+            }
+        });
+    
+    // POST /l2/settle - User settles session (with signature)
+    let settle = warp::path!("l2" / "settle")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then({
+            let l1 = l1_client.clone();
+            move |body: serde_json::Value| {
+                let l1 = l1.clone();
+                async move {
+                    // Extract from body
+                    let session_id = body["session_id"].as_str().unwrap();
+                    let wallet = body["wallet_address"].as_str().unwrap();
+                    let final_balance = body["final_l2_balance"].as_u64().unwrap();
+                    let locked_bets = body["locked_in_bets"].as_u64().unwrap_or(0);
+                    let signature = hex::decode(body["signature"].as_str().unwrap()).unwrap();
+                    let timestamp = body["timestamp"].as_u64().unwrap();
+                    let nonce = body["nonce"].as_str().unwrap().to_string();
+                    
+                    // Forward to L1 via gRPC
+                    let mut l1_client = l1.lock().await;
+                    match l1_client.settle_session(session_id, wallet, final_balance, locked_bets, signature, timestamp, nonce).await {
+                        Ok(resp) => {
+                            // Clear L2 balance
+                            // l2_balances.remove(wallet);
+                            
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": resp.success,
+                                "settlement_type": resp.settlement_type,
+                                "net_pnl": resp.net_pnl,
+                                "l1_after": resp.l1_after,
+                            })))
+                        }
+                        Err(e) => {
+                            Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": e.to_string()
+                            })))
+                        }
+                    }
+                }
+            }
+        });
+    
+    draw.or(settle)
+}
+
+
+STEP 3.3: L2 Main Server Setup
+─────────────────────────────────────────────────────────────────────────────
+File: l2_server/src/main.rs (in your L2 repo)
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+mod l1_client;
+mod routes;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🎰 Starting L2 Casino Server...");
+    
+    // Connect to L1 gRPC server
+    let l1_client = l1_client::L1Client::connect("http://127.0.0.1:50051").await?;
+    let l1_client = Arc::new(Mutex::new(l1_client));
+    
+    println!("✅ Connected to L1 gRPC server");
+    
+    // Create routes
+    let credit_routes = routes::credit::credit_routes(l1_client.clone());
+    let market_routes = routes::markets::market_routes(); // Your existing routes
+    let bet_routes = routes::bets::bet_routes(); // Your existing routes
+    
+    let routes = credit_routes
+        .or(market_routes)
+        .or(bet_routes);
+    
+    // Start server
+    println!("🚀 L2 Server listening on 0.0.0.0:1234");
+    warp::serve(routes)
+        .run(([0, 0, 0, 0], 1234))
+        .await;
+    
+    Ok(())
+}
+
+
+================================================================================
+PHASE 4: TESTING STRATEGY
+================================================================================
+
+STEP 4.1: Unit Tests for gRPC Service
+─────────────────────────────────────────────────────────────────────────────
+File: src/grpc/credit_service_tests.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Request;
+    
+    #[tokio::test]
+    async fn test_credit_draw_signature_verification() {
+        // Setup
+        let service = create_test_service();
+        
+        // Create request with invalid signature
+        let request = Request::new(CreditDrawRequest {
+            wallet_address: "L1_TEST".to_string(),
+            signature: vec![0u8; 64], // Invalid
+            // ...
+        });
+        
+        // Should reject
+        let result = service.credit_draw(request).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+    
+    #[tokio::test]
+    async fn test_credit_settle_wallet_mismatch() {
+        // Setup session with wallet A
+        // Try to settle with wallet B
+        // Should reject
+    }
+}
+
+
+STEP 4.2: Integration Tests
+─────────────────────────────────────────────────────────────────────────────
+File: tests/grpc_integration_test.rs
+
+#[tokio::test]
+async fn test_full_credit_flow() {
+    // 1. Start L1 gRPC server
+    // 2. Create L2 gRPC client
+    // 3. Approve credit line
+    // 4. Draw funds
+    // 5. Settle session
+    // 6. Verify balances
+}
+
+
+STEP 4.3: Manual Testing with grpcurl
+─────────────────────────────────────────────────────────────────────────────
+
+# Install grpcurl
+cargo install grpcurl
+
+# Test CreditDraw
+grpcurl -plaintext \
+  -d '{
+    "wallet_address": "L1_TEST",
+    "public_key": "abc123...",
+    "session_id": "session_1",
+    "amount": 100000000,
+    "reason": "initial",
+    "signature": "def456...",
+    "timestamp": 1735084800,
+    "nonce": "unique-uuid"
+  }' \
+  127.0.0.1:50051 \
+  blackbook.settlement.SettlementNode/CreditDraw
+
+
+================================================================================
+PHASE 5: DEPLOYMENT & MIGRATION
+================================================================================
+
+DEPLOYMENT CHECKLIST:
+─────────────────────────────────────────────────────────────────────────────
+
+□ L1 Deployment:
+  □ Compile proto files (cargo build)
+  □ Verify src/generated/ contains settlement.rs
+  □ Start gRPC server on port 50051
+  □ Keep REST API running on port 8080 (for SDK)
+  □ Monitor gRPC connections
+
+□ L2 Deployment:
+  □ Build L2 server with gRPC client
+  □ Configure L1_GRPC_URL environment variable
+  □ Test connection to L1 on startup
+  □ Expose REST endpoints for SDK on port 1234
+
+□ SDK (No changes needed):
+  □ SDK continues using REST API
+  □ L2 internally uses gRPC to L1
+  □ No breaking changes for frontend
+
+□ Monitoring:
+  □ gRPC connection status
+  □ Request latency (should be <1ms)
+  □ Error rates on signature verification
+  □ Credit line balances reconciliation
+
+
+ROLLBACK PLAN:
+─────────────────────────────────────────────────────────────────────────────
+If gRPC has issues:
+1. L2 can fall back to calling L1's REST API directly
+2. No changes needed on SDK side
+3. Disable gRPC server, use existing REST routes
+
+
+PERFORMANCE EXPECTATIONS:
+─────────────────────────────────────────────────────────────────────────────
+REST/JSON:   ~2-5ms per request
+gRPC:        ~0.1-0.5ms per request
+Improvement: 10-20x faster L1↔L2 communication
+
+
+================================================================================
+PHASE 6: FUTURE ENHANCEMENTS
+================================================================================
+
+□ Bidirectional Streaming:
+  - L2 → L1: Real-time bet stream
+  - L1 → L2: Balance updates push
+
+□ Connection Pooling:
+  - Reuse gRPC connections
+  - Handle reconnections gracefully
+
+□ Load Balancing:
+  - Multiple L1 gRPC servers
+  - L2 client-side load balancing
+
+□ Metrics:
+  - Prometheus metrics for gRPC
+  - Request duration histograms
+  - Error rate tracking
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+WHAT WE'RE BUILDING:
+  - L1 gRPC server (settlement.proto → Rust service)
+  - L2 gRPC client (calls L1 for credit operations)
+  - Keep REST API for SDK (no breaking changes)
+
+WHY:
+  - 10x faster server-to-server communication
+  - Type-safe contracts (proto enforced)
+  - Better scalability for high-frequency operations
+
+TIMELINE:
+  Phase 1-2: 1-2 days (L1 gRPC server)
+  Phase 3:   1 day (L2 gRPC client)
+  Phase 4:   1 day (Testing)
+  Phase 5:   1 day (Deployment)
+
+RISK MITIGATION:
+  - Incremental rollout (gRPC alongside REST)
+  - No SDK changes (transparent upgrade)
+  - Easy rollback (disable gRPC, use REST)
+
+NEXT STEPS:
+  1. Run `cargo build` to verify protoc setup
+  2. Implement CreditLineService in src/grpc/credit_service.rs
+  3. Test locally with grpcurl
+  4. Deploy to staging
+  5. Monitor performance improvements
+
+================================================================================

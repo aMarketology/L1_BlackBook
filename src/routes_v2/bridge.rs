@@ -242,6 +242,71 @@ pub struct WalletLookupResponse {
     pub found: bool,
 }
 
+// ============================================================================
+// CREDIT LINE SYSTEM - Casino Bank Model
+// ============================================================================
+
+/// Why a credit draw is happening
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DrawReason {
+    Initial,       // First draw when session starts
+    LowBalance,    // Auto-replenish when L2 balance low
+    UserRequest,   // Manual top-up request
+}
+
+/// A signed approval allowing L2 to draw from L1 up to a limit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditLineApproval {
+    pub approval_id: String,
+    pub wallet_address: String,
+    pub public_key: String,           // For signature verification
+    pub credit_limit: f64,            // Max L2 can draw (signed by user)
+    pub total_drawn: f64,             // Cumulative amount drawn
+    pub signature: String,            // Ed25519 signature of approval
+    pub approved_at: u64,             // Unix timestamp
+    pub expires_at: u64,              // Auto-expire
+    pub is_active: bool,
+    pub nonce: u64,                   // Replay protection
+}
+
+/// Active credit session on L2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditSession {
+    pub session_id: String,
+    pub wallet_address: String,
+    pub credit_limit: f64,            // Max L2 can hold
+    pub l2_balance: f64,              // Current available on L2
+    pub locked_in_bets: f64,          // Amount in active bets
+    pub total_drawn: f64,             // Total drawn from L1
+    pub total_returned: f64,          // Total returned to L1
+    pub started_at: u64,
+    pub expires_at: u64,
+    pub is_active: bool,
+    pub draw_count: u32,
+}
+
+/// Draw request from L2 to L1
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditDrawRequest {
+    pub session_id: String,
+    pub wallet_address: String,
+    pub amount: f64,
+    pub current_l2_balance: f64,
+    pub reason: DrawReason,
+}
+
+/// Settlement when session ends
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditSettlement {
+    pub session_id: String,
+    pub wallet_address: String,
+    pub final_l2_balance: f64,
+    pub locked_in_bets: f64,
+    pub total_wagered: f64,
+    pub net_pnl: f64,
+    pub settlement_hash: String,
+}
+
 /// Shared bridge state
 #[derive(Debug, Clone, Default)]
 pub struct BridgeState {
@@ -250,30 +315,30 @@ pub struct BridgeState {
     pub total_bridged_l1_to_l2: f64,
     pub total_bridged_l2_to_l1: f64,
     // L2 Integration: Nonce tracking
-    pub cross_layer_nonces: HashMap<String, u64>,     // address → next cross-layer nonce
-    pub last_activity_slots: HashMap<String, u64>,    // address → last L1 slot with activity
+    pub cross_layer_nonces: HashMap<String, u64>,
+    pub last_activity_slots: HashMap<String, u64>,
     // L2 Integration: Settlement records
     pub settlements: HashMap<String, SettlementRecord>,
     pub total_settlements: u64,
     // L2 → L1 Withdrawal tracking
-    pub processed_withdrawals: HashMap<String, WithdrawalRequest>,  // withdrawal_id → request
+    pub processed_withdrawals: HashMap<String, WithdrawalRequest>,
     pub total_withdrawn_l2_to_l1: f64,
-    // Merkle settlement roots for scalable settlements
-    pub settlement_roots: HashMap<String, MerkleSettlementRoot>,   // root_id → merkle root
-    pub processed_claims: HashMap<String, bool>,                    // claim_key → processed
-    // =========================================================================
-    // ESCROW LOCK TRACKING
-    // =========================================================================
-    /// Maps lock_id → bridge_id for correlating escrow locks with bridges
+    // Merkle settlement roots
+    pub settlement_roots: HashMap<String, MerkleSettlementRoot>,
+    pub processed_claims: HashMap<String, bool>,
+    // Escrow lock tracking
     pub lock_to_bridge: HashMap<String, String>,
-    /// Maps bridge_id → lock_id for reverse lookup
     pub bridge_to_lock: HashMap<String, String>,
     // =========================================================================
-    // OPTIMISTIC EXECUTION: L2 Session State (Live Game Balances)
+    // CREDIT LINE SYSTEM (Casino Bank Model)
     // =========================================================================
-    // These track "hot wallet" balances during active gaming sessions.
-    // L1 balance = "Vault" (Truth), L2 balance = "Game Session" (Live)
-    pub l2_sessions: HashMap<String, L2Session>,                   // address → session
+    pub credit_approvals: HashMap<String, CreditLineApproval>,   // wallet → approval
+    pub credit_sessions: HashMap<String, CreditSession>,         // session_id → session
+    pub total_credit_extended: f64,
+    pub total_credit_draws: u64,
+    pub total_credit_settlements: u64,
+    // Legacy session support (deprecated)
+    pub l2_sessions: HashMap<String, L2Session>,
     pub total_sessions_created: u64,
     pub total_sessions_settled: u64,
 }
@@ -283,32 +348,15 @@ pub struct BridgeState {
 // ============================================================================
 
 /// An active L2 gaming session for a user
-/// Tracks the "hot wallet" balance during optimistic execution
+/// L1 only tracks that the session exists and the initial deposit amount.
+/// All bet tracking happens on L2. L1 validates the final state at settlement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L2Session {
     pub session_id: String,
     pub wallet_address: String,
-    pub l1_balance_at_start: f64,      // Snapshot of L1 balance when session started
-    pub l2_balance: f64,               // Current "live" balance (updated by bets)
-    pub total_wagered: f64,            // Sum of all bets placed
-    pub total_won: f64,                // Sum of all winnings
-    pub total_lost: f64,               // Sum of all losses
-    pub bet_count: u32,                // Number of bets in this session
+    pub initial_deposit: f64,          // Amount locked on L1 when session started
     pub started_at: u64,               // Unix timestamp
-    pub last_activity: u64,            // Last bet timestamp
     pub is_active: bool,               // Can still place bets
-}
-
-impl L2Session {
-    /// Calculate net profit/loss for this session
-    pub fn net_pnl(&self) -> f64 {
-        self.l2_balance - self.l1_balance_at_start
-    }
-    
-    /// Check if user has winnings to claim
-    pub fn has_winnings(&self) -> bool {
-        self.net_pnl() > 0.0
-    }
 }
 
 /// Request to start a new L2 session (connect to game)
@@ -334,16 +382,7 @@ pub struct SettleSessionRequest {
     pub l2_signature: Option<String>,        // L2 authority signature for batch settlements
 }
 
-/// Result of a bet on L2 (updates session balance)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct L2BetResult {
-    pub session_id: String,
-    pub bet_id: String,
-    pub amount: f64,
-    pub won: bool,
-    pub payout: f64,                         // 0 if lost, winnings if won
-    pub new_l2_balance: f64,
-}
+
 
 impl BridgeState {
     pub fn new() -> Self {
@@ -376,27 +415,19 @@ impl BridgeState {
     // L2 SESSION MANAGEMENT (Optimistic Execution)
     // =========================================================================
     
-    /// Start a new L2 session for a user (mirrors L1 balance to L2)
-    pub fn start_session(&mut self, wallet_address: &str, l1_balance: f64, allocation: Option<f64>) -> L2Session {
+    /// Start a new L2 session for a user
+    /// L1 locks funds and creates a session. L2 handles all betting independently.
+    pub fn start_session(&mut self, wallet_address: &str, initial_deposit: f64) -> L2Session {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         
-        // Use allocation or full L1 balance
-        let l2_balance = allocation.unwrap_or(l1_balance).min(l1_balance);
-        
         let session = L2Session {
             session_id: format!("session_{}_{}", now, &wallet_address[..wallet_address.len().min(8)]),
             wallet_address: wallet_address.to_string(),
-            l1_balance_at_start: l2_balance,  // This is what we "mirror" from L1
-            l2_balance,
-            total_wagered: 0.0,
-            total_won: 0.0,
-            total_lost: 0.0,
-            bet_count: 0,
+            initial_deposit,
             started_at: now,
-            last_activity: now,
             is_active: true,
         };
         
@@ -416,42 +447,6 @@ impl BridgeState {
         self.l2_sessions.get_mut(wallet_address)
     }
     
-    /// Update L2 balance after a bet (called by L2 server)
-    pub fn record_bet(&mut self, wallet_address: &str, amount: f64, won: bool, payout: f64) -> Option<L2BetResult> {
-        let session = self.l2_sessions.get_mut(wallet_address)?;
-        
-        if !session.is_active {
-            return None;
-        }
-        
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        // Update session stats
-        session.total_wagered += amount;
-        session.bet_count += 1;
-        session.last_activity = now;
-        
-        if won {
-            session.total_won += payout;
-            session.l2_balance += payout - amount;  // Net gain
-        } else {
-            session.total_lost += amount;
-            session.l2_balance -= amount;
-        }
-        
-        Some(L2BetResult {
-            session_id: session.session_id.clone(),
-            bet_id: format!("bet_{}_{}", now, session.bet_count),
-            amount,
-            won,
-            payout,
-            new_l2_balance: session.l2_balance,
-        })
-    }
-    
     /// Close a session (mark as inactive, ready for settlement)
     pub fn close_session(&mut self, wallet_address: &str) -> Option<&L2Session> {
         if let Some(session) = self.l2_sessions.get_mut(wallet_address) {
@@ -466,6 +461,127 @@ impl BridgeState {
     pub fn remove_session(&mut self, wallet_address: &str) -> Option<L2Session> {
         self.total_sessions_settled += 1;
         self.l2_sessions.remove(wallet_address)
+    }
+    
+    // =========================================================================
+    // CREDIT LINE MANAGEMENT (Casino Bank Model)
+    // =========================================================================
+    
+    /// Create a new credit line approval
+    pub fn approve_credit(
+        &mut self,
+        wallet_address: &str,
+        public_key: &str,
+        credit_limit: f64,
+        signature: &str,
+        nonce: u64,
+        expires_in_hours: u64,
+    ) -> (CreditLineApproval, CreditSession) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let expires_at = now + (expires_in_hours * 3600);
+        
+        let approval = CreditLineApproval {
+            approval_id: format!("credit_{}_{}", now, &wallet_address[..wallet_address.len().min(8)]),
+            wallet_address: wallet_address.to_string(),
+            public_key: public_key.to_string(),
+            credit_limit,
+            total_drawn: 0.0,
+            signature: signature.to_string(),
+            approved_at: now,
+            expires_at,
+            is_active: true,
+            nonce,
+        };
+        
+        let session = CreditSession {
+            session_id: approval.approval_id.clone(),
+            wallet_address: wallet_address.to_string(),
+            credit_limit,
+            l2_balance: 0.0,
+            locked_in_bets: 0.0,
+            total_drawn: 0.0,
+            total_returned: 0.0,
+            started_at: now,
+            expires_at,
+            is_active: true,
+            draw_count: 0,
+        };
+        
+        self.credit_approvals.insert(wallet_address.to_string(), approval.clone());
+        self.credit_sessions.insert(session.session_id.clone(), session.clone());
+        
+        (approval, session)
+    }
+    
+    /// Get credit approval for a wallet
+    pub fn get_credit_approval(&self, wallet_address: &str) -> Option<&CreditLineApproval> {
+        self.credit_approvals.get(wallet_address)
+    }
+    
+    /// Get credit session by ID
+    pub fn get_credit_session(&self, session_id: &str) -> Option<&CreditSession> {
+        self.credit_sessions.get(session_id)
+    }
+    
+    /// Get active credit session for a wallet
+    pub fn get_active_credit_session(&self, wallet_address: &str) -> Option<&CreditSession> {
+        self.credit_sessions.values()
+            .find(|s| s.wallet_address == wallet_address && s.is_active)
+    }
+    
+    /// Draw funds from L1 to L2 credit
+    pub fn credit_draw(&mut self, wallet_address: &str, session_id: &str, amount: f64) -> Result<f64, String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        
+        // Check approval
+        let approval = self.credit_approvals.get_mut(wallet_address)
+            .ok_or("No credit approval found")?;
+        
+        if !approval.is_active || approval.expires_at < now {
+            return Err("Credit approval expired".to_string());
+        }
+        
+        let remaining = approval.credit_limit - approval.total_drawn;
+        if amount > remaining {
+            return Err(format!("Draw {} exceeds remaining limit {}", amount, remaining));
+        }
+        
+        // Update approval
+        approval.total_drawn += amount;
+        
+        // Update session
+        let session = self.credit_sessions.get_mut(session_id)
+            .ok_or("Session not found")?;
+        
+        session.l2_balance += amount;
+        session.total_drawn += amount;
+        session.draw_count += 1;
+        
+        self.total_credit_extended += amount;
+        self.total_credit_draws += 1;
+        
+        Ok(session.l2_balance)
+    }
+    
+    /// Return unused credit to L1
+    pub fn credit_return(&mut self, session_id: &str, final_balance: f64, locked_in_bets: f64) -> Result<CreditSession, String> {
+        let session = self.credit_sessions.get_mut(session_id)
+            .ok_or("Session not found")?;
+        
+        session.l2_balance = final_balance;
+        session.locked_in_bets = locked_in_bets;
+        session.total_returned = final_balance;
+        session.is_active = false;
+        
+        // Deactivate approval
+        if let Some(approval) = self.credit_approvals.get_mut(&session.wallet_address) {
+            approval.is_active = false;
+        }
+        
+        self.total_credit_extended -= session.total_drawn;
+        self.total_credit_settlements += 1;
+        
+        Ok(session.clone())
     }
 }
 
@@ -2283,10 +2399,13 @@ pub fn start_session_route(
                 if l1_balance <= 0.0 {
                     return Ok(warp::reply::json(&serde_json::json!({
                         "success": false,
-                        "error": "No L1 balance to mirror",
+                        "error": "No L1 balance available",
                         "l1_balance": l1_balance
                     })));
                 }
+                
+                // Determine deposit amount (allocation or full balance)
+                let initial_deposit = allocation.unwrap_or(l1_balance).min(l1_balance);
                 
                 // Check if session already exists
                 {
@@ -2297,7 +2416,7 @@ pub fn start_session_route(
                                 "success": false,
                                 "error": "Active session already exists",
                                 "session_id": existing.session_id,
-                                "l2_balance": existing.l2_balance
+                                "initial_deposit": existing.initial_deposit
                             })));
                         }
                     }
@@ -2306,19 +2425,18 @@ pub fn start_session_route(
                 // Start new session
                 let session = {
                     let mut state = lock_bridge_state(&bridge_state);
-                    state.start_session(&wallet_address, l1_balance, allocation)
+                    state.start_session(&wallet_address, initial_deposit)
                 };
                 
-                println!("✅ Session started: {} with {} BB (L1: {} BB)", 
-                         session.session_id, session.l2_balance, l1_balance);
+                println!("✅ Session started: {} with {} BB locked on L1", 
+                         session.session_id, session.initial_deposit);
                 
                 Ok(warp::reply::json(&serde_json::json!({
                     "success": true,
                     "session_id": session.session_id,
                     "wallet_address": wallet_address,
-                    "l1_balance": l1_balance,
-                    "l2_balance": session.l2_balance,
-                    "message": "L2 session started. L1 balance mirrored to L2 for optimistic execution."
+                    "initial_deposit": session.initial_deposit,
+                    "message": "L2 session started. L1 funds locked. L2 will track all betting."
                 })))
             }
         })
@@ -2349,42 +2467,23 @@ pub fn session_status_route(
                 let state = lock_bridge_state(&bridge_state);
                 
                 if let Some(session) = state.get_session(&wallet_address) {
-                    let net_pnl = session.net_pnl();
-                    let has_winnings = session.has_winnings();
-                    
                     Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                         "success": true,
                         "has_session": true,
                         "session": {
                             "session_id": session.session_id,
                             "is_active": session.is_active,
-                            "l1_balance_at_start": session.l1_balance_at_start,
-                            "l2_balance": session.l2_balance,
-                            "net_pnl": net_pnl,
-                            "total_wagered": session.total_wagered,
-                            "total_won": session.total_won,
-                            "total_lost": session.total_lost,
-                            "bet_count": session.bet_count,
-                            "started_at": session.started_at,
-                            "last_activity": session.last_activity
+                            "initial_deposit": session.initial_deposit,
+                            "started_at": session.started_at
                         },
-                        "balances": {
-                            "vault_l1": l1_balance,
-                            "game_l2": session.l2_balance,
-                            "net_pnl": net_pnl,
-                            "can_claim_winnings": has_winnings
-                        }
+                        "l1_balance": l1_balance,
+                        "message": "Session active. L2 tracks current balance. Settle to sync with L1."
                     })))
                 } else {
                     Ok(warp::reply::json(&serde_json::json!({
                         "success": true,
                         "has_session": false,
-                        "balances": {
-                            "vault_l1": l1_balance,
-                            "game_l2": 0.0,
-                            "net_pnl": 0.0,
-                            "can_claim_winnings": false
-                        },
+                        "l1_balance": l1_balance,
                         "message": "No active session. Call POST /session/start to begin."
                     })))
                 }
@@ -2392,79 +2491,13 @@ pub fn session_status_route(
         })
 }
 
-/// POST /session/bet - Record a bet result (called by L2 server)
-/// 
-/// Updates the L2 balance optimistically. No L1 transaction yet.
-pub fn record_bet_route(
-    bridge_state: Arc<Mutex<BridgeState>>,
-) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    warp::path("session")
-        .and(warp::path("bet"))
-        .and(warp::post())
-        .and(warp::body::json::<serde_json::Value>())
-        .and_then(move |body: serde_json::Value| {
-            let bridge_state = bridge_state.clone();
-            async move {
-                let wallet_address = match body.get("wallet_address").and_then(|v| v.as_str()) {
-                    Some(addr) => addr.to_string(),
-                    None => {
-                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                            "success": false,
-                            "error": "wallet_address is required"
-                        })));
-                    }
-                };
-                let amount = body.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let won = body.get("won").and_then(|v| v.as_bool()).unwrap_or(false);
-                let payout = body.get("payout").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                
-                if amount <= 0.0 {
-                    return Ok(warp::reply::json(&serde_json::json!({
-                        "success": false,
-                        "error": "amount must be positive"
-                    })));
-                }
-                
-                let mut state = lock_bridge_state(&bridge_state);
-                
-                // Check if user has enough L2 balance
-                if let Some(session) = state.get_session(&wallet_address) {
-                    if session.l2_balance < amount {
-                        return Ok(warp::reply::json(&serde_json::json!({
-                            "success": false,
-                            "error": "Insufficient L2 balance",
-                            "l2_balance": session.l2_balance,
-                            "required": amount
-                        })));
-                    }
-                }
-                
-                match state.record_bet(&wallet_address, amount, won, payout) {
-                    Some(result) => {
-                        println!("🎰 Bet recorded: {} {} {} BB → {} BB", 
-                                 wallet_address, if won { "WON" } else { "LOST" }, amount, result.new_l2_balance);
-                        
-                        Ok(warp::reply::json(&serde_json::json!({
-                            "success": true,
-                            "bet": result,
-                            "message": "Bet recorded on L2. No L1 transaction (optimistic execution)."
-                        })))
-                    },
-                    None => {
-                        Ok(warp::reply::json(&serde_json::json!({
-                            "success": false,
-                            "error": "No active session for this wallet"
-                        })))
-                    }
-                }
-            }
-        })
-}
-
 /// POST /session/settle - Settle session and write PnL to L1
 /// 
-/// This is the "Claim Winnings" / "Checkpoint" flow.
-/// Takes the net profit/loss from L2 and writes ONE transaction to L1.
+/// L1 acts as validator/consensus layer:
+/// - Accepts final_l2_balance from L2
+/// - Validates it's reasonable (≤ initial_deposit * 10)
+/// - Calculates PnL and updates L1 balance
+/// - L1 provides immutable audit trail of L2 settlements
 pub fn settle_session_route(
     blockchain: Arc<Mutex<EnhancedBlockchain>>,
     bridge_state: Arc<Mutex<BridgeState>>,
@@ -2477,7 +2510,7 @@ pub fn settle_session_route(
             let blockchain = blockchain.clone();
             let bridge_state = bridge_state.clone();
             async move {
-                println!("💰 Settling L2 session (writing to L1)");
+                println!("💰 Validating L2 session settlement");
                 
                 let wallet_address = match body.get("wallet_address").and_then(|v| v.as_str()) {
                     Some(addr) => addr.to_string(),
@@ -2489,11 +2522,22 @@ pub fn settle_session_route(
                     }
                 };
                 
-                // Get session and calculate PnL
-                let (session, net_pnl) = {
+                // Get final L2 balance from L2 server (via SDK)
+                let final_l2_balance = match body.get("final_l2_balance").and_then(|v| v.as_f64()) {
+                    Some(balance) => balance,
+                    None => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "final_l2_balance is required (from L2 server)"
+                        })));
+                    }
+                };
+                
+                // Get session
+                let session = {
                     let state = lock_bridge_state(&bridge_state);
                     match state.get_session(&wallet_address) {
-                        Some(s) => (s.clone(), s.net_pnl()),
+                        Some(s) => s.clone(),
                         None => {
                             return Ok(warp::reply::json(&serde_json::json!({
                                 "success": false,
@@ -2503,13 +2547,30 @@ pub fn settle_session_route(
                     }
                 };
                 
+                // === L1 CONSENSUS: VALIDATE L2's FINAL STATE ===
+                // Sanity check: User shouldn't have more than 10x their initial deposit
+                // (Catches obvious fraud/bugs, allows reasonable wins)
+                let max_reasonable_balance = session.initial_deposit * 10.0;
+                if final_l2_balance > max_reasonable_balance {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Settlement rejected: final balance exceeds reasonable limit",
+                        "final_l2_balance": final_l2_balance,
+                        "initial_deposit": session.initial_deposit,
+                        "max_allowed": max_reasonable_balance
+                    })));
+                }
+                
+                // Calculate net PnL
+                let net_pnl = final_l2_balance - session.initial_deposit;
+                
                 // Get current L1 balance
                 let l1_balance_before = {
                     let bc = lock_or_recover(&blockchain);
                     bc.balances.get(&wallet_address).copied().unwrap_or(0.0)
                 };
                 
-                // Apply net PnL to L1 balance (THE SETTLEMENT)
+                // Apply net PnL to L1 balance (THE SETTLEMENT - L1 CONSENSUS)
                 let l1_balance_after = {
                     let mut bc = lock_or_recover(&blockchain);
                     let new_balance = (l1_balance_before + net_pnl).max(0.0); // Can't go negative
@@ -2531,8 +2592,8 @@ pub fn settle_session_route(
                     "BREAK_EVEN"
                 };
                 
-                println!("✅ Settlement complete: {} {} BB (L1: {} → {})", 
-                         wallet_address, net_pnl, l1_balance_before, l1_balance_after);
+                println!("✅ L1 Consensus: {} settlement validated and recorded", wallet_address);
+                println!("   Net PnL: {} BB (L1: {} → {})", net_pnl, l1_balance_before, l1_balance_after);
                 
                 Ok(warp::reply::json(&serde_json::json!({
                     "success": true,
@@ -2540,19 +2601,16 @@ pub fn settle_session_route(
                     "wallet_address": wallet_address,
                     "session_summary": {
                         "session_id": session.session_id,
-                        "total_wagered": session.total_wagered,
-                        "total_won": session.total_won,
-                        "total_lost": session.total_lost,
-                        "bet_count": session.bet_count,
-                        "duration_seconds": session.last_activity - session.started_at
+                        "initial_deposit": session.initial_deposit,
+                        "final_l2_balance": final_l2_balance,
+                        "duration_seconds": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - session.started_at
                     },
                     "settlement": {
                         "net_pnl": net_pnl,
                         "l1_before": l1_balance_before,
-                        "l1_after": l1_balance_after,
-                        "l2_final": session.l2_balance
+                        "l1_after": l1_balance_after
                     },
-                    "message": format!("Session settled. {} BB {} to L1 vault.", 
+                    "message": format!("L1 consensus: Settlement validated. {} BB {} to L1 vault.", 
                                        net_pnl.abs(), 
                                        if net_pnl >= 0.0 { "added" } else { "deducted" })
                 })))
@@ -2581,6 +2639,564 @@ pub fn list_sessions_route(
                     "total_created": state.total_sessions_created,
                     "total_settled": state.total_sessions_settled,
                     "sessions": sessions
+                })))
+            }
+        })
+}
+
+// ============================================================================
+// CREDIT LINE ROUTES (Casino Bank Model)
+// ============================================================================
+
+/// Request body for credit approval
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditApprovalRequest {
+    pub wallet_address: String,
+    pub public_key: String,
+    pub credit_limit: f64,
+    pub expires_in_hours: u64,
+    pub signature: String,
+    pub nonce: u64,
+}
+
+/// Request body for credit draw
+/// SECURITY: Every L1→L2 transfer requires a valid Ed25519 signature
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditDrawBody {
+    pub wallet_address: String,
+    pub public_key: String,       // For signature verification
+    pub session_id: String,
+    pub amount: f64,
+    pub reason: String,           // "initial", "low_balance", "user_request"
+    pub timestamp: u64,           // Replay protection
+    pub nonce: String,            // Replay protection
+    pub signature: String,        // Ed25519 signature of: CREDIT_DRAW:wallet:session:amount:timestamp:nonce
+}
+
+/// Request body for credit settlement
+/// SECURITY: Settlement returns tokens to L1 - requires signature from original depositor
+/// L2 can ONLY return tokens to the SAME wallet that deposited them
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditSettleBody {
+    pub session_id: String,
+    pub wallet_address: String,   // Must match session's wallet (L2 can only return to same wallet)
+    pub public_key: String,       // For signature verification
+    pub final_l2_balance: f64,
+    pub locked_in_bets: f64,
+    pub timestamp: u64,           // Replay protection
+    pub nonce: String,            // Replay protection  
+    pub signature: String,        // Ed25519 signature of: CREDIT_SETTLE:session:wallet:balance:timestamp:nonce
+}
+
+/// POST /credit/approve - User approves credit line (requires signature)
+/// 
+/// This is the ONE-TIME signature the user must provide to allow
+/// the L2 to automatically draw funds from their L1 balance.
+/// Like giving the casino permission to advance you chips.
+pub fn credit_approve_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("credit")
+        .and(warp::path("approve"))
+        .and(warp::post())
+        .and(warp::body::json::<CreditApprovalRequest>())
+        .and_then(move |request: CreditApprovalRequest| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                println!("🏦 Credit line approval request: {} for {} BB", 
+                         request.wallet_address, request.credit_limit);
+                
+                // Verify the signature
+                let message = format!(
+                    "APPROVE_CREDIT:{}:{}:{}",
+                    request.wallet_address,
+                    request.credit_limit,
+                    request.nonce
+                );
+                
+                match verify_ed25519_signature(&request.public_key, &message, &request.signature) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid signature"
+                        })));
+                    },
+                    Err(e) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature verification error: {}", e)
+                        })));
+                    }
+                }
+                
+                // Check L1 balance
+                let l1_balance = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.balances.get(&request.wallet_address).copied().unwrap_or(0.0)
+                };
+                
+                if request.credit_limit > l1_balance {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Credit limit cannot exceed L1 balance",
+                        "requested": request.credit_limit,
+                        "available": l1_balance
+                    })));
+                }
+                
+                // Check for existing active approval
+                {
+                    let state = lock_bridge_state(&bridge_state);
+                    if let Some(existing) = state.get_credit_approval(&request.wallet_address) {
+                        if existing.is_active {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Active credit approval already exists",
+                                "existing_session_id": existing.approval_id,
+                                "existing_credit_limit": existing.credit_limit
+                            })));
+                        }
+                    }
+                }
+                
+                // Create approval and session
+                let (approval, session) = {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    state.approve_credit(
+                        &request.wallet_address,
+                        &request.public_key,
+                        request.credit_limit,
+                        &request.signature,
+                        request.nonce,
+                        request.expires_in_hours,
+                    )
+                };
+                
+                println!("✅ Credit line approved: {} can draw up to {} BB", 
+                         request.wallet_address, request.credit_limit);
+                
+                Ok(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "message": "Credit line approved. L2 can now draw funds automatically.",
+                    "approval": {
+                        "approval_id": approval.approval_id,
+                        "credit_limit": approval.credit_limit,
+                        "expires_at": approval.expires_at,
+                        "l1_balance": l1_balance
+                    },
+                    "session": {
+                        "session_id": session.session_id,
+                        "l2_balance": session.l2_balance,
+                        "credit_limit": session.credit_limit
+                    }
+                })))
+            }
+        })
+}
+
+/// POST /credit/draw - L2 draws funds from user's credit line
+/// 
+/// SECURITY: Every L1→L2 transfer requires valid Ed25519 signature.
+/// The wallet owner must sign each draw request - tokens cannot move
+/// without authorization from the key holder.
+pub fn credit_draw_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("credit")
+        .and(warp::path("draw"))
+        .and(warp::post())
+        .and(warp::body::json::<CreditDrawBody>())
+        .and_then(move |body: CreditDrawBody| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                println!("💳 Credit draw request: {} drawing {} BB (reason: {})", 
+                         body.wallet_address, body.amount, body.reason);
+                
+                // ============================================================
+                // SECURITY: Verify Ed25519 signature (REQUIRED for all L1 token movement)
+                // ============================================================
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                
+                // Check timestamp freshness (5 minutes)
+                if now > body.timestamp + 300 {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Request expired (>5 minutes old)"
+                    })));
+                }
+                
+                if body.timestamp > now + 60 {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Request timestamp is in the future"
+                    })));
+                }
+                
+                // Verify signature: CREDIT_DRAW:wallet:session:amount:timestamp:nonce
+                let message = format!(
+                    "CREDIT_DRAW:{}:{}:{}:{}:{}",
+                    body.wallet_address, body.session_id, body.amount, body.timestamp, body.nonce
+                );
+                
+                match verify_ed25519_signature(&body.public_key, &message, &body.signature) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid signature - L1 token transfers require valid signature"
+                        })));
+                    },
+                    Err(e) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature verification error: {}", e)
+                        })));
+                    }
+                }
+                
+                // Verify public_key matches the credit approval's public_key
+                {
+                    let state = lock_bridge_state(&bridge_state);
+                    if let Some(approval) = state.get_credit_approval(&body.wallet_address) {
+                        if approval.public_key != body.public_key {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Public key does not match credit approval"
+                            })));
+                        }
+                    }
+                }
+                
+                println!("✅ Signature verified for credit draw");
+                
+                // Validate amount
+                if body.amount <= 0.0 {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Amount must be positive"
+                    })));
+                }
+                
+                // Check L1 balance
+                let l1_balance = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.balances.get(&body.wallet_address).copied().unwrap_or(0.0)
+                };
+                
+                if body.amount > l1_balance {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Insufficient L1 balance",
+                        "requested": body.amount,
+                        "available": l1_balance
+                    })));
+                }
+                
+                // Execute draw
+                let (new_l2_balance, approval_info) = {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    
+                    // Get approval info first
+                    let approval = match state.get_credit_approval(&body.wallet_address) {
+                        Some(a) => a.clone(),
+                        None => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "No credit approval found. User must sign approval first."
+                            })));
+                        }
+                    };
+                    
+                    match state.credit_draw(&body.wallet_address, &body.session_id, body.amount) {
+                        Ok(balance) => (balance, approval),
+                        Err(e) => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": e
+                            })));
+                        }
+                    }
+                };
+                
+                // Deduct from L1 balance
+                let l1_balance_after = {
+                    let mut bc = lock_or_recover(&blockchain);
+                    let new_balance = l1_balance - body.amount;
+                    bc.balances.insert(body.wallet_address.clone(), new_balance);
+                    new_balance
+                };
+                
+                println!("✅ Credit draw complete: {} now has {} BB on L2", 
+                         body.wallet_address, new_l2_balance);
+                
+                Ok(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "message": "Funds drawn from L1 to L2",
+                    "draw": {
+                        "amount": body.amount,
+                        "reason": body.reason,
+                        "l1_before": l1_balance,
+                        "l1_after": l1_balance_after
+                    },
+                    "session": {
+                        "session_id": body.session_id,
+                        "l2_balance": new_l2_balance,
+                        "remaining_credit": approval_info.credit_limit - approval_info.total_drawn - body.amount
+                    }
+                })))
+            }
+        })
+}
+
+/// POST /credit/settle - Settle credit session, return unused to L1
+/// 
+/// SECURITY: 
+/// 1. Requires valid Ed25519 signature from wallet owner
+/// 2. L2 can ONLY return tokens to the SAME wallet that deposited them
+/// 3. wallet_address in request must match session's original wallet
+pub fn credit_settle_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("credit")
+        .and(warp::path("settle"))
+        .and(warp::post())
+        .and(warp::body::json::<CreditSettleBody>())
+        .and_then(move |body: CreditSettleBody| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                println!("💰 Credit settlement: session {} finalizing with {} BB", 
+                         body.session_id, body.final_l2_balance);
+                
+                // ============================================================
+                // SECURITY: Verify Ed25519 signature (REQUIRED for all L1 token movement)
+                // ============================================================
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                
+                // Check timestamp freshness (5 minutes)
+                if now > body.timestamp + 300 {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Request expired (>5 minutes old)"
+                    })));
+                }
+                
+                if body.timestamp > now + 60 {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Request timestamp is in the future"
+                    })));
+                }
+                
+                // Verify signature: CREDIT_SETTLE:session:wallet:balance:timestamp:nonce
+                let message = format!(
+                    "CREDIT_SETTLE:{}:{}:{}:{}:{}",
+                    body.session_id, body.wallet_address, body.final_l2_balance, body.timestamp, body.nonce
+                );
+                
+                match verify_ed25519_signature(&body.public_key, &message, &body.signature) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid signature - settlements require valid signature"
+                        })));
+                    },
+                    Err(e) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature verification error: {}", e)
+                        })));
+                    }
+                }
+                
+                println!("✅ Signature verified for credit settlement");
+                
+                // Get session info before settlement
+                let session_info = {
+                    let state = lock_bridge_state(&bridge_state);
+                    match state.get_credit_session(&body.session_id) {
+                        Some(s) => s.clone(),
+                        None => {
+                            return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Session not found"
+                            })));
+                        }
+                    }
+                };
+                
+                // ============================================================
+                // SECURITY: L2 can ONLY return tokens to the SAME wallet
+                // ============================================================
+                if body.wallet_address != session_info.wallet_address {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Wallet mismatch: L2 can only return tokens to the original depositor",
+                        "requested_wallet": body.wallet_address,
+                        "session_wallet": session_info.wallet_address
+                    })));
+                }
+                
+                // Verify public_key matches the credit approval
+                {
+                    let state = lock_bridge_state(&bridge_state);
+                    if let Some(approval) = state.get_credit_approval(&session_info.wallet_address) {
+                        if approval.public_key != body.public_key {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Public key does not match credit approval - unauthorized settlement attempt"
+                            })));
+                        }
+                    }
+                }
+                
+                // Fraud detection: final balance shouldn't exceed credit limit
+                if body.final_l2_balance > session_info.credit_limit {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Settlement rejected: final balance exceeds credit limit",
+                        "final_l2_balance": body.final_l2_balance,
+                        "credit_limit": session_info.credit_limit
+                    })));
+                }
+                
+                // Calculate net PnL
+                let total_drawn = session_info.total_drawn;
+                let net_pnl = body.final_l2_balance - total_drawn;
+                
+                // Execute settlement
+                let settled_session = {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    match state.credit_return(&body.session_id, body.final_l2_balance, body.locked_in_bets) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": e
+                            })));
+                        }
+                    }
+                };
+                
+                // Get L1 balance and apply PnL
+                let (l1_before, l1_after) = {
+                    let mut bc = lock_or_recover(&blockchain);
+                    let before = bc.balances.get(&session_info.wallet_address).copied().unwrap_or(0.0);
+                    
+                    // Return unused credit: final_l2_balance goes back to L1
+                    // If user won, they get more back than they put in
+                    // If user lost, they get less back (some was deducted in draws)
+                    let after = before + body.final_l2_balance;
+                    bc.balances.insert(session_info.wallet_address.clone(), after);
+                    (before, after)
+                };
+                
+                let settlement_type = if net_pnl > 0.0 {
+                    "WINNINGS"
+                } else if net_pnl < 0.0 {
+                    "LOSSES"
+                } else {
+                    "BREAK_EVEN"
+                };
+                
+                println!("✅ Credit settlement complete: {} {} {} BB", 
+                         session_info.wallet_address, settlement_type, net_pnl.abs());
+                
+                Ok(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "settlement_type": settlement_type,
+                    "wallet_address": session_info.wallet_address,
+                    "session_summary": {
+                        "session_id": body.session_id,
+                        "total_drawn": total_drawn,
+                        "final_l2_balance": body.final_l2_balance,
+                        "locked_in_bets": body.locked_in_bets,
+                        "draw_count": settled_session.draw_count
+                    },
+                    "settlement": {
+                        "net_pnl": net_pnl,
+                        "l1_before": l1_before,
+                        "l1_after": l1_after,
+                        "returned_to_l1": body.final_l2_balance
+                    },
+                    "message": format!("Session closed. {} BB returned to L1. Net PnL: {} BB", 
+                                       body.final_l2_balance, net_pnl)
+                })))
+            }
+        })
+}
+
+/// GET /credit/status/:wallet - Get credit line status
+/// 
+/// Returns current credit approval, session state, and balances.
+pub fn credit_status_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("credit")
+        .and(warp::path("status"))
+        .and(warp::path::param::<String>())
+        .and(warp::get())
+        .and_then(move |wallet_address: String| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                // Get L1 balance
+                let l1_balance = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.balances.get(&wallet_address).copied().unwrap_or(0.0)
+                };
+                
+                let state = lock_bridge_state(&bridge_state);
+                
+                // Get approval
+                let approval_info = state.get_credit_approval(&wallet_address).map(|a| {
+                    serde_json::json!({
+                        "approval_id": a.approval_id,
+                        "credit_limit": a.credit_limit,
+                        "total_drawn": a.total_drawn,
+                        "remaining": a.credit_limit - a.total_drawn,
+                        "is_active": a.is_active,
+                        "expires_at": a.expires_at
+                    })
+                });
+                
+                // Get active session
+                let session_info = state.get_active_credit_session(&wallet_address).map(|s| {
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "l2_balance": s.l2_balance,
+                        "locked_in_bets": s.locked_in_bets,
+                        "available_to_bet": s.l2_balance - s.locked_in_bets,
+                        "total_drawn": s.total_drawn,
+                        "draw_count": s.draw_count,
+                        "is_active": s.is_active
+                    })
+                });
+                
+                let has_active_credit = approval_info.as_ref()
+                    .map(|a| a.get("is_active").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .unwrap_or(false);
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "wallet_address": wallet_address,
+                    "l1_balance": l1_balance,
+                    "has_active_credit": has_active_credit,
+                    "approval": approval_info,
+                    "session": session_info,
+                    "stats": {
+                        "total_credit_extended": state.total_credit_extended,
+                        "total_draws": state.total_credit_draws,
+                        "total_settlements": state.total_credit_settlements
+                    }
                 })))
             }
         })

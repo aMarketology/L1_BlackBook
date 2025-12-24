@@ -18,6 +18,8 @@ pub mod routes_v2;              // Route handlers (NEW - Pure signature auth)
 pub mod rpc;                    // Internal & Cross-Layer RPC
 pub mod unified_wallet;         // Unified wallet system (L1/L2 address logic)
 pub mod consensus;              // Consensus (hot upgrades, validator selection, P2P)
+
+// Note: USDC Reserve System (usdc/) is staged but not integrated yet
 pub mod grpc;                   // gRPC Settlement (L1 ↔ L2 internal communication)
 
 // Root-level modules (infrastructure)

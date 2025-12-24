@@ -2,818 +2,653 @@
 // BLACKBOOK L1↔L2 INTEGRATION SDK
 // ============================================================================
 //
-// This SDK explains and implements the integration between:
-//   L1 (Bank/Vault) - Holds real money, final settlement
-//   L2 (Casino/Gaming) - Fast bets, instant UX
-//
-// ============================================================================
-// ARCHITECTURE OVERVIEW
-// ============================================================================
+// ARCHITECTURE:
 //
 //  ┌─────────────────────────────────────────────────────────────────────────┐
-//  │                        USER WALLET                                      │
-//  │                   (One keypair, two views)                              │
-//  │                                                                         │
-//  │   Public Key: c0e349153cbc75e9529b5f1963205cab20253db573ec65e8ff31155d  │
-//  │   Private Key: [encrypted in vault, decrypted client-side]              │
-//  │                                                                         │
-//  │   L1 Address: L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD               │
-//  │   L2 Address: L2_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD               │
-//  │              (Same hash, different layer prefix)                        │
+//  │                     L1 (Consensus Layer)                                │
+//  │  • Validates all L2 settlements                                         │
+//  │  • Manages Credit Line approvals & sessions                             │
+//  │  • Provides immutable audit trail                                       │
+//  │  REST: localhost:8080                                                   │
 //  └─────────────────────────────────────────────────────────────────────────┘
-//                              │
+//                              ▲
+//                              │ Credit Draw / Settlement
 //                              ▼
 //  ┌─────────────────────────────────────────────────────────────────────────┐
-//  │                                                                         │
-//  │  ┌─────────────────────────┐     gRPC      ┌─────────────────────────┐  │
-//  │  │     L1 (THE BANK)       │◄─────────────►│    L2 (THE CASINO)      │  │
-//  │  │                         │   :50051      │                         │  │
-//  │  │  • Real money storage   │               │  • Fast betting engine  │  │
-//  │  │  • Ed25519 verification │               │  • Dealer fronts bets   │  │
-//  │  │  • Final settlement     │               │  • Sub-second UX        │  │
-//  │  │  • Bridge lock/unlock   │               │  • Requests reimburse   │  │
-//  │  │                         │               │                         │  │
-//  │  │  REST: localhost:8080   │               │  REST: localhost:3000   │  │
-//  │  │  gRPC: localhost:50051  │               │  (calls L1 gRPC)        │  │
-//  │  └─────────────────────────┘               └─────────────────────────┘  │
-//  │                                                                         │
+//  │                L2 (Prediction Market Backbone)                          │
+//  │  • CPMM prediction markets                                              │
+//  │  • Tracks all bets internally                                           │
+//  │  • Calculates prices & payouts                                          │
+//  │  • Auto-requests credit draws when balance low                          │
+//  │  REST: localhost:1234                                                   │
 //  └─────────────────────────────────────────────────────────────────────────┘
 //
-// ============================================================================
-// THE DEALER MODEL - Why Betting is Instant
-// ============================================================================
-//
-// Traditional Model (SLOW):
-//   Alice bets $50 → Wait for Bob to bet $50 → Match → Wait for result → Settle
-//   Problem: Latency, counterparty risk, bad UX
-//
-// Dealer Model (INSTANT):
-//   Alice bets $50 → Dealer takes bet immediately → Result → Dealer pays/collects
-//   The Dealer is the house, always has liquidity, no waiting
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │  EXAMPLE: Alice bets $50 on Heads                                       │
-// │                                                                         │
-// │  BEFORE:  Alice L1: $1000    Dealer L1: $100,000                       │
-// │                                                                         │
-// │  1. Alice locks $50 for betting (L1 → L2 bridge)                        │
-// │     Alice L1: $950 (available) + $50 (locked)                           │
-// │                                                                         │
-// │  2. Alice places bet on L2 - Dealer fronts it INSTANTLY                 │
-// │     L2 says: "Dealer, front Alice's $50 bet"                            │
-// │     Dealer agrees (Alice has locked balance)                            │
-// │                                                                         │
-// │  3. L2 requests reimbursement from L1                                   │
-// │     L1 moves Alice's locked $50 → Dealer                                │
-// │     Alice L1: $950 (available) + $0 (locked)                            │
-// │     Dealer L1: $100,050                                                 │
-// │                                                                         │
-// │  4. Coin flip: HEADS! Alice wins!                                       │
-// │     L2 tells L1: "Pay Alice $100 (2x stake)"                            │
-// │                                                                         │
-// │  5. L1 Settlement:                                                      │
-// │     Dealer L1 → Alice L1: $100                                          │
-// │     Alice L1: $1,050                                                    │
-// │     Dealer L1: $99,950                                                  │
-// │                                                                         │
-// │  RESULT: Alice started with $1000, now has $1050 (+$50 profit)          │
-// │          Dealer started with $100k, now has $99,950 (-$50)              │
-// └─────────────────────────────────────────────────────────────────────────┘
+// CREDIT LINE FLOW (Casino Bank Model):
+//   1. wallet.approveCreditLine(500) → User signs ONCE to allow L2 draws
+//   2. wallet.draw(100) → L2 draws initial funds
+//   3. wallet.placeBet(...) → L2 handles bet internally
+//   4. wallet.ensureFundsForBet(50) → Auto-draw if L2 balance low
+//   5. wallet.closeSession() → Return unused L2 balance to L1
 //
 // ============================================================================
 
 import nacl from 'tweetnacl';
-import { createHash, randomBytes } from 'crypto';
 
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-export const CHAIN_ID_L1 = 0x01;  // Layer 1 (Bank)
-export const CHAIN_ID_L2 = 0x02;  // Layer 2 (Casino)
-
-export const L1_REST_URL = 'http://localhost:8080';
-export const L1_GRPC_URL = 'localhost:50051';
-export const L2_REST_URL = 'http://localhost:1234';  // Layer 2 betting server
-
-export const MICROTOKENS_PER_BB = 1_000_000;  // 1 BB = 1,000,000 µBB
-
-// Dealer address (the house)
-export const DEALER_ADDRESS = 'L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3';
-export const DEALER_L2_ADDRESS = 'L2_F5C46483E8A28394F5E8687DEADF6BD4E924CED3';
-
-// Real L2 market (Tesla RoboTaxi)
-export const TEST_MARKET_ID = 'tesla_rtaxi';
-
-// ============================================================================
-// ADDRESS UTILITIES
-// ============================================================================
+export const L1_URL = 'http://localhost:8080';
+export const L2_URL = 'http://localhost:1234';
 
 /**
- * Derive L1/L2 addresses from public key
- * Both layers use the same hash, just different prefix
+ * Strip L1_/L2_ prefix from address
  */
-export function deriveAddresses(publicKeyHex) {
-  const hash = createHash('sha256')
-    .update(Buffer.from(publicKeyHex, 'hex'))
-    .digest('hex')
-    .slice(0, 40)
-    .toUpperCase();
-  
-  return {
-    l1: `L1_${hash}`,
-    l2: `L2_${hash}`,
-    hash: hash
-  };
-}
-
-/**
- * Convert L1 address to L2 address (same hash, different prefix)
- */
-export function l1ToL2Address(l1Address) {
-  if (!l1Address.startsWith('L1_')) {
-    throw new Error('Invalid L1 address format');
-  }
-  return 'L2_' + l1Address.slice(3);
-}
-
-/**
- * Convert L2 address to L1 address
- */
-export function l2ToL1Address(l2Address) {
-  if (!l2Address.startsWith('L2_')) {
-    throw new Error('Invalid L2 address format');
-  }
-  return 'L1_' + l2Address.slice(3);
-}
-
-/**
- * Get base hash (without prefix)
- */
-export function stripPrefix(address) {
-  if (address.startsWith('L1_') || address.startsWith('L2_')) {
-    return address.slice(3);
-  }
-  return address;
+function stripPrefix(address) {
+  return address.startsWith('L1_') || address.startsWith('L2_') 
+    ? address.slice(3) 
+    : address;
 }
 
 // ============================================================================
-// AMOUNT UTILITIES
-// ============================================================================
-
-export function bbToMicrotokens(bb) {
-  return Math.round(bb * MICROTOKENS_PER_BB);
-}
-
-export function microtokensToBb(microtokens) {
-  return microtokens / MICROTOKENS_PER_BB;
-}
-
-// ============================================================================
-// SIGNATURE UTILITIES
-// ============================================================================
-
-/**
- * Sign a message with domain separation (prevents L1/L2 replay)
- */
-export function signWithDomainSeparation(privateKeyHex, message, chainId) {
-  const domainSeparated = Buffer.concat([
-    Buffer.from([chainId]),
-    Buffer.from(message, 'utf8')
-  ]);
-  
-  const privateKey = Buffer.from(privateKeyHex, 'hex');
-  const keypair = nacl.sign.keyPair.fromSeed(privateKey);
-  const secretKey = new Uint8Array(64);
-  secretKey.set(privateKey, 0);
-  secretKey.set(keypair.publicKey, 32);
-  
-  const signature = nacl.sign.detached(domainSeparated, secretKey);
-  return Buffer.from(signature).toString('hex');
-}
-
-/**
- * Create intent hash for bet (binds bet parameters)
- */
-export function createIntentHash(params) {
-  const data = JSON.stringify({
-    market_id: params.marketId,
-    outcome: params.outcome,
-    stake: params.stake,
-    user: params.userAddress,
-    nonce: params.nonce,
-    timestamp: params.timestamp
-  });
-  
-  return createHash('sha256').update(data).digest();
-}
-
-// ============================================================================
-// L1 CLIENT - Talk to the Bank
+// L1 CLIENT
 // ============================================================================
 
 export class L1Client {
-  constructor(baseUrl = L1_REST_URL) {
+  constructor(baseUrl = L1_URL) {
     this.baseUrl = baseUrl;
   }
   
-  /**
-   * Get L1 balance for an address
-   * @param {string} l1Address - Must be L1_<40hex> format
-   */
-  async getBalance(l1Address) {
-    if (!l1Address.startsWith('L1_')) {
-      throw new Error('L1 balance query requires L1_ prefix');
-    }
-    
-    const response = await fetch(`${this.baseUrl}/balance/${l1Address}`);
-    const data = await response.json();
-    
-    if (!data.success) {
-      throw new Error(data.error || 'Balance query failed');
-    }
-    
-    return {
-      address: data.address,
-      balance: data.balance,
-      layer: data.layer
-    };
+  async getBalance(address) {
+    const res = await fetch(`${this.baseUrl}/balance/${address}`);
+    const data = await res.json();
+    return data.balance || 0;
   }
   
-  /**
-   * Initiate bridge lock (L1 → L2)
-   * Locks funds on L1 so they can be used on L2
-   */
-  async bridgeLock(userWallet, amount) {
-    const nonce = Date.now();
-    const payload = {
-      action: 'bridge_lock',
-      amount: bbToMicrotokens(amount),
-      target_layer: 'L2',
-      nonce,
-      timestamp: Date.now()
-    };
-    
-    const payloadStr = JSON.stringify(payload);
-    const message = `${userWallet.publicKey}:${nonce}:${payload.timestamp}:${payloadStr}`;
-    const signature = signWithDomainSeparation(userWallet.privateKey, message, CHAIN_ID_L1);
-    
-    const response = await fetch(`${this.baseUrl}/bridge/initiate`, {
+  async startSession(walletAddress, amount) {
+    const res = await fetch(`${this.baseUrl}/session/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        public_key: userWallet.publicKey,
-        wallet_address: userWallet.l1Address,
-        payload: payloadStr,
-        signature,
-        nonce: nonce.toString(),
-        timestamp: payload.timestamp,
-        chain_id: CHAIN_ID_L1
+        wallet_address: walletAddress,
+        allocation: amount
       })
     });
-    
-    return response.json();
+    return res.json();
   }
   
-  /**
-   * Transfer tokens on L1
-   */
-  async transfer(fromWallet, toAddress, amount) {
-    const nonce = Date.now();
-    const payload = { to: toAddress, amount };
-    const payloadStr = JSON.stringify(payload);
-    const message = `${fromWallet.publicKey}:${nonce}:${Date.now()}:${payloadStr}`;
-    const signature = signWithDomainSeparation(fromWallet.privateKey, message, CHAIN_ID_L1);
-    
-    const response = await fetch(`${this.baseUrl}/transfer`, {
+  async settleSession(walletAddress, finalL2Balance) {
+    const res = await fetch(`${this.baseUrl}/session/settle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        public_key: fromWallet.publicKey,
-        wallet_address: fromWallet.l1Address,
-        payload: payloadStr,
-        signature,
-        nonce: nonce.toString(),
-        timestamp: Date.now(),
-        chain_id: CHAIN_ID_L1
+        wallet_address: walletAddress,
+        final_l2_balance: finalL2Balance
       })
     });
-    
-    return response.json();
+    return res.json();
+  }
+  
+  async getSessionStatus(walletAddress) {
+    const res = await fetch(`${this.baseUrl}/session/status/${walletAddress}`);
+    return res.json();
+  }
+  
+  // =========================================================================
+  // CREDIT LINE ENDPOINTS (Casino Bank Model)
+  // =========================================================================
+  
+  /**
+   * Approve a credit line (requires signature)
+   */
+  async approveCreditLine(walletAddress, publicKey, creditLimit, signature, nonce, expiresInHours = 24) {
+    const res = await fetch(`${this.baseUrl}/credit/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wallet_address: walletAddress,
+        public_key: publicKey,
+        credit_limit: creditLimit,
+        signature,
+        nonce,
+        expires_in_hours: expiresInHours
+      })
+    });
+    return res.json();
   }
   
   /**
-   * Check server health
+   * Draw funds from credit line (requires signed request)
+   * SECURITY: Every L1→L2 transfer requires valid Ed25519 signature
    */
-  async health() {
-    const response = await fetch(`${this.baseUrl}/health`);
-    return response.json();
+  async creditDraw(signedRequest) {
+    const res = await fetch(`${this.baseUrl}/credit/draw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedRequest)
+    });
+    return res.json();
+  }
+  
+  /**
+   * Settle credit session (requires signed request)
+   * SECURITY: Settlement returns tokens to L1 - requires signature from original depositor
+   */
+  async creditSettle(signedRequest) {
+    const res = await fetch(`${this.baseUrl}/credit/settle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedRequest)
+    });
+    return res.json();
+  }
+  
+  /**
+   * Get credit line status
+   */
+  async getCreditStatus(walletAddress) {
+    const res = await fetch(`${this.baseUrl}/credit/status/${walletAddress}`);
+    return res.json();
   }
 }
 
 // ============================================================================
-// L2 CLIENT - Talk to the Casino
+// L2 CLIENT
 // ============================================================================
 
 export class L2Client {
-  constructor(baseUrl = L2_REST_URL) {
+  constructor(baseUrl = L2_URL) {
     this.baseUrl = baseUrl;
   }
   
-  /**
-   * Check L2 server health
-   */
-  async health() {
-    const response = await fetch(`${this.baseUrl}/health`);
-    return response.json();
+  async getBalance(address) {
+    const clean = stripPrefix(address);
+    const res = await fetch(`${this.baseUrl}/balance/${clean}`);
+    return res.json();
   }
   
-  /**
-   * Get L2 balance (funds available for betting)
-   */
-  async getBalance(userAddress) {
-    // L2 uses addresses without L1_/L2_ prefix
-    const cleanAddress = stripPrefix(userAddress);
-    const response = await fetch(`${this.baseUrl}/balance/${cleanAddress}`);
-    return response.json();
+  async getMarkets() {
+    const res = await fetch(`${this.baseUrl}/markets`);
+    return res.json();
   }
   
-  /**
-   * Credit user on L2 (simulates L1→L2 bridge)
-   */
-  async credit(userAddress, amount) {
-    const cleanAddress = stripPrefix(userAddress);
-    const response = await fetch(`${this.baseUrl}/credit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user: cleanAddress,
-        amount: amount  // In BB
-      })
-    });
-    return response.json();
-  }
-  
-  /**
-   * List all markets
-   */
-  async listMarkets() {
-    const response = await fetch(`${this.baseUrl}/markets`);
-    return response.json();
-  }
-  
-  /**
-   * Get market details
-   */
   async getMarket(marketId) {
-    const response = await fetch(`${this.baseUrl}/markets/${marketId}`);
-    return response.json();
+    const res = await fetch(`${this.baseUrl}/markets/${marketId}`);
+    return res.json();
   }
   
-  /**
-   * Get buy price quote
-   */
-  async getQuote(marketId, outcome, amount) {
-    const response = await fetch(`${this.baseUrl}/quote`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        market_id: marketId,
-        outcome: outcome,
-        amount: amount
-      })
-    });
-    return response.json();
-  }
-  
-  /**
-   * Place a bet on L2 (CPMM market)
-   * @param {string} userAddress - User's address (with or without prefix)
-   * @param {string} marketId - Market ID (e.g., "tesla_rtaxi")
-   * @param {string} outcome - "YES" or "NO"
-   * @param {number} amount - Amount to bet in BB
-   */
-  async placeBet(userAddress, marketId, outcome, amount) {
-    const cleanAddress = stripPrefix(userAddress);
-    
-    // Convert outcome string to index (0=YES, 1=NO)
+  async placeBet(address, marketId, outcome, amount) {
+    const clean = stripPrefix(address);
     const outcomeIndex = outcome.toUpperCase() === 'YES' ? 0 : 1;
     
-    const response = await fetch(`${this.baseUrl}/bet`, {
+    const res = await fetch(`${this.baseUrl}/bet`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        user: cleanAddress,
+        user: clean,
         market_id: marketId,
         outcome: outcomeIndex,
-        amount: amount
+        amount
       })
     });
-    
-    return response.json();
+    return res.json();
   }
   
-  /**
-   * Get user's bets
-   */
-  async getUserBets(userAddress) {
-    const cleanAddress = stripPrefix(userAddress);
-    const response = await fetch(`${this.baseUrl}/bets/${cleanAddress}`);
-    return response.json();
-  }
-  
-  /**
-   * Get user's position in a market
-   */
-  async getUserPosition(userAddress, marketId) {
-    const cleanAddress = stripPrefix(userAddress);
-    const response = await fetch(`${this.baseUrl}/position/${cleanAddress}/${marketId}`);
-    return response.json();
-  }
-  
-  /**
-   * Sell tokens back to pool
-   */
-  async sellTokens(userAddress, marketId, outcome, amount) {
-    const cleanAddress = stripPrefix(userAddress);
-    
-    const response = await fetch(`${this.baseUrl}/sell`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user: cleanAddress,
-        market_id: marketId,
-        outcome: outcome,
-        amount: amount
-      })
-    });
-    
-    return response.json();
+  async getPosition(address, marketId) {
+    const clean = stripPrefix(address);
+    const res = await fetch(`${this.baseUrl}/position/${clean}/${marketId}`);
+    return res.json();
   }
 }
 
 // ============================================================================
-// UNIFIED WALLET - Manages both L1 and L2
+// UNIFIED WALLET
 // ============================================================================
 
 export class UnifiedWallet {
-  constructor(privateKeyHex, publicKeyHex = null, l1Address = null, l2Address = null) {
-    this.privateKey = privateKeyHex;
-    
-    // Derive public key if not provided
-    if (!publicKeyHex) {
-      const keypair = nacl.sign.keyPair.fromSeed(Buffer.from(privateKeyHex, 'hex'));
-      this.publicKey = Buffer.from(keypair.publicKey).toString('hex');
-    } else {
-      this.publicKey = publicKeyHex;
-    }
-    
-    // Use provided addresses (for test accounts) or derive them
-    if (l1Address && l2Address) {
-      this.l1Address = l1Address;
-      this.l2Address = l2Address;
-      this.hash = stripPrefix(l1Address);
-    } else {
-      const addresses = deriveAddresses(this.publicKey);
-      this.l1Address = addresses.l1;
-      this.l2Address = addresses.l2;
-      this.hash = addresses.hash;
-    }
-    
-    // Clients
-    this.l1Client = new L1Client();
-    this.l2Client = new L2Client();
-    
-    // Cached balances
-    this.l1Balance = 0;
-    this.l2Balance = 0;
+  constructor(walletAddress) {
+    this.address = walletAddress;
+    this.l1 = new L1Client();
+    this.l2 = new L2Client();
   }
   
   /**
-   * Refresh balances from both layers
+   * Get balances from both layers
    */
-  async refresh() {
-    try {
-      const l1Data = await this.l1Client.getBalance(this.l1Address);
-      this.l1Balance = l1Data.balance;
-    } catch (e) {
-      console.error('L1 balance fetch failed:', e.message);
-    }
-    
-    try {
-      const l2Data = await this.l2Client.getBalance(this.l2Address);
-      this.l2Balance = l2Data.balance || 0;
-    } catch (e) {
-      // L2 might not be running -silent fail
-      this.l2Balance = 0;
-    }
-    
+  async getBalances() {
+    const l1Balance = await this.l1.getBalance(this.address);
+    const l2Data = await this.l2.getBalance(this.address);
     return {
-      l1: this.l1Balance,
-      l2: this.l2Balance,
-      total: this.l1Balance + this.l2Balance
+      l1: l1Balance,
+      l2: l2Data.balance || 0
     };
   }
   
   /**
-   * Credit L2 balance (simulates L1→L2 bridge)
+   * Step 1: Start L2 session (lock funds on L1)
    */
-  async creditL2(amount) {
-    return this.l2Client.credit(this.l2Address, amount);
+  async startSession(amount) {
+    console.log(`🎮 Starting session with ${amount} BB...`);
+    const result = await this.l1.startSession(this.address, amount);
+    if (result.success) {
+      console.log(`✅ Session started: ${result.session_id}`);
+    }
+    return result;
   }
   
   /**
-   * Place a bet on L2
+   * Step 2: Place bet on L2 (L2 tracks internally)
    */
   async placeBet(marketId, outcome, amount) {
-    return this.l2Client.placeBet(this.l2Address, marketId, outcome, amount);
+    console.log(`🎰 Betting ${amount} BB on ${outcome}...`);
+    const result = await this.l2.placeBet(this.address, marketId, outcome, amount);
+    if (result.success) {
+      console.log(`✅ Bet placed`);
+    }
+    return result;
   }
   
   /**
-   * Get markets from L2
+   * Step 3: Settle session (L2 → L1 validation)
+   */
+  async settleSession() {
+    console.log(`💰 Settling session...`);
+    
+    // Get final L2 balance
+    console.log(`📊 Fetching final L2 balance...`);
+    const l2Data = await this.l2.getBalance(this.address);
+    const finalBalance = l2Data.balance || 0;
+    console.log(`   L2 Balance: ${finalBalance} BB`);
+    
+    // Send to L1 for validation
+    console.log(`🔍 L1 validating settlement...`);
+    const result = await this.l1.settleSession(this.address, finalBalance);
+    
+    if (result.success) {
+      const pnl = result.settlement?.net_pnl || 0;
+      console.log(`✅ Settlement validated`);
+      console.log(`   Net PnL: ${pnl >= 0 ? '+' : ''}${pnl} BB`);
+      console.log(`   L1 Balance: ${result.settlement?.l1_before} → ${result.settlement?.l1_after} BB`);
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Get markets
    */
   async getMarkets() {
-    return this.l2Client.listMarkets();
+    return this.l2.getMarkets();
   }
   
   /**
    * Get market details
    */
   async getMarket(marketId) {
-    return this.l2Client.getMarket(marketId);
+    return this.l2.getMarket(marketId);
   }
   
   /**
-   * Get user's bets
-   */
-  async getBets() {
-    return this.l2Client.getUserBets(this.l2Address);
-  }
-  
-  /**
-   * Get position in a market
+   * Get position
    */
   async getPosition(marketId) {
-    return this.l2Client.getUserPosition(this.l2Address, marketId);
+    return this.l2.getPosition(this.address, marketId);
+  }
+}
+
+// ============================================================================
+// CREDIT LINE WALLET (Casino Bank Model)
+// ============================================================================
+
+/**
+ * CreditLineWallet provides a casino-like experience where users never
+ * run out of L2 tokens as long as they have L1 balance.
+ * 
+ * FLOW:
+ *   1. User signs ONE credit approval for a limit (e.g., 500 BB)
+ *   2. L2 automatically draws funds as needed (initial + replenish)
+ *   3. Session ends → unused tokens return to L1
+ * 
+ * SECURITY:
+ *   - Credit approval requires Ed25519 signature
+ *   - L1 validates all settlements (fraud detection)
+ *   - Session expiry returns unused funds
+ */
+export class CreditLineWallet {
+  constructor(privateKeyHex, walletAddress = null) {
+    // Store keys
+    this.privateKey = privateKeyHex;
+    
+    // Derive public key
+    const keypair = nacl.sign.keyPair.fromSeed(Buffer.from(privateKeyHex, 'hex'));
+    this.publicKey = Buffer.from(keypair.publicKey).toString('hex');
+    
+    // Use provided address or generate from public key
+    this.address = walletAddress || `L1_${this.publicKey.slice(0, 40).toUpperCase()}`;
+    
+    // Initialize clients
+    this.l1 = new L1Client();
+    this.l2 = new L2Client();
+    
+    // Session state
+    this.sessionId = null;
+    this.creditLimit = 0;
+    this.l2Balance = 0;
+    this.nonce = Date.now();
+    
+    // Auto-replenish settings
+    this.autoReplenishThreshold = 10; // Draw more when L2 balance < 10
+    this.autoReplenishAmount = 50;    // Draw 50 BB at a time
   }
   
   /**
-   * Transfer on L1
+   * Sign a message with Ed25519
    */
-  async transfer(toAddress, amount) {
-    return this.l1Client.transfer(this, toAddress, amount);
+  sign(message) {
+    const privateKey = Buffer.from(this.privateKey, 'hex');
+    const keypair = nacl.sign.keyPair.fromSeed(privateKey);
+    
+    const secretKey = new Uint8Array(64);
+    secretKey.set(privateKey, 0);
+    secretKey.set(keypair.publicKey, 32);
+    
+    const signature = nacl.sign.detached(Buffer.from(message, 'utf8'), secretKey);
+    return Buffer.from(signature).toString('hex');
   }
-}
-
-// ============================================================================
-// TEST ACCOUNTS (Match L1 server's unified_auth.rs accounts)
-// ============================================================================
-
-export const TEST_ACCOUNTS = {
-  alice: {
-    // These are the ACTUAL addresses from L1 server
-    // Must match src/integration/unified_auth.rs
-    privateKey: '37b5e0e7f8a456d3b70ff2c4c5ea8f9e3c2c89c0f0a91e27e4d6f8c3e1a2b4d0',
-    publicKey: 'c0e349153cbc75e9529b5f1963205cab20253db573ec65e8ff31155dc131bd05',
-    l1Address: 'L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD',
-    l2Address: 'L2_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD',
-    l1Balance: 10000,
-    username: 'alice_test'
-  },
-  bob: {
-    privateKey: '9f3c7e5a2b8d1f6e4c9a0d7e3b2f8c5e1a4d6f9c2b7e5a1d3f8c6e9b4a7d2f5e',
-    publicKey: '582420216093fcff65b0eec2ca2c82279db682b076526c341b80d5e2dc5c32b7',
-    l1Address: 'L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9',
-    l2Address: 'L2_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9',
-    l1Balance: 5000,
-    username: 'bob_test'
-  },
-  dealer: {
-    privateKey: 'e5284bcb4d8fb72a8969d48a888512b1f42fe5c57d1ae5119a09785ba13654ae',
-    publicKey: '07943256765557e704e4945aa4d1d56a1b0aac60bd8cc328faa99572aee5e84a',
-    l1Address: 'L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3',
-    l2Address: 'L2_F5C46483E8A28394F5E8687DEADF6BD4E924CED3',
-    l1Balance: 100000,
-    username: 'dealer_house'
-  }
-};
-
-/**
-    account.privateKey, 
-    account.publicKey,
-    account.l1Address,
-    account.l2Address
   
- * Create a UnifiedWallet from a test account
- */
-export function createTestWallet(accountName) {
-  const account = TEST_ACCOUNTS[accountName];
-  if (!account) throw new Error(`Unknown test account: ${accountName}`);
-  return new UnifiedWallet(account.privateKey, account.publicKey);
+  /**
+   * Step 1: Approve credit line (ONE-TIME signature)
+   * 
+   * Like giving the casino permission to advance you chips up to your credit limit.
+   */
+  async approveCreditLine(creditLimit, expiresInHours = 24) {
+    console.log(`🏦 Approving credit line: ${creditLimit} BB for ${expiresInHours} hours`);
+    
+    // Create the message to sign
+    this.nonce = Date.now();
+    const message = `APPROVE_CREDIT:${this.address}:${creditLimit}:${this.nonce}`;
+    
+    // Sign it
+    const signature = this.sign(message);
+    console.log(`🔐 Signed credit approval`);
+    
+    // Send to L1
+    const result = await this.l1.approveCreditLine(
+      this.address,
+      this.publicKey,
+      creditLimit,
+      signature,
+      this.nonce,
+      expiresInHours
+    );
+    
+    if (result.success) {
+      this.sessionId = result.session.session_id;
+      this.creditLimit = creditLimit;
+      console.log(`✅ Credit line approved: Session ${this.sessionId}`);
+    } else {
+      console.error(`❌ Credit approval failed: ${result.error}`);
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Step 2: Draw funds from L1 to L2
+   * 
+   * SECURITY: Every L1→L2 transfer requires valid Ed25519 signature.
+   * The wallet owner must sign each draw request.
+   */
+  async draw(amount, reason = 'user_request') {
+    if (!this.sessionId) {
+      throw new Error('No active credit session. Call approveCreditLine() first.');
+    }
+    
+    console.log(`💳 Drawing ${amount} BB (${reason})`);
+    
+    // Create signed request
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    
+    // Sign: CREDIT_DRAW:wallet:session:amount:timestamp:nonce
+    const message = `CREDIT_DRAW:${this.address}:${this.sessionId}:${amount}:${timestamp}:${nonce}`;
+    const signature = this.sign(message);
+    
+    console.log(`🔐 Signed draw request`);
+    
+    const signedRequest = {
+      wallet_address: this.address,
+      public_key: this.publicKey,
+      session_id: this.sessionId,
+      amount,
+      reason,
+      timestamp,
+      nonce,
+      signature
+    };
+    
+    const result = await this.l1.creditDraw(signedRequest);
+    
+    if (result.success) {
+      this.l2Balance = result.session.l2_balance;
+      console.log(`✅ Drew ${amount} BB. L2 balance: ${this.l2Balance} BB`);
+    } else {
+      console.error(`❌ Draw failed: ${result.error}`);
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Auto-replenish L2 balance if needed before a bet
+   * 
+   * This is called internally before placing bets.
+   */
+  async ensureFundsForBet(betAmount) {
+    // Get current L2 balance
+    const l2Data = await this.l2.getBalance(this.address);
+    this.l2Balance = l2Data.balance || 0;
+    
+    // Check if we need to draw more
+    const available = this.l2Balance;
+    if (available < betAmount) {
+      // Draw enough for this bet plus some buffer
+      const drawAmount = Math.max(betAmount - available + this.autoReplenishAmount, this.autoReplenishAmount);
+      console.log(`⚡ Auto-replenishing: need ${betAmount}, have ${available}, drawing ${drawAmount}`);
+      
+      const result = await this.draw(drawAmount, 'low_balance');
+      if (!result.success) {
+        throw new Error(`Failed to auto-replenish: ${result.error}`);
+      }
+    }
+    
+    return { sufficient: true, balance: this.l2Balance };
+  }
+  
+  /**
+   * Place a bet (auto-replenishes if needed)
+   */
+  async placeBet(marketId, outcome, amount) {
+    // Ensure we have enough funds
+    await this.ensureFundsForBet(amount);
+    
+    console.log(`🎰 Betting ${amount} BB on ${outcome}`);
+    const result = await this.l2.placeBet(this.address, marketId, outcome, amount);
+    
+    if (result.success) {
+      // Update local balance estimate
+      this.l2Balance -= amount;
+      console.log(`✅ Bet placed. Estimated L2 balance: ${this.l2Balance} BB`);
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Step 3: Close session and return unused funds to L1
+   * 
+   * SECURITY: Settlement requires valid Ed25519 signature.
+   * L2 can ONLY return tokens to the SAME wallet that deposited them.
+   */
+  async closeSession() {
+    if (!this.sessionId) {
+      throw new Error('No active credit session.');
+    }
+    
+    console.log(`💰 Closing credit session ${this.sessionId}...`);
+    
+    // Get final L2 balance
+    const l2Data = await this.l2.getBalance(this.address);
+    const finalBalance = l2Data.balance || 0;
+    
+    // TODO: Get locked in bets from L2 if any positions are open
+    const lockedInBets = 0;
+    
+    console.log(`📊 Final L2 balance: ${finalBalance} BB`);
+    
+    // Create signed settlement request
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    
+    // Sign: CREDIT_SETTLE:session:wallet:balance:timestamp:nonce
+    const message = `CREDIT_SETTLE:${this.sessionId}:${this.address}:${finalBalance}:${timestamp}:${nonce}`;
+    const signature = this.sign(message);
+    
+    console.log(`🔐 Signed settlement request`);
+    
+    const signedRequest = {
+      session_id: this.sessionId,
+      wallet_address: this.address,
+      public_key: this.publicKey,
+      final_l2_balance: finalBalance,
+      locked_in_bets: lockedInBets,
+      timestamp,
+      nonce,
+      signature
+    };
+    
+    // Settle with L1
+    const result = await this.l1.creditSettle(signedRequest);
+    
+    if (result.success) {
+      const netPnL = result.settlement.net_pnl;
+      console.log(`✅ Session settled`);
+      console.log(`   Net PnL: ${netPnL >= 0 ? '+' : ''}${netPnL} BB`);
+      console.log(`   L1 Balance: ${result.settlement.l1_before} → ${result.settlement.l1_after} BB`);
+      console.log(`   Returned to L1: ${result.settlement.returned_to_l1} BB`);
+      
+      // Clear session state
+      this.sessionId = null;
+      this.creditLimit = 0;
+      this.l2Balance = 0;
+    } else {
+      console.error(`❌ Settlement failed: ${result.error}`);
+    }
+    
+    return result;
+  }
+  
+  /**
+   * Get current status
+   */
+  async getStatus() {
+    const [l1Balance, l2Data, creditStatus] = await Promise.all([
+      this.l1.getBalance(this.address),
+      this.l2.getBalance(this.address),
+      this.l1.getCreditStatus(this.address)
+    ]);
+    
+    return {
+      address: this.address,
+      l1_balance: l1Balance,
+      l2_balance: l2Data.balance || 0,
+      credit: creditStatus.success ? creditStatus : null,
+      session_id: this.sessionId
+    };
+  }
+  
+  /**
+   * Get markets
+   */
+  async getMarkets() {
+    return this.l2.getMarkets();
+  }
+  
+  /**
+   * Get market details
+   */
+  async getMarket(marketId) {
+    return this.l2.getMarket(marketId);
+  }
+  
+  /**
+   * Get position
+   */
+  async getPosition(marketId) {
+    return this.l2.getPosition(this.address, marketId);
+  }
 }
 
 // ============================================================================
-// INTEGRATION FLOW EXAMPLES
+// EXAMPLE USAGE
 // ============================================================================
 
-/**
- * Example: Complete betting flow
- * 
- * This demonstrates the full L1↔L2 integration:
- * 1. Alice checks her L1 balance
- * 2. Alice locks funds for L2 betting
- * 3. Alice places a bet on L2 (Dealer fronts it)
- * 4. L2 requests reimbursement from L1
- * 5. Bet resolves, L2 tells L1 to settle
- * 6. L1 moves funds between Dealer and Alice
- */
-export async function exampleBettingFlow() {
+export async function exampleFlow() {
   console.log('═══════════════════════════════════════════════════════════════');
   console.log('  BLACKBOOK L1↔L2 INTEGRATION DEMO');
-  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('═══════════════════════════════════════════════════════════════\n');
   
-  // Create wallets
-  const alice = createTestWallet('alice');
-  const l1 = new L1Client();
+  const wallet = new UnifiedWallet('L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD');
   
-  // Step 1: Check L1 balance
-  console.log('\n📊 Step 1: Checking Alice\'s L1 balance...');
-  try {
-    const balance = await l1.getBalance(alice.l1Address);
-    console.log(`   L1 Balance: ${balance.balance} BB`);
-  } catch (e) {
-    console.log(`   Error: ${e.message}`);
-  }
+  // Step 1: Start session
+  await wallet.startSession(100);
   
-  // Step 2: Lock funds for betting
-  console.log('\n🔒 Step 2: Locking 100 BB for L2 betting...');
-  console.log('   (This would call /bridge/initiate on L1)');
-  console.log('   After lock: L1 available: 9,900 BB, L1 locked: 100 BB');
+  // Step 2: Place bets
+  await wallet.placeBet('tesla_rtaxi', 'YES', 10);
+  await wallet.placeBet('tesla_rtaxi', 'YES', 20);
   
-  // Step 3: Place bet on L2
-  console.log('\n🎰 Step 3: Placing bet on L2...');
-  console.log('   Market: "Will BTC hit $150k by EOY?"');
-  console.log('   Outcome: YES');
-  console.log('   Stake: 50 BB');
-  console.log('   → Dealer fronts bet immediately (great UX!)');
-  
-  // Step 4: L2 requests reimbursement
-  console.log('\n💰 Step 4: L2 → L1 Reimbursement (gRPC)...');
-  console.log('   L2 calls: SettlementNode.RequestReimbursement');
-  console.log('   L1 moves: Alice locked 50 → Dealer');
-  console.log('   Alice locked: 50 BB, Dealer: +50 BB');
-  
-  // Step 5: Bet resolves
-  console.log('\n🎲 Step 5: Market resolves to YES! Alice wins!');
-  console.log('   Payout: 2x stake = 100 BB');
-  
-  // Step 6: Settlement
-  console.log('\n✅ Step 6: L2 → L1 Settlement (gRPC)...');
-  console.log('   L2 calls: SettlementNode.ExecuteSettlement');
-  console.log('   L1 moves: Dealer → Alice: 100 BB');
-  console.log('   Final: Alice L1: 10,050 BB (+50 profit)');
+  // Step 3: Settle
+  await wallet.settleSession();
   
   console.log('\n═══════════════════════════════════════════════════════════════');
-  console.log('  FLOW COMPLETE');
+  console.log('  COMPLETE');
   console.log('═══════════════════════════════════════════════════════════════');
 }
 
-// ============================================================================
-// GRPC MESSAGE BUILDERS (for L2 to call L1)
-// ============================================================================
-
 /**
- * Build a ReimbursementRequest message
- * Used by L2 when Dealer fronts a bet
+ * Example: Credit Line Flow (Casino Model)
  */
-export function buildReimbursementRequest(params) {
-  const { dealerWallet, userAddress, betId, amount, nonce } = params;
+export async function creditLineExample() {
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('  CREDIT LINE DEMO (Casino Bank Model)');
+  console.log('═══════════════════════════════════════════════════════════════\n');
   
-  const timestamp = Date.now();
-  const message = JSON.stringify({
-    dealer_address: dealerWallet.l1Address,
-    user_address: userAddress,
-    bet_id: betId,
-    amount: bbToMicrotokens(amount),
-    nonce,
-    timestamp
-  });
+  // Create wallet from private key
+  const privateKey = 'a'.repeat(64); // Replace with actual private key
+  const wallet = new CreditLineWallet(privateKey);
   
-  const signature = signWithDomainSeparation(
-    dealerWallet.privateKey, 
-    message, 
-    CHAIN_ID_L2  // L2 is making this request
-  );
+  console.log(`Wallet: ${wallet.address}\n`);
   
-  return {
-    dealer_address: dealerWallet.l1Address,
-    user_address: userAddress,
-    bet_id: betId,
-    amount: bbToMicrotokens(amount),
-    public_key: dealerWallet.publicKey,
-    signature: Buffer.from(signature, 'hex'),
-    nonce,
-    timestamp,
-    chain_id: CHAIN_ID_L2
-  };
+  // Step 1: Approve credit line (ONE-TIME signature)
+  await wallet.approveCreditLine(500, 24);
+  
+  // Step 2: Draw initial funds
+  await wallet.draw(100, 'initial');
+  
+  // Step 3: Place bets (auto-replenishes if needed)
+  await wallet.placeBet('tesla_rtaxi', 'YES', 50);
+  await wallet.placeBet('ai_2025', 'NO', 30);
+  await wallet.placeBet('btc_100k', 'YES', 80); // This triggers auto-replenish!
+  
+  // Step 4: Close session (returns unused to L1)
+  await wallet.closeSession();
+  
+  console.log('\n═══════════════════════════════════════════════════════════════');
+  console.log('  COMPLETE');
+  console.log('═══════════════════════════════════════════════════════════════');
 }
-
-/**
- * Build a SettlementRequest message
- * Used by L2 when a bet resolves
- */
-export function buildSettlementRequest(params) {
-  const { 
-    dealerWallet, 
-    userAddress, 
-    beneficiary,
-    betId, 
-    marketId,
-    outcome,
-    stakeAmount,
-    payoutAmount,
-    intentHash,
-    nonce 
-  } = params;
-  
-  const timestamp = Date.now();
-  const message = JSON.stringify({
-    dealer_address: dealerWallet.l1Address,
-    user_address: userAddress,
-    beneficiary,
-    bet_id: betId,
-    market_id: marketId,
-    outcome,
-    stake_amount: bbToMicrotokens(stakeAmount),
-    payout_amount: bbToMicrotokens(payoutAmount),
-    nonce,
-    timestamp
-  });
-  
-  const signature = signWithDomainSeparation(
-    dealerWallet.privateKey,
-    message,
-    CHAIN_ID_L2
-  );
-  
-  return {
-    dealer_address: dealerWallet.l1Address,
-    user_address: userAddress,
-    beneficiary,
-    bet_id: betId,
-    market_id: marketId,
-    outcome,
-    stake_amount: bbToMicrotokens(stakeAmount),
-    payout_amount: bbToMicrotokens(payoutAmount),
-    public_key: dealerWallet.publicKey,
-    signature: Buffer.from(signature, 'hex'),
-    intent_hash: intentHash,
-    nonce,
-    timestamp,
-    chain_id: CHAIN_ID_L2
-  };
-}
-
-// ============================================================================
-// EXPORTS
-// ============================================================================
 
 export default {
-  // Constants
-  CHAIN_ID_L1,
-  CHAIN_ID_L2,
-  DEALER_ADDRESS,
-  L1_REST_URL,
-  L1_GRPC_URL,
-  L2_REST_URL,
-  
-  // Address utilities
-  deriveAddresses,
-  l1ToL2Address,
-  l2ToL1Address,
-  stripPrefix,
-  
-  // Amount utilities
-  bbToMicrotokens,
-  microtokensToBb,
-  
-  // Signature utilities
-  signWithDomainSeparation,
-  createIntentHash,
-  
-  // Clients
   L1Client,
   L2Client,
   UnifiedWallet,
-  
-  // Test accounts
-  TEST_ACCOUNTS,
-  createTestWallet,
-  
-  // gRPC message builders
-  buildReimbursementRequest,
-  buildSettlementRequest,
-  
-  // Examples
-  exampleBettingFlow
+  CreditLineWallet,
+  exampleFlow,
+  creditLineExample
 };
