@@ -279,7 +279,7 @@ const TEST_ACCOUNTS = {
   
   // Dealer: L2 Oracle account - private key in .env ONLY
   DEALER: {
-    address: 'L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3',
+    address: 'L2_F5C46483E8A28394F5E8687DEADF6BD4E924CED3',
     publicKey: '07943256765557e704e4945aa4d1d56a1b0aac60bd8cc328faa99572aee5e84a',
     // ⚠️ PRIVATE KEY NEVER IN CODE - Load from process.env.DEALER_PRIVATE_KEY
   }

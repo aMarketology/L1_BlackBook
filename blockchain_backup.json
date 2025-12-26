@@ -18,11 +18,11 @@
     },
     {
       "index": 1,
-      "timestamp": 1766778643,
+      "timestamp": 1766781516,
       "previous_hash": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
-      "hash": "1408d64b50a9ae5a0e5acfb961979c2e982d0c20e59b88d1209724be298b6979",
-      "slot": 1,
-      "poh_hash": "d1ef6132ff43e48048c48d58f88e5171381cb7a54c825e9b3d4dd482a199f450",
+      "hash": "c42d165e8013cc2328bbe3524ac40de3960f077a783b70ad979405d5ef2f4667",
+      "slot": 4,
+      "poh_hash": "029740e3b45de86121dfc8b9ff0b90ae938a2a396ab2a0fef35c7810d1b17e24",
       "parent_slot": 0,
       "sequencer": "genesis_airdrop",
       "leader": "genesis_airdrop",
@@ -31,7 +31,7 @@
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
           "to": "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
           "amount": 10000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
@@ -41,13 +41,13 @@
             "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
           ],
           "tx_type": "Transfer",
-          "id": "e471ce67-6cd2-4997-954b-4ebbafb3d575"
+          "id": "5cdeb15c-c12b-436d-bdad-ba57fdfe071c"
         },
         {
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
           "to": "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
           "amount": 5000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
@@ -57,23 +57,23 @@
             "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
           ],
           "tx_type": "Transfer",
-          "id": "c32d1e55-41a9-45c1-ad9a-48358a8b2803"
+          "id": "e8f0a20b-09a4-497f-b117-8d53c48561e5"
         },
         {
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
-          "to": "F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+          "to": "2B50705D8485D278C23D51B3273B59ABAB49B8E4",
           "amount": 100000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
           ],
           "write_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
-            "F5C46483E8A28394F5E8687DEADF6BD4E924CED3"
+            "2B50705D8485D278C23D51B3273B59ABAB49B8E4"
           ],
           "tx_type": "Transfer",
-          "id": "369853a3-62b7-4529-906c-a7f610fdd8cf"
+          "id": "6e48aeb2-9512-461e-a167-69fc3ffc1d45"
         }
       ],
       "social_txs": [],
@@ -82,7 +82,7 @@
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
           "to": "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
           "amount": 10000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
@@ -92,13 +92,13 @@
             "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
           ],
           "tx_type": "Transfer",
-          "id": "e471ce67-6cd2-4997-954b-4ebbafb3d575"
+          "id": "5cdeb15c-c12b-436d-bdad-ba57fdfe071c"
         },
         {
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
           "to": "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
           "amount": 5000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
@@ -108,33 +108,33 @@
             "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
           ],
           "tx_type": "Transfer",
-          "id": "c32d1e55-41a9-45c1-ad9a-48358a8b2803"
+          "id": "e8f0a20b-09a4-497f-b117-8d53c48561e5"
         },
         {
           "from": "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
-          "to": "F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+          "to": "2B50705D8485D278C23D51B3273B59ABAB49B8E4",
           "amount": 100000.0,
-          "timestamp": 1766778643,
+          "timestamp": 1766781516,
           "signature": "",
           "read_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1"
           ],
           "write_accounts": [
             "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1",
-            "F5C46483E8A28394F5E8687DEADF6BD4E924CED3"
+            "2B50705D8485D278C23D51B3273B59ABAB49B8E4"
           ],
           "tx_type": "Transfer",
-          "id": "369853a3-62b7-4529-906c-a7f610fdd8cf"
+          "id": "6e48aeb2-9512-461e-a167-69fc3ffc1d45"
         }
       ],
-      "engagement_score": 15.0,
+      "engagement_score": 15.299999999999999,
       "tx_count": 3
     },
     {
       "index": 2,
-      "timestamp": 1766778643,
-      "previous_hash": "1408d64b50a9ae5a0e5acfb961979c2e982d0c20e59b88d1209724be298b6979",
-      "hash": "b46d3e3cc62cf704839ce203fd26f1130ede78b70316e852385a8a3c7caa03bb",
+      "timestamp": 1766781516,
+      "previous_hash": "c42d165e8013cc2328bbe3524ac40de3960f077a783b70ad979405d5ef2f4667",
+      "hash": "8c559bd9f49065f0420a5a3cd04bf7b98f030724944d4e9b402baf4611315720",
       "slot": 0,
       "poh_hash": "567f35021a2fa095f8c1cff2e124f57a0228d0ece2b18bc103e3945efa48a3b4",
       "parent_slot": 0,
@@ -150,22 +150,32 @@
   "pending_transactions": [],
   "balances": {
     "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": 999885000.0,
-    "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 10000.0,
-    "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": 5000.0,
-    "F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100000.0,
-    "genesis_airdrop": 30.0
+    "F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 99900.0,
+    "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 20000.0,
+    "2B50705D8485D278C23D51B3273B59ABAB49B8E4": 100000.0,
+    "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": 10000.0,
+    "genesis_airdrop": 30.599999999999998
   },
   "mining_reward": 10.0,
   "daily_jackpot": 0.0,
-  "jackpot_last_reset": 1766778643,
+  "jackpot_last_reset": 1766781516,
   "current_slot": 1,
-  "current_poh_hash": "d1ef6132ff43e48048c48d58f88e5171381cb7a54c825e9b3d4dd482a199f450",
+  "current_poh_hash": "029740e3b45de86121dfc8b9ff0b90ae938a2a396ab2a0fef35c7810d1b17e24",
   "engagement_stakes": {
-    "genesis_airdrop": 2.772588722239781
+    "genesis_airdrop": 2.7911651078127164
   },
   "username_balances": {},
   "address_to_username": {},
   "accounts": {
+    "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": {
+      "lamports": 10000000000,
+      "nonce": 0,
+      "owner": "BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+      "data_hash": "",
+      "created_slot": 1,
+      "last_modified_slot": 1,
+      "rent_exempt": true
+    },
     "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": {
       "lamports": 1000000000000000,
       "nonce": 0,
@@ -174,12 +184,45 @@
       "created_slot": 0,
       "last_modified_slot": 0,
       "rent_exempt": true
+    },
+    "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": {
+      "lamports": 5000000000,
+      "nonce": 0,
+      "owner": "AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+      "data_hash": "",
+      "created_slot": 1,
+      "last_modified_slot": 1,
+      "rent_exempt": true
+    },
+    "F5C46483E8A28394F5E8687DEADF6BD4E924CED3": {
+      "lamports": 100000000000,
+      "nonce": 0,
+      "owner": "F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+      "data_hash": "",
+      "created_slot": 1,
+      "last_modified_slot": 1,
+      "rent_exempt": true
     }
   },
   "recent_blockhashes": {
     "0": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
-    "1": "1408d64b50a9ae5a0e5acfb961979c2e982d0c20e59b88d1209724be298b6979"
+    "4": "c42d165e8013cc2328bbe3524ac40de3960f077a783b70ad979405d5ef2f4667"
   },
-  "locked_balances": {},
-  "lock_records": {}
+  "locked_balances": {
+    "F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100.0
+  },
+  "lock_records": {
+    "lock_1766781540_1_F5C46483": {
+      "lock_id": "lock_1766781540_1_F5C46483",
+      "owner": "F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+      "amount": 100.0,
+      "purpose": "BridgeToL2",
+      "created_at": 1766781540,
+      "created_slot": 1,
+      "release_authorized": false,
+      "settlement_proof": null,
+      "released_at": null,
+      "beneficiary": null
+    }
+  }
 }
