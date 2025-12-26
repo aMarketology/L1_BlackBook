@@ -4,6 +4,7 @@
 // Core functionality:
 // - Bridge tokens L1 → L2 (lock on L1)
 // - Credit line management (Casino Bank Model)
+// - L2 State Root anchoring (Optimistic Rollup)
 // - Signature verification
 // - Balance queries
 // ============================================================================
@@ -40,6 +41,39 @@ pub struct CreditSettleRequest {
     pub locked_in_bets: f64,
     pub signature: String,
     pub nonce: u64,
+}
+
+// ============================================================================
+// L2 STATE ROOT STRUCTURES (Optimistic Rollup)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L2StateRootSubmission {
+    pub state_root: String,        // 64 hex chars (256-bit hash)
+    pub block_height: u64,         // L2 block number
+    pub timestamp: u64,            // Unix timestamp
+    pub tx_count: u64,             // Number of transactions in this batch
+    pub prev_state_root: String,   // Previous state root for chain validation
+    pub signature: Option<String>, // Optional L2 sequencer signature
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchoredStateRoot {
+    pub state_root: String,
+    pub l2_block_height: u64,
+    pub l1_block_height: u64,      // L1 block when this was anchored
+    pub anchored_at: u64,          // Unix timestamp when anchored on L1
+    pub tx_count: u64,
+    pub status: StateRootStatus,
+    pub challenge_period_ends: u64, // When this root becomes finalized
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum StateRootStatus {
+    Pending,      // Within challenge period
+    Finalized,    // Challenge period passed, root is final
+    Challenged,   // Someone disputed this root
+    Invalid,      // Root was proven invalid
 }
 
 // ============================================================================
@@ -104,10 +138,17 @@ pub struct L2Session {
     pub started_at: u64,
 }
 
+// Challenge period for optimistic rollup (in seconds)
+// 7 days in production, 60 seconds for testing
+const CHALLENGE_PERIOD_SECONDS: u64 = 60; // TODO: Increase to 604800 (7 days) for production
+
 #[derive(Debug, Default)]
 pub struct BridgeState {
     pub credit_approvals: HashMap<String, CreditApproval>,
     pub sessions: HashMap<String, L2Session>,
+    pub anchored_state_roots: Vec<AnchoredStateRoot>,
+    pub latest_l2_block: u64,
+    pub latest_state_root: Option<String>,
 }
 
 impl BridgeState {
@@ -142,10 +183,68 @@ impl BridgeState {
     pub fn add_session(&mut self, session: L2Session) {
         self.sessions.insert(session.session_id.clone(), session);
     }
+
+    pub fn anchor_state_root(&mut self, submission: L2StateRootSubmission, l1_block: u64) -> AnchoredStateRoot {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let anchored = AnchoredStateRoot {
+            state_root: submission.state_root.clone(),
+            l2_block_height: submission.block_height,
+            l1_block_height: l1_block,
+            anchored_at: now,
+            tx_count: submission.tx_count,
+            status: StateRootStatus::Pending,
+            challenge_period_ends: now + CHALLENGE_PERIOD_SECONDS,
+        };
+
+        self.latest_l2_block = submission.block_height;
+        self.latest_state_root = Some(submission.state_root);
+        self.anchored_state_roots.push(anchored.clone());
+        
+        anchored
+    }
+
+    pub fn get_latest_finalized_root(&self) -> Option<&AnchoredStateRoot> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.anchored_state_roots
+            .iter()
+            .rev()
+            .find(|r| r.status == StateRootStatus::Finalized || 
+                      (r.status == StateRootStatus::Pending && r.challenge_period_ends <= now))
+    }
+
+    pub fn finalize_expired_roots(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for root in &mut self.anchored_state_roots {
+            if root.status == StateRootStatus::Pending && root.challenge_period_ends <= now {
+                root.status = StateRootStatus::Finalized;
+            }
+        }
+    }
 }
 
+// L2 Base URL for bridge operations
+const L2_BASE_URL: &str = "http://localhost:1234";
+
 // ============================================================================
-// ROUTE: Bridge Initiate (L1 → L2)
+// ROUTE: Bridge Initiate (L1 → L2) - LOW LATENCY
+// ============================================================================
+// Flow:
+// 1. Verify signature (fast, in-memory)
+// 2. Lock tokens on L1 (fast, Sled write)
+// 3. Fire async HTTP to L2 (non-blocking)
+// 4. Return immediately with lock_id
 // ============================================================================
 
 pub fn bridge_initiate_route(
@@ -160,7 +259,9 @@ pub fn bridge_initiate_route(
             let blockchain = blockchain.clone();
             let _bridge_state = bridge_state.clone();
             async move {
-                // Verify signature
+                let start_time = std::time::Instant::now();
+                
+                // Verify signature (fast)
                 let wallet_address = match request.verify() {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -171,7 +272,7 @@ pub fn bridge_initiate_route(
                     }
                 };
 
-                // Parse payload
+                // Parse payload (fast)
                 let payload: BridgeInitiatePayload = match request.parse_payload() {
                     Ok(p) => p,
                     Err(_) => {
@@ -190,7 +291,7 @@ pub fn bridge_initiate_route(
                     })));
                 }
 
-                // Lock tokens on L1 (strip L1_ prefix for internal address)
+                // Lock tokens on L1 (fast Sled write)
                 let lock_id = {
                     let mut bc = lock_or_recover(&blockchain);
                     let internal_address = strip_prefix(&wallet_address);
@@ -210,15 +311,90 @@ pub fn bridge_initiate_route(
                     }
                 };
 
-                println!("🌉 Bridge initiated: {} locked {} BB on L1", 
-                         &wallet_address[..8], payload.amount);
+                let l1_lock_time = start_time.elapsed();
+                println!("🔒 L1 lock completed in {:?}", l1_lock_time);
+
+                // ============================================================
+                // ASYNC L2 CREDIT - Fire and await (fast HTTP)
+                // ============================================================
+                let l2_url = format!("{}/bridge/credit", L2_BASE_URL);
+                let l2_wallet = wallet_address.replace("L1_", "L2_");
+                
+                let l2_payload = serde_json::json!({
+                    "wallet_address": l2_wallet,
+                    "amount": payload.amount,
+                    "lock_id": lock_id,
+                    "source": "L1_bridge"
+                });
+
+                // Use reqwest with connection pooling for low latency
+                let client = reqwest::Client::builder()
+                    .pool_max_idle_per_host(10)
+                    .timeout(std::time::Duration::from_millis(2000))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+
+                let l2_result = client
+                    .post(&l2_url)
+                    .json(&l2_payload)
+                    .send()
+                    .await;
+
+                let l2_response = match l2_result {
+                    Ok(response) => {
+                        let status = response.status();
+                        match response.json::<serde_json::Value>().await {
+                            Ok(json) => {
+                                let total_time = start_time.elapsed();
+                                println!("🌉 Bridge L1→L2 complete in {:?} (L1: {:?})", total_time, l1_lock_time);
+                                println!("   ✅ L2 credited {} BB to {}", payload.amount, l2_wallet);
+                                Some(json)
+                            }
+                            Err(e) => {
+                                println!("   ⚠️ L2 response parse error: {}", e);
+                                Some(serde_json::json!({
+                                    "status": status.as_u16(),
+                                    "error": format!("L2 response parse error: {}", e)
+                                }))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // L2 not reachable - tokens are still locked on L1
+                        // User can retry or L2 can sync from L1 locks
+                        println!("   ⚠️ L2 not reachable: {} (tokens safe on L1)", e);
+                        None
+                    }
+                };
+
+                let l2_success = l2_response
+                    .as_ref()
+                    .and_then(|r| r.get("success"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let l2_balance = l2_response
+                    .as_ref()
+                    .and_then(|r| r.get("new_balance"))
+                    .and_then(|v| v.as_f64());
+
+                let total_time = start_time.elapsed();
+                println!("🌉 Bridge initiated: {} locked {} BB on L1 → L2 (total: {:?})", 
+                         &wallet_address[..8], payload.amount, total_time);
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                     "success": true,
                     "lock_id": lock_id,
                     "amount": payload.amount,
                     "target_layer": payload.target_layer,
-                    "message": "Tokens locked on L1. Transfer to L2 in progress."
+                    "l2_credited": l2_success,
+                    "l2_balance": l2_balance,
+                    "latency_ms": total_time.as_millis(),
+                    "message": if l2_success { 
+                        "Tokens locked on L1 and credited on L2" 
+                    } else { 
+                        "Tokens locked on L1. L2 credit pending." 
+                    }
                 })))
             }
         })
@@ -840,6 +1016,182 @@ pub fn credit_settle_route(
                     } else {
                         format!("Session closed. Lost {} BB. {} BB returned to L1.", net_pnl.abs(), amount_to_return)
                     }
+                })))
+            }
+        })
+}
+// ============================================================================
+// ROUTE: L2 State Root Submission (Optimistic Rollup)
+// ============================================================================
+// L2 posts state roots to L1 for anchoring. After challenge period (7 days prod,
+// 60s test), the root becomes finalized and L2 withdrawals can be processed.
+// ============================================================================
+
+pub fn l2_state_root_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("l2")
+        .and(warp::path("state_root"))
+        .and(warp::post())
+        .and(warp::body::json::<L2StateRootSubmission>())
+        .and_then(move |submission: L2StateRootSubmission| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                let start_time = std::time::Instant::now();
+
+                // Validate state root format (64 hex chars = 256 bits)
+                if submission.state_root.len() != 64 || 
+                   !submission.state_root.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Invalid state root format. Expected 64 hex characters."
+                    })));
+                }
+
+                // Get current L1 block height (use current_slot as L1 block equivalent)
+                let l1_block = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.current_slot
+                };
+
+                // Validate block height is sequential
+                {
+                    let state = lock_bridge_state(&bridge_state);
+                    if submission.block_height <= state.latest_l2_block && state.latest_l2_block > 0 {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!(
+                                "Block height {} is not greater than latest anchored block {}",
+                                submission.block_height,
+                                state.latest_l2_block
+                            )
+                        })));
+                    }
+
+                    // Validate prev_state_root matches (if not genesis)
+                    if let Some(ref latest) = state.latest_state_root {
+                        if submission.prev_state_root != *latest {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Previous state root mismatch. L2 chain may have forked.",
+                                "expected": latest,
+                                "received": submission.prev_state_root
+                            })));
+                        }
+                    }
+                }
+
+                // Anchor the state root
+                let anchored = {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    state.anchor_state_root(submission.clone(), l1_block)
+                };
+
+                let latency = start_time.elapsed();
+                
+                println!("📦 L2 State Root anchored in {:?}", latency);
+                println!("   └─ L2 Block: {} | State: {}...{}", 
+                         anchored.l2_block_height,
+                         &anchored.state_root[..8],
+                         &anchored.state_root[56..]);
+                println!("   └─ L1 Block: {} | Finalized at: {}", 
+                         anchored.l1_block_height,
+                         anchored.challenge_period_ends);
+
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "anchored": {
+                        "state_root": anchored.state_root,
+                        "l2_block_height": anchored.l2_block_height,
+                        "l1_block_height": anchored.l1_block_height,
+                        "anchored_at": anchored.anchored_at,
+                        "tx_count": anchored.tx_count,
+                        "status": "pending",
+                        "challenge_period_ends": anchored.challenge_period_ends,
+                        "challenge_period_seconds": CHALLENGE_PERIOD_SECONDS
+                    },
+                    "latency_ms": latency.as_millis(),
+                    "message": format!(
+                        "State root anchored. Will finalize after {} seconds (challenge period).",
+                        CHALLENGE_PERIOD_SECONDS
+                    )
+                })))
+            }
+        })
+}
+
+// ============================================================================
+// ROUTE: Get Latest State Root
+// ============================================================================
+
+pub fn l2_latest_state_root_route(
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("l2")
+        .and(warp::path("state_root"))
+        .and(warp::path("latest"))
+        .and(warp::get())
+        .and_then(move || {
+            let bridge_state = bridge_state.clone();
+            async move {
+                let mut state = lock_bridge_state(&bridge_state);
+                
+                // Finalize any roots past their challenge period
+                state.finalize_expired_roots();
+
+                let latest = state.get_latest_finalized_root().cloned();
+                let pending_count = state.anchored_state_roots
+                    .iter()
+                    .filter(|r| r.status == StateRootStatus::Pending)
+                    .count();
+
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "latest_finalized": latest,
+                    "latest_l2_block": state.latest_l2_block,
+                    "latest_state_root": state.latest_state_root,
+                    "pending_roots": pending_count,
+                    "total_anchored": state.anchored_state_roots.len()
+                })))
+            }
+        })
+}
+
+// ============================================================================
+// ROUTE: Get All State Roots (for debugging/monitoring)
+// ============================================================================
+
+pub fn l2_all_state_roots_route(
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("l2")
+        .and(warp::path("state_roots"))
+        .and(warp::get())
+        .and_then(move || {
+            let bridge_state = bridge_state.clone();
+            async move {
+                let mut state = lock_bridge_state(&bridge_state);
+                state.finalize_expired_roots();
+
+                let roots: Vec<_> = state.anchored_state_roots
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "state_root": r.state_root,
+                        "l2_block_height": r.l2_block_height,
+                        "l1_block_height": r.l1_block_height,
+                        "anchored_at": r.anchored_at,
+                        "tx_count": r.tx_count,
+                        "status": format!("{:?}", r.status),
+                        "challenge_period_ends": r.challenge_period_ends
+                    }))
+                    .collect();
+
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "state_roots": roots,
+                    "count": roots.len()
                 })))
             }
         })

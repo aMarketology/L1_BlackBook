@@ -479,6 +479,11 @@ async fn main() {
     let bridge_pending = routes_v2::bridge::bridge_pending_route(bridge_state.clone());
     let bridge_stats = routes_v2::bridge::bridge_stats_route(bridge_state.clone());
     
+    // L2 STATE ROOT ANCHORING (Optimistic Rollup)
+    let l2_state_root = routes_v2::bridge::l2_state_root_route(blockchain.clone(), bridge_state.clone());
+    let l2_latest_state = routes_v2::bridge::l2_latest_state_root_route(bridge_state.clone());
+    let l2_all_states = routes_v2::bridge::l2_all_state_roots_route(bridge_state.clone());
+    
     // CREDIT LINE ROUTES (Casino Bank Model) - CORE FUNCTIONALITY
     let credit_approve = routes_v2::bridge::credit_approve_route(blockchain.clone(), bridge_state.clone());
     let credit_draw = routes_v2::bridge::credit_draw_route(blockchain.clone(), bridge_state.clone());
@@ -558,6 +563,12 @@ async fn main() {
         .or(bridge_status)
         .or(bridge_pending)
         .or(bridge_stats)
+        // ═══════════════════════════════════════════════════════════════
+        // L2 STATE ROOT ANCHORING (Optimistic Rollup)
+        // ═══════════════════════════════════════════════════════════════
+        .or(l2_state_root)
+        .or(l2_latest_state)
+        .or(l2_all_states)
         // ═══════════════════════════════════════════════════════════════
         // CREDIT LINE (Casino Bank Model)
         // One-time approval, auto-draw, session settlement
