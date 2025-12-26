@@ -146,7 +146,7 @@ pub const LAMPORTS_PER_BB: u64 = 1_000_000;
 pub const RENT_EXEMPT_MINIMUM: u64 = 1_000;
 
 /// Solana-style Account structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Account {
     /// Balance in lamports (1 BB = 1_000_000 lamports)
     pub lamports: u64,

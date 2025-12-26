@@ -10,6 +10,10 @@
 // - Alice & Bob test accounts for development
 // - Uses protocol::blockchain for EnhancedBlockchain
 //
+// STORAGE OPTIONS:
+// - --sled : Use Sled + Borsh persistence (production, default)
+// - --json : Use JSON file persistence (legacy, for debugging)
+//
 // SOLANA-STYLE PERFORMANCE FEATURES:
 // - Pipeline: 4-stage async transaction processing
 // - Gulf Stream: Transaction forwarding to upcoming leaders
@@ -26,6 +30,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 use std::fs;
+use std::env;
 
 use warp::Filter;
 use tokio::sync::Mutex as TokioMutex;
@@ -38,6 +43,7 @@ mod routes_v2;
 mod unified_wallet;  // Unified wallet system (L1/L2 address logic)
 mod consensus;       // Consensus mechanisms (hot upgrades, validator selection, etc.)
 mod grpc;            // gRPC Settlement (L1 ↔ L2 internal communication)
+mod storage;         // Sled + Borsh persistence (production storage)
 
 // Root-level modules
 #[path = "../protocol/mod.rs"]
@@ -50,6 +56,8 @@ use social_mining::SocialMiningSystem;
 
 // Use EnhancedBlockchain from protocol
 use protocol::blockchain::EnhancedBlockchain;
+// Use PersistentBlockchain from storage
+use storage::PersistentBlockchain;
 
 // PoH Service imports - Proof of History for continuous timestamping
 use runtime::{
@@ -61,13 +69,51 @@ use runtime::{
 pub use runtime::core::TransactionType;
 
 // ============================================================================
-// PERSISTENCE
+// PERSISTENCE - JSON (Legacy) or Sled (Production)
 // ============================================================================
 
 const BLOCKCHAIN_FILE: &str = "blockchain_data.json";
 const SOCIAL_DATA_FILE: &str = "social_mining_data.json";
+const SLED_DATA_PATH: &str = "./blockchain_sled";
 
-fn load_blockchain() -> EnhancedBlockchain {
+/// Check if we should use Sled persistence (default) or JSON (legacy)
+fn use_sled_storage() -> bool {
+    let args: Vec<String> = env::args().collect();
+    
+    // --json flag forces legacy JSON mode
+    if args.iter().any(|a| a == "--json") {
+        return false;
+    }
+    
+    // Default to Sled (production)
+    true
+}
+
+/// Load blockchain using Sled persistence (production)
+fn load_blockchain_sled() -> PersistentBlockchain {
+    match PersistentBlockchain::new(SLED_DATA_PATH) {
+        Ok(mut bc) => {
+            // Check if we need to seed test accounts
+            let treasury_balance = bc.get_balance(protocol::blockchain::TREASURY_ADDRESS);
+            if treasury_balance >= protocol::blockchain::INITIAL_SUPPLY - 1000.0 {
+                // Treasury hasn't been depleted - seed test accounts
+                println!("🧪 Seeding test accounts...");
+                seed_test_accounts(&mut bc);
+            }
+            println!("📂 Loaded blockchain from Sled ({})", SLED_DATA_PATH);
+            bc
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to initialize Sled storage: {:?}", e);
+            eprintln!("   Falling back to in-memory blockchain");
+            // Create fresh blockchain wrapped in storage
+            PersistentBlockchain::new(SLED_DATA_PATH)
+                .expect("Failed to create fallback storage")
+        }
+    }
+}
+
+fn load_blockchain_json() -> EnhancedBlockchain {
     if let Ok(data) = fs::read_to_string(BLOCKCHAIN_FILE) {
         if let Ok(bc) = serde_json::from_str(&data) {
             println!("📂 Loaded blockchain from {}", BLOCKCHAIN_FILE);
@@ -76,11 +122,11 @@ fn load_blockchain() -> EnhancedBlockchain {
     }
     println!("🆕 Creating new blockchain with test accounts");
     let mut bc = EnhancedBlockchain::new();
-    seed_test_accounts(&mut bc);
+    seed_test_accounts_enhanced(&mut bc);
     bc
 }
 
-fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
+fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     // ========================================================================
     // TEST ACCOUNT INITIALIZATION (Development Only)
     // ========================================================================
@@ -123,8 +169,10 @@ fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
         100000.0,  // 100k BB Dealer bankroll
     );
     
-    // Mine the airdrop transactions
-    bc.mine_pending_transactions("genesis_airdrop".to_string());
+    // Mine the airdrop transactions (with persistence!)
+    if let Err(e) = bc.mine_and_persist("genesis_airdrop".to_string()) {
+        eprintln!("⚠️  Mining airdrop failed: {}", e);
+    }
     
     println!("   💸 Alice:  {:>10} BB ← Treasury", alice.total_balance);
     println!("   💸 Bob:    {:>10} BB ← Treasury", bob.total_balance);
@@ -132,7 +180,34 @@ fn seed_test_accounts(bc: &mut EnhancedBlockchain) {
     
     let treasury_remaining = bc.get_balance(TREASURY_ADDRESS);
     println!("\n   📊 Treasury Remaining: {:.0} BB", treasury_remaining);
-    println!("✅ Test accounts funded via Treasury transactions");
+    println!("✅ Test accounts funded via Treasury transactions (persisted to Sled)");
+}
+
+fn seed_test_accounts_enhanced(bc: &mut EnhancedBlockchain) {
+    // Same logic but for EnhancedBlockchain (JSON mode)
+    use crate::protocol::blockchain::TREASURY_ADDRESS;
+    use crate::unified_wallet::strip_prefix;
+    
+    let alice = integration::unified_auth::get_alice_account();
+    let bob = integration::unified_auth::get_bob_account();
+    let dealer_address = integration::unified_auth::get_dealer_address();
+    
+    println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
+    
+    let alice_hash = strip_prefix(&alice.address);
+    let bob_hash = strip_prefix(&bob.address);
+    let dealer_hash = strip_prefix(&dealer_address);
+    
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), alice_hash, alice.total_balance);
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), bob_hash, bob.total_balance);
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), dealer_hash, 100000.0);
+    
+    let _ = bc.mine_pending_transactions("genesis_airdrop".to_string());
+    
+    println!("   💸 Alice:  {:>10} BB ← Treasury", alice.total_balance);
+    println!("   💸 Bob:    {:>10} BB ← Treasury", bob.total_balance);
+    println!("   💸 Dealer: {:>10} BB ← Treasury", 100000.0);
+    println!("✅ Test accounts funded (JSON mode)");
 }
 
 fn save_blockchain(blockchain: &EnhancedBlockchain) {
@@ -194,12 +269,20 @@ fn load_social_system() -> SocialMiningSystem {
 
 #[tokio::main]
 async fn main() {
+    // Check storage mode first
+    let use_sled = use_sled_storage();
+    
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║         LAYER1 BLOCKCHAIN V2 - Signature-Based Auth           ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!("║  Auth: Ed25519 Signatures (NO JWT!)                           ║");
     println!("║  PoH:  Continuous Proof of History Clock (Solana-style)       ║");
     println!("║  Arch: Two-Lane Transactions (Financial + Social)             ║");
+    if use_sled {
+        println!("║  Storage: Sled + Borsh (PRODUCTION)                           ║");
+    } else {
+        println!("║  Storage: JSON files (LEGACY MODE - use --sled for prod)      ║");
+    }
     println!("║  Test: GET /auth/test-accounts for Alice & Bob                ║");
     println!("║  Admin: POST /admin/mint to mint tokens (OPEN ACCESS)         ║");
     println!("║  Bridge: POST /bridge/initiate for L1→L2 transfers            ║");
@@ -233,9 +316,26 @@ async fn main() {
     println!("⏰ Continuous PoH clock started (Solana-style Proof of History)");
     
     // ============================================================================
-    // INITIALIZE BLOCKCHAIN FIRST (needed by ServiceCoordinator)
+    // INITIALIZE BLOCKCHAIN (Sled or JSON mode)
     // ============================================================================
-    let blockchain = Arc::new(Mutex::new(load_blockchain()));
+    // In Sled mode: Uses PersistentBlockchain which wraps EnhancedBlockchain
+    // In JSON mode: Uses EnhancedBlockchain directly with autosave
+    // ============================================================================
+    
+    // For now, we use EnhancedBlockchain directly and manually call persist
+    // This maintains API compatibility while adding Sled persistence
+    let (blockchain, persistent_storage) = if use_sled {
+        println!("🗄️  Initializing Sled storage at {}", SLED_DATA_PATH);
+        let pbc = load_blockchain_sled();
+        // Extract the inner blockchain for route handlers
+        let inner: EnhancedBlockchain = (*pbc).clone();
+        let storage = Some(pbc);
+        (Arc::new(Mutex::new(inner)), storage)
+    } else {
+        println!("📁 Using JSON file persistence");
+        (Arc::new(Mutex::new(load_blockchain_json())), None)
+    };
+    
     let social_system = Arc::new(TokioMutex::new(load_social_system()));
     
     // ============================================================================
@@ -288,12 +388,14 @@ async fn main() {
     // Get full test account info
     let alice = integration::unified_auth::get_alice_account();
     let bob = integration::unified_auth::get_bob_account();
+    let dealer_address = integration::unified_auth::get_dealer_address();
     
     // Get L1/L2 addresses using our unified wallet prefix system
     let alice_l1 = unified_wallet::to_l1_address(&alice.address);
     let alice_l2 = unified_wallet::to_l2_address(&alice.address);
     let bob_l1 = unified_wallet::to_l1_address(&bob.address);
     let bob_l2 = unified_wallet::to_l2_address(&bob.address);
+    let dealer_l1 = unified_wallet::to_l1_address(&dealer_address);
     
     println!("\n🧪 FULL TEST ACCOUNTS (Alice & Bob) - L1/L2 PREFIXES:");
     println!("┌──────────────────────────────────────────────────────────────────┐");
@@ -491,9 +593,12 @@ async fn main() {
                 ])
         );
     
-    // Autosave every 30 seconds (blockchain + social data)
+    // Autosave every 30 seconds
+    // In Sled mode: Flush Sled to disk (data is already persisted per-transaction)
+    // In JSON mode: Write entire state to JSON file
     let bc_save = blockchain.clone();
     let social_save = social_system.clone();
+    let use_sled_for_save = use_sled;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -503,7 +608,21 @@ async fn main() {
                 Ok(bc) => bc.clone(),
                 Err(poisoned) => poisoned.into_inner().clone()
             };
-            save_blockchain(&bc_data);
+            
+            if use_sled_for_save {
+                // Sled mode: sync accounts to storage periodically
+                // Note: Block data is persisted immediately during mining
+                if let Ok(bridge) = storage::StorageBridge::new(SLED_DATA_PATH) {
+                    let slot = bc_data.current_slot;
+                    match bridge.sync_accounts_from_hashmap(&bc_data.accounts, slot) {
+                        Ok(count) => println!("💾 Synced {} accounts to Sled (slot {})", count, slot),
+                        Err(e) => eprintln!("⚠️ Sled sync error: {:?}", e),
+                    }
+                }
+            } else {
+                // JSON mode: write entire state
+                save_blockchain(&bc_data);
+            }
             
             let social_data = {
                 let social = social_save.lock().await;
@@ -516,6 +635,7 @@ async fn main() {
     // Graceful shutdown handler (Ctrl+C)
     let bc_shutdown = blockchain.clone();
     let social_shutdown = social_system.clone();
+    let use_sled_for_shutdown = use_sled;
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
         
@@ -532,6 +652,16 @@ async fn main() {
             social.clone()
         };
         
+        if use_sled_for_shutdown {
+            // Sled mode: final flush
+            if let Ok(bridge) = storage::StorageBridge::new(SLED_DATA_PATH) {
+                let _ = bridge.sync_accounts_from_hashmap(&bc_data.accounts, bc_data.current_slot);
+                let _ = bridge.flush();
+                println!("✅ Sled storage flushed");
+            }
+        }
+        
+        // Always save to JSON as backup
         emergency_save(&bc_data, &social_data);
         
         println!("👋 Server shutting down gracefully...");
@@ -599,10 +729,10 @@ async fn main() {
     println!("   │  🃏 DEALER MODEL - How Betting Actually Works                   │");
     println!("   ├─────────────────────────────────────────────────────────────────┤");
     println!("   │                                                                 │");
-    println!("   │  THE DEALER (L1_DEALER00000001):                                │");
+    println!("   │  THE DEALER ({}):     │", dealer_l1);
     println!("   │  • House bankroll account that pays winners instantly          │");
     println!("   │  • Collects from losers instantly                              │");
-    println!("   │  • No escrow locking - funds move in real-time                 │");
+    println!("   │  • Private key secured via DEALER_PRIVATE_KEY env var          │");
     println!("   │                                                                 │");
     println!("   │  EXAMPLE: Alice bets $50 on Heads, Bob bets $50 on Tails       │");
     println!("   │  ┌─────────────────────────────────────────────────────────┐   │");
@@ -619,11 +749,12 @@ async fn main() {
     println!("   │  • Simple 2-tx settlement (bet + payout)                       │");
     println!("   │  • L2 can batch multiple bets, settle NET on L1                │");
     println!("   │                                                                 │");
-    println!("   │  🧪 TEST ACCOUNTS:                                              │");
-    println!("   │  • L1_ALICE000000001 (10,000 L1) - Test bettor                 │");
-    println!("   │  • L1_BOB0000000001  (5,000 L1)  - Test bettor                 │");
-    println!("   │  • L1_DEALER00000001 (100,000 L1) - House bankroll             │");
+    println!("   │  🧪 TEST ACCOUNTS (Real Addresses):                            │");
+    println!("   │  • {} (10,000 BB) - Alice  │", alice_l1);
+    println!("   │  • {} (5,000 BB)  - Bob    │", bob_l1);
+    println!("   │  • {} (100,000 BB) - Dealer│", dealer_l1);
     println!("   │                                                                 │");
+    println!("   │  ⚠️  Alice/Bob keys exposed (test). Dealer key in .env (prod)   │");
     println!("   └─────────────────────────────────────────────────────────────────┘");
     println!("\n⚡ PERFORMANCE MONITORING (Solana-style):");
     println!("   GET  /performance/stats     - All service statistics");

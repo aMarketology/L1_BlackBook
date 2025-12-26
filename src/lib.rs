@@ -18,6 +18,7 @@ pub mod routes_v2;              // Route handlers (NEW - Pure signature auth)
 pub mod rpc;                    // Internal & Cross-Layer RPC
 pub mod unified_wallet;         // Unified wallet system (L1/L2 address logic)
 pub mod consensus;              // Consensus (hot upgrades, validator selection, P2P)
+pub mod storage;                // RocksDB + Merkle state (production storage layer)
 
 // Note: USDC Reserve System (usdc/) is staged but not integrated yet
 pub mod grpc;                   // gRPC Settlement (L1 ↔ L2 internal communication)
@@ -36,10 +37,17 @@ pub mod runtime;
 pub use protocol::blockchain::EnhancedBlockchain;
 pub use runtime::core::{TransactionType, Transaction, Block};
 
+// Storage layer (Sled + Borsh - production persistence)
+pub use storage::{
+    StorageEngine, StorageBridge, StoredAccount, StoredBlockHeader, 
+    StoredSocialData, TxLocation, DbStats, StorageError, StorageResult,
+    MerkleState, AccountProof, PersistentBlockchain, PersistentConfig,
+};
+
 // Social mining (used by tests)
 pub use social_mining::{SocialMiningSystem, SocialActionType, SocialAction, DailyLimits};
 
-// Persistence (used by tests)
+// Persistence (used by tests) - LEGACY, use StorageBridge for new code
 pub use protocol::EnhancedPersistence;
 
 // PoH runtime (used internally and by advanced tests)

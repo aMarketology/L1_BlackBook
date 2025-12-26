@@ -38,6 +38,7 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1.7", features = ["derive"] }
+bcrypt = "0.15"  # For auth_key hashing in Fork Architecture
 
 # Parallel processing - Sealevel-style execution
 rayon = "1.10"
@@ -71,6 +72,19 @@ memmap2 = "0.9"
 
 # Atomic operations for fine-grained locking
 atomic = "0.6"
+
+# ═══════════════════════════════════════════════════════════════
+# PRODUCTION STORAGE LAYER (Sled + Merkle Trie)
+# ═══════════════════════════════════════════════════════════════
+# Sled - Pure Rust embedded key-value store (no C deps!)
+# Modern, lock-free, concurrent B+ tree with ACID guarantees
+sled = "0.34"
+
+# Merkle Tree for state roots and light client proofs
+rs_merkle = "1.4"
+
+# NOTE: Using Borsh (already in deps) for serialization - Solana-compatible
+# bincode removed - Borsh is deterministic (required for Merkle proofs)
 
 # ═══════════════════════════════════════════════════════════════
 # PHASE 9: P2P DISTRIBUTED NETWORK (Proof of Engagement)

@@ -18,6 +18,31 @@ use crate::integration::unified_auth::SignedRequest;
 use crate::unified_wallet::strip_prefix;
 
 // ============================================================================
+// REQUEST STRUCTURES FOR CREDIT OPERATIONS
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditDrawRequest {
+    pub wallet_address: String,
+    pub public_key: String,
+    pub amount: f64,
+    pub reason: String,
+    pub signature: String,
+    pub nonce: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditSettleRequest {
+    pub wallet_address: String,
+    pub public_key: String,
+    pub session_id: String,
+    pub final_l2_balance: f64,
+    pub locked_in_bets: f64,
+    pub signature: String,
+    pub nonce: u64,
+}
+
+// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
@@ -61,6 +86,8 @@ pub struct CreditApproval {
     pub wallet_address: String,
     pub credit_limit: f64,
     pub total_drawn: f64,
+    pub available_credit: f64,  // credit_limit - total_drawn
+    pub lock_id: Option<String>, // L1 lock ID for the escrowed funds
     pub is_active: bool,
     pub expires_at: u64,
     pub created_at: u64,
@@ -70,8 +97,9 @@ pub struct CreditApproval {
 pub struct L2Session {
     pub session_id: String,
     pub wallet_address: String,
-    pub l2_balance: f64,
-    pub total_drawn: f64,
+    pub l2_balance: f64,       // Current credited balance on L2
+    pub total_drawn: f64,       // Total drawn from credit line
+    pub total_winnings: f64,    // Net winnings from betting
     pub is_active: bool,
     pub started_at: u64,
 }
@@ -91,12 +119,24 @@ impl BridgeState {
         self.credit_approvals.get(wallet)
     }
 
+    pub fn get_credit_approval_mut(&mut self, wallet: &str) -> Option<&mut CreditApproval> {
+        self.credit_approvals.get_mut(wallet)
+    }
+
     pub fn add_credit_approval(&mut self, approval: CreditApproval) {
         self.credit_approvals.insert(approval.wallet_address.clone(), approval);
     }
 
     pub fn get_session(&self, wallet: &str) -> Option<&L2Session> {
         self.sessions.values().find(|s| s.wallet_address == wallet && s.is_active)
+    }
+
+    pub fn get_session_mut(&mut self, wallet: &str) -> Option<&mut L2Session> {
+        self.sessions.values_mut().find(|s| s.wallet_address == wallet && s.is_active)
+    }
+
+    pub fn get_session_by_id_mut(&mut self, session_id: &str) -> Option<&mut L2Session> {
+        self.sessions.get_mut(session_id)
     }
 
     pub fn add_session(&mut self, session: L2Session) {
@@ -281,7 +321,27 @@ pub fn credit_approve_route(
                     }
                 }
 
-                // Create approval
+                // LOCK TOKENS ON L1 - This is the escrow for the credit line
+                let lock_id = {
+                    let mut bc = lock_or_recover(&blockchain);
+                    let internal_address = strip_prefix(&request.wallet_address);
+                    match bc.lock_tokens(
+                        &internal_address,
+                        request.credit_limit,
+                        LockPurpose::MarketEscrow, // Credit line is market escrow
+                        None, // Returns to same wallet
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": format!("Failed to lock tokens: {}", e)
+                            })));
+                        }
+                    }
+                };
+
+                // Create approval with lock reference
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let approval_id = format!("credit_{}_{}", now, &request.wallet_address[..10]);
                 
@@ -290,6 +350,8 @@ pub fn credit_approve_route(
                     wallet_address: request.wallet_address.clone(),
                     credit_limit: request.credit_limit,
                     total_drawn: 0.0,
+                    available_credit: request.credit_limit,
+                    lock_id: Some(lock_id.clone()),
                     is_active: true,
                     expires_at: now + (request.expires_in_hours * 3600),
                     created_at: now,
@@ -301,6 +363,7 @@ pub fn credit_approve_route(
                     wallet_address: request.wallet_address.clone(),
                     l2_balance: 0.0,
                     total_drawn: 0.0,
+                    total_winnings: 0.0,
                     is_active: true,
                     started_at: now,
                 };
@@ -312,15 +375,19 @@ pub fn credit_approve_route(
                     state.add_session(session.clone());
                 }
 
-                println!("✅ Credit approved: {} - {} BB", &approval_id[..16], request.credit_limit);
+                println!("✅ Credit approved: {} - {} BB locked (lock_id: {})", 
+                         &approval_id[..16], request.credit_limit, &lock_id[..16]);
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                     "success": true,
                     "approval": approval,
+                    "lock_id": lock_id,
                     "session": serde_json::json!({
                         "session_id": session.session_id,
                         "credit_limit": request.credit_limit,
-                    })
+                        "tokens_locked": request.credit_limit,
+                    }),
+                    "message": format!("{} BB locked on L1 as credit line collateral", request.credit_limit)
                 })))
             }
         })
@@ -452,40 +519,327 @@ fn verify_ed25519_signature(public_key: &str, message: &str, signature: &str) ->
 }
 
 // ============================================================================
-// PLACEHOLDER ROUTES (Not yet implemented)
+// ROUTE: Credit Draw - L2 draws from approved credit line
+// ============================================================================
+// This is called by L2 when a user needs funds for betting.
+// The user's SDK signs the request, L2 forwards it, L1 validates.
 // ============================================================================
 
 pub fn credit_draw_route(
-    _blockchain: Arc<Mutex<EnhancedBlockchain>>,
-    _bridge_state: Arc<Mutex<BridgeState>>,
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")
         .and(warp::path("draw"))
         .and(warp::post())
-        .and(warp::body::json::<serde_json::Value>())
-        .and_then(move |_req: serde_json::Value| {
+        .and(warp::body::json::<CreditDrawRequest>())
+        .and_then(move |request: CreditDrawRequest| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
             async move {
+                println!("💳 Credit draw request: {} for {} BB", 
+                         &request.wallet_address[..16], request.amount);
+
+                // Verify signature
+                let message = format!(
+                    "CREDIT_DRAW:{}:{}:{}:{}",
+                    request.wallet_address,
+                    request.amount,
+                    request.reason,
+                    request.nonce
+                );
+
+                match verify_ed25519_signature(&request.public_key, &message, &request.signature) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid signature"
+                        })));
+                    },
+                    Err(e) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature error: {}", e)
+                        })));
+                    }
+                }
+
+                // Validate amount
+                if request.amount <= 0.0 {
+                    return Ok(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Draw amount must be positive"
+                    })));
+                }
+
+                // Check approval exists and has available credit
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                
+                let (approval_id, new_total_drawn, new_available, new_l2_balance) = {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    
+                    // Get approval
+                    let approval = match state.get_credit_approval_mut(&request.wallet_address) {
+                        Some(a) => a,
+                        None => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "No credit approval found. Call /credit/approve first."
+                            })));
+                        }
+                    };
+
+                    // Check active and not expired
+                    if !approval.is_active {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Credit approval is not active"
+                        })));
+                    }
+
+                    if now > approval.expires_at {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Credit approval has expired"
+                        })));
+                    }
+
+                    // Check sufficient credit
+                    if request.amount > approval.available_credit {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Insufficient credit available",
+                            "requested": request.amount,
+                            "available": approval.available_credit
+                        })));
+                    }
+
+                    // Update approval
+                    approval.total_drawn += request.amount;
+                    approval.available_credit -= request.amount;
+                    let approval_id = approval.approval_id.clone();
+                    let new_total = approval.total_drawn;
+                    let new_avail = approval.available_credit;
+
+                    // Update session
+                    let session = match state.get_session_mut(&request.wallet_address) {
+                        Some(s) => s,
+                        None => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "No active session found"
+                            })));
+                        }
+                    };
+
+                    session.l2_balance += request.amount;
+                    session.total_drawn += request.amount;
+                    let new_l2 = session.l2_balance;
+
+                    (approval_id, new_total, new_avail, new_l2)
+                };
+
+                // Log the draw
+                println!("✅ Credit draw completed: {} drew {} BB (total: {}, available: {})", 
+                         &request.wallet_address[..16], request.amount, new_total_drawn, new_available);
+
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                    "success": false,
-                    "error": "Credit draw not yet implemented"
+                    "success": true,
+                    "draw": {
+                        "amount": request.amount,
+                        "reason": request.reason,
+                        "approval_id": approval_id
+                    },
+                    "credit_status": {
+                        "total_drawn": new_total_drawn,
+                        "available_credit": new_available
+                    },
+                    "l2_balance": new_l2_balance,
+                    "message": format!("{} BB credited to L2 balance", request.amount)
                 })))
             }
         })
 }
 
+// ============================================================================
+// ROUTE: Credit Settle - Close session and return unused funds
+// ============================================================================
+// Called when user ends their betting session.
+// Returns unused credit to L1, keeps winnings in L2 balance.
+// ============================================================================
+
 pub fn credit_settle_route(
-    _blockchain: Arc<Mutex<EnhancedBlockchain>>,
-    _bridge_state: Arc<Mutex<BridgeState>>,
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")
         .and(warp::path("settle"))
         .and(warp::post())
-        .and(warp::body::json::<serde_json::Value>())
-        .and_then(move |_req: serde_json::Value| {
+        .and(warp::body::json::<CreditSettleRequest>())
+        .and_then(move |request: CreditSettleRequest| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
             async move {
+                println!("🔄 Credit settle request: {} session {} (final L2: {} BB)", 
+                         &request.wallet_address[..16], &request.session_id[..16], request.final_l2_balance);
+
+                // Verify signature
+                let message = format!(
+                    "CREDIT_SETTLE:{}:{}:{}:{}:{}",
+                    request.wallet_address,
+                    request.session_id,
+                    request.final_l2_balance,
+                    request.locked_in_bets,
+                    request.nonce
+                );
+
+                match verify_ed25519_signature(&request.public_key, &message, &request.signature) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid signature"
+                        })));
+                    },
+                    Err(e) => {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature error: {}", e)
+                        })));
+                    }
+                }
+
+                // Get session and approval info
+                let (lock_id, credit_limit, total_drawn, l2_balance_before) = {
+                    let state = lock_bridge_state(&bridge_state);
+                    
+                    let approval = match state.get_credit_approval(&request.wallet_address) {
+                        Some(a) => a,
+                        None => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "No credit approval found"
+                            })));
+                        }
+                    };
+
+                    let session = match state.sessions.get(&request.session_id) {
+                        Some(s) => s,
+                        None => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Session not found"
+                            })));
+                        }
+                    };
+
+                    if !session.is_active {
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Session already settled"
+                        })));
+                    }
+
+                    (
+                        approval.lock_id.clone(),
+                        approval.credit_limit,
+                        approval.total_drawn,
+                        session.l2_balance,
+                    )
+                };
+
+                // Calculate settlement
+                // Winnings = final_l2_balance - total_drawn (positive = profit, negative = loss)
+                let net_pnl = request.final_l2_balance - total_drawn;
+                let unused_credit = credit_limit - total_drawn;
+                
+                // Amount to return to user = unused_credit + any profit (capped at locked amount)
+                // If loss: locked funds cover the loss
+                let amount_to_return = if net_pnl >= 0.0 {
+                    // Won or broke even: return unused credit + winnings
+                    unused_credit + net_pnl
+                } else {
+                    // Lost: return unused credit (loss comes from drawn funds)
+                    unused_credit
+                };
+
+                // Release the lock on L1
+                if let Some(lid) = &lock_id {
+                    let mut bc = lock_or_recover(&blockchain);
+                    let internal_address = strip_prefix(&request.wallet_address);
+                    
+                    // Authorize and release the lock
+                    match bc.release_tokens(lid) {
+                        Ok((owner, released_amount)) => {
+                            println!("🔓 Released {} BB from lock {} (owner: {})", 
+                                     released_amount, &lid[..16], &owner[..16]);
+                            
+                            // Credit the settlement amount back to user's L1 balance
+                            // The full locked amount was released, now we add back what user should get
+                            if amount_to_return > 0.0 {
+                                // Add winnings/unused to balance
+                                // Note: release_tokens already added the locked amount back
+                                // We need to adjust if there was a loss
+                                if net_pnl < 0.0 {
+                                    // User lost some - deduct the loss from their balance
+                                    let _ = bc.create_transaction(
+                                        internal_address.clone(),
+                                        "L1_DEALER_HOUSE".to_string(), // House keeps losses
+                                        net_pnl.abs()
+                                    );
+                                } else if net_pnl > 0.0 {
+                                    // User won - they get paid from house
+                                    let _ = bc.create_transaction(
+                                        "L1_DEALER_HOUSE".to_string(),
+                                        internal_address.clone(),
+                                        net_pnl
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": format!("Failed to release lock: {}", e)
+                            })));
+                        }
+                    }
+                }
+
+                // Mark session and approval as inactive
+                {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    
+                    if let Some(session) = state.get_session_by_id_mut(&request.session_id) {
+                        session.is_active = false;
+                        session.l2_balance = 0.0;
+                        session.total_winnings = net_pnl;
+                    }
+
+                    if let Some(approval) = state.get_credit_approval_mut(&request.wallet_address) {
+                        approval.is_active = false;
+                    }
+                }
+
+                println!("✅ Session settled: {} | P&L: {} BB | Returned: {} BB", 
+                         &request.session_id[..16], net_pnl, amount_to_return);
+
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                    "success": false,
-                    "error": "Credit settle not yet implemented"
+                    "success": true,
+                    "settlement": {
+                        "session_id": request.session_id,
+                        "credit_limit": credit_limit,
+                        "total_drawn": total_drawn,
+                        "final_l2_balance": request.final_l2_balance,
+                        "net_pnl": net_pnl,
+                        "amount_returned_to_l1": amount_to_return
+                    },
+                    "message": if net_pnl >= 0.0 {
+                        format!("Session closed. Won {} BB! {} BB returned to L1.", net_pnl, amount_to_return)
+                    } else {
+                        format!("Session closed. Lost {} BB. {} BB returned to L1.", net_pnl.abs(), amount_to_return)
+                    }
                 })))
             }
         })

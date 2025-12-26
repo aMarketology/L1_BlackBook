@@ -555,6 +555,122 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 ---
 
+## Fork Architecture V2 Compatibility
+
+### The Problem
+
+Fork Architecture V2 uses **two separate keys** derived from the password:
+
+```
+password → forkPassword()
+├─ authKey = SHA256(AUTH_DOMAIN + password + auth_salt)   → Server (bcrypt hashed)
+└─ vaultKey = Argon2id(VAULT_DOMAIN + password + vault_salt) → Client-only (never sent)
+```
+
+The vault (encrypted mnemonic) is encrypted with `vaultKey`, which is derived from the password. When a user **resets their password via Supabase**, the old `vaultKey` is **unrecoverable** without the old password.
+
+### SSS Recovery Flow for Fork V2
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   FORK V2 PASSWORD RESET RECOVERY                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+BEFORE (Wallet Creation):
+  1. Generate mnemonic
+  2. Split mnemonic into 3 SSS shares (threshold 2)
+  3. Encrypt vault with vaultKey (derived from password + vault_salt)
+  4. Store: auth_key_hash, auth_salt, vault_salt, encrypted_vault
+  5. Distribute SSS shares:
+     - Share 1 → Server (encrypted with SERVER_ENCRYPTION_KEY)
+     - Share 2 → Cloud backup (encrypted with PIN)
+     - Share 3 → Email backup (encrypted with PIN)
+
+AFTER PASSWORD RESET:
+  1. User resets password via Supabase
+  2. Trigger sets needs_recovery = TRUE
+  3. User logs in with new password → SDK detects needs_recovery
+  4. SDK prompts for PIN + backup share (cloud OR email)
+  5. Server decrypts its share, user decrypts their share
+  6. SSS combines 2 shares → recovers mnemonic
+  7. Server verifies: SHA256(derived_pubkey) == stored_public_key
+  8. Client generates NEW auth_salt + vault_salt
+  9. Client forks NEW password → new authKey + vaultKey
+  10. Client encrypts mnemonic with NEW vaultKey
+  11. Client sends new encrypted_vault + auth_key to server
+  12. Server clears needs_recovery flag
+  13. Wallet restored with new password ✅
+```
+
+### Critical Security Notes
+
+1. **Mnemonic Transmission**: During recovery, the server temporarily holds the recovered mnemonic. This is necessary because the client cannot decrypt the vault (old vaultKey is gone). The mnemonic is transmitted over TLS and immediately used to re-encrypt.
+
+2. **PIN Brute Force**: With 6 digits and 100k PBKDF2 iterations:
+   - 1 million combinations × ~100ms each = ~27 hours offline attack
+   - Rate limit online attempts to 5/hour per user
+
+3. **Two-Factor Requirement**: User needs BOTH:
+   - PIN (knowledge factor)
+   - Backup share (possession factor)
+
+4. **Re-encryption**: After recovery, the vault is encrypted with an entirely NEW vaultKey from the NEW password. Old auth_salt and vault_salt are replaced.
+
+### SDK Methods for Fork V2 Recovery
+
+```javascript
+// In blackbook-wallet-sdk.js
+
+// Check if recovery needed after password reset
+async checkRecoveryStatus(username) → { needs_recovery: bool }
+
+// Perform SSS recovery after password reset
+async recoverAfterPasswordReset(username, newPassword, pin, encryptedBackupShare)
+  → { success: true, address, message }
+
+// Change password when user knows old password (no SSS needed)
+async changePassword(oldPassword, newPassword)
+  → { success: bool }
+```
+
+### Database Schema Additions for Fork V2
+
+```sql
+-- Add to user_vaults table
+ALTER TABLE user_vaults ADD COLUMN IF NOT EXISTS needs_recovery BOOLEAN DEFAULT FALSE;
+
+-- SSS recovery shares table
+CREATE TABLE IF NOT EXISTS wallet_recovery_shares (
+    user_id UUID REFERENCES auth.users(id) PRIMARY KEY,
+    server_share TEXT NOT NULL,           -- Encrypted with SERVER_ENCRYPTION_KEY
+    share_version INTEGER DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Trigger for Supabase password reset
+CREATE OR REPLACE FUNCTION flag_vault_for_recovery()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE user_vaults 
+    SET needs_recovery = TRUE,
+        updated_at = NOW()
+    WHERE user_id = NEW.id;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS on_password_change_vault ON auth.users;
+CREATE TRIGGER on_password_change_vault
+    AFTER UPDATE OF encrypted_password ON auth.users
+    FOR EACH ROW
+    WHEN (OLD.encrypted_password IS DISTINCT FROM NEW.encrypted_password)
+    EXECUTE FUNCTION flag_vault_for_recovery();
+```
+
+---
+
 ## Next Steps
 
 1. ✅ Create this documentation

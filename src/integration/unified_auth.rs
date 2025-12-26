@@ -152,6 +152,130 @@ pub const WALLET_CONSTANT: &str = "BLACKBOOK_WALLET_V1";
 /// Request expiry time (5 minutes for replay protection)
 pub const REQUEST_EXPIRY_SECS: u64 = 300;
 
+/// Signature format version (increment when changing signing logic)
+pub const SIGNATURE_VERSION: u8 = 2;
+
+// ============================================================================
+// CANONICAL PAYLOAD SCHEMA - Operation Type Registry (V2)
+// ============================================================================
+// 
+// Each operation type defines the EXACT fields and ORDER that must be signed.
+// This prevents:
+// 1. JSON.stringify non-determinism (key ordering varies by implementation)
+// 2. Field injection attacks (attacker adds extra fields)
+// 3. Type confusion (amount as string vs number)
+//
+// CRITICAL: Must match PAYLOAD_SCHEMAS in unified-wallet-sdk.js exactly!
+
+/// Get the canonical field order for an operation type
+pub fn get_payload_schema(operation_type: &str) -> Option<Vec<&'static str>> {
+    match operation_type {
+        // Transfer tokens between addresses
+        "transfer" => Some(vec!["to", "amount"]),
+        
+        // Bridge operations (L1 ↔ L2)
+        "bridge_deposit" => Some(vec!["amount"]),
+        "bridge_withdraw" => Some(vec!["amount"]),
+        
+        // Dealer operations
+        "dealer_deposit" => Some(vec!["user_address", "amount"]),
+        "dealer_withdraw" => Some(vec!["user_address", "amount"]),
+        "dealer_settle" => Some(vec!["user_address", "amount", "game_id"]),
+        
+        // Wallet operations
+        "wallet_register" => Some(vec!["username"]),
+        "wallet_login" => Some(vec![]),  // No payload fields, just proves ownership
+        
+        // Social mining
+        "social_claim" => Some(vec!["action_type"]),
+        "social_post" => Some(vec!["content_hash"]),
+        
+        // Market operations
+        "market_order" => Some(vec!["market_id", "side", "amount"]),
+        "market_cancel" => Some(vec!["order_id"]),
+        
+        // Generic fallback (uses alphabetically sorted keys)
+        "generic" => None,
+        
+        // Unknown operation
+        _ => None,
+    }
+}
+
+/// Create a canonical hash of payload fields (must match JS implementation exactly)
+pub fn create_canonical_payload_hash(
+    operation_type: &str, 
+    payload_fields: &serde_json::Value
+) -> Result<String, String> {
+    use sha2::{Sha256, Digest};
+    
+    let mut hasher = Sha256::new();
+    hasher.update(operation_type.as_bytes());
+    
+    match get_payload_schema(operation_type) {
+        Some(fields) => {
+            // Known operation type: hash fields in exact schema order
+            for field_name in fields {
+                if let Some(value) = payload_fields.get(field_name) {
+                    hasher.update(field_name.as_bytes());
+                    hasher.update(normalize_field_value(value)?.as_bytes());
+                } else {
+                    return Err(format!("Missing required field '{}' for operation '{}'", field_name, operation_type));
+                }
+            }
+        },
+        None => {
+            // Generic fallback: sort keys alphabetically
+            println!("⚠️ Using generic payload schema for '{}' - consider adding explicit schema", operation_type);
+            if let Some(obj) = payload_fields.as_object() {
+                let mut keys: Vec<&String> = obj.keys().collect();
+                keys.sort();
+                for key in keys {
+                    hasher.update(key.as_bytes());
+                    hasher.update(normalize_field_value(&obj[key])?.as_bytes());
+                }
+            }
+        }
+    }
+    
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Normalize a field value to a deterministic string (must match JS normalizeFieldValue exactly)
+fn normalize_field_value(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok("null".to_string()),
+        serde_json::Value::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
+        serde_json::Value::Number(n) => {
+            // Integer handling
+            if let Some(i) = n.as_i64() {
+                return Ok(i.to_string());
+            }
+            if let Some(u) = n.as_u64() {
+                return Ok(u.to_string());
+            }
+            // Float handling (match JS toPrecision behavior)
+            if let Some(f) = n.as_f64() {
+                // Use full precision, trim trailing zeros
+                let s = format!("{:.15}", f);
+                let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+                return Ok(trimmed.to_string());
+            }
+            Err("Invalid number format".to_string())
+        },
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Array(arr) => {
+            // Sort array elements for determinism
+            let mut strings: Vec<String> = arr.iter()
+                .map(|v| v.to_string())
+                .collect();
+            strings.sort();
+            Ok(serde_json::to_string(&strings).unwrap_or_default())
+        },
+        serde_json::Value::Object(_) => Err("Cannot normalize nested objects. Flatten in schema.".to_string()),
+    }
+}
+
 // ============================================================================
 // DOMAIN SEPARATION - Prevents L1/L2 Replay Attacks
 // ============================================================================
@@ -169,6 +293,7 @@ pub const CHAIN_ID_L2: u8 = 0x02;
 // ============================================================================
 
 /// A signed request that proves wallet ownership via ed25519 signature
+/// Supports both V1 (legacy JSON) and V2 (canonical hash) formats
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedRequest {
     /// Ed25519 public key (64 hex chars) - used for signature verification
@@ -179,13 +304,32 @@ pub struct SignedRequest {
     #[serde(default)]
     pub wallet_address: Option<String>,
     
-    /// The actual request payload (JSON string)
-    pub payload: String,
+    // === V1 (Legacy) Fields ===
+    /// The actual request payload (JSON string) - V1 legacy format
+    #[serde(default)]
+    pub payload: Option<String>,
+    
+    // === V2 (Canonical Hash) Fields ===
+    /// SHA256 hash of canonically-ordered payload fields - V2 format
+    #[serde(default)]
+    pub payload_hash: Option<String>,
+    
+    /// The individual payload field values - V2 format
+    #[serde(default)]
+    pub payload_fields: Option<serde_json::Value>,
+    
+    /// Operation type (e.g., "transfer", "bridge_deposit") - V2 format
+    #[serde(default)]
+    pub operation_type: Option<String>,
+    
+    /// Schema version (1 = legacy JSON, 2 = canonical hash)
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u8,
     
     /// Unix timestamp (for replay protection)
     pub timestamp: u64,
     
-    /// Random nonce (for replay protection)
+    /// Random nonce (UUID for V2, counter string for V1)
     pub nonce: String,
     
     /// Chain ID for domain separation (0x01 = L1, 0x02 = L2)
@@ -201,8 +345,14 @@ pub struct SignedRequest {
     pub request_path: Option<String>,
     
     /// Ed25519 signature (128 hex chars)
-    /// Signs: chain_id + request_path + payload\ntimestamp\nnonce
+    /// V1: Signs chain_id + request_path + payload + timestamp + nonce
+    /// V2: Signs chain_id + request_path + payload_hash + timestamp + nonce
     pub signature: String,
+}
+
+/// Default schema version is 1 for backward compatibility
+fn default_schema_version() -> u8 {
+    1
 }
 
 /// Default chain ID is L1 for backward compatibility
@@ -220,6 +370,8 @@ impl SignedRequest {
     /// 
     /// The `expected_path` parameter allows the server to enforce that the signature
     /// was created for this specific endpoint, preventing cross-endpoint replay attacks.
+    /// 
+    /// Supports both V1 (legacy JSON) and V2 (canonical hash) signature formats.
     pub fn verify_with_path(&self, expected_path: Option<&str>) -> Result<String, String> {
         // 1. Check timestamp freshness (5 min window)
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -253,21 +405,23 @@ impl SignedRequest {
         // 4. Check for nonce replay attack (deduplication)
         check_and_mark_nonce(&self.public_key, &self.nonce, self.timestamp)?;
         
-        // 5. Reconstruct the signed message with DOMAIN SEPARATION + PATH BINDING
-        // Format: [chain_id][request_path\n][payload\ntimestamp\nnonce]
+        // 5. Reconstruct the signed message based on schema version
+        let payload_component = self.get_payload_component()?;
         let path_component = self.request_path.as_deref().unwrap_or("");
+        
         let payload_str = if path_component.is_empty() {
             // Backward compatibility: no path in signature
-            format!("{}\n{}\n{}", self.payload, self.timestamp, self.nonce)
+            format!("{}\n{}\n{}", payload_component, self.timestamp, self.nonce)
         } else {
             // New format: path included in signature
-            format!("{}\n{}\n{}\n{}", path_component, self.payload, self.timestamp, self.nonce)
+            format!("{}\n{}\n{}\n{}", path_component, payload_component, self.timestamp, self.nonce)
         };
+        
         let mut signed_msg = Vec::new();
         signed_msg.push(self.chain_id);  // <--- CRITICAL: Domain separator
         signed_msg.extend_from_slice(payload_str.as_bytes());
         
-        // 5. Decode public key
+        // 6. Decode public key
         let pubkey_bytes = hex::decode(&self.public_key)
             .map_err(|_| "Invalid public key hex")?;
         
@@ -279,7 +433,7 @@ impl SignedRequest {
             pubkey_bytes.as_slice().try_into().unwrap()
         ).map_err(|e| format!("Invalid ed25519 key: {}", e))?;
         
-        // 6. Decode signature
+        // 7. Decode signature
         let sig_bytes = hex::decode(&self.signature)
             .map_err(|_| "Invalid signature hex")?;
         
@@ -291,17 +445,47 @@ impl SignedRequest {
             sig_bytes.as_slice().try_into().unwrap()
         );
         
-        // 7. Verify signature (DOMAIN-SEPARATED)
+        // 8. Verify signature (DOMAIN-SEPARATED)
         // This will FAIL if:
         // - Signature was created for L1 (0x01) but verified against L2 (0x02)
         // - Signature was created for L2 (0x02) but verified against L1 (0x01)
         verifying_key.verify(&signed_msg, &signature)
-            .map_err(|_| format!("Invalid signature for chain 0x{:02x}", self.chain_id))?;
+            .map_err(|_| format!("Invalid signature for chain 0x{:02x} (schema v{})", self.chain_id, self.schema_version))?;
         
-        // 8. Return wallet address (derived from public key)
+        // 9. Return wallet address (derived from public key)
         let chain_name = if self.chain_id == CHAIN_ID_L1 { "L1" } else { "L2" };
-        println!("🔐 Domain-separated signature verified for {} chain", chain_name);
+        println!("🔐 Domain-separated signature verified for {} chain (schema v{})", chain_name, self.schema_version);
         Ok(self.derive_wallet_address())
+    }
+    
+    /// Get the payload component for signature verification
+    /// V1: Returns the raw JSON payload string
+    /// V2: Reconstructs the canonical hash from payload_fields
+    fn get_payload_component(&self) -> Result<String, String> {
+        if self.schema_version >= 2 {
+            // V2: Use canonical payload hash
+            if let (Some(ref op_type), Some(ref fields)) = (&self.operation_type, &self.payload_fields) {
+                // Reconstruct the hash server-side to verify it matches
+                let computed_hash = create_canonical_payload_hash(op_type, fields)?;
+                
+                // If client sent a payload_hash, verify it matches our computation
+                if let Some(ref client_hash) = self.payload_hash {
+                    if client_hash != &computed_hash {
+                        return Err(format!(
+                            "Payload hash mismatch: client sent {} but fields compute to {}",
+                            &client_hash[..16], &computed_hash[..16]
+                        ));
+                    }
+                }
+                
+                Ok(computed_hash)
+            } else {
+                Err("V2 signature requires operation_type and payload_fields".to_string())
+            }
+        } else {
+            // V1: Use legacy JSON payload string
+            self.payload.clone().ok_or_else(|| "V1 signature requires payload field".to_string())
+        }
     }
     
     /// Get wallet address - uses wallet_address if provided, else public_key
@@ -311,10 +495,41 @@ impl SignedRequest {
         self.wallet_address.clone().unwrap_or_else(|| self.public_key.clone())
     }
     
-    /// Parse the payload as JSON
+    /// Parse the payload as JSON (V1) or return payload_fields (V2)
     pub fn parse_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
-        serde_json::from_str(&self.payload)
-            .map_err(|e| format!("Invalid payload JSON: {}", e))
+        if self.schema_version >= 2 {
+            // V2: payload_fields already parsed
+            if let Some(ref fields) = self.payload_fields {
+                serde_json::from_value(fields.clone())
+                    .map_err(|e| format!("Invalid payload_fields: {}", e))
+            } else {
+                Err("V2 signature requires payload_fields".to_string())
+            }
+        } else {
+            // V1: parse JSON string
+            if let Some(ref payload) = self.payload {
+                serde_json::from_str(payload)
+                    .map_err(|e| format!("Invalid payload JSON: {}", e))
+            } else {
+                Err("V1 signature requires payload field".to_string())
+            }
+        }
+    }
+    
+    /// Get operation type (V2) or infer from path (V1)
+    pub fn get_operation_type(&self) -> Option<String> {
+        if let Some(ref op) = self.operation_type {
+            return Some(op.clone());
+        }
+        // Infer from request_path for V1
+        self.request_path.as_ref().and_then(|path| {
+            match path.as_str() {
+                "/transfer" => Some("transfer".to_string()),
+                "/bridge/deposit" => Some("bridge_deposit".to_string()),
+                "/bridge/withdraw" => Some("bridge_withdraw".to_string()),
+                _ => None,
+            }
+        })
     }
 }
 
@@ -668,10 +883,15 @@ pub fn create_signed_request(
     // Sign with domain separation
     let signature = sign_with_domain_separation(private_key_hex, &message, chain_id)?;
     
+    // Create V1 (legacy) format request for backward compatibility
     Ok(SignedRequest {
         public_key: public_key_hex.to_string(),
         wallet_address: None,
-        payload,
+        payload: Some(payload),  // V1: payload as JSON string
+        payload_hash: None,      // V2 only
+        payload_fields: None,    // V2 only
+        operation_type: None,    // V2 only
+        schema_version: 1,       // V1 format
         timestamp,
         nonce,
         chain_id,
@@ -796,6 +1016,27 @@ pub fn get_dealer_public_key() -> String {
     DEALER_PUBLIC_KEY.to_string()
 }
 
+/// Get the Dealer's private key from environment variable
+/// SECURITY: This is ONLY for signing - never log or expose this value!
+/// Returns None if DEALER_PRIVATE_KEY is not set (safer for production)
+pub fn get_dealer_private_key() -> Option<String> {
+    std::env::var("DEALER_PRIVATE_KEY").ok()
+}
+
+/// Check if Dealer private key is configured
+pub fn is_dealer_configured() -> bool {
+    std::env::var("DEALER_PRIVATE_KEY").is_ok()
+}
+
+/// Sign a message as the Dealer (for L2 market operations)
+/// Returns Err if DEALER_PRIVATE_KEY is not set
+pub fn sign_as_dealer(message: &str) -> Result<String, String> {
+    let private_key = get_dealer_private_key()
+        .ok_or_else(|| "DEALER_PRIVATE_KEY not set in environment".to_string())?;
+    
+    sign_message(&private_key, message)
+}
+
 /// Get the Dealer's address
 pub fn get_dealer_address() -> String {
     DEALER_ADDRESS.to_string()
@@ -898,10 +1139,15 @@ mod tests {
         let message = format!("{}\n{}\n{}", payload, timestamp, nonce);
         let signature = sign_message(&private, &message).unwrap();
         
+        // Create V1 (legacy) format request for test
         let request = SignedRequest {
             public_key: public.clone(),
             wallet_address: Some(public),
-            payload: payload.to_string(),
+            payload: Some(payload.to_string()),  // V1 format
+            payload_hash: None,
+            payload_fields: None,
+            operation_type: None,
+            schema_version: 1,
             timestamp,
             nonce: nonce.to_string(),
             chain_id: CHAIN_ID_L1,
