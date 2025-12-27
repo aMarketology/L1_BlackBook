@@ -384,17 +384,17 @@ impl SettlementNode for L1BankService {
     // CREDIT LINE METHODS (Casino Bank Model)
     // ========================================================================
     
-    async fn approve_credit_line(
+    async fn request_credit_line(
         &self,
-        request: Request<CreditApprovalRequest>,
-    ) -> Result<Response<CreditApprovalResponse>, Status> {
+        request: Request<CreditLineRequest>,
+    ) -> Result<Response<CreditLineResponse>, Status> {
         let req = request.into_inner();
         
-        println!("🏦 [L1 Bank] Credit line approval - {} requesting {} µBB", 
+        println!("🏦 [L1 Bank] Credit line request - {} requesting {} µBB", 
             req.wallet_address, req.credit_limit);
 
         let bc = self.blockchain.lock().unwrap();
-        let l1_balance = Self::bb_to_microtokens(bc.get_balance(&req.wallet_address));
+        let _l1_balance = Self::bb_to_microtokens(bc.get_balance(&req.wallet_address));
         drop(bc);
 
         // In production, verify the signature here
@@ -408,15 +408,13 @@ impl SettlementNode for L1BankService {
 
         println!("✅ [L1 Bank] Credit line approved - Session: {}", &session_id[..16]);
 
-        Ok(Response::new(CreditApprovalResponse {
+        Ok(Response::new(CreditLineResponse {
             success: true,
             error_code: 0,  // ERROR_NONE
             error_message: String::new(),
             approval_id,
-            session_id: session_id.clone(),
             credit_limit: req.credit_limit,
             expires_at,
-            l1_balance,
             session: Some(CreditSessionInfo {
                 session_id,
                 l2_balance: 0,

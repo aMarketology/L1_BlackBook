@@ -16,8 +16,8 @@ Email:            alice@blackbook.test
 
 Mnemonic:         machine sword cause scrub simple damage program together spoon lock ball banana
 
-L1 Address:       L1BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
-L2 Address:       L2BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
+L1 Address:       L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
+L2 Address:       L2_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
 
 Public Key:       c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705
 Private Key:      18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24
@@ -48,8 +48,8 @@ Email:            bob@blackbook.test
 
 Mnemonic:         base echo grape penalty hawk resemble obscure unusual throw paddle carpet elder
 
-L1 Address:       L1AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9
-L2 Address:       L2AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9
+L1 Address:       L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9
+L2 Address:       L2_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9
 
 Public Key:       582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a
 Private Key:      e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b

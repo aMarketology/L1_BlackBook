@@ -9,7 +9,7 @@
 // │  L1 (Bank/Vault)              │  L2 (Casino/Gaming)                    │
 // │  ─────────────────            │  ───────────────────                   │
 // │  • Holds real money           │  • Runs games instantly                │
-// │  • Ed25519 sig verification   │  • Tracks bets internally              │
+// │  • Ed25519 sig verification   │  • Dealer fronts bets                  │
 // │  • Final settlement           │  • Sub-second UX                       │
 // │  • gRPC server on :50051      │  • gRPC client to L1                   │
 // │                               │                                         │
@@ -17,27 +17,15 @@
 // │  (same hash, different layer) │  (same hash, different layer)          │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
-// FLOWS:
-//
-// === LEGACY FLOW (Dealer Fronting) ===
+// FLOW:
 // 1. User locks funds: L1 debits user, marks as "locked for L2"
 // 2. User bets on L2: Dealer fronts stake immediately (great UX)
 // 3. L2 requests reimbursement: L1 moves user's locked → Dealer
 // 4. Bet resolves: L2 tells L1 outcome, L1 settles Dealer↔User
 // 5. User withdraws: L1 unlocks remaining funds
 //
-// === CREDIT LINE FLOW (Casino Bank Model - CURRENT) ===
-// 1. ApproveCreditLine: User signs approval for credit limit (e.g., 500 BB)
-// 2. CreditDraw: User signs each L1→L2 transfer (initial + auto-replenish)
-// 3. User bets: L2 tracks all bets internally, no L1 calls per bet
-// 4. CreditSettle: User signs settlement, L2 balance returns to L1
-//    - L2 can ONLY return to SAME wallet that deposited
-//    - Net PnL calculated: final_balance - total_drawn
-//
 // SECURITY:
-// - ALL L1 token movements require valid Ed25519 signature
-// - L1→L2 transfers require signature EACH TIME (not just approval)
-// - L2→L1 returns MUST go to original depositor wallet
+// - All requests signed with Ed25519 (public_key required)
 // - Domain separation: chain_id prevents L1/L2 replay attacks
 // - Nonces prevent replay within same chain
 // - Intent hashes bind bet parameters
@@ -64,19 +52,18 @@ service SettlementNode {
   rpc ReleaseBridgeFunds(BridgeReleaseRequest) returns (BridgeReleaseResponse);
   rpc VerifySettlementProof(SettlementProofRequest) returns (SettlementProofResponse);
   
-  // === Credit Line Operations (Casino Bank Model) ===
-  // SECURITY: All L1 token movements require valid Ed25519 signature
-  rpc ApproveCreditLine(CreditApprovalRequest) returns (CreditApprovalResponse);
-  rpc CreditDraw(CreditDrawRequest) returns (CreditDrawResponse);
-  rpc CreditSettle(CreditSettleRequest) returns (CreditSettleResponse);
-  rpc GetCreditStatus(CreditStatusRequest) returns (CreditStatusResponse);
-  
   // === Balance Queries ===
   rpc GetBalance(BalanceRequest) returns (BalanceResponse);
   rpc CheckSufficientBalance(SufficientBalanceRequest) returns (SufficientBalanceResponse);
   
   // === Signature Verification (L2 validates L1 signatures) ===
   rpc VerifySignature(SignatureVerifyRequest) returns (SignatureVerifyResponse);
+  
+  // === Credit Line Operations (Casino Bank Model) ===
+  rpc RequestCreditLine(CreditLineRequest) returns (CreditLineResponse);
+  rpc CreditDraw(CreditDrawRequest) returns (CreditDrawResponse);
+  rpc CreditSettle(CreditSettleRequest) returns (CreditSettleResponse);
+  rpc GetCreditStatus(CreditStatusRequest) returns (CreditStatusResponse);
   
   // === Health & Status ===
   rpc HealthCheck(HealthRequest) returns (HealthResponse);
@@ -336,170 +323,164 @@ message BlockHeightResponse {
 }
 
 // ============================================================================
-// CREDIT LINE MESSAGES - Casino Bank Model
-// ============================================================================
-//
-// SECURITY MODEL:
-// 1. ANY L1 token movement requires valid Ed25519 signature
-// 2. L1→L2 transfers require signature EACH TIME (not just once)
-// 3. L2 can ONLY return tokens to the SAME wallet that deposited them
-//
-// FLOW:
-// 1. ApproveCreditLine - User signs to approve a credit limit (e.g., 500 BB)
-// 2. CreditDraw - User signs each draw from L1→L2 (initial + replenishments)
-// 3. CreditSettle - User signs settlement, unused L2 balance returns to L1
-//
-// CASINO ANALOGY:
-// - Approval = "I authorize up to $500 in chips"
-// - Draw = "Give me $100 in chips" (requires signature each time)
-// - Settle = "Cash out my remaining chips" (returns to SAME wallet)
+// L2 LEDGER SERVICE - L1 notifies L2 about bridge events
 // ============================================================================
 
-message CreditApprovalRequest {
-  // Identity
-  string wallet_address = 1;     // L1_<40hex>
-  string public_key = 2;         // Ed25519 public key (64 hex)
+service L2LedgerNode {
+  // L1 calls this to notify L2 that tokens have been locked for bridging
+  rpc NotifyBridgeDeposit(BridgeDepositNotification) returns (BridgeDepositAck);
   
-  // Credit terms
-  uint64 credit_limit = 3;       // Maximum drawable amount (microtokens)
-  uint64 expires_in_hours = 4;   // How long approval is valid
+  // L1 calls this to notify L2 that tokens have been released (withdrawal complete)
+  rpc NotifyBridgeWithdraw(BridgeWithdrawNotification) returns (BridgeWithdrawAck);
   
-  // Security
-  bytes signature = 10;          // Signature of: APPROVE_CREDIT:wallet:limit:nonce
-  uint64 nonce = 11;             // Replay protection
-  uint64 timestamp = 12;         // Request timestamp (seconds since epoch)
+  // Health check for L2
+  rpc L2HealthCheck(L2HealthRequest) returns (L2HealthResponse);
 }
 
-message CreditApprovalResponse {
+message BridgeDepositNotification {
+  string lock_id = 1;            // L1's lock ID for reference
+  string user_address = 2;       // User's address (L1_<40hex> format)
+  uint64 amount = 3;             // Amount locked on L1 (microtokens)
+  uint64 timestamp = 4;          // When the lock occurred
+  string l1_tx_hash = 5;         // L1 transaction hash for audit
+  
+  // Verification
+  bytes l1_signature = 10;       // L1's signature proving the lock
+  string l1_public_key = 11;     // L1's public key
+}
+
+message BridgeDepositAck {
   bool success = 1;
-  ErrorCode error_code = 2;
+  string error_message = 2;
+  string l2_tx_id = 3;           // L2's internal transaction ID
+  uint64 new_l2_balance = 4;     // User's new L2 balance
+}
+
+message BridgeWithdrawNotification {
+  string lock_id = 1;            // Reference to original lock
+  string user_address = 2;       // User's address
+  uint64 amount = 3;             // Amount released
+  uint64 timestamp = 4;
+  string l1_tx_hash = 5;
+}
+
+message BridgeWithdrawAck {
+  bool success = 1;
+  string error_message = 2;
+  uint64 remaining_l2_balance = 3;
+}
+
+message L2HealthRequest {}
+
+message L2HealthResponse {
+  string status = 1;
+  uint64 transaction_count = 2;
+  uint64 active_users = 3;
+  uint64 active_markets = 4;
+}
+
+// ============================================================================
+// CREDIT LINE MESSAGES - Casino Bank Model
+// ============================================================================
+
+message CreditLineRequest {
+  string wallet_address = 1;      // User's L1 address
+  string public_key = 2;          // Ed25519 public key
+  uint64 credit_limit = 3;        // Requested credit limit in µBB
+  uint64 expires_in_hours = 4;    // Credit line expiration
+  string signature = 5;           // Ed25519 signature
+  uint64 nonce = 6;               // Replay protection
+}
+
+message CreditLineResponse {
+  bool success = 1;
+  int32 error_code = 2;
   string error_message = 3;
-  
-  // Approval details
-  string approval_id = 4;        // Unique approval identifier
-  string session_id = 5;         // Associated session ID
-  uint64 credit_limit = 6;       // Approved limit
-  uint64 expires_at = 7;         // Unix timestamp when approval expires
-  uint64 l1_balance = 8;         // Current L1 balance
-  
-  // Session state
-  CreditSessionInfo session = 20;
+  string approval_id = 4;
+  uint64 credit_limit = 5;
+  uint64 expires_at = 6;
+  CreditSessionInfo session = 7;
 }
 
 message CreditDrawRequest {
-  // Identity - REQUIRED for all L1 token movements
-  string wallet_address = 1;     // L1_<40hex>
-  string public_key = 2;         // Ed25519 public key (64 hex)
-  
-  // Draw details
-  string session_id = 3;         // Credit session ID
-  uint64 amount = 4;             // Amount to draw (microtokens)
-  string reason = 5;             // "initial", "low_balance", "user_request"
-  
-  // Security - SIGNATURE REQUIRED FOR EVERY DRAW
-  bytes signature = 10;          // Signature of: CREDIT_DRAW:wallet:session:amount:timestamp:nonce
-  uint64 timestamp = 11;         // Request timestamp (seconds since epoch)
-  string nonce = 12;             // Replay protection (UUID or random string)
+  string wallet_address = 1;      // User's L1 address
+  string public_key = 2;          // Ed25519 public key
+  uint64 amount = 3;              // Amount to draw in µBB
+  string reason = 4;              // Reason for draw (e.g., "bet")
+  string signature = 5;           // Ed25519 signature
+  uint64 nonce = 6;               // Replay protection
 }
 
 message CreditDrawResponse {
   bool success = 1;
-  ErrorCode error_code = 2;
+  int32 error_code = 2;
   string error_message = 3;
-  
-  // Draw result
-  uint64 amount_drawn = 4;       // Amount transferred L1→L2
-  uint64 l1_before = 5;          // L1 balance before draw
-  uint64 l1_after = 6;           // L1 balance after draw
-  
-  // Updated session state
-  uint64 l2_balance = 10;        // New L2 balance
-  uint64 remaining_credit = 11;  // Remaining drawable credit
-  uint32 draw_count = 12;        // Total draws in this session
+  uint64 amount_drawn = 4;
+  uint64 l1_before = 5;
+  uint64 l1_after = 6;
+  uint64 l2_balance = 7;
+  uint64 remaining_credit = 8;
+  uint64 draw_count = 9;
 }
 
 message CreditSettleRequest {
-  // Session reference
-  string session_id = 1;
-  
-  // Identity - MUST match session's original wallet
-  // SECURITY: L2 can ONLY return tokens to the SAME wallet that deposited
-  string wallet_address = 2;     // Must match session.wallet_address
-  string public_key = 3;         // Ed25519 public key (64 hex)
-  
-  // Settlement details
-  uint64 final_l2_balance = 4;   // Remaining L2 balance to return
-  uint64 locked_in_bets = 5;     // Amount still locked in open positions
-  
-  // Security - SIGNATURE REQUIRED FOR SETTLEMENT
-  bytes signature = 10;          // Signature of: CREDIT_SETTLE:session:wallet:balance:timestamp:nonce
-  uint64 timestamp = 11;         // Request timestamp (seconds since epoch)
-  string nonce = 12;             // Replay protection
+  string wallet_address = 1;      // User's L1 address
+  string public_key = 2;          // Ed25519 public key
+  string session_id = 3;          // Credit session ID
+  uint64 final_l2_balance = 4;    // Final L2 balance in µBB
+  uint64 locked_in_bets = 5;      // Amount still locked in active bets
+  string signature = 6;           // Ed25519 signature
+  uint64 nonce = 7;               // Replay protection
 }
 
 message CreditSettleResponse {
   bool success = 1;
-  ErrorCode error_code = 2;
+  int32 error_code = 2;
   string error_message = 3;
-  
-  // Settlement result
-  string settlement_type = 4;    // "WINNINGS", "LOSSES", "BREAK_EVEN"
-  int64 net_pnl = 5;             // Net profit/loss (can be negative)
-  
-  // Session summary
-  uint64 total_drawn = 10;       // Total amount drawn during session
-  uint64 final_l2_balance = 11;  // Amount returned to L1
-  uint64 locked_in_bets = 12;    // Amount still locked
-  uint32 draw_count = 13;        // Total draws in session
-  
-  // Balance changes
-  uint64 l1_before = 20;         // L1 balance before settlement
-  uint64 l1_after = 21;          // L1 balance after settlement
-  uint64 returned_to_l1 = 22;    // Amount returned from L2
+  string settlement_type = 4;     // "WINNINGS", "LOSSES", "BREAK_EVEN"
+  int64 net_pnl = 5;              // Net profit/loss in µBB (can be negative)
+  uint64 total_drawn = 6;
+  uint64 final_l2_balance = 7;
+  uint64 locked_in_bets = 8;
+  uint64 draw_count = 9;
+  uint64 l1_before = 10;
+  uint64 l1_after = 11;
+  uint64 returned_to_l1 = 12;
 }
 
 message CreditStatusRequest {
-  string wallet_address = 1;     // L1_<40hex>
+  string wallet_address = 1;      // User's L1 address
 }
 
 message CreditStatusResponse {
   bool success = 1;
-  ErrorCode error_code = 2;
+  int32 error_code = 2;
   string error_message = 3;
-  
-  // Current state
   string wallet_address = 4;
-  uint64 l1_balance = 5;         // Current L1 balance
-  bool has_active_credit = 6;    // Has active credit approval
-  
-  // Credit approval (if exists)
-  CreditApprovalInfo approval = 10;
-  
-  // Active session (if exists)
-  CreditSessionInfo session = 20;
-  
-  // Global stats
-  uint64 total_credit_extended = 30;
-  uint32 total_draws = 31;
-  uint32 total_settlements = 32;
+  uint64 l1_balance = 5;
+  bool has_active_credit = 6;
+  CreditApprovalInfo approval = 7;
+  CreditSessionInfo session = 8;
+  uint64 total_credit_extended = 9;
+  uint64 total_draws = 10;
+  uint64 total_settlements = 11;
 }
 
-// Helper message types
 message CreditApprovalInfo {
   string approval_id = 1;
   uint64 credit_limit = 2;
   uint64 total_drawn = 3;
   uint64 remaining_credit = 4;
   bool is_active = 5;
-  uint64 expires_at = 6;         // Unix timestamp
+  uint64 expires_at = 6;
 }
 
 message CreditSessionInfo {
   string session_id = 1;
-  uint64 l2_balance = 2;         // Current L2 balance
-  uint64 locked_in_bets = 3;     // Amount locked in open positions
-  uint64 available_to_bet = 4;   // l2_balance - locked_in_bets
-  uint64 total_drawn = 5;        // Total drawn during session
-  uint32 draw_count = 6;         // Number of draws
+  uint64 l2_balance = 2;
+  uint64 locked_in_bets = 3;
+  uint64 available_to_bet = 4;
+  uint64 total_drawn = 5;
+  uint64 draw_count = 6;
   bool is_active = 7;
 }

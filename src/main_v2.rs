@@ -220,9 +220,8 @@ fn save_blockchain(blockchain: &EnhancedBlockchain) {
 
 fn save_social_system(social_system: &SocialMiningSystem) {
     if let Ok(data) = serde_json::to_string_pretty(social_system) {
-        if fs::write(SOCIAL_DATA_FILE, data).is_ok() {
-            println!("💾 Saved social mining data to {}", SOCIAL_DATA_FILE);
-        }
+        let _ = fs::write(SOCIAL_DATA_FILE, data);
+        // Silent save - no console spam
     }
 }
 
