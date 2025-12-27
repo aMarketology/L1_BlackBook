@@ -80,8 +80,8 @@ pub fn microtokens_to_bb(mt: u64) -> f64 { mt as f64 / 1_000_000.0 }
 // ============================================================================
 // Address format: L1_ + 40 hex chars OR L2_ + 40 hex chars (43 chars total)
 // L1 and L2 addresses share the SAME hash - only prefix differs
-// Example: L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
-//          L2_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD
+// Example: L1_ALICE000000001
+//          L2_ALICE000000001
 
 /// Strip L1_/L2_ prefix from an address to get the hash
 pub fn strip_prefix(addr: &str) -> String {

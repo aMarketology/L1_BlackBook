@@ -69,71 +69,34 @@ pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = 
         .and(warp::path("test-accounts"))
         .and(warp::get())
         .and_then(|| async move {
-            let alice = crate::integration::unified_auth::get_alice_account();
-            let bob = crate::integration::unified_auth::get_bob_account();
-            
             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                 "success": true,
                 "message": "UNIFIED WALLET MODEL - Test accounts for L1 and L2",
-                "architecture": {
-                    "description": "Users see ONE total balance. Funds must be bridged to L2 for betting.",
-                    "flow": [
-                        "1. User starts with all funds in L1 (available)",
-                        "2. bridgeToL2(amount) → locks on L1, credits L2",
-                        "3. User bets on L2 (instant, off-chain)",
-                        "4. withdrawToL1() → settles L2 balance back to L1"
-                    ]
-                },
                 "alice": {
-                    "name": alice.name,
-                    "email": alice.email,
-                    "username": alice.username,
-                    "public_key": alice.public_key,
-                    "private_key": alice.private_key,
-                    "address": alice.address,
-                    "total_balance": alice.total_balance,
-                    "l1_available": alice.l1_available,
-                    "l1_locked": alice.l1_locked,
-                    "l2_balance": alice.l2_balance,
-                    "capabilities": [
-                        "✅ Sign transactions with Ed25519",
-                        "✅ L1 transfers",
-                        "✅ Bridge L1 → L2",
-                        "✅ Bet on L2",
-                        "✅ Withdraw L2 → L1",
-                        "✅ Social mining"
-                    ]
+                    "name": "Alice",
+                    "username": "alice_test",
+                    "email": "alice@blackbook.test",
+                    "l1_address": "L1_ALICE000000001",
+                    "public_key": "c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705",
+                    "private_key": "18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24",
+                    "initial_balance": 10000.0
                 },
                 "bob": {
-                    "name": bob.name,
-                    "email": bob.email,
-                    "username": bob.username,
-                    "public_key": bob.public_key,
-                    "private_key": bob.private_key,
-                    "address": bob.address,
-                    "total_balance": bob.total_balance,
-                    "l1_available": bob.l1_available,
-                    "l1_locked": bob.l1_locked,
-                    "l2_balance": bob.l2_balance,
-                    "capabilities": [
-                        "✅ Sign transactions with Ed25519",
-                        "✅ L1 transfers",
-                        "✅ Bridge L1 → L2",
-                        "✅ Bet on L2",
-                        "✅ Withdraw L2 → L1",
-                        "✅ Social mining"
-                    ]
+                    "name": "Bob",
+                    "username": "bob_test",
+                    "email": "bob@blackbook.test",
+                    "l1_address": "L1_BOB00000000001",
+                    "public_key": "582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a",
+                    "private_key": "e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b",
+                    "initial_balance": 5000.0
                 },
-                "testing": {
-                    "l1_rpc": "http://localhost:8080",
-                    "l2_rpc": std::env::var("L2_RPC_URL").unwrap_or_else(|_| "http://localhost:1234".to_string()),
-                    "examples": {
-                        "transfer": "Alice sends 100 BB to Bob on L1",
-                        "bridge": "Bob bridges 50 BB from L1 to L2",
-                        "social": "Alice creates a post for social mining rewards"
-                    }
+                "dealer": {
+                    "name": "Dealer",
+                    "l1_address": "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+                    "public_key": "d9d4a8d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3",
+                    "initial_balance": 100000.0
                 },
-                "note": "⚠️ PRIVATE KEYS EXPOSED - For testing only! Never use in production."
+                "note": "⚠️ PRIVATE KEYS EXPOSED - For testing only!"
             })))
         })
 }

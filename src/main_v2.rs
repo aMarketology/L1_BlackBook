@@ -136,9 +136,13 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     use crate::protocol::blockchain::TREASURY_ADDRESS;
     use crate::unified_wallet::strip_prefix;
     
-    let alice = integration::unified_auth::get_alice_account();
-    let bob = integration::unified_auth::get_bob_account();
-    let dealer_address = integration::unified_auth::get_dealer_address();
+    // Hardcoded test accounts
+    let alice_address = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
+    let bob_address = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
+    let dealer_address = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
+    let alice_balance = 10000.0;
+    let bob_balance = 5000.0;
+    let dealer_balance = 100000.0;
     
     println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
     println!("   ┌─────────────────────────────────────────────────────────┐");
@@ -146,27 +150,27 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     println!("   └─────────────────────────────────────────────────────────┘");
     
     // Fund test accounts via Treasury transfers (proper blockchain transactions)
-    let alice_hash = strip_prefix(&alice.address);
-    let bob_hash = strip_prefix(&bob.address);
-    let dealer_hash = strip_prefix(&dealer_address);
+    let alice_hash = strip_prefix(alice_address);
+    let bob_hash = strip_prefix(bob_address);
+    let dealer_hash = strip_prefix(dealer_address);
     
     // Create airdrop transactions from Treasury
     let _ = bc.create_transaction(
         TREASURY_ADDRESS.to_string(),
         alice_hash.clone(),
-        alice.total_balance,
+        alice_balance,
     );
     
     let _ = bc.create_transaction(
         TREASURY_ADDRESS.to_string(),
         bob_hash.clone(),
-        bob.total_balance,
+        bob_balance,
     );
     
     let _ = bc.create_transaction(
         TREASURY_ADDRESS.to_string(),
         dealer_hash.clone(),
-        100000.0,  // 100k BB Dealer bankroll
+        dealer_balance,
     );
     
     // Mine the airdrop transactions (with persistence!)
@@ -174,9 +178,9 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
         eprintln!("⚠️  Mining airdrop failed: {}", e);
     }
     
-    println!("   💸 Alice:  {:>10} BB ← Treasury", alice.total_balance);
-    println!("   💸 Bob:    {:>10} BB ← Treasury", bob.total_balance);
-    println!("   💸 Dealer: {:>10} BB ← Treasury (House Bankroll)", 100000.0);
+    println!("   💸 Alice:  {:>10} BB ← Treasury", alice_balance);
+    println!("   💸 Bob:    {:>10} BB ← Treasury", bob_balance);
+    println!("   💸 Dealer: {:>10} BB ← Treasury (House Bankroll)", dealer_balance);
     
     let treasury_remaining = bc.get_balance(TREASURY_ADDRESS);
     println!("\n   📊 Treasury Remaining: {:.0} BB", treasury_remaining);
@@ -188,25 +192,29 @@ fn seed_test_accounts_enhanced(bc: &mut EnhancedBlockchain) {
     use crate::protocol::blockchain::TREASURY_ADDRESS;
     use crate::unified_wallet::strip_prefix;
     
-    let alice = integration::unified_auth::get_alice_account();
-    let bob = integration::unified_auth::get_bob_account();
-    let dealer_address = integration::unified_auth::get_dealer_address();
+    // New secure format test accounts
+    let alice_address = "L1_ALICE000000001";
+    let bob_address = "L1_BOB00000000001";
+    let dealer_address = "L2DEALER00000001";
+    let alice_balance = 10000.0;
+    let bob_balance = 5000.0;
+    let dealer_balance = 100000.0;
     
     println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
     
-    let alice_hash = strip_prefix(&alice.address);
-    let bob_hash = strip_prefix(&bob.address);
-    let dealer_hash = strip_prefix(&dealer_address);
+    let alice_hash = strip_prefix(alice_address);
+    let bob_hash = strip_prefix(bob_address);
+    let dealer_hash = strip_prefix(dealer_address);
     
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), alice_hash, alice.total_balance);
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), bob_hash, bob.total_balance);
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), dealer_hash, 100000.0);
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), alice_hash, alice_balance);
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), bob_hash, bob_balance);
+    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), dealer_hash, dealer_balance);
     
     let _ = bc.mine_pending_transactions("genesis_airdrop".to_string());
     
-    println!("   💸 Alice:  {:>10} BB ← Treasury", alice.total_balance);
-    println!("   💸 Bob:    {:>10} BB ← Treasury", bob.total_balance);
-    println!("   💸 Dealer: {:>10} BB ← Treasury", 100000.0);
+    println!("   💸 Alice:  {:>10} BB ← Treasury", alice_balance);
+    println!("   💸 Bob:    {:>10} BB ← Treasury", bob_balance);
+    println!("   💸 Dealer: {:>10} BB ← Treasury", dealer_balance);
     println!("✅ Test accounts funded (JSON mode)");
 }
 
@@ -381,56 +389,19 @@ async fn main() {
     // Initialize bridge state
     let bridge_state = Arc::new(Mutex::new(routes_v2::bridge::BridgeState::new()));
     
-    // Initialize MPC storage (for 2-of-2 threshold signing)
-    let mpc_storage = integration::mpc_auth::MpcStorage::new();
+    // Test account addresses (hardcoded for startup display)
+    let alice_l1 = "L1_ALICE000000001";
+    let bob_l1 = "L1_BOB00000000001";
+    let dealer_l1 = "L2DEALER00000001";
     
-    // Get full test account info
-    let alice = integration::unified_auth::get_alice_account();
-    let bob = integration::unified_auth::get_bob_account();
-    let dealer_address = integration::unified_auth::get_dealer_address();
-    
-    // Get L1/L2 addresses using our unified wallet prefix system
-    let alice_l1 = unified_wallet::to_l1_address(&alice.address);
-    let alice_l2 = unified_wallet::to_l2_address(&alice.address);
-    let bob_l1 = unified_wallet::to_l1_address(&bob.address);
-    let bob_l2 = unified_wallet::to_l2_address(&bob.address);
-    let dealer_l1 = unified_wallet::to_l1_address(&dealer_address);
-    
-    println!("\n🧪 FULL TEST ACCOUNTS (Alice & Bob) - L1/L2 PREFIXES:");
+    println!("\n🧪 TEST ACCOUNTS:");
     println!("┌──────────────────────────────────────────────────────────────────┐");
-    println!("│ 👛 UNIFIED WALLET: ALICE                                         │");
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ Username: {:52} │", alice.username);
-    println!("│ Email:    {:52} │", alice.email);
-    println!("│ Public:   {}... │", &alice.public_key[..32]);
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ 📍 L1 Address: {:48} │", alice_l1);
-    println!("│    (Real balance - trading, withdrawals, transfers)            │");
-    println!("│ 📍 L2 Address: {:48} │", alice_l2);
-    println!("│    (Locked balance - betting sessions)                          │");
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ 💰 L1 Balance:  {:46} │", format!("{} BB (available)", alice.l1_available));
-    println!("│ 🔒 L1 Locked:   {:46} │", format!("{} BB (bridged to L2)", alice.l1_locked));
-    println!("│ 🎰 L2 Balance:  {:46} │", format!("{} BB (betting)", alice.l2_balance));
-    println!("├──────────────────────────────────────────────────────────────────┤");
-    println!("│ 👛 UNIFIED WALLET: BOB                                           │");
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ Username: {:52} │", bob.username);
-    println!("│ Email:    {:52} │", bob.email);
-    println!("│ Public:   {}... │", &bob.public_key[..32]);
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ 📍 L1 Address: {:48} │", bob_l1);
-    println!("│    (Real balance - trading, withdrawals, transfers)            │");
-    println!("│ 📍 L2 Address: {:48} │", bob_l2);
-    println!("│    (Locked balance - betting sessions)                          │");
-    println!("│ ─────────────────────────────────────────────────────────────── │");
-    println!("│ 💰 L1 Balance:  {:46} │", format!("{} BB (available)", bob.l1_available));
-    println!("│ 🔒 L1 Locked:   {:46} │", format!("{} BB (bridged to L2)", bob.l1_locked));
-    println!("│ 🎰 L2 Balance:  {:46} │", format!("{} BB (betting)", bob.l2_balance));
+    println!("│ 👛 ALICE:  {} - 10,000 BB  │", alice_l1);
+    println!("│ 👛 BOB:    {} - 5,000 BB   │", bob_l1);
+    println!("│ 🎰 DEALER: {} - 100,000 BB │", dealer_l1);
     println!("└──────────────────────────────────────────────────────────────────┘");
-    println!("  💡 L1_ prefix = Real balance (can withdraw, trade, transfer)");
-    println!("  💡 L2_ prefix = Locked for betting (just-in-time allocation)");
-    println!("  🔄 Flow: L1_xxx → Lock → L2_xxx → Bet → Settle → L1_xxx");
+    println!("  💡 Use /balance/<address> to check balances");
+    println!("  💡 Use /transfer with SignedRequest to transfer BB tokens");
     
     // Clone for routes
     let bc1 = blockchain.clone();
@@ -520,9 +491,6 @@ async fn main() {
             }))
         });
     
-    // MPC routes (Multi-Party Computation for threshold signing)
-    let mpc_routes = integration::mpc_auth::mpc_routes(mpc_storage.clone());
-    
     // Start gRPC server on 50051 (internal L1↔L2 communication)
     let grpc_blockchain = blockchain.clone();
     tokio::spawn(async move {
@@ -576,8 +544,6 @@ async fn main() {
         .or(credit_draw)
         .or(credit_settle)
         .or(credit_status)
-        // MPC routes (threshold signing)
-        .or(mpc_routes)
         // Admin routes
         .or(admin_mint)
         // Protocol upgrade routes - TODO: Implement upgrade_manager

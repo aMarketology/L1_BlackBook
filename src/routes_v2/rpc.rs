@@ -195,7 +195,7 @@ pub fn public_balance_route(
                             "Address must start with L1_ prefix (43 chars total)"
                         },
                         "expected_format": "L1_<40_hex_chars>",
-                        "example": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
+                        "example": "L1_ALICE000000001"
                     })));
                 }
                 

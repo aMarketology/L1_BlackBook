@@ -58,9 +58,8 @@ pub use integration::unified_auth::{
     SignedRequest, 
     with_signature_auth, 
     AuthError,
+    generate_keypair,
     // Domain separation for L1/L2 replay attack prevention
     CHAIN_ID_L1,
     CHAIN_ID_L2,
-    sign_with_domain_separation,
-    create_signed_request,
 };

@@ -96,6 +96,8 @@ pub fn transfer_route(
                     
                     // Check balance
                     let current_balance = bc.get_balance(&from_address);
+                    println!("💳 Transfer check: from={}, balance={}", &from_address[..14], current_balance);
+                    
                     if current_balance < transfer.amount {
                         return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                             "success": false,

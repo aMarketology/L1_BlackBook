@@ -62,7 +62,7 @@ const BIP39_WORDLIST = [
   'barrel','base','basic','basket','battle','beach','bean','beauty','because','become',
   'beef','before','begin','behave','behind','believe','below','belt','bench','benefit',
   'best','betray','better','between','beyond','bicycle','bid','bike','bind','biology',
-  'bird','birth','bitter','black','blade','blame','blanket','blast','bleak','bless',
+  'bird','birth','bitter','black','blackbook', 'blade','blame','blanket','blast','bleak','bless',
   'blind','blood','blossom','blouse','blue','blur','blush','board','boat','body',
   'boil','bomb','bone','bonus','book','boost','border','boring','borrow','boss',
   'bottom','bounce','box','boy','bracket','brain','brand','brass','brave','bread',
@@ -256,25 +256,28 @@ const BIP39_WORDLIST = [
 // ═══════════════════════════════════════════════════════════════
 
 const TEST_ACCOUNTS = {
-  // Alice: Primary test account with 10,000 BB starting balance
+  // Alice: Primary test account with 20,000 BB starting balance
+  // Ed25519 keypair derived from 32-byte seed
   ALICE: {
     username: 'alice_test',
     email: 'alice@blackbook.test',
     address: 'L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD',
-    publicKey: '18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24',
-    startingBalance: 10000.0,
-    // Private key derived from seed - DO NOT use in production
-    // Seed bytes: [0x18, 0xf2, 0xc2, 0xe3, 0xbc, 0xb7, 0xa4, 0xb5, ...]
+    publicKey: 'c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705',
+    privateKey: '18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24',
+    startingBalance: 20000.0,
+    // ⚠️ privateKey is 32-byte SEED for nacl.sign.keyPair.fromSeed()
   },
   
-  // Bob: Secondary test account with 5,000 BB starting balance  
+  // Bob: Secondary test account with 10,000 BB starting balance
+  // Ed25519 keypair derived from 32-byte seed  
   BOB: {
     username: 'bob_test',
     email: 'bob@blackbook.test',
     address: 'L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9',
-    publicKey: 'e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b',
-    startingBalance: 5000.0,
-    // Private key derived from seed - DO NOT use in production
+    publicKey: '582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a',
+    privateKey: 'e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b',
+    startingBalance: 10000.0,
+    // ⚠️ privateKey is 32-byte SEED for nacl.sign.keyPair.fromSeed()
   },
   
   // Dealer: L2 Oracle account - private key in .env ONLY

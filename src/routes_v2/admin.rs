@@ -29,7 +29,7 @@ pub struct MintRequest {
 /// Request:
 /// ```json
 /// {
-///   "to": "L1BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+///   "to": "L1_ALICE000000001",
 ///   "amount": 10000.0
 /// }
 /// ```
