@@ -203,6 +203,7 @@ pub struct Transaction {
 /// - Financial Lane: Transfer, BetPlacement, BetResolution, StakeDeposit, StakeWithdraw
 /// - Social Lane: SocialAction
 /// - System: SystemReward (internal)
+/// - Admin: Mint, Burn (treasury operations)
 /// 
 /// NOTE: No ContractCall - we use native logic, no VM execution needed.
 /// Implements both Serde and Borsh for hybrid serialization
@@ -216,6 +217,8 @@ pub enum TransactionType {
     StakeDeposit,
     StakeWithdraw,
     SystemReward,
+    Mint,
+    Burn,
 }
 
 impl TransactionType {

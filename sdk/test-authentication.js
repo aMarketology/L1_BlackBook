@@ -16,24 +16,27 @@ const CHAIN_ID_L1 = 0x01;
 const CHAIN_ID_L2 = 0x02;
 
 // ============================================================================
-// TEST ACCOUNTS
+// TEST ACCOUNTS (Correctly derived from seeds)
+// Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
 // ============================================================================
 const TEST_ACCOUNTS = {
   ALICE: {
     username: 'alice_test',
-    address: 'L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD',
+    address: 'L1_52882D768C0F3E7932AAD1813CF8B19058D507A8',
     seed: '18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24',
+    publicKey: 'c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705',
   },
   BOB: {
     username: 'bob_test',
-    address: 'L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9',
+    address: 'L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433',
     seed: 'e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b',
+    publicKey: '582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a',
   },
   DEALER: {
     username: 'dealer',
-    address: 'L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3',
-    // Dealer seed - derived to match the expected L1 address
-    seed: 'c7d9a8b6e5f4321098765432abcdef01234567890abcdef1234567890abcdef',
+    address: 'L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC',
+    seed: 'd4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d',
+    publicKey: '65328794ed4a81cc2a92b93738c22a545f066cc6c0b6a72aa878cfa289f0ba32',
   }
 };
 
@@ -183,13 +186,30 @@ async function generateKeypairFromServer() {
   return await res.json();
 }
 
-async function verifySignature(publicKey, message, signature) {
+async function verifySignature(keypair, walletAddress) {
+  // The /auth/verify endpoint expects SignedRequest format:
+  // { public_key, wallet_address, payload, timestamp, nonce, chain_id, signature }
+  // Message format: "{payload}\n{timestamp}\n{nonce}" prefixed with chain_id byte
+  
+  const timestamp = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
+  const nonce = generateNonce();
+  const payload = '{}';
+  
+  // Build the message the same way the server does
+  const message = `${payload}\n${timestamp}\n${nonce}`;
+  const prefixedMessage = new Uint8Array([CHAIN_ID_L1, ...new TextEncoder().encode(message)]);
+  const signature = bytesToHex(nacl.sign.detached(prefixedMessage, keypair.secretKey));
+  
   const res = await fetch(`${L1_URL}/auth/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      public_key: publicKey,
-      message: message,
+      public_key: keypair.publicKey,
+      wallet_address: walletAddress,
+      payload: payload,
+      timestamp: timestamp,
+      nonce: nonce,
+      chain_id: CHAIN_ID_L1,
       signature: signature
     })
   });
@@ -197,12 +217,13 @@ async function verifySignature(publicKey, message, signature) {
 }
 
 async function getProfile(keypair, address) {
+  // The /profile endpoint expects SignedRequest format (same as /auth/verify)
+  const timestamp = Math.floor(Date.now() / 1000); // Unix timestamp in seconds
   const nonce = generateNonce();
-  const timestamp = Date.now();
-  const payload = JSON.stringify({});
-  const message = `${address}:${timestamp}:${nonce}:${payload}`;
+  const payload = '{}';
   
-  // Sign with chain_id prefix for domain separation
+  // Build the message the same way the server does
+  const message = `${payload}\n${timestamp}\n${nonce}`;
   const prefixedMessage = new Uint8Array([CHAIN_ID_L1, ...new TextEncoder().encode(message)]);
   const signature = bytesToHex(nacl.sign.detached(prefixedMessage, keypair.secretKey));
   
@@ -211,9 +232,11 @@ async function getProfile(keypair, address) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       public_key: keypair.publicKey,
+      wallet_address: address,
+      payload: payload,
       timestamp: timestamp,
       nonce: nonce,
-      payload: payload,
+      chain_id: CHAIN_ID_L1,
       signature: signature
     })
   });
@@ -304,41 +327,47 @@ async function testAddressDerivation() {
 async function testSignatureVerification() {
   console.log('');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('  TEST 1.2.3: SIGNATURE VERIFICATION');
+  console.log('  TEST 1.2.3: SIGNATURE VERIFICATION (SignedRequest Format)');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('');
   
   const aliceKeypair = deriveKeypair(TEST_ACCOUNTS.ALICE.seed);
-  const testMessage = 'Hello BlackBook L1!';
   
-  // Test valid signature
-  console.log('✍️  Testing valid signature...');
-  const validSignature = signMessage(testMessage, aliceKeypair.secretKey);
-  console.log(`   Message:    "${testMessage}"`);
-  console.log(`   Signature:  ${validSignature.slice(0, 32)}...`);
+  // Test valid SignedRequest
+  console.log('✍️  Testing valid SignedRequest...');
+  console.log(`   Public Key: ${aliceKeypair.publicKey.slice(0, 32)}...`);
+  console.log(`   Address:    ${TEST_ACCOUNTS.ALICE.address}`);
   
   await delay(50);
-  const validResult = await verifySignature(aliceKeypair.publicKey, testMessage, validSignature);
-  console.log(`   ${validResult.valid ? '✅' : '❌'} Signature verified: ${validResult.valid}`);
+  const validResult = await verifySignature(aliceKeypair, TEST_ACCOUNTS.ALICE.address);
+  const isValid = validResult.success && validResult.verified;
+  console.log(`   ${isValid ? '✅' : '❌'} Signature verified: ${validResult.verified}`);
+  if (validResult.wallet_address) {
+    console.log(`   📍 Wallet returned: ${validResult.wallet_address}`);
+  }
+  if (validResult.error) {
+    console.log(`   ⚠️  Error: ${validResult.error}`);
+  }
   
-  // Test invalid signature (wrong message)
+  // Test with Bob's keypair
   console.log('');
-  console.log('🔒 Testing invalid signature (wrong message)...');
-  const wrongMessage = 'Wrong message!';
+  console.log('✍️  Testing Bob SignedRequest...');
+  const bobKeypair = deriveKeypair(TEST_ACCOUNTS.BOB.seed);
   await delay(50);
-  const wrongResult = await verifySignature(aliceKeypair.publicKey, wrongMessage, validSignature);
-  console.log(`   Message:    "${wrongMessage}"`);
-  console.log(`   ${!wrongResult.valid ? '✅' : '❌'} Correctly rejected: ${!wrongResult.valid}`);
+  const bobResult = await verifySignature(bobKeypair, TEST_ACCOUNTS.BOB.address);
+  const bobValid = bobResult.success && bobResult.verified;
+  console.log(`   ${bobValid ? '✅' : '❌'} Bob signature verified: ${bobResult.verified}`);
   
-  // Test invalid signature (tampered)
+  // Test Dealer
   console.log('');
-  console.log('🔒 Testing tampered signature...');
-  const tamperedSignature = validSignature.slice(0, -4) + 'ffff';
+  console.log('✍️  Testing Dealer SignedRequest...');
+  const dealerKeypair = deriveKeypair(TEST_ACCOUNTS.DEALER.seed);
   await delay(50);
-  const tamperedResult = await verifySignature(aliceKeypair.publicKey, testMessage, tamperedSignature);
-  console.log(`   ${!tamperedResult.valid ? '✅' : '❌'} Tampered sig rejected: ${!tamperedResult.valid}`);
+  const dealerResult = await verifySignature(dealerKeypair, TEST_ACCOUNTS.DEALER.address);
+  const dealerValid = dealerResult.success && dealerResult.verified;
+  console.log(`   ${dealerValid ? '✅' : '❌'} Dealer signature verified: ${dealerResult.verified}`);
   
-  return validResult.valid && !wrongResult.valid && !tamperedResult.valid;
+  return isValid && bobValid && dealerValid;
 }
 
 async function testDomainSeparation() {

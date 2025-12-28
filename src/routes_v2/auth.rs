@@ -75,8 +75,9 @@ pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = 
                     "name": "Alice",
                     "username": "alice_test",
                     "email": "alice@blackbook.test",
-                    "l1_address": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+                    "l1_address": "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8",
                     "seed": "18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24",
+                    "public_key": "c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705",
                     "initial_balance": 20000.0,
                     "note": "Use seed with nacl.sign.keyPair.fromSeed() to derive keypair"
                 },
@@ -84,16 +85,19 @@ pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = 
                     "name": "Bob",
                     "username": "bob_test",
                     "email": "bob@blackbook.test",
-                    "l1_address": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+                    "l1_address": "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433",
                     "seed": "e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b",
+                    "public_key": "582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a",
                     "initial_balance": 10000.0,
                     "note": "Use seed with nacl.sign.keyPair.fromSeed() to derive keypair"
                 },
                 "dealer": {
                     "name": "Dealer",
-                    "l1_address": "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+                    "l1_address": "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC",
+                    "seed": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d",
+                    "public_key": "65328794ed4a81cc2a92b93738c22a545f066cc6c0b6a72aa878cfa289f0ba32",
                     "initial_balance": 100000.0,
-                    "note": "House bankroll - private key in .env only"
+                    "note": "House bankroll - seed exposed for testing only"
                 },
                 "warning": "⚠️ Seeds exposed - For testing only!"
             })))

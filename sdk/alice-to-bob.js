@@ -14,21 +14,21 @@ const L1_URL = 'http://localhost:8080';
 const CHAIN_ID_L1 = 0x01;
 
 // ============================================================================
-// TEST ACCOUNTS (from SDK - single source of truth)
-// The publicKey field is the 32-byte seed for Ed25519 keypair derivation
+// TEST ACCOUNTS (correctly derived from seeds)
+// Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
 // ============================================================================
 const TEST_ACCOUNTS = {
   ALICE: {
     username: 'alice_test',
     email: 'alice@blackbook.test',
-    address: 'L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD',
+    address: 'L1_52882D768C0F3E7932AAD1813CF8B19058D507A8',
     publicKey: '18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24',
     startingBalance: 20000.0,
   },
   BOB: {
     username: 'bob_test',
     email: 'bob@blackbook.test',
-    address: 'L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9',
+    address: 'L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433',
     publicKey: 'e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b',
     startingBalance: 10000.0,
   }

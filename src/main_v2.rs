@@ -139,10 +139,11 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     
     use crate::protocol::blockchain::TREASURY_ADDRESS;
     
-    // Real cryptographic test accounts (Ed25519 derived)
-    let alice_address = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
-    let bob_address = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
-    let dealer_address = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
+    // Real cryptographic test accounts (Ed25519 derived from seeds)
+    // Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
+    let alice_address = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";  // seed: 18f2c2e3...
+    let bob_address = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";    // seed: e4ac49e5...
+    let dealer_address = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC"; // seed: d4e5f6a7...
     
     // Initial funding amounts (only applied if balance is 0)
     let alice_initial = 20000.0;
@@ -222,10 +223,11 @@ fn seed_test_accounts_enhanced(bc: &mut EnhancedBlockchain) {
     
     use crate::protocol::blockchain::TREASURY_ADDRESS;
     
-    // Real cryptographic test accounts (Ed25519 derived)
-    let alice_address = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
-    let bob_address = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
-    let dealer_address = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
+    // Real cryptographic test accounts (Ed25519 derived from seeds)
+    // Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
+    let alice_address = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";  // seed: 18f2c2e3...
+    let bob_address = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";    // seed: e4ac49e5...
+    let dealer_address = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC"; // seed: d4e5f6a7...
     
     // Initial funding amounts (only applied if balance is 0)
     let alice_initial = 20000.0;
@@ -461,10 +463,10 @@ async fn main() {
     // Initialize bridge state
     let bridge_state = Arc::new(Mutex::new(routes_v2::bridge::BridgeState::new()));
     
-    // Real Ed25519 test account addresses
-    let alice_l1 = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
-    let bob_l1 = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
-    let dealer_l1 = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
+    // Real Ed25519 test account addresses (derived from seeds)
+    let alice_l1 = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";
+    let bob_l1 = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";
+    let dealer_l1 = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC";
     
     // Get actual balances for display
     let (alice_bal, bob_bal, dealer_bal) = {
@@ -541,6 +543,7 @@ async fn main() {
     
     // Admin routes (OPEN ACCESS - DEVELOPMENT ONLY)
     let admin_mint = routes_v2::admin::mint_tokens_route(blockchain.clone());
+    let admin_burn = routes_v2::admin::burn_tokens_route(blockchain.clone());
     
     // Protocol upgrade routes - TODO: Implement upgrade_manager in blockchain
     // let upgrade_propose = routes_v2::admin::propose_upgrade_route(blockchain.clone());
@@ -626,6 +629,7 @@ async fn main() {
         .or(credit_status)
         // Admin routes
         .or(admin_mint)
+        .or(admin_burn)
         // Protocol upgrade routes - TODO: Implement upgrade_manager
         // .or(upgrade_propose)
         // .or(upgrade_vote)

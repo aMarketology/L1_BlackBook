@@ -410,6 +410,11 @@ impl EnhancedBlockchain {
     }
     
     pub fn create_transaction(&mut self, from: String, to: String, amount: f64) -> String {
+        self.create_transaction_typed(from, to, amount, TransactionType::Transfer)
+    }
+    
+    /// Create a transaction with a specific type (Transfer, Mint, Burn, etc.)
+    pub fn create_transaction_typed(&mut self, from: String, to: String, amount: f64, tx_type: TransactionType) -> String {
         let transaction_id = Uuid::new_v4().to_string();
         
         let read_accounts = vec![from.clone()];
@@ -424,14 +429,21 @@ impl EnhancedBlockchain {
             signature: String::new(),
             read_accounts,
             write_accounts,
-            tx_type: TransactionType::Transfer,
+            tx_type,
         };
         
         // Balance changes now happen ONLY during mining, not here
         // This fixes the double-deduction bug
-        self.pending_transactions.push(transaction);
+        self.pending_transactions.push(transaction.clone());
         
-        println!("💰 Transaction created: {} -> {} ({} L1)", from, to, amount);
+        // Log with appropriate emoji based on type
+        let emoji = match transaction.tx_type {
+            TransactionType::Mint => "🏦",
+            TransactionType::Burn => "🔥",
+            TransactionType::Transfer => "💰",
+            _ => "📝",
+        };
+        println!("{} Transaction created: {} -> {} ({} BB) [type: {:?}]", emoji, from, to, amount, transaction.tx_type);
         transaction_id
     }
     

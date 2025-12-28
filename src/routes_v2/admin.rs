@@ -24,6 +24,13 @@ pub struct MintRequest {
     pub amount: f64,
 }
 
+/// Burn request payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BurnRequest {
+    pub from: String,
+    pub amount: f64,
+}
+
 /// POST /admin/mint - Mint new tokens (OPEN ACCESS - DEVELOPMENT ONLY)
 /// 
 /// Request:
@@ -124,6 +131,103 @@ pub fn mint_tokens_route(
                         "amount": request.amount,
                         "new_balance": new_balance
                     }
+                })))
+            }
+        })
+}
+
+/// POST /admin/burn - Burn tokens from an address (OPEN ACCESS - DEVELOPMENT ONLY)
+/// 
+/// Request:
+/// ```json
+/// {
+///   "from": "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8",
+///   "amount": 999999.0
+/// }
+/// ```
+/// 
+/// Response:
+/// ```json
+/// {
+///   "success": true,
+///   "transaction": {
+///     "id": "uuid",
+///     "from": "L1...",
+///     "amount": 999999.0,
+///     "new_balance": 1.0
+///   }
+/// }
+/// ```
+pub fn burn_tokens_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("admin" / "burn")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then(move |request: BurnRequest| {
+            let blockchain = blockchain.clone();
+            async move {
+                // Validate input
+                if request.amount <= 0.0 {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Amount must be positive"
+                    })));
+                }
+                
+                if request.from.is_empty() {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Source address is required"
+                    })));
+                }
+                
+                // Check balance first
+                let current_balance = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.get_balance(&request.from)
+                };
+                
+                if current_balance < request.amount {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": format!("Insufficient balance: {} BB available, {} BB requested to burn", 
+                                        current_balance, request.amount)
+                    })));
+                }
+                
+                // Burn tokens by sending to "burn" address (system sink)
+                let (tx_id, new_balance) = {
+                    let mut bc = lock_or_recover(&blockchain);
+                    
+                    // Create transaction to "burn" address (removes from circulation)
+                    let tx_id = bc.create_transaction(
+                        request.from.clone(),
+                        "BURN_ADDRESS".to_string(),
+                        request.amount
+                    );
+                    
+                    // Mine immediately
+                    let _ = bc.mine_pending_transactions("admin_burn".to_string());
+                    
+                    let balance = bc.get_balance(&request.from);
+                    
+                    (tx_id, balance)
+                };
+                
+                println!("🔥 ADMIN BURN: {} BB from {} (new balance: {} BB, tx: {})", 
+                         request.amount, &request.from, 
+                         new_balance, &tx_id[..8]);
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "transaction": {
+                        "id": tx_id,
+                        "from": request.from,
+                        "amount": request.amount,
+                        "new_balance": new_balance
+                    },
+                    "message": format!("Burned {} BB, {} BB remaining", request.amount, new_balance)
                 })))
             }
         })
