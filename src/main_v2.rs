@@ -130,92 +130,164 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     // ========================================================================
     // TEST ACCOUNT INITIALIZATION (Development Only)
     // ========================================================================
-    // In production, these accounts would be funded via real transactions.
-    // For testing, we create "airdrop" transactions from Treasury.
+    // Real Ed25519 derived addresses for Alice, Bob, and Dealer
+    // These match the SDK TEST_ACCOUNTS for consistent testing
+    // 
+    // PERSISTENCE: Only fund accounts if they have zero balance.
+    // Real crypto addresses persist their balances across sessions.
+    // ========================================================================
     
     use crate::protocol::blockchain::TREASURY_ADDRESS;
-    use crate::unified_wallet::strip_prefix;
     
-    // Hardcoded test accounts
+    // Real cryptographic test accounts (Ed25519 derived)
     let alice_address = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
     let bob_address = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
     let dealer_address = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
-    let alice_balance = 10000.0;
-    let bob_balance = 5000.0;
-    let dealer_balance = 100000.0;
     
-    println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
+    // Initial funding amounts (only applied if balance is 0)
+    let alice_initial = 20000.0;
+    let bob_initial = 10000.0;
+    let dealer_initial = 100000.0;
+    
+    // Check existing balances (persistence!)
+    let alice_bal = bc.get_balance(alice_address);
+    let bob_bal = bc.get_balance(bob_address);
+    let dealer_bal = bc.get_balance(dealer_address);
+    
+    println!("🧪 Test Account Status (Real Ed25519 Addresses):");
     println!("   ┌─────────────────────────────────────────────────────────┐");
-    println!("   │ TREASURY → Test Account Airdrops                        │");
-    println!("   └─────────────────────────────────────────────────────────┘");
     
-    // Fund test accounts via Treasury transfers (proper blockchain transactions)
-    let alice_hash = strip_prefix(alice_address);
-    let bob_hash = strip_prefix(bob_address);
-    let dealer_hash = strip_prefix(dealer_address);
+    let mut funded_any = false;
     
-    // Create airdrop transactions from Treasury
-    let _ = bc.create_transaction(
-        TREASURY_ADDRESS.to_string(),
-        alice_hash.clone(),
-        alice_balance,
-    );
-    
-    let _ = bc.create_transaction(
-        TREASURY_ADDRESS.to_string(),
-        bob_hash.clone(),
-        bob_balance,
-    );
-    
-    let _ = bc.create_transaction(
-        TREASURY_ADDRESS.to_string(),
-        dealer_hash.clone(),
-        dealer_balance,
-    );
-    
-    // Mine the airdrop transactions (with persistence!)
-    if let Err(e) = bc.mine_and_persist("genesis_airdrop".to_string()) {
-        eprintln!("⚠️  Mining airdrop failed: {}", e);
+    // Only fund if balance is zero (first run)
+    if alice_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            alice_address.to_string(),
+            alice_initial,
+        );
+        println!("   │ 💸 Alice:  {} BB ← Treasury (NEW)         │", alice_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 👛 Alice:  {} BB (persisted)                   │", alice_bal);
     }
     
-    println!("   💸 Alice:  {:>10} BB ← Treasury", alice_balance);
-    println!("   💸 Bob:    {:>10} BB ← Treasury", bob_balance);
-    println!("   💸 Dealer: {:>10} BB ← Treasury (House Bankroll)", dealer_balance);
+    if bob_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            bob_address.to_string(),
+            bob_initial,
+        );
+        println!("   │ 💸 Bob:    {} BB ← Treasury (NEW)          │", bob_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 👛 Bob:    {} BB (persisted)                    │", bob_bal);
+    }
     
-    let treasury_remaining = bc.get_balance(TREASURY_ADDRESS);
-    println!("\n   📊 Treasury Remaining: {:.0} BB", treasury_remaining);
-    println!("✅ Test accounts funded via Treasury transactions (persisted to Sled)");
+    if dealer_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            dealer_address.to_string(),
+            dealer_initial,
+        );
+        println!("   │ 💸 Dealer: {} BB ← Treasury (NEW)       │", dealer_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 🎰 Dealer: {} BB (persisted)                 │", dealer_bal);
+    }
+    
+    println!("   └─────────────────────────────────────────────────────────┘");
+    
+    // Only mine if we funded any accounts
+    if funded_any {
+        if let Err(e) = bc.mine_and_persist("genesis_airdrop".to_string()) {
+            eprintln!("⚠️  Mining airdrop failed: {}", e);
+        }
+        println!("✅ New accounts funded from Treasury (persisted to Sled)");
+    } else {
+        println!("✅ All accounts loaded from persistent storage");
+    }
 }
 
 fn seed_test_accounts_enhanced(bc: &mut EnhancedBlockchain) {
-    // Same logic but for EnhancedBlockchain (JSON mode)
+    // ========================================================================
+    // TEST ACCOUNT INITIALIZATION (Development Only)
+    // ========================================================================
+    // Real Ed25519 derived addresses for Alice, Bob, and Dealer
+    // These match the SDK TEST_ACCOUNTS for consistent testing
+    // 
+    // PERSISTENCE: Only fund accounts if they have zero balance.
+    // Real crypto addresses persist their balances across sessions.
+    // ========================================================================
+    
     use crate::protocol::blockchain::TREASURY_ADDRESS;
-    use crate::unified_wallet::strip_prefix;
     
-    // New secure format test accounts
-    let alice_address = "L1_ALICE000000001";
-    let bob_address = "L1_BOB00000000001";
-    let dealer_address = "L2DEALER00000001";
-    let alice_balance = 10000.0;
-    let bob_balance = 5000.0;
-    let dealer_balance = 100000.0;
+    // Real cryptographic test accounts (Ed25519 derived)
+    let alice_address = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
+    let bob_address = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
+    let dealer_address = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
     
-    println!("🧪 Funding Test Accounts from Treasury (Development Mode):");
+    // Initial funding amounts (only applied if balance is 0)
+    let alice_initial = 20000.0;
+    let bob_initial = 10000.0;
+    let dealer_initial = 100000.0;
     
-    let alice_hash = strip_prefix(alice_address);
-    let bob_hash = strip_prefix(bob_address);
-    let dealer_hash = strip_prefix(dealer_address);
+    // Check existing balances (persistence!)
+    let alice_bal = bc.get_balance(alice_address);
+    let bob_bal = bc.get_balance(bob_address);
+    let dealer_bal = bc.get_balance(dealer_address);
     
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), alice_hash, alice_balance);
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), bob_hash, bob_balance);
-    let _ = bc.create_transaction(TREASURY_ADDRESS.to_string(), dealer_hash, dealer_balance);
+    println!("🧪 Test Account Status (Real Ed25519 Addresses):");
+    println!("   ┌─────────────────────────────────────────────────────────┐");
     
-    let _ = bc.mine_pending_transactions("genesis_airdrop".to_string());
+    let mut funded_any = false;
     
-    println!("   💸 Alice:  {:>10} BB ← Treasury", alice_balance);
-    println!("   💸 Bob:    {:>10} BB ← Treasury", bob_balance);
-    println!("   💸 Dealer: {:>10} BB ← Treasury", dealer_balance);
-    println!("✅ Test accounts funded (JSON mode)");
+    // Only fund if balance is zero (first run)
+    if alice_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            alice_address.to_string(),
+            alice_initial,
+        );
+        println!("   │ 💸 Alice:  {} BB ← Treasury (NEW)         │", alice_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 👛 Alice:  {} BB (persisted)                   │", alice_bal);
+    }
+    
+    if bob_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            bob_address.to_string(),
+            bob_initial,
+        );
+        println!("   │ 💸 Bob:    {} BB ← Treasury (NEW)          │", bob_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 👛 Bob:    {} BB (persisted)                    │", bob_bal);
+    }
+    
+    if dealer_bal == 0.0 {
+        let _ = bc.create_transaction(
+            TREASURY_ADDRESS.to_string(),
+            dealer_address.to_string(),
+            dealer_initial,
+        );
+        println!("   │ 💸 Dealer: {} BB ← Treasury (NEW)       │", dealer_initial);
+        funded_any = true;
+    } else {
+        println!("   │ 🎰 Dealer: {} BB (persisted)                 │", dealer_bal);
+    }
+    
+    println!("   └─────────────────────────────────────────────────────────┘");
+    
+    // Only mine if we funded any accounts
+    if funded_any {
+        let _ = bc.mine_pending_transactions("genesis_airdrop".to_string());
+        println!("✅ New accounts funded from Treasury");
+    } else {
+        println!("✅ All accounts loaded from persistent storage");
+    }
 }
 
 fn save_blockchain(blockchain: &EnhancedBlockchain) {
@@ -389,17 +461,23 @@ async fn main() {
     // Initialize bridge state
     let bridge_state = Arc::new(Mutex::new(routes_v2::bridge::BridgeState::new()));
     
-    // Test account addresses (hardcoded for startup display)
-    let alice_l1 = "L1_ALICE000000001";
-    let bob_l1 = "L1_BOB00000000001";
-    let dealer_l1 = "L2DEALER00000001";
+    // Real Ed25519 test account addresses
+    let alice_l1 = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
+    let bob_l1 = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
+    let dealer_l1 = "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3";
     
-    println!("\n🧪 TEST ACCOUNTS:");
-    println!("┌──────────────────────────────────────────────────────────────────┐");
-    println!("│ 👛 ALICE:  {} - 10,000 BB  │", alice_l1);
-    println!("│ 👛 BOB:    {} - 5,000 BB   │", bob_l1);
-    println!("│ 🎰 DEALER: {} - 100,000 BB │", dealer_l1);
-    println!("└──────────────────────────────────────────────────────────────────┘");
+    // Get actual balances for display
+    let (alice_bal, bob_bal, dealer_bal) = {
+        let bc = blockchain.lock().unwrap();
+        (bc.get_balance(alice_l1), bc.get_balance(bob_l1), bc.get_balance(dealer_l1))
+    };
+    
+    println!("\n🧪 TEST ACCOUNTS (Real Ed25519 Addresses):");
+    println!("┌────────────────────────────────────────────────────────────────────────────┐");
+    println!("│ 👛 ALICE:  {}  {:>10} BB │", alice_l1, alice_bal);
+    println!("│ 👛 BOB:    {}  {:>10} BB │", bob_l1, bob_bal);
+    println!("│ 🎰 DEALER: {}  {:>10} BB │", dealer_l1, dealer_bal);
+    println!("└────────────────────────────────────────────────────────────────────────────┘");
     println!("  💡 Use /balance/<address> to check balances");
     println!("  💡 Use /transfer with SignedRequest to transfer BB tokens");
     
@@ -423,6 +501,7 @@ async fn main() {
     let rpc = routes_v2::rpc::rpc_route(bc3);
     let poh_status = routes_v2::rpc::poh_status_route(poh_service.clone());
     let poh_verify = routes_v2::rpc::poh_verify_route(poh_service.clone());
+    let ledger = routes_v2::rpc::ledger_route(blockchain.clone());
     
     // Auth routes
     let keypair = routes_v2::auth::generate_keypair_route();
@@ -512,6 +591,7 @@ async fn main() {
         .or(rpc)
         .or(poh_status)
         .or(poh_verify)
+        .or(ledger)
         .or(keypair)
         .or(test_accounts)
         .or(verify)

@@ -192,7 +192,7 @@ async function runExponentialTransfers() {
   const MULTIPLIER = 5;
   let amount = 5;  // Start at 5 BB
   let round = 1;
-  let aliceToBoB = true;  // First transfer: Alice → Bob
+  let aliceToBoB = false;  // First transfer: Bob → Alice (alternating)
   
   const results = [];
   
@@ -264,6 +264,9 @@ async function runExponentialTransfers() {
     round++;
     amount *= MULTIPLIER;
     aliceToBoB = !aliceToBoB;  // Alternate direction
+    
+    // Add delay between transfers for realistic timing
+    await new Promise(resolve => setTimeout(resolve, 50));
     
     // Safety limit (prevent infinite loops)
     if (round > 20) {

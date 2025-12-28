@@ -689,3 +689,210 @@ fn verify_signature(public_key: &str, message: &str, signature: &str) -> Result<
         Err(_) => Ok(false),
     }
 }
+
+// ============================================================================
+// LEDGER ROUTE - Human-Readable Transaction History
+// ============================================================================
+
+use crate::runtime::core::TransactionType;
+use chrono::{TimeZone, Utc, Local};
+
+/// GET /ledger - Display all L1 transactions in human-readable format (public)
+/// 
+/// Returns a text/plain response with formatted transaction history
+pub fn ledger_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("ledger")
+        .and(warp::get())
+        .and_then(move || {
+            let blockchain = blockchain.clone();
+            async move {
+                let ledger_text = {
+                    let bc = lock_or_recover(&blockchain);
+                    format_ledger(&bc)
+                };
+                
+                println!("📒 Ledger requested");
+                
+                Ok::<_, warp::Rejection>(
+                    warp::reply::with_header(
+                        ledger_text,
+                        "Content-Type",
+                        "text/plain; charset=utf-8"
+                    )
+                )
+            }
+        })
+}
+
+/// Format the entire blockchain ledger as human-readable text
+fn format_ledger(bc: &EnhancedBlockchain) -> String {
+    let mut output = String::new();
+    
+    // Header
+    output.push_str("╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    output.push_str("║                                         L1 BLACKBOOK LEDGER                                                      ║\n");
+    output.push_str("╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣\n");
+    
+    // Collect all transactions from all blocks
+    let mut all_txs: Vec<(u64, &crate::runtime::core::Transaction, u64)> = Vec::new(); // (block_index, tx, block_timestamp)
+    
+    for block in &bc.chain {
+        // Skip genesis block (no transactions)
+        if block.index == 0 && block.financial_txs.is_empty() && block.social_txs.is_empty() && block.transactions.is_empty() {
+            continue;
+        }
+        
+        // Collect from financial_txs
+        for tx in &block.financial_txs {
+            all_txs.push((block.index, tx, block.timestamp));
+        }
+        
+        // Collect from social_txs
+        for tx in &block.social_txs {
+            all_txs.push((block.index, tx, block.timestamp));
+        }
+        
+        // Collect from legacy transactions field (backward compat)
+        for tx in &block.transactions {
+            all_txs.push((block.index, tx, block.timestamp));
+        }
+    }
+    
+    if all_txs.is_empty() {
+        output.push_str("║  No transactions recorded yet.                                                                                   ║\n");
+    } else {
+        // Sort by timestamp (newest first)
+        all_txs.sort_by(|a, b| b.1.timestamp.cmp(&a.1.timestamp));
+        
+        for (_block_idx, tx, _block_ts) in &all_txs {
+            let line = format_transaction(tx);
+            output.push_str(&format!("║  {}  ║\n", line));
+        }
+    }
+    
+    output.push_str("╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣\n");
+    
+    // Summary
+    let total_txs = all_txs.len();
+    let total_blocks = bc.chain.len();
+    let total_supply: f64 = bc.balances.values().sum();
+    
+    // Get Alice and Bob balances (test accounts)
+    let alice_addr = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
+    let bob_addr = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
+    let alice_bal = *bc.balances.get(alice_addr).unwrap_or(&0.0);
+    let bob_bal = *bc.balances.get(bob_addr).unwrap_or(&0.0);
+    
+    // Format supply with commas manually
+    let supply_str = format_with_commas(total_supply);
+    let alice_str = format_with_commas(alice_bal);
+    let bob_str = format_with_commas(bob_bal);
+    
+    output.push_str(&format!("║  👛 Alice: {} BB  |  👛 Bob: {} BB                                                           ║\n",
+        alice_str, bob_str));
+    output.push_str(&format!("║  Total Transactions: {:5}  |  Blocks: {:5}  |  Circulating Supply: {} BB                               ║\n", 
+        total_txs, total_blocks, supply_str));
+    output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
+    
+    output
+}
+
+/// Format a number with commas as thousands separators
+fn format_with_commas(n: f64) -> String {
+    let whole = n.trunc() as i64;
+    let frac = ((n.fract() * 100.0).round() as i64).abs();
+    
+    // Format whole part with commas
+    let whole_str = whole.abs().to_string();
+    let mut result = String::new();
+    let sign = if whole < 0 { "-" } else { "" };
+    
+    for (i, c) in whole_str.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+    }
+    
+    format!("{}{}.{:02}", sign, result, frac)
+}
+
+/// Format a single transaction as a ledger line
+fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
+    // Abbreviate addresses: L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD -> L1_BF1...B5DD
+    let from_abbr = abbreviate_address(&tx.from);
+    let to_abbr = abbreviate_address(&tx.to);
+    
+    // Transaction type string
+    let tx_type_str = match tx.tx_type {
+        TransactionType::Transfer => "TRANSFER",
+        TransactionType::BetPlacement => "BET_PLACE",
+        TransactionType::BetResolution => "BET_RESOLVE",
+        TransactionType::SocialAction => "SOCIAL",
+        TransactionType::StakeDeposit => "STAKE_IN",
+        TransactionType::StakeWithdraw => "STAKE_OUT",
+        TransactionType::SystemReward => "SYS_REWARD",
+    };
+    
+    // Build description based on type
+    let description = match tx.tx_type {
+        TransactionType::Transfer => format!("{:.2} BB → {}", tx.amount, to_abbr),
+        TransactionType::BetPlacement => format!("{:.2} BB bet placed", tx.amount),
+        TransactionType::BetResolution => format!("{:.2} BB bet resolved", tx.amount),
+        TransactionType::SocialAction => "social action".to_string(),
+        TransactionType::StakeDeposit => format!("{:.2} BB staked", tx.amount),
+        TransactionType::StakeWithdraw => format!("{:.2} BB unstaked", tx.amount),
+        TransactionType::SystemReward => format!("{:.2} BB reward", tx.amount),
+    };
+    
+    // Abbreviate tx id
+    let tx_id_abbr = abbreviate_tx_id(&tx.id);
+    
+    // Format timestamp
+    let timestamp_str = format_timestamp(tx.timestamp);
+    
+    // Build the line (padded to fixed width)
+    format!("{:<14} | {:<10} | {:<30} | tx:{:<12} | [{}]",
+        from_abbr,
+        tx_type_str,
+        description,
+        tx_id_abbr,
+        timestamp_str
+    )
+}
+
+/// Abbreviate an address: L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD -> L1_BF1...B5DD
+fn abbreviate_address(addr: &str) -> String {
+    if addr.len() > 14 {
+        let prefix = &addr[..7];  // "L1_BF15"
+        let suffix = &addr[addr.len()-4..];  // "B5DD"
+        format!("{}...{}", prefix, suffix)
+    } else {
+        addr.to_string()
+    }
+}
+
+/// Abbreviate transaction ID: a1b2c3d4-e5f6-... -> a1b2...e5f6
+fn abbreviate_tx_id(id: &str) -> String {
+    if id.len() > 12 {
+        let prefix = &id[..4];
+        let suffix = &id[id.len()-4..];
+        format!("{}...{}", prefix, suffix)
+    } else {
+        id.to_string()
+    }
+}
+
+/// Format Unix timestamp to human-readable datetime
+fn format_timestamp(timestamp: u64) -> String {
+    match Utc.timestamp_opt(timestamp as i64, 0) {
+        chrono::LocalResult::Single(dt) => {
+            // Convert to local time and format
+            let local = dt.with_timezone(&Local);
+            local.format("%Y-%m-%d %H:%M:%S").to_string()
+        },
+        _ => format!("{}", timestamp)
+    }
+}

@@ -61,9 +61,8 @@ pub fn generate_keypair_route() -> impl Filter<Extract = impl warp::Reply, Error
 
 /// GET /auth/test-accounts - Get Alice & Bob test accounts with full credentials
 /// 
-/// Returns comprehensive test accounts with UNIFIED WALLET MODEL.
-/// Alice: 10,000 BB starting balance
-/// Bob: 5,000 BB starting balance
+/// Returns comprehensive test accounts with REAL Ed25519 addresses.
+/// Balances persist across server restarts.
 pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("auth")
         .and(warp::path("test-accounts"))
@@ -71,32 +70,32 @@ pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = 
         .and_then(|| async move {
             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                 "success": true,
-                "message": "UNIFIED WALLET MODEL - Test accounts for L1 and L2",
+                "message": "Real Ed25519 test accounts - balances persist across sessions",
                 "alice": {
                     "name": "Alice",
                     "username": "alice_test",
                     "email": "alice@blackbook.test",
-                    "l1_address": "L1_ALICE000000001",
-                    "public_key": "c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705",
-                    "private_key": "18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24",
-                    "initial_balance": 10000.0
+                    "l1_address": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+                    "seed": "18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24",
+                    "initial_balance": 20000.0,
+                    "note": "Use seed with nacl.sign.keyPair.fromSeed() to derive keypair"
                 },
                 "bob": {
                     "name": "Bob",
                     "username": "bob_test",
                     "email": "bob@blackbook.test",
-                    "l1_address": "L1_BOB00000000001",
-                    "public_key": "582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a",
-                    "private_key": "e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b",
-                    "initial_balance": 5000.0
+                    "l1_address": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+                    "seed": "e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b",
+                    "initial_balance": 10000.0,
+                    "note": "Use seed with nacl.sign.keyPair.fromSeed() to derive keypair"
                 },
                 "dealer": {
                     "name": "Dealer",
                     "l1_address": "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
-                    "public_key": "d9d4a8d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3",
-                    "initial_balance": 100000.0
+                    "initial_balance": 100000.0,
+                    "note": "House bankroll - private key in .env only"
                 },
-                "note": "⚠️ PRIVATE KEYS EXPOSED - For testing only!"
+                "warning": "⚠️ Seeds exposed - For testing only!"
             })))
         })
 }

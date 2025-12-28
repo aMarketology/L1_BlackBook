@@ -797,9 +797,25 @@ impl EnhancedBlockchain {
         self.current_poh_hash = format!("{:x}", Sha256::digest(tick_input.as_bytes()));
         
         let engagement_score = self.calculate_block_engagement_score(&transactions);
-        let engagement_threshold = 5.0;
         
-        if engagement_score >= engagement_threshold {
+        // Check if we have any financial transactions (transfers, bets, etc.)
+        // Financial transactions should ALWAYS be committed regardless of engagement score
+        let has_financial_txs = transactions.iter().any(|tx| 
+            matches!(tx.tx_type, 
+                TransactionType::Transfer | 
+                TransactionType::BetPlacement | 
+                TransactionType::BetResolution |
+                TransactionType::StakeDeposit |
+                TransactionType::StakeWithdraw |
+                TransactionType::SystemReward
+            )
+        );
+        
+        // Only require engagement threshold for pure social blocks
+        // Financial transactions are always committed
+        let engagement_threshold = if has_financial_txs { 0.0 } else { 5.0 };
+        
+        if engagement_score >= engagement_threshold || has_financial_txs {
             let (financial_txs, social_txs): (Vec<_>, Vec<_>) = transactions.into_iter()
                 .partition(|tx| matches!(tx.tx_type, 
                     TransactionType::Transfer | 
