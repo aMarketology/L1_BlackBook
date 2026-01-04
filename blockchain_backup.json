@@ -18,9 +18,9 @@
     },
     {
       "index": 1,
-      "timestamp": 1766894697,
+      "timestamp": 1767558182,
       "previous_hash": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
-      "hash": "a3c2a98b427a19cf44ee86b3dfbfc9352f015dd7a66a64dbc2150c96d48cbdbd",
+      "hash": "38d4adb3a7c95b9339e5e9d2fe216a13795692088dda7fb9fcdbb52a93fab15e",
       "slot": 0,
       "poh_hash": "567f35021a2fa095f8c1cff2e124f57a0228d0ece2b18bc103e3945efa48a3b4",
       "parent_slot": 0,
@@ -31,336 +31,27 @@
       "transactions": [],
       "engagement_score": 0.0,
       "tx_count": 0
-    },
-    {
-      "index": 2,
-      "timestamp": 1766894829,
-      "previous_hash": "a3c2a98b427a19cf44ee86b3dfbfc9352f015dd7a66a64dbc2150c96d48cbdbd",
-      "hash": "75e6f0da9054c6ad014b36496cbccfcf58ea6791890a379ede5d1050c24d49af",
-      "slot": 2,
-      "poh_hash": "77cf6f81ce517064815ec276b62000f744e8b60b70741e99f3b3be6dbbd2804d",
-      "parent_slot": 0,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 5.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "1bc0d72f-831c-4292-a353-95bd55c38777"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 5.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "1bc0d72f-831c-4292-a353-95bd55c38777"
-        }
-      ],
-      "engagement_score": 2.0,
-      "tx_count": 1
-    },
-    {
-      "index": 3,
-      "timestamp": 1766894829,
-      "previous_hash": "75e6f0da9054c6ad014b36496cbccfcf58ea6791890a379ede5d1050c24d49af",
-      "hash": "81c121fcdd525649b003114cd3b334a4478a1dcb20aabc4fbe15cb2432a2e630",
-      "slot": 3,
-      "poh_hash": "11419a0aba2578a20d3151836fc6dd000bb3df45d23f2c2497bb4b330c614d9a",
-      "parent_slot": 2,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 25.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "56b2af70-dfde-4000-8452-11a3a81a8cee"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 25.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "56b2af70-dfde-4000-8452-11a3a81a8cee"
-        }
-      ],
-      "engagement_score": 3.5,
-      "tx_count": 1
-    },
-    {
-      "index": 4,
-      "timestamp": 1766894829,
-      "previous_hash": "81c121fcdd525649b003114cd3b334a4478a1dcb20aabc4fbe15cb2432a2e630",
-      "hash": "75af09fb6ad5742b9c82950738bd9c89fd22df8410d8bd726ad70c2c12363221",
-      "slot": 4,
-      "poh_hash": "4e0a34de053fe716c6b4e58c837139c4ae0da92d6c32b7ce328f43870fb9daa8",
-      "parent_slot": 3,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 125.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "7c7476ac-7b7d-4bbd-9a12-d82bbcaabd7c"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 125.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "7c7476ac-7b7d-4bbd-9a12-d82bbcaabd7c"
-        }
-      ],
-      "engagement_score": 3.5,
-      "tx_count": 1
-    },
-    {
-      "index": 5,
-      "timestamp": 1766894829,
-      "previous_hash": "75af09fb6ad5742b9c82950738bd9c89fd22df8410d8bd726ad70c2c12363221",
-      "hash": "8a4c612880b5903a48478a10136c316fc10531a75848af238aaa8a5a52dbb928",
-      "slot": 5,
-      "poh_hash": "0ee3bdcd4f6a9034dd1369e9b5d4c731fe7542d63d01f03888f28b5f4d3db322",
-      "parent_slot": 4,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 625.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "2bb8269d-70b8-4a61-8427-b9569aa399fb"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 625.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "2bb8269d-70b8-4a61-8427-b9569aa399fb"
-        }
-      ],
-      "engagement_score": 3.5,
-      "tx_count": 1
-    },
-    {
-      "index": 6,
-      "timestamp": 1766894829,
-      "previous_hash": "8a4c612880b5903a48478a10136c316fc10531a75848af238aaa8a5a52dbb928",
-      "hash": "0a1fa3b936dd3c2900dece2a12dd0d8e12de268c0ef2b4bca0b249a9b2e209df",
-      "slot": 6,
-      "poh_hash": "8518723e084e87deae0a2da581878332359b5db16f4d789994b3803735d9ff44",
-      "parent_slot": 5,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 3125.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "c4077ac0-388b-454b-88db-39236e7bbab7"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "to": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "amount": 3125.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "write_accounts": [
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "tx_type": "Transfer",
-          "id": "c4077ac0-388b-454b-88db-39236e7bbab7"
-        }
-      ],
-      "engagement_score": 3.5,
-      "tx_count": 1
-    },
-    {
-      "index": 7,
-      "timestamp": 1766894829,
-      "previous_hash": "0a1fa3b936dd3c2900dece2a12dd0d8e12de268c0ef2b4bca0b249a9b2e209df",
-      "hash": "c947b1ff23ab217e17b819dedd11299a7f9f2993aff8a5d99cc8b61639e83999",
-      "slot": 7,
-      "poh_hash": "16b29afd0a9ea7945d69531accf601a405db2ac2c42ac58a3d34d390a62c1c33",
-      "parent_slot": 6,
-      "sequencer": "transfer_miner",
-      "leader": "transfer_miner",
-      "financial_txs": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 15625.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "a1dd2a9d-0ee9-4a25-b0a4-d40985f5337c"
-        }
-      ],
-      "social_txs": [],
-      "transactions": [
-        {
-          "from": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-          "to": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
-          "amount": 15625.0,
-          "timestamp": 1766894829,
-          "signature": "",
-          "read_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD"
-          ],
-          "write_accounts": [
-            "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-            "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9"
-          ],
-          "tx_type": "Transfer",
-          "id": "a1dd2a9d-0ee9-4a25-b0a4-d40985f5337c"
-        }
-      ],
-      "engagement_score": 3.5,
-      "tx_count": 1
     }
   ],
   "pending_transactions": [],
   "balances": {
-    "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100000.0,
-    "transfer_miner": 39.0,
-    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 6980.0,
-    "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": 23020.0,
-    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": 1000000000.0
+    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": 1000000000.0,
+    "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433": 10000.0,
+    "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8": 20000.0,
+    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 20000.0,
+    "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": 10000.0,
+    "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC": 100000.0,
+    "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100000.0
   },
   "mining_reward": 10.0,
   "daily_jackpot": 0.0,
-  "jackpot_last_reset": 1766894697,
-  "current_slot": 7,
-  "current_poh_hash": "16b29afd0a9ea7945d69531accf601a405db2ac2c42ac58a3d34d390a62c1c33",
-  "engagement_stakes": {
-    "transfer_miner": 8.618999272549482
-  },
+  "jackpot_last_reset": 1767558182,
+  "current_slot": 1,
+  "current_poh_hash": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
+  "engagement_stakes": {},
   "username_balances": {},
   "address_to_username": {},
   "accounts": {
-    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": {
-      "lamports": 1000000000000000,
-      "nonce": 0,
-      "owner": "SYSTEM",
-      "data_hash": "",
-      "created_slot": 0,
-      "last_modified_slot": 0,
-      "rent_exempt": true
-    },
     "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": {
       "lamports": 20000000000,
       "nonce": 0,
@@ -387,16 +78,46 @@
       "created_slot": 1,
       "last_modified_slot": 1,
       "rent_exempt": true
+    },
+    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": {
+      "lamports": 1000000000000000,
+      "nonce": 0,
+      "owner": "SYSTEM",
+      "data_hash": "",
+      "created_slot": 0,
+      "last_modified_slot": 0,
+      "rent_exempt": true
+    },
+    "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC": {
+      "lamports": 100000000000,
+      "nonce": 0,
+      "owner": "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC",
+      "data_hash": "",
+      "created_slot": 2,
+      "last_modified_slot": 2,
+      "rent_exempt": true
+    },
+    "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8": {
+      "lamports": 20000000000,
+      "nonce": 0,
+      "owner": "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8",
+      "data_hash": "",
+      "created_slot": 2,
+      "last_modified_slot": 2,
+      "rent_exempt": true
+    },
+    "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433": {
+      "lamports": 10000000000,
+      "nonce": 0,
+      "owner": "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433",
+      "data_hash": "",
+      "created_slot": 2,
+      "last_modified_slot": 2,
+      "rent_exempt": true
     }
   },
   "recent_blockhashes": {
-    "4": "75af09fb6ad5742b9c82950738bd9c89fd22df8410d8bd726ad70c2c12363221",
-    "3": "81c121fcdd525649b003114cd3b334a4478a1dcb20aabc4fbe15cb2432a2e630",
-    "0": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
-    "2": "75e6f0da9054c6ad014b36496cbccfcf58ea6791890a379ede5d1050c24d49af",
-    "6": "0a1fa3b936dd3c2900dece2a12dd0d8e12de268c0ef2b4bca0b249a9b2e209df",
-    "7": "c947b1ff23ab217e17b819dedd11299a7f9f2993aff8a5d99cc8b61639e83999",
-    "5": "8a4c612880b5903a48478a10136c316fc10531a75848af238aaa8a5a52dbb928"
+    "0": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b"
   },
   "locked_balances": {},
   "lock_records": {}

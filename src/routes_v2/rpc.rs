@@ -834,6 +834,8 @@ fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
         TransactionType::StakeDeposit => "STAKE_IN",
         TransactionType::StakeWithdraw => "STAKE_OUT",
         TransactionType::SystemReward => "SYS_REWARD",
+        TransactionType::Mint => "MINT",
+        TransactionType::Burn => "BURN",
     };
     
     // Build description based on type
@@ -845,6 +847,8 @@ fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
         TransactionType::StakeDeposit => format!("{:.2} BB staked", tx.amount),
         TransactionType::StakeWithdraw => format!("{:.2} BB unstaked", tx.amount),
         TransactionType::SystemReward => format!("{:.2} BB reward", tx.amount),
+        TransactionType::Mint => format!("{:.2} BB minted", tx.amount),
+        TransactionType::Burn => format!("{:.2} BB burned", tx.amount),
     };
     
     // Abbreviate tx id

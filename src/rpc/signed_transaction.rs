@@ -71,6 +71,10 @@ pub enum SignedTxType {
     BetPlacement = 7,
     /// Bet resolution
     BetResolution = 8,
+    /// Token minting
+    Mint = 9,
+    /// Token burning
+    Burn = 10,
 }
 
 impl From<TransactionType> for SignedTxType {
@@ -83,6 +87,8 @@ impl From<TransactionType> for SignedTxType {
             TransactionType::SystemReward => SignedTxType::System,
             TransactionType::BetPlacement => SignedTxType::BetPlacement,
             TransactionType::BetResolution => SignedTxType::BetResolution,
+            TransactionType::Mint => SignedTxType::Mint,
+            TransactionType::Burn => SignedTxType::Burn,
         }
     }
 }

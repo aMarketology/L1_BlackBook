@@ -192,7 +192,11 @@ async function runExponentialTransfers() {
   const MULTIPLIER = 5;
   let amount = 5;  // Start at 5 BB
   let round = 1;
-  let aliceToBoB = false;  // First transfer: Bob → Alice (alternating)
+  
+  // DYNAMIC START: Whoever has MORE balance sends first
+  // This ensures tests work regardless of previous runs
+  let aliceToBoB = aliceBalance >= bobBalance;
+  console.log(`📍 Starting with ${aliceToBoB ? 'Alice' : 'Bob'} (higher balance: ${aliceToBoB ? aliceBalance : bobBalance} BB)`);
   
   const results = [];
   

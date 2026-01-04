@@ -37,8 +37,10 @@ pub fn balance_route(
                 
                 let (available, locked, total) = {
                     let bc = lock_or_recover(&blockchain);
-                    let total = bc.get_balance(&base_addr);
-                    let locked = bc.get_locked_balance(&base_addr);
+                    // Use L1 address for balance lookup (get_balance normalizes internally)
+                    // Also check base_addr for backwards compatibility
+                    let total = bc.get_balance(&l1_addr).max(bc.get_balance(&base_addr));
+                    let locked = bc.get_locked_balance(&l1_addr).max(bc.get_locked_balance(&base_addr));
                     let available = (total - locked).max(0.0);
                     (available, locked, total)
                 };
@@ -81,8 +83,9 @@ pub fn wallet_info_route(
                 
                 let (available, locked, total, sent_count, received_count, total_sent, total_received) = {
                     let bc = lock_or_recover(&blockchain);
-                    let total = bc.get_balance(&base_addr);
-                    let locked = bc.get_locked_balance(&base_addr);
+                    // Use L1 address for balance lookup, with fallback to base_addr
+                    let total = bc.get_balance(&l1_addr).max(bc.get_balance(&base_addr));
+                    let locked = bc.get_locked_balance(&l1_addr).max(bc.get_locked_balance(&base_addr));
                     let available = (total - locked).max(0.0);
                     
                     let mut sent_count = 0;
