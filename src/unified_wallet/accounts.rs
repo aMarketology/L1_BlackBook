@@ -34,30 +34,34 @@ impl std::fmt::Display for WalletId {
 }
 
 /// L1 Account - Bank/Vault (SOURCE OF TRUTH)
+/// Holds $BC (BlackCoin) - the L1 native token
+/// Amounts stored as f64: 1.00 = $1, 0.01 = 1 cent
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L1Account {
-    pub available: u64,  // microtokens (1 BB = 1_000_000)
-    pub locked: u64,
+    pub available: f64,  // $BC balance (e.g., 100.50 = $100.50)
+    pub locked: f64,
     pub last_sync: u64,
 }
 
 impl L1Account {
     pub fn new() -> Self { Self::default() }
-    pub fn with_balance(amount: u64) -> Self { L1Account { available: amount, ..Default::default() } }
-    pub fn available_bb(&self) -> f64 { self.available as f64 / 1_000_000.0 }
+    pub fn with_balance(amount: f64) -> Self { L1Account { available: amount, ..Default::default() } }
+    pub fn available_bc(&self) -> f64 { self.available }
 }
 
 /// L2 Account - Gaming Layer (NO available field = invariant enforced!)
+/// Holds $BB (BlackBook) - L2 gaming token, 1:1 backed by locked $BC
+/// Amounts stored as f64: 1.00 = $1, 0.01 = 1 cent
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L2Account {
-    pub locked: u64,           // Active bets only
+    pub locked: f64,           // Active bets only ($BB)
     pub active_bet_count: u32,
     pub last_sync: u64,
 }
 
 impl L2Account {
     pub fn new() -> Self { Self::default() }
-    pub fn locked_bb(&self) -> f64 { self.locked as f64 / 1_000_000.0 }
+    pub fn locked_bb(&self) -> f64 { self.locked }
 }
 
 /// Wallet errors
@@ -66,14 +70,13 @@ pub enum WalletError {
     #[error("Invalid wallet ID")]
     InvalidWalletId,
     #[error("Insufficient funds: need {required}, have {available}")]
-    InsufficientFunds { required: u64, available: u64 },
+    InsufficientFunds { required: f64, available: f64 },
     #[error("Account not found: {0}")]
     AccountNotFound(String),
 }
 
-/// BB to microtokens
-pub fn bb_to_microtokens(bb: f64) -> u64 { (bb * 1_000_000.0) as u64 }
-pub fn microtokens_to_bb(mt: u64) -> f64 { mt as f64 / 1_000_000.0 }
+// Removed microtoken conversions - now using direct f64 values
+// 1.00 = $1, 0.01 = 1 cent
 
 // ============================================================================
 // ADDRESS HELPERS - L1/L2 prefix system

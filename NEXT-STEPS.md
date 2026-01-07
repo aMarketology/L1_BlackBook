@@ -206,8 +206,24 @@ Complete the casino-bank architecture for instant L2 bets.
 | 4.1 | Start gambling session | `sdk/test-dealer-session.js` | ⬜ |
 | 4.2 | Real-time L1 balance query | `sdk/test-dealer-balance.js` | ⬜ |
 | 4.3 | Settle session (net P&L) | `sdk/test-dealer-settle.js` | ⬜ |
-| 4.4 | Credit line signature verification | `src/grpc/validator.rs` | ⬜ |
+| 4.4 | Credit line signature verification | `sdk/test-credit-line-grpc.js` | ✅ |
 | 4.5 | Dealer reimbursement flow | `src/routes_v2/bridge.rs` | ⬜ |
+
+### Test 4.4 Results (Credit Line Signature Verification)
+```
+TEST 4.4: Credit Line Signature Verification (gRPC) - 30/30 PASS ✅
+├── 4.4.1  gRPC Health Check           ✅
+├── 4.4.2  Get L1 Balances via gRPC    ✅
+├── 4.4.3  Ed25519 Signature Verification ✅
+├── 4.4.4  Alice Request Credit Line   ✅
+├── 4.4.5  Invalid Signature Rejected  ✅
+├── 4.4.6  Bob Request Credit Line     ✅
+├── 4.4.7  Credit Draw (Lock for L2)   ✅
+├── 4.4.8  Check Credit Status         ✅
+├── 4.4.9  Bridge Lock via gRPC        ✅
+├── 4.4.10 Credit Settle (End Session) ✅
+└── 4.4.11 Final Balance Check         ✅
+```
 
 ### Session Flow
 ```
@@ -219,6 +235,11 @@ Complete the casino-bank architecture for instant L2 bets.
    - User lost 500 BB → L1 debits -500 BB
 ```
 
+### Run Credit Line Tests
+```bash
+cd sdk && node test-credit-line-grpc.js   # 30/30 tests ✅
+```
+
 ### Tests to Run After M4
 ```bash
 cd sdk && node test-dealer-session.js
@@ -228,6 +249,8 @@ cd sdk && node test-dealer-settle.js
 ```
 
 ### Success Criteria
+- [x] Credit line signature verification works (Ed25519)
+- [x] gRPC credit operations (request, draw, settle, status)
 - [ ] Gambling sessions start/settle correctly
 - [ ] Dealer fronting works (instant bets)
 - [ ] Net P&L settles to L1 atomically

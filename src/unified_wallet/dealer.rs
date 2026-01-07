@@ -15,16 +15,17 @@ pub fn is_dealer(id: &str) -> bool {
 
 /// Dealer Pool - L2 liquidity provider
 /// 
-/// The Dealer fronts bets on L2 and later claims reimbursement from L1.
+/// The Dealer fronts bets on L2 ($BB) and later claims reimbursement from L1 ($BC).
 /// This is the L1-side representation of the Dealer's state.
+/// Amounts stored as f64: 1.00 = $1, 0.01 = 1 cent
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DealerPool {
-    /// Available balance (microtokens) - what the dealer can front
-    pub available: u64,
-    /// Total fronted but not yet settled (microtokens)
-    pub pending_settlements: u64,
-    /// Total settled lifetime (microtokens)
-    pub total_settled: u64,
+    /// Available balance ($BC) - what the dealer can front
+    pub available: f64,
+    /// Total fronted but not yet settled
+    pub pending_settlements: f64,
+    /// Total settled lifetime
+    pub total_settled: f64,
     /// Last sync timestamp
     pub last_sync: u64,
 }
@@ -32,18 +33,18 @@ pub struct DealerPool {
 impl DealerPool {
     pub fn new() -> Self { Self::default() }
     
-    pub fn with_seed(amount: u64) -> Self {
+    pub fn with_seed(amount: f64) -> Self {
         DealerPool {
             available: amount,
             ..Default::default()
         }
     }
     
-    pub fn available_bb(&self) -> f64 { self.available as f64 / 1_000_000.0 }
-    pub fn pending_bb(&self) -> f64 { self.pending_settlements as f64 / 1_000_000.0 }
+    pub fn available_bb(&self) -> f64 { self.available }
+    pub fn pending_bb(&self) -> f64 { self.pending_settlements }
     
     /// Front tokens for a bet (L2 operation)
-    pub fn front(&mut self, amount: u64) -> bool {
+    pub fn front(&mut self, amount: f64) -> bool {
         if self.available >= amount {
             self.available -= amount;
             self.pending_settlements += amount;

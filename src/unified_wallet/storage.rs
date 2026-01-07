@@ -1,28 +1,33 @@
-//! Dual Balance Storage - Two HashMaps + Dealer Pool
+//! Dual Balance Storage - Two HashMaps + Oracle Pool
 //!
-//! L1: Bank/Vault (available + locked)
-//! L2: Gaming Layer (locked only - bets in flight)
-//! Dealer: Counterparty pool on L2
+//! L1: Bank/Vault (available + locked) - $BC tokens
+//! L2: Gaming Layer (locked only - bets in flight) - $BB tokens
+//! Oracle: Oversees bridge operations between L1 and L2
 
-use super::{L1Account, L2Account, WalletId, DealerPool, bb_to_microtokens};
+use super::{L1Account, L2Account, WalletId, OraclePool};
 use std::collections::HashMap;
 
-/// Core storage: L1 accounts, L2 accounts, and the Dealer
+/// Core storage: L1 accounts, L2 accounts, and the Oracle
 #[derive(Debug, Default)]
 pub struct DualBalanceStorage {
     pub l1: HashMap<[u8; 14], L1Account>,
     pub l2: HashMap<[u8; 14], L2Account>,
-    pub dealer: DealerPool,
+    pub oracle: OraclePool,
 }
 
 impl DualBalanceStorage {
     pub fn new() -> Self { Self::default() }
     
-    pub fn with_dealer_seed(amount_bb: f64) -> Self {
-        DualBalanceStorage {
-            dealer: DealerPool::with_seed(bb_to_microtokens(amount_bb)),
+    pub fn with_oracle_seed(amount_bc: f64) -> Self {
+        Self {
+            oracle: OraclePool::with_seed(amount_bc),
             ..Default::default()
         }
+    }
+    
+    // Deprecated alias for backward compatibility
+    pub fn with_dealer_seed(amount_bb: f64) -> Self {
+        Self::with_oracle_seed(amount_bb)
     }
     
     // L1 Operations
@@ -34,11 +39,11 @@ impl DualBalanceStorage {
         self.l1.entry(*id.as_bytes()).or_default()
     }
     
-    pub fn credit_l1(&mut self, id: &WalletId, amount: u64) {
+    pub fn credit_l1(&mut self, id: &WalletId, amount: f64) {
         self.get_l1_mut(id).available += amount;
     }
     
-    pub fn debit_l1(&mut self, id: &WalletId, amount: u64) -> bool {
+    pub fn debit_l1(&mut self, id: &WalletId, amount: f64) -> bool {
         let acc = self.get_l1_mut(id);
         if acc.available >= amount {
             acc.available -= amount;
@@ -58,7 +63,7 @@ impl DualBalanceStorage {
     }
     
     /// JIT Bridge: L1.available → L2.locked (atomic)
-    pub fn bridge_to_l2(&mut self, id: &WalletId, amount: u64) -> bool {
+    pub fn bridge_to_l2(&mut self, id: &WalletId, amount: f64) -> bool {
         let l1 = self.get_l1_mut(id);
         if l1.available < amount { return false; }
         l1.available -= amount;
@@ -69,20 +74,20 @@ impl DualBalanceStorage {
         true
     }
     
-    /// Settle: L2.locked → L1 (win) or Dealer (loss)
-    pub fn settle(&mut self, id: &WalletId, stake: u64, payout: u64) -> bool {
+    /// Settle: L2.locked → L1 (win) or Oracle (loss)
+    pub fn settle(&mut self, id: &WalletId, stake: f64, payout: f64) -> bool {
         let l2 = self.get_l2_mut(id);
         if l2.locked < stake { return false; }
         l2.locked -= stake;
         l2.active_bet_count = l2.active_bet_count.saturating_sub(1);
         
-        if payout > 0 {
-            // Win: payout to L1, dealer pays the profit
+        if payout > 0.0 {
+            // Win: payout to L1, oracle facilitates the profit
             self.get_l1_mut(id).available += payout;
-            self.dealer.payout(payout.saturating_sub(stake)); // profit portion
+            self.oracle.payout((payout - stake).max(0.0)); // profit portion
         } else {
-            // Loss: stake goes to dealer
-            self.dealer.collect(stake);
+            // Loss: stake goes to oracle
+            self.oracle.collect(stake);
         }
         true
     }

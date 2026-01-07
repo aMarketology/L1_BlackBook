@@ -1,8 +1,12 @@
 // ============================================================================
 // BRIDGE ROUTES - Simplified L1 ↔ L2 Communication
 // ============================================================================
+// Token Naming:
+// - $BC (BlackCoin) = L1 native token
+// - $BB (BlackBook) = L2 gaming token (1:1 backed by locked $BC)
+//
 // Core functionality:
-// - Bridge tokens L1 → L2 (lock on L1)
+// - Bridge tokens L1 → L2 (lock $BC on L1, mint $BB on L2)
 // - Credit line management (Casino Bank Model)
 // - L2 State Root anchoring (Optimistic Rollup)
 // - Signature verification
@@ -17,6 +21,41 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::blockchain::{EnhancedBlockchain, LockPurpose};
 use crate::integration::unified_auth::SignedRequest;
 use crate::unified_wallet::strip_prefix;
+use ed25519_dalek::{SigningKey, Signer};
+
+// ============================================================================
+// L1 NODE SIGNING - Signs messages to prove L1 authority to L2
+// ============================================================================
+
+/// Get the L1 node's signing key from environment (DEALER_PRIVATE_KEY)
+fn get_l1_signing_key() -> Option<SigningKey> {
+    let key_hex = std::env::var("DEALER_PRIVATE_KEY").ok()?;
+    let key_bytes = hex::decode(&key_hex).ok()?;
+    if key_bytes.len() != 32 {
+        return None;
+    }
+    let key_array: [u8; 32] = key_bytes.try_into().ok()?;
+    Some(SigningKey::from_bytes(&key_array))
+}
+
+/// Get L1 node's public key (hex string)
+#[allow(dead_code)]
+fn get_l1_public_key() -> Option<String> {
+    let signing_key = get_l1_signing_key()?;
+    Some(hex::encode(signing_key.verifying_key().as_bytes()))
+}
+
+/// Sign a message with L1 node's key for L2 verification
+/// Format expected by L2: BRIDGE_LOCK:{user_address}:{amount}:{lock_id}
+fn sign_bridge_lock_message(user_address: &str, amount: f64, lock_id: &str) -> Option<(String, String)> {
+    let signing_key = get_l1_signing_key()?;
+    let message = format!("BRIDGE_LOCK:{}:{}:{}", user_address, amount, lock_id);
+    let signature = signing_key.sign(message.as_bytes());
+    let signature_hex = hex::encode(signature.to_bytes());
+    let public_key_hex = hex::encode(signing_key.verifying_key().as_bytes());
+    println!("🔐 L1 signing bridge lock: {}", message);
+    Some((signature_hex, public_key_hex))
+}
 
 // ============================================================================
 // REQUEST STRUCTURES FOR CREDIT OPERATIONS
@@ -320,10 +359,32 @@ pub fn bridge_initiate_route(
                 let l2_url = format!("{}/bridge/credit", L2_BASE_URL);
                 let l2_wallet = wallet_address.replace("L1_", "L2_");
                 
+                // Sign the bridge lock message for L2 verification
+                let (l1_signature, l1_public_key) = match sign_bridge_lock_message(
+                    &l2_wallet,
+                    payload.amount,
+                    &lock_id
+                ) {
+                    Some((sig, pk)) => (sig, pk),
+                    None => {
+                        println!("⚠️ L1 signing failed, proceeding without signature");
+                        (String::new(), String::new())
+                    }
+                };
+
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
                 let l2_payload = serde_json::json!({
-                    "wallet_address": l2_wallet,
+                    "user_address": l2_wallet,
                     "amount": payload.amount,
                     "lock_id": lock_id,
+                    "l1_public_key": l1_public_key,
+                    "l1_signature": l1_signature,
+                    "l1_tx_hash": lock_id,
+                    "timestamp": timestamp,
                     "source": "L1_bridge"
                 });
 
@@ -347,7 +408,7 @@ pub fn bridge_initiate_route(
                             Ok(json) => {
                                 let total_time = start_time.elapsed();
                                 println!("🌉 Bridge L1→L2 complete in {:?} (L1: {:?})", total_time, l1_lock_time);
-                                println!("   ✅ L2 credited {} BB to {}", payload.amount, l2_wallet);
+                                println!("   ✅ L2 credited {} $BB to {}", payload.amount, l2_wallet);
                                 Some(json)
                             }
                             Err(e) => {
@@ -379,7 +440,7 @@ pub fn bridge_initiate_route(
                     .and_then(|v| v.as_f64());
 
                 let total_time = start_time.elapsed();
-                println!("🌉 Bridge initiated: {} locked {} BB on L1 → L2 (total: {:?})", 
+                println!("🌉 Bridge initiated: {} locked {} $BC on L1 → $BB on L2 (total: {:?})", 
                          &wallet_address[..8], payload.amount, total_time);
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
@@ -442,7 +503,7 @@ pub fn credit_approve_route(
             let blockchain = blockchain.clone();
             let bridge_state = bridge_state.clone();
             async move {
-                println!("🏦 Credit approval: {} for {} BB", 
+                println!("🏦 Credit approval: {} for {} $BC", 
                          request.wallet_address, request.credit_limit);
 
                 // Verify signature
@@ -551,7 +612,7 @@ pub fn credit_approve_route(
                     state.add_session(session.clone());
                 }
 
-                println!("✅ Credit approved: {} - {} BB locked (lock_id: {})", 
+                println!("✅ Credit approved: {} - {} $BC locked (lock_id: {})", 
                          &approval_id[..16], request.credit_limit, &lock_id[..16]);
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
@@ -563,7 +624,7 @@ pub fn credit_approve_route(
                         "credit_limit": request.credit_limit,
                         "tokens_locked": request.credit_limit,
                     }),
-                    "message": format!("{} BB locked on L1 as credit line collateral", request.credit_limit)
+                    "message": format!("{} $BC locked on L1 as credit line collateral", request.credit_limit)
                 })))
             }
         })
@@ -713,7 +774,7 @@ pub fn credit_draw_route(
             let blockchain = blockchain.clone();
             let bridge_state = bridge_state.clone();
             async move {
-                println!("💳 Credit draw request: {} for {} BB", 
+                println!("💳 Credit draw request: {} for {} $BB", 
                          &request.wallet_address[..16], request.amount);
 
                 // Verify signature
@@ -817,8 +878,59 @@ pub fn credit_draw_route(
                 };
 
                 // Log the draw
-                println!("✅ Credit draw completed: {} drew {} BB (total: {}, available: {})", 
+                println!("✅ Credit draw completed: {} drew {} $BB (total: {}, available: {})", 
                          &request.wallet_address[..16], request.amount, new_total_drawn, new_available);
+
+                // ============================================================
+                // NOTIFY L2 - Send signed credit to L2 for balance update
+                // ============================================================
+                let l2_wallet = request.wallet_address.replace("L1_", "L2_");
+                let lock_id = format!("draw_{}_{}", approval_id, now);
+                
+                // Sign the bridge lock message for L2 verification
+                let (l1_signature, l1_public_key) = match sign_bridge_lock_message(
+                    &l2_wallet,
+                    request.amount,
+                    &lock_id
+                ) {
+                    Some((sig, pk)) => (sig, pk),
+                    None => {
+                        println!("⚠️ L1 signing failed for credit draw");
+                        (String::new(), String::new())
+                    }
+                };
+
+                let l2_url = format!("{}/bridge/credit", L2_BASE_URL);
+                let l2_payload = serde_json::json!({
+                    "user_address": l2_wallet,
+                    "amount": request.amount,
+                    "lock_id": lock_id,
+                    "l1_public_key": l1_public_key,
+                    "l1_signature": l1_signature,
+                    "l1_tx_hash": approval_id,
+                    "timestamp": now,
+                    "source": "L1_credit_draw"
+                });
+
+                // Async notify L2
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_millis(2000))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+
+                let l2_result = client.post(&l2_url).json(&l2_payload).send().await;
+                
+                let l2_notified = match l2_result {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        println!("📡 L2 notified: {} - {:?}", status, resp.text().await.ok());
+                        status.is_success()
+                    },
+                    Err(e) => {
+                        println!("⚠️ L2 notification failed: {}", e);
+                        false
+                    }
+                };
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                     "success": true,
@@ -832,7 +944,8 @@ pub fn credit_draw_route(
                         "available_credit": new_available
                     },
                     "l2_balance": new_l2_balance,
-                    "message": format!("{} BB credited to L2 balance", request.amount)
+                    "l2_notified": l2_notified,
+                    "message": format!("{} $BB credited to L2 balance", request.amount)
                 })))
             }
         })
@@ -857,7 +970,7 @@ pub fn credit_settle_route(
             let blockchain = blockchain.clone();
             let bridge_state = bridge_state.clone();
             async move {
-                println!("🔄 Credit settle request: {} session {} (final L2: {} BB)", 
+                println!("🔄 Credit settle request: {} session {} (final L2: {} $BB)", 
                          &request.wallet_address[..16], &request.session_id[..16], request.final_l2_balance);
 
                 // Verify signature
@@ -948,7 +1061,7 @@ pub fn credit_settle_route(
                     // Authorize and release the lock
                     match bc.release_tokens(lid) {
                         Ok((owner, released_amount)) => {
-                            println!("🔓 Released {} BB from lock {} (owner: {})", 
+                            println!("🔓 Released {} $BC from lock {} (owner: {})", 
                                      released_amount, &lid[..16], &owner[..16]);
                             
                             // Credit the settlement amount back to user's L1 balance
@@ -998,7 +1111,7 @@ pub fn credit_settle_route(
                     }
                 }
 
-                println!("✅ Session settled: {} | P&L: {} BB | Returned: {} BB", 
+                println!("✅ Session settled: {} | P&L: {} $BB | Returned: {} $BC", 
                          &request.session_id[..16], net_pnl, amount_to_return);
 
                 Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
@@ -1012,9 +1125,9 @@ pub fn credit_settle_route(
                         "amount_returned_to_l1": amount_to_return
                     },
                     "message": if net_pnl >= 0.0 {
-                        format!("Session closed. Won {} BB! {} BB returned to L1.", net_pnl, amount_to_return)
+                        format!("Session closed. Won {} $BB! {} $BC returned to L1.", net_pnl, amount_to_return)
                     } else {
-                        format!("Session closed. Lost {} BB. {} BB returned to L1.", net_pnl.abs(), amount_to_return)
+                        format!("Session closed. Lost {} $BB. {} $BC returned to L1.", net_pnl.abs(), amount_to_return)
                     }
                 })))
             }

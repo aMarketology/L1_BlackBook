@@ -377,7 +377,7 @@ pub fn rpc_route(
                             Some(block) => serde_json::json!({
                                 "blockhash": block.hash.clone(),
                                 "feeCalculator": {
-                                    "lamportsPerSignature": 5000  // 0.005 BB fee
+                                    "lamportsPerSignature": 5000  // 0.005 $BC fee
                                 },
                                 "slot": block.slot,
                                 "lastValidBlockHeight": block.index + 150  // Valid for ~150 slots
@@ -466,7 +466,7 @@ pub fn rpc_route(
                             bc.current_slot
                         };
                         serde_json::json!({
-                            "value": 5000,  // 5000 lamports = 0.005 BB
+                            "value": 5000,  // 5000 lamports = 0.005 $BC
                             "context": {
                                 "slot": current_slot
                             }
@@ -790,9 +790,9 @@ fn format_ledger(bc: &EnhancedBlockchain) -> String {
     let alice_str = format_with_commas(alice_bal);
     let bob_str = format_with_commas(bob_bal);
     
-    output.push_str(&format!("║  👛 Alice: {} BB  |  👛 Bob: {} BB                                                           ║\n",
+    output.push_str(&format!("║  👛 Alice: {} $BC  |  👛 Bob: {} $BC                                                           ║\n",
         alice_str, bob_str));
-    output.push_str(&format!("║  Total Transactions: {:5}  |  Blocks: {:5}  |  Circulating Supply: {} BB                               ║\n", 
+    output.push_str(&format!("║  Total Transactions: {:5}  |  Blocks: {:5}  |  Circulating Supply: {} $BC                               ║\n", 
         total_txs, total_blocks, supply_str));
     output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
     
@@ -840,15 +840,15 @@ fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
     
     // Build description based on type
     let description = match tx.tx_type {
-        TransactionType::Transfer => format!("{:.2} BB → {}", tx.amount, to_abbr),
-        TransactionType::BetPlacement => format!("{:.2} BB bet placed", tx.amount),
-        TransactionType::BetResolution => format!("{:.2} BB bet resolved", tx.amount),
+        TransactionType::Transfer => format!("{:.2} $BC → {}", tx.amount, to_abbr),
+        TransactionType::BetPlacement => format!("{:.2} $BC bet placed", tx.amount),
+        TransactionType::BetResolution => format!("{:.2} $BC bet resolved", tx.amount),
         TransactionType::SocialAction => "social action".to_string(),
-        TransactionType::StakeDeposit => format!("{:.2} BB staked", tx.amount),
-        TransactionType::StakeWithdraw => format!("{:.2} BB unstaked", tx.amount),
-        TransactionType::SystemReward => format!("{:.2} BB reward", tx.amount),
-        TransactionType::Mint => format!("{:.2} BB minted", tx.amount),
-        TransactionType::Burn => format!("{:.2} BB burned", tx.amount),
+        TransactionType::StakeDeposit => format!("{:.2} $BC staked", tx.amount),
+        TransactionType::StakeWithdraw => format!("{:.2} $BC unstaked", tx.amount),
+        TransactionType::SystemReward => format!("{:.2} $BC reward", tx.amount),
+        TransactionType::Mint => format!("{:.2} $BC minted", tx.amount),
+        TransactionType::Burn => format!("{:.2} $BC burned", tx.amount),
     };
     
     // Abbreviate tx id

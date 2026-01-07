@@ -35,29 +35,22 @@ static BATCH_ID: AtomicU64 = AtomicU64::new(1);
 // CORE TYPES
 // ============================================================================
 
-/// Microtokens (1 BB = 1,000,000 microtokens)
-pub type Microtokens = u64;
+// Removed Microtokens - now using direct f64 (1.00 = $1, 0.01 = 1 cent)
 
-/// Convert BB to microtokens
-pub fn bb_to_microtokens(bb: f64) -> Microtokens { (bb * 1_000_000.0) as Microtokens }
-
-/// Convert microtokens to BB  
-pub fn microtokens_to_bb(mt: Microtokens) -> f64 { mt as f64 / 1_000_000.0 }
-
-/// L1 Account - Simple balance tracking
+/// L1 Account - Simple balance tracking for $BC (BlackCoin)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct L1Account {
-    pub available: Microtokens,
+    pub available: f64,
     pub last_nonce: u64,
     pub last_sync: u64,
 }
 
 impl L1Account {
     pub fn new() -> Self { Self::default() }
-    pub fn with_balance(amount: Microtokens) -> Self { 
+    pub fn with_balance(amount: f64) -> Self { 
         L1Account { available: amount, ..Default::default() } 
     }
-    pub fn available_bb(&self) -> f64 { microtokens_to_bb(self.available) }
+    pub fn available_bc(&self) -> f64 { self.available }
 }
 
 /// Settlement errors - L1 only cares about these
@@ -65,7 +58,7 @@ impl L1Account {
 pub enum SettlementError {
     InvalidSignature,
     ReplayAttack { nonce: u64 },
-    InsufficientFunds { required: Microtokens, available: Microtokens },
+    InsufficientFunds { required: f64, available: f64 },
     InvalidPublicKey,
     BatchEmpty,
     DealerNotFound,
@@ -99,8 +92,8 @@ impl std::error::Error for SettlementError {}
 pub struct SolverIntent {
     /// User's wallet address (the one being debited)
     pub user_address: String,
-    /// Amount in microtokens
-    pub amount: Microtokens,
+    /// Amount in dollars (1.00 = $1, 0.01 = 1 cent)
+    pub amount: f64,
     /// Unique nonce for replay protection (must be > last_nonce)
     pub nonce: u64,
     /// Dealer's wallet address (the one being credited)
@@ -175,8 +168,8 @@ pub struct SettlementReceipt {
     pub settlement_id: u64,
     pub user_address: String,
     pub dealer_address: String,
-    pub amount: Microtokens,
-    pub user_remaining: Microtokens,
+    pub amount: f64,
+    pub user_remaining: f64,
     pub intent_hash: [u8; 32],
     pub timestamp: u64,
 }
@@ -185,7 +178,7 @@ pub struct SettlementReceipt {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchSettlementResult {
     pub batch_id: u64,
-    pub total_settled: Microtokens,
+    pub total_settled: f64,
     pub successful: Vec<SettlementReceipt>,
     pub failed: Vec<(String, SettlementError)>, // (user_address, error)
     pub timestamp: u64,
@@ -205,7 +198,7 @@ pub struct SettlementExecutor {
 }
 
 impl SettlementExecutor {
-    pub fn new(dealer_address: String, dealer_initial_balance: Microtokens) -> Self {
+    pub fn new(dealer_address: String, dealer_initial_balance: f64) -> Self {
         let mut accounts = HashMap::new();
         let dealer_account = L1Account::with_balance(dealer_initial_balance);
         accounts.insert(dealer_address.clone(), dealer_account.clone());
@@ -228,7 +221,7 @@ impl SettlementExecutor {
     }
     
     /// Create account with initial balance (for testing/airdrops)
-    pub fn create_account(&mut self, address: String, initial_balance: Microtokens) {
+    pub fn create_account(&mut self, address: String, initial_balance: f64) {
         self.accounts.insert(address, L1Account::with_balance(initial_balance));
     }
     
@@ -245,7 +238,7 @@ impl SettlementExecutor {
         let user_acc = self.accounts.get_mut(&intent.user_address)
             .ok_or(SettlementError::InsufficientFunds { 
                 required: intent.amount, 
-                available: 0 
+                available: 0.0 
             })?;
         
         // 3. REPLAY PROTECTION
@@ -295,7 +288,7 @@ impl SettlementExecutor {
         if intents.is_empty() {
             return BatchSettlementResult {
                 batch_id: BATCH_ID.fetch_add(1, Ordering::SeqCst),
-                total_settled: 0,
+                total_settled: 0.0,
                 successful: vec![],
                 failed: vec![],
                 timestamp: get_timestamp(),
@@ -304,7 +297,7 @@ impl SettlementExecutor {
         
         let mut successful = Vec::new();
         let mut failed = Vec::new();
-        let mut total_settled: Microtokens = 0;
+        let mut total_settled: f64 = 0.0;
         
         for signed in intents {
             let user_addr = signed.intent.user_address.clone();
@@ -349,7 +342,7 @@ impl SettlementExecutor {
     }
     
     /// Get dealer's current balance
-    pub fn dealer_balance(&self) -> Microtokens {
+    pub fn dealer_balance(&self) -> f64 {
         self.dealer_account.available
     }
     
@@ -393,7 +386,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{SigningKey, Signer};
     
-    fn create_test_intent(user: &str, amount: Microtokens, nonce: u64, dealer: &str) -> SolverIntent {
+    fn create_test_intent(user: &str, amount: f64, nonce: u64, dealer: &str) -> SolverIntent {
         SolverIntent {
             user_address: user.to_string(),
             amount,
@@ -417,28 +410,28 @@ mod tests {
     
     #[test]
     fn test_single_settlement() {
-        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0);
-        executor.create_account("ALICE".to_string(), bb_to_microtokens(1000.0));
+        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0.0);
+        executor.create_account("ALICE".to_string(), 1000.0);
         
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let intent = create_test_intent("ALICE", bb_to_microtokens(100.0), 1, "DEALER");
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let intent = create_test_intent("ALICE", 100.0, 1, "DEALER");
         let signed = sign_intent(&intent, &signing_key);
         
         let result = executor.execute_single(&signed);
         assert!(result.is_ok());
         
         let receipt = result.unwrap();
-        assert_eq!(receipt.amount, bb_to_microtokens(100.0));
-        assert_eq!(executor.dealer_balance(), bb_to_microtokens(100.0));
+        assert_eq!(receipt.amount, 100.0);
+        assert_eq!(executor.dealer_balance(), 100.0);
     }
     
     #[test]
     fn test_replay_protection() {
-        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0);
-        executor.create_account("ALICE".to_string(), bb_to_microtokens(1000.0));
+        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0.0);
+        executor.create_account("ALICE".to_string(), 1000.0);
         
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let intent = create_test_intent("ALICE", bb_to_microtokens(50.0), 1, "DEALER");
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let intent = create_test_intent("ALICE", 50.0, 1, "DEALER");
         let signed = sign_intent(&intent, &signing_key);
         
         // First settlement should succeed
@@ -451,11 +444,11 @@ mod tests {
     
     #[test]
     fn test_insufficient_funds() {
-        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0);
-        executor.create_account("BOB".to_string(), bb_to_microtokens(10.0));
+        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0.0);
+        executor.create_account("BOB".to_string(), 10.0);
         
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let intent = create_test_intent("BOB", bb_to_microtokens(100.0), 1, "DEALER");
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let intent = create_test_intent("BOB", 100.0, 1, "DEALER");
         let signed = sign_intent(&intent, &signing_key);
         
         let result = executor.execute_single(&signed);
@@ -464,24 +457,24 @@ mod tests {
     
     #[test]
     fn test_batch_settlement() {
-        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0);
-        executor.create_account("ALICE".to_string(), bb_to_microtokens(1000.0));
-        executor.create_account("BOB".to_string(), bb_to_microtokens(500.0));
+        let mut executor = SettlementExecutor::new("DEALER".to_string(), 0.0);
+        executor.create_account("ALICE".to_string(), 1000.0);
+        executor.create_account("BOB".to_string(), 500.0);
         
-        let alice_key = SigningKey::generate(&mut rand::thread_rng());
-        let bob_key = SigningKey::generate(&mut rand::thread_rng());
+        let alice_key = SigningKey::generate(&mut rand::rng());
+        let bob_key = SigningKey::generate(&mut rand::rng());
         
         let intents = vec![
-            sign_intent(&create_test_intent("ALICE", bb_to_microtokens(100.0), 1, "DEALER"), &alice_key),
-            sign_intent(&create_test_intent("BOB", bb_to_microtokens(50.0), 1, "DEALER"), &bob_key),
-            sign_intent(&create_test_intent("ALICE", bb_to_microtokens(200.0), 2, "DEALER"), &alice_key),
+            sign_intent(&create_test_intent("ALICE", 100.0, 1, "DEALER"), &alice_key),
+            sign_intent(&create_test_intent("BOB", 50.0, 1, "DEALER"), &bob_key),
+            sign_intent(&create_test_intent("ALICE", 200.0, 2, "DEALER"), &alice_key),
         ];
         
         let result = executor.execute_batch(intents);
         
         assert_eq!(result.successful.len(), 3);
         assert_eq!(result.failed.len(), 0);
-        assert_eq!(result.total_settled, bb_to_microtokens(350.0));
-        assert_eq!(executor.dealer_balance(), bb_to_microtokens(350.0));
+        assert_eq!(result.total_settled, 350.0);
+        assert_eq!(executor.dealer_balance(), 350.0);
     }
 }

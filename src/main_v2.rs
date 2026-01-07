@@ -726,7 +726,7 @@ async fn main() {
         // Always save to JSON as backup
         emergency_save(&bc_data, &social_data);
         
-        println!("👋 Server shutting down gracefully...");
+        println!("👋 Good bye, chosen one. Server is shutting down gracefully 👋");
         std::process::exit(0);
     });
     
