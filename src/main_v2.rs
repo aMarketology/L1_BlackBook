@@ -515,8 +515,9 @@ async fn main() {
     let wallet_balance = routes_v2::wallet::balance_route(bc5);
     let wallet_info = routes_v2::wallet::wallet_info_route(bc6);
     
-    // Transfer routes
+    // Transfer routes (with PoH integration)
     let transfer = routes_v2::transfer::transfer_route(blockchain.clone());
+    let transfer_poh = routes_v2::transfer::transfer_poh_route(blockchain.clone(), poh_service.clone());
     let transactions = routes_v2::transfer::transactions_route(blockchain.clone());
     
     // Social routes
@@ -602,6 +603,7 @@ async fn main() {
         .or(wallet_balance)
         .or(wallet_info)
         .or(transfer)
+        .or(transfer_poh)
         .or(transactions)
         .or(post)
         .or(like)

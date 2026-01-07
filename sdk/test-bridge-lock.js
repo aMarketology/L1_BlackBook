@@ -9,20 +9,20 @@ import { createHash } from 'crypto';
 
 const L1_URL = 'http://localhost:8080';
 
-// Test accounts with correct derived addresses
+// Test accounts with correct derived addresses (from working alice-to-bob.js)
 const TEST_ACCOUNTS = {
   ALICE: {
-    seed: '18f2c2e3d4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091011',
+    seed: '18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24',
     address: 'L1_52882D768C0F3E7932AAD1813CF8B19058D507A8',
     name: 'Alice'
   },
   BOB: {
-    seed: 'e4ac49e518f55c23b27fcad66b9ac12f8c2d6b3a4e5f607182939a0b1c2d3e4f',
+    seed: 'e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b',
     address: 'L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433',
     name: 'Bob'
   },
   DEALER: {
-    seed: 'd4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809',
+    seed: 'd4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d',
     address: 'L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC',
     name: 'Dealer'
   }
@@ -58,8 +58,8 @@ function signMessage(message, secretKey, chainId = CHAIN_ID_L1) {
 
 async function getBalance(address) {
   try {
-    const internalAddr = address.replace('L1_', '');
-    const response = await fetch(`${L1_URL}/balance/${internalAddr}`);
+    // Use full L1 address - server handles both formats
+    const response = await fetch(`${L1_URL}/balance/${address}`);
     const data = await response.json();
     return data.balance || 0;
   } catch (e) {
@@ -135,8 +135,8 @@ async function getPendingLocks() {
 
 async function getLockedBalance(address) {
   try {
-    const internalAddr = address.replace('L1_', '');
-    const response = await fetch(`${L1_URL}/bridge/l1-balance/${internalAddr}`);
+    // Use full L1 address
+    const response = await fetch(`${L1_URL}/bridge/l1-balance/${address}`);
     const text = await response.text();
     try {
       return JSON.parse(text);

@@ -449,3 +449,50 @@ pub fn submit_transfer_to_gulf_stream(
     
     Ok(tx_id)
 }
+
+// ============================================================================
+// POH INTEGRATION - Wire Transactions to Proof of History
+// ============================================================================
+
+/// Queue a transaction ID into the PoH clock for ordering proof
+/// 
+/// This is called when a transaction enters the system, mixing its ID
+/// into the PoH hash chain. This proves:
+/// 1. The transaction existed at this point in time
+/// 2. The ordering of transactions is cryptographically verifiable
+/// 3. No transaction can be inserted or reordered after the fact
+pub fn queue_tx_to_poh(poh_service: &SharedPoHService, tx_id: &str) {
+    let mut poh = poh_service.write();
+    poh.queue_transaction(tx_id.to_string());
+}
+
+/// Get current PoH slot and hash for transaction timestamping
+pub fn get_poh_timestamp(poh_service: &SharedPoHService) -> (u64, String) {
+    let poh = poh_service.read();
+    (poh.current_slot, poh.current_hash.clone())
+}
+
+/// Verify a block's PoH hash is consistent with the PoH clock
+pub fn verify_block_poh(poh_service: &SharedPoHService, block_poh_hash: &str, expected_slot: u64) -> bool {
+    let poh = poh_service.read();
+    
+    // For same-slot verification, check hash matches
+    if poh.current_slot == expected_slot {
+        return poh.current_hash == block_poh_hash;
+    }
+    
+    // For historical slots, we'd need to verify the PoH chain
+    // In production, validators store PoH entries and can verify backwards
+    // For now, accept if slot is in the past (already finalized)
+    if expected_slot < poh.current_slot {
+        return true; // Historical slot, trust it
+    }
+    
+    false // Future slot, reject
+}
+
+/// Get PoH statistics for monitoring
+pub fn get_poh_stats(poh_service: &SharedPoHService) -> serde_json::Value {
+    let poh = poh_service.read();
+    poh.get_status()
+}

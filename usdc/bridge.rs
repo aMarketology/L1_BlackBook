@@ -3,6 +3,8 @@
 //! HTTP handlers for deposit notifications and withdrawal requests.
 
 use serde::{Deserialize, Serialize};
+use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use sha2::{Sha256, Digest};
 
 // ============================================================================
 // REQUEST/RESPONSE TYPES
@@ -110,49 +112,143 @@ pub struct UserReserveResponse {
 // ENDPOINT HANDLERS (integrate with your router)
 // ============================================================================
 
-/// Verify Oracle signature on deposit request
-pub fn verify_oracle_signature(request: &DepositRequest, oracle_pubkey: &str) -> bool {
-    // TODO: Implement Ed25519 signature verification
-    // For now, accept all (DEVELOPMENT ONLY)
+/// Verify Ed25519 signature helper
+fn verify_ed25519_signature(pubkey_hex: &str, message: &[u8], signature_hex: &str) -> Result<bool, String> {
+    // Decode public key
+    let pubkey_bytes = hex::decode(pubkey_hex)
+        .map_err(|e| format!("Invalid pubkey hex: {}", e))?;
     
+    if pubkey_bytes.len() != 32 {
+        return Err(format!("Invalid pubkey length: {} (expected 32)", pubkey_bytes.len()));
+    }
+    
+    let pubkey_array: [u8; 32] = pubkey_bytes.try_into()
+        .map_err(|_| "Failed to convert pubkey to array")?;
+    
+    let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
+        .map_err(|e| format!("Invalid public key: {}", e))?;
+    
+    // Decode signature
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|e| format!("Invalid signature hex: {}", e))?;
+    
+    if sig_bytes.len() != 64 {
+        return Err(format!("Invalid signature length: {} (expected 64)", sig_bytes.len()));
+    }
+    
+    let sig_array: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| "Failed to convert signature to array")?;
+    
+    let signature = Signature::from_bytes(&sig_array);
+    
+    // Verify
+    match verifying_key.verify(message, &signature) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Derive L1 address from public key (SHA256 → first 20 bytes → uppercase hex)
+fn derive_address_from_pubkey(pubkey_hex: &str) -> Result<String, String> {
+    let pubkey_bytes = hex::decode(pubkey_hex)
+        .map_err(|e| format!("Invalid pubkey hex: {}", e))?;
+    
+    let mut hasher = Sha256::new();
+    hasher.update(&pubkey_bytes);
+    let hash = hasher.finalize();
+    
+    let address_bytes = &hash[..20];
+    let address = format!("L1_{}", hex::encode(address_bytes).to_uppercase());
+    
+    Ok(address)
+}
+
+/// Verify Oracle signature on deposit request (PRODUCTION)
+pub fn verify_oracle_signature(request: &DepositRequest, oracle_pubkey: &str) -> bool {
     if oracle_pubkey.is_empty() {
         println!("⚠️  WARNING: Oracle pubkey not configured, skipping signature check");
         return true;
     }
     
+    if request.oracle_signature.is_empty() {
+        println!("❌ [USDC Bridge] Deposit missing oracle signature");
+        return false;
+    }
+    
     // Message format: "DEPOSIT:{user}:{amount}:{eth_tx}"
-    let _message = format!(
+    let message = format!(
         "DEPOSIT:{}:{}:{}",
         request.user_l1_address,
         request.amount,
         request.eth_tx_hash
     );
     
-    // TODO: Verify signature against message using oracle_pubkey
-    // ed25519_verify(oracle_pubkey, message, request.oracle_signature)
-    
-    true // Placeholder
+    match verify_ed25519_signature(oracle_pubkey, message.as_bytes(), &request.oracle_signature) {
+        Ok(true) => {
+            println!("✅ [USDC Bridge] Oracle signature verified for deposit");
+            true
+        }
+        Ok(false) => {
+            println!("❌ [USDC Bridge] Oracle signature verification FAILED");
+            false
+        }
+        Err(e) => {
+            println!("❌ [USDC Bridge] Oracle signature error: {}", e);
+            false
+        }
+    }
 }
 
-/// Verify user signature on withdrawal request
+/// Verify user signature on withdrawal request (PRODUCTION)
 pub fn verify_user_signature(request: &WithdrawalRequest, user_pubkey: &str) -> bool {
-    // TODO: Implement Ed25519 signature verification
-    
     if user_pubkey.is_empty() {
+        println!("❌ [USDC Bridge] User pubkey not provided for withdrawal");
+        return false;
+    }
+    
+    if request.user_signature.is_empty() {
+        println!("❌ [USDC Bridge] Withdrawal missing user signature");
         return false;
     }
     
     // Message format: "WITHDRAW:{user}:{eth_address}:{amount}"
-    let _message = format!(
+    let message = format!(
         "WITHDRAW:{}:{}:{}",
         request.user_l1_address,
         request.user_eth_address,
         request.amount
     );
     
-    // TODO: Verify signature
+    // Verify pubkey derives to claimed address
+    match derive_address_from_pubkey(user_pubkey) {
+        Ok(derived) if derived == request.user_l1_address => {
+            println!("✅ [USDC Bridge] User pubkey matches claimed address");
+        }
+        Ok(derived) => {
+            println!("❌ [USDC Bridge] Address mismatch: derived={}, claimed={}", 
+                derived, request.user_l1_address);
+            return false;
+        }
+        Err(e) => {
+            println!("❌ [USDC Bridge] Address derivation error: {}", e);
+            return false;
+        }
+    }
     
-    true // Placeholder
+    match verify_ed25519_signature(user_pubkey, message.as_bytes(), &request.user_signature) {
+        Ok(true) => {
+            println!("✅ [USDC Bridge] User signature verified for withdrawal");
+            true
+        }
+        Ok(false) => {
+            println!("❌ [USDC Bridge] User signature verification FAILED");
+            false
+        }
+        Err(e) => {
+            println!("❌ [USDC Bridge] User signature error: {}", e);
+            false
+        }
+    }
 }
 
 // ============================================================================

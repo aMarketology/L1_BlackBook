@@ -139,8 +139,8 @@ pub struct L2Session {
 }
 
 // Challenge period for optimistic rollup (in seconds)
-// 7 days in production, 60 seconds for testing
-const CHALLENGE_PERIOD_SECONDS: u64 = 60; // TODO: Increase to 604800 (7 days) for production
+// 7 days = 604800 seconds (PRODUCTION)
+const CHALLENGE_PERIOD_SECONDS: u64 = 604800;
 
 #[derive(Debug, Default)]
 pub struct BridgeState {

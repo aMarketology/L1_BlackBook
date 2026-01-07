@@ -443,7 +443,23 @@ impl EnhancedBlockchain {
             TransactionType::Transfer => "💰",
             _ => "📝",
         };
-        println!("{} Transaction created: {} -> {} ({} BB) [type: {:?}]", emoji, from, to, amount, transaction.tx_type);
+        
+        // Detect L2 addresses for cross-layer visibility
+        let from_is_l2 = from.starts_with("L2_");
+        let to_is_l2 = to.starts_with("L2_");
+        
+        if from_is_l2 || to_is_l2 {
+            println!("🌉 ═══════════════════════════════════════════════════════════");
+            println!("🌉 CROSS-LAYER TRANSACTION DETECTED");
+            println!("🌉 From: {} {}", from, if from_is_l2 { "(L2 WALLET)" } else { "(L1)" });
+            println!("🌉 To:   {} {}", to, if to_is_l2 { "(L2 WALLET)" } else { "(L1)" });
+            println!("🌉 Amount: {} BB | Type: {:?}", amount, transaction.tx_type);
+            println!("🌉 TX ID: {}", transaction_id);
+            println!("🌉 ═══════════════════════════════════════════════════════════");
+        } else {
+            println!("{} Transaction created: {} -> {} ({} BB) [type: {:?}]", emoji, from, to, amount, transaction.tx_type);
+        }
+        
         transaction_id
     }
     

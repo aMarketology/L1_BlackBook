@@ -105,6 +105,7 @@ impl FeatureFlags {
 // UPGRADE MANAGER
 // ============================================================================
 
+#[derive(Debug, Clone)]
 pub struct UpgradeManager {
     pub version: ProtocolVersion,
     proposals: HashMap<String, UpgradeProposal>,
