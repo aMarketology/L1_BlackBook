@@ -515,9 +515,15 @@ async fn main() {
     let wallet_balance = routes_v2::wallet::balance_route(bc5);
     let wallet_info = routes_v2::wallet::wallet_info_route(bc6);
     
-    // Transfer routes (with PoH integration)
+    // Transfer routes (with PoH integration and Pipeline)
     let transfer = routes_v2::transfer::transfer_route(blockchain.clone());
     let transfer_poh = routes_v2::transfer::transfer_poh_route(blockchain.clone(), poh_service.clone());
+    let transfer_pipeline = routes_v2::transfer::transfer_pipeline_route(
+        blockchain.clone(), 
+        pipeline.clone(),
+        current_slot.clone()
+    );
+    let transfer_status = routes_v2::transfer::transfer_status_route(blockchain.clone(), current_slot.clone());
     let transactions = routes_v2::transfer::transactions_route(blockchain.clone());
     
     // Social routes
@@ -604,6 +610,8 @@ async fn main() {
         .or(wallet_info)
         .or(transfer)
         .or(transfer_poh)
+        .or(transfer_pipeline)
+        .or(transfer_status)
         .or(transactions)
         .or(post)
         .or(like)

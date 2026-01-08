@@ -132,3 +132,27 @@ path = "src/main_v2.rs"
 # [[bin]]
 # name = "layer1-legacy"
 # path = "src/main.rs"
+
+# ═══════════════════════════════════════════════════════════════
+# PROFILE CONFIGURATION - Fix Windows linker crashes
+# ═══════════════════════════════════════════════════════════════
+# Debug builds on Windows crash link.exe due to excessive debug symbols.
+# Solution: Disable debug info entirely for dev builds.
+
+[profile.dev]
+# CRITICAL: Set to 0 to completely disable debug symbols (fixes Windows link.exe crash)
+debug = 0
+# Enable optimizations even in debug (faster builds, smaller binaries)
+opt-level = 1
+
+[profile.dev.package."*"]
+# Optimize all dependencies in debug mode
+opt-level = 2
+debug = 0
+
+[profile.release]
+# Full optimizations for production
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

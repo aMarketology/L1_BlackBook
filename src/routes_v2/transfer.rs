@@ -1,13 +1,26 @@
 // ============================================================================
 // TRANSFER ROUTES - Token Transfers (V2 - Pure Signature Auth)
 // ============================================================================
+// 
+// PIPELINE INTEGRATION:
+// Transfers are now submitted through TransactionPipeline.submit() for true
+// parallel processing (Solana-style 4-stage async pipeline).
+//
+// FINALITY:
+// Transactions require 2 confirmations before being considered final.
+// Response includes confirmation status for client-side tracking.
+// ============================================================================
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::AtomicU64;
 use warp::Filter;
 use serde::{Deserialize, Serialize};
 use crate::protocol::blockchain::EnhancedBlockchain;
 use crate::integration::unified_auth::SignedRequest;
-use crate::runtime::SharedPoHService;
+use crate::runtime::{
+    SharedPoHService, SharedPipeline, PipelinePacket, 
+    CONFIRMATIONS_REQUIRED, ConfirmationStatus,
+};
 
 /// Helper to recover from poisoned locks
 fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
@@ -149,14 +162,214 @@ pub fn transfer_route(
                         "from": from_address,
                         "to": transfer.to,
                         "amount": transfer.amount,
-                        "memo": transfer.memo
+                        "memo": transfer.memo,
+                        "confirmations": 0,
+                        "confirmations_required": CONFIRMATIONS_REQUIRED,
+                        "status": "processing"
                     },
                     "balances": {
                         "from": from_balance,
                         "to": to_balance
+                    },
+                    "finality": {
+                        "confirmations_required": CONFIRMATIONS_REQUIRED,
+                        "status": "processing",
+                        "note": "Transaction will be confirmed after 2 blocks"
                     }
                 })))
             }
+        })
+}
+
+/// POST /transfer/pipeline - Transfer via Transaction Pipeline (TRUE PARALLEL PROCESSING)
+/// 
+/// Submits transaction through the 4-stage async pipeline:
+/// 1. FETCH: Transaction enters pipeline buffer
+/// 2. VERIFY: Signature verification (parallel workers)
+/// 3. EXECUTE: Sealevel-style parallel execution
+/// 4. COMMIT: Finalization with confirmation tracking
+///
+/// Returns immediately with pending status, transaction commits in background.
+/// Use GET /transfer/status/:tx_id to check confirmation status.
+pub fn transfer_pipeline_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    pipeline: SharedPipeline,
+    current_slot: Arc<AtomicU64>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("transfer" / "pipeline")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then(move |request: SignedRequest| {
+            let blockchain = blockchain.clone();
+            let pipeline = pipeline.clone();
+            let current_slot = current_slot.clone();
+            async move {
+                // 1. Verify signature BEFORE submitting to pipeline
+                let from_address = match request.verify() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature verification failed: {}", e)
+                        })));
+                    }
+                };
+                
+                // 2. Parse transfer payload
+                let transfer: TransferPayload = match request.parse_payload() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Invalid transfer payload: {}", e)
+                        })));
+                    }
+                };
+                
+                // 3. Basic validation
+                if transfer.amount <= 0.0 || transfer.to.is_empty() || from_address == transfer.to {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Invalid transfer parameters"
+                    })));
+                }
+                
+                // 4. Quick balance check (don't hold lock long)
+                let current_balance = {
+                    let bc = lock_or_recover(&blockchain);
+                    bc.get_balance(&from_address)
+                };
+                
+                if current_balance < transfer.amount {
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": format!("Insufficient balance: {} BB (need {} BB)", 
+                                       current_balance, transfer.amount)
+                    })));
+                }
+                
+                // 5. Create transaction ID and pipeline packet
+                let tx_id = format!("tx_{}", uuid::Uuid::new_v4());
+                let slot = current_slot.load(std::sync::atomic::Ordering::Relaxed);
+                
+                let packet = PipelinePacket::new(
+                    tx_id.clone(),
+                    from_address.clone(),
+                    transfer.to.clone(),
+                    transfer.amount,
+                );
+                
+                // 6. Submit to pipeline for async parallel processing
+                match pipeline.submit(packet).await {
+                    Ok(_) => {
+                        println!("🚀 Pipeline submit: {} -> {} : {} BB (tx: {}, slot: {})", 
+                                 &from_address[..14], &transfer.to[..14.min(transfer.to.len())], 
+                                 transfer.amount, &tx_id[..16], slot);
+                        
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": true,
+                            "transaction": {
+                                "id": tx_id,
+                                "from": from_address,
+                                "to": transfer.to,
+                                "amount": transfer.amount,
+                                "memo": transfer.memo,
+                                "slot": slot,
+                                "pipeline": true
+                            },
+                            "status": "pending",
+                            "finality": {
+                                "confirmations": 0,
+                                "confirmations_required": CONFIRMATIONS_REQUIRED,
+                                "status": "pending",
+                                "note": "Transaction submitted to pipeline, check /transfer/status/:id"
+                            },
+                            "pipeline_stats": pipeline.get_stats()
+                        })))
+                    }
+                    Err(e) => {
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Pipeline submission failed: {}", e)
+                        })))
+                    }
+                }
+            }
+        })
+}
+
+/// GET /transfer/status/:tx_id - Check transaction confirmation status
+pub fn transfer_status_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    current_slot: Arc<AtomicU64>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("transfer" / "status" / String)
+        .and(warp::get())
+        .map(move |tx_id: String| {
+            let bc = lock_or_recover(&blockchain);
+            let current = current_slot.load(std::sync::atomic::Ordering::Relaxed);
+            
+            // Find transaction in chain
+            for block in bc.chain.iter().rev() {
+                for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
+                    if tx.id == tx_id {
+                        let tx_slot = block.slot;
+                        let confirmations = current.saturating_sub(tx_slot);
+                        let status = if confirmations >= CONFIRMATIONS_REQUIRED {
+                            ConfirmationStatus::Confirmed
+                        } else if confirmations > 0 {
+                            ConfirmationStatus::Processing { confirmations }
+                        } else {
+                            ConfirmationStatus::Pending
+                        };
+                        
+                        return warp::reply::json(&serde_json::json!({
+                            "found": true,
+                            "transaction": {
+                                "id": tx_id,
+                                "from": tx.from,
+                                "to": tx.to,
+                                "amount": tx.amount,
+                                "slot": tx_slot,
+                                "block_index": block.index
+                            },
+                            "finality": {
+                                "confirmations": confirmations,
+                                "confirmations_required": CONFIRMATIONS_REQUIRED,
+                                "status": status,
+                                "is_final": confirmations >= CONFIRMATIONS_REQUIRED
+                            }
+                        }));
+                    }
+                }
+            }
+            
+            // Check pending transactions
+            for tx in &bc.pending_transactions {
+                if tx.id == tx_id {
+                    return warp::reply::json(&serde_json::json!({
+                        "found": true,
+                        "transaction": {
+                            "id": tx_id,
+                            "from": tx.from,
+                            "to": tx.to,
+                            "amount": tx.amount,
+                        },
+                        "finality": {
+                            "confirmations": 0,
+                            "confirmations_required": CONFIRMATIONS_REQUIRED,
+                            "status": ConfirmationStatus::Pending,
+                            "is_final": false,
+                            "note": "Transaction in pending pool"
+                        }
+                    }));
+                }
+            }
+            
+            warp::reply::json(&serde_json::json!({
+                "found": false,
+                "error": "Transaction not found"
+            }))
         })
 }
 

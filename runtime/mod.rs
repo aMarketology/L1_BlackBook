@@ -14,7 +14,15 @@ pub mod poh_service;
 // Core types (used by main_v2.rs and tests)
 
 // PoH Service (used by main_v2.rs)
-pub use poh_service::{PoHService, SharedPoHService, create_poh_service, run_poh_clock, TransactionPipeline, verify_poh_chain};
+pub use poh_service::{
+    PoHService, SharedPoHService, create_poh_service, run_poh_clock, 
+    TransactionPipeline, SharedPipeline, verify_poh_chain,
+    PipelinePacket, CommittedPacket,
+    // Finality constants
+    CONFIRMATIONS_REQUIRED, ConfirmationStatus,
+    // Pruning constants
+    PRUNED_SLOTS_RETENTION, NodePruningMode,
+};
 
 // Consensus types (used by main_v2.rs and services.rs)
 pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};

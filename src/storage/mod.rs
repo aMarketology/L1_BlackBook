@@ -650,6 +650,122 @@ impl StorageEngine {
         }
     }
 
+    // ========================================================================
+    // PRUNING (For Non-Archive Nodes)
+    // ========================================================================
+
+    /// Prune old blocks and transactions older than `keep_slots`
+    /// 
+    /// Pruned nodes only keep recent history to reduce storage:
+    /// - Default: 300,000 slots (~3.5 days at 1 second slots)
+    /// - Keeps all account state (only prunes block/tx history)
+    /// - Genesis and first 100 blocks are never pruned
+    /// 
+    /// Returns: (blocks_pruned, transactions_pruned)
+    pub fn prune_old_slots(&self, keep_slots: u64) -> StorageResult<PruningStats> {
+        let latest_slot = self.get_latest_slot()?.unwrap_or(0);
+        
+        // Calculate cutoff (preserve genesis + buffer)
+        let min_preserved_slot = 100u64; // Always keep first 100 blocks
+        let cutoff = latest_slot.saturating_sub(keep_slots).max(min_preserved_slot);
+        
+        if cutoff <= min_preserved_slot {
+            return Ok(PruningStats::default());
+        }
+        
+        let mut blocks_pruned = 0u64;
+        let mut transactions_pruned = 0u64;
+        let mut bytes_freed = 0u64;
+        
+        // Prune blocks tree
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        for result in self.blocks_tree.iter() {
+            let (key, value) = result?;
+            if key.len() == 8 {
+                let slot = u64::from_be_bytes(key.as_ref().try_into().unwrap_or([0u8; 8]));
+                if slot < cutoff && slot >= min_preserved_slot {
+                    keys_to_remove.push(key.to_vec());
+                    bytes_freed += value.len() as u64;
+                }
+            }
+        }
+        
+        for key in keys_to_remove {
+            self.blocks_tree.remove(&key)?;
+            blocks_pruned += 1;
+        }
+        
+        // Prune transaction index (find transactions in pruned slots)
+        let mut tx_keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        for result in self.tx_tree.iter() {
+            let (key, value) = result?;
+            if let Ok(location) = borsh::from_slice::<TxLocation>(&value) {
+                if location.slot < cutoff && location.slot >= min_preserved_slot {
+                    tx_keys_to_remove.push(key.to_vec());
+                    bytes_freed += value.len() as u64 + key.len() as u64;
+                }
+            }
+        }
+        
+        for key in tx_keys_to_remove {
+            self.tx_tree.remove(&key)?;
+            transactions_pruned += 1;
+        }
+        
+        // Flush after pruning
+        self.db.flush()?;
+        
+        if blocks_pruned > 0 || transactions_pruned > 0 {
+            println!("🧹 Pruned {} blocks, {} transactions (freed ~{} bytes)", 
+                     blocks_pruned, transactions_pruned, bytes_freed);
+        }
+        
+        Ok(PruningStats {
+            blocks_pruned,
+            transactions_pruned,
+            bytes_freed,
+            cutoff_slot: cutoff,
+            latest_slot,
+        })
+    }
+    
+    /// Check if pruning is needed based on threshold
+    pub fn needs_pruning(&self, keep_slots: u64) -> StorageResult<bool> {
+        let latest = self.get_latest_slot()?.unwrap_or(0);
+        let block_count = self.count_blocks() as u64;
+        
+        // Need pruning if we have significantly more blocks than retention
+        Ok(block_count > keep_slots + 10_000)
+    }
+    
+    /// Get pruning statistics without actually pruning
+    pub fn pruning_info(&self, keep_slots: u64) -> StorageResult<PruningInfo> {
+        let latest_slot = self.get_latest_slot()?.unwrap_or(0);
+        let total_blocks = self.count_blocks() as u64;
+        let cutoff = latest_slot.saturating_sub(keep_slots).max(100);
+        
+        // Count blocks that would be pruned
+        let mut pruneable_blocks = 0u64;
+        for result in self.blocks_tree.iter() {
+            let (key, _) = result?;
+            if key.len() == 8 {
+                let slot = u64::from_be_bytes(key.as_ref().try_into().unwrap_or([0u8; 8]));
+                if slot < cutoff && slot >= 100 {
+                    pruneable_blocks += 1;
+                }
+            }
+        }
+        
+        Ok(PruningInfo {
+            total_blocks,
+            pruneable_blocks,
+            retention_slots: keep_slots,
+            cutoff_slot: cutoff,
+            latest_slot,
+            disk_size_bytes: self.db.size_on_disk().unwrap_or(0),
+        })
+    }
+
     /// Export all data to JSON (for disaster recovery / debugging)
     pub fn export_json(&self) -> serde_json::Value {
         let accounts: Vec<serde_json::Value> = self.iter_accounts()
@@ -678,13 +794,34 @@ impl StorageEngine {
 }
 
 /// Database statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DbStats {
     pub account_count: usize,
     pub block_count: usize,
     pub latest_slot: u64,
     pub state_root: String,
     pub genesis_hash: String,
+    pub disk_size_bytes: u64,
+}
+
+/// Pruning operation results
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PruningStats {
+    pub blocks_pruned: u64,
+    pub transactions_pruned: u64,
+    pub bytes_freed: u64,
+    pub cutoff_slot: u64,
+    pub latest_slot: u64,
+}
+
+/// Pruning state information
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PruningInfo {
+    pub total_blocks: u64,
+    pub pruneable_blocks: u64,
+    pub retention_slots: u64,
+    pub cutoff_slot: u64,
+    pub latest_slot: u64,
     pub disk_size_bytes: u64,
 }
 

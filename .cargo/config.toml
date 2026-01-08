@@ -1,0 +1,9 @@
+# ═══════════════════════════════════════════════════════════════
+# Cargo Configuration - Use LLD linker to fix Windows link.exe crashes
+# ═══════════════════════════════════════════════════════════════
+# Microsoft's link.exe crashes on large projects (exit code 0xc0000409).
+# Solution: Use LLVM's lld-link which handles large projects much better.
+
+[target.x86_64-pc-windows-msvc]
+# Use LLD linker (comes with Rust, much faster and more stable)
+linker = "rust-lld"

@@ -18,9 +18,9 @@
     },
     {
       "index": 1,
-      "timestamp": 1767770126,
+      "timestamp": 1767853273,
       "previous_hash": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
-      "hash": "df73f263505cd8318d42a3fde32df9cfc06b23f383930456157b73a4fe8cc0ed",
+      "hash": "3bbff800d3f8a7a49e998bcad26b799d5900700fb1310dc8813134aab7e0bca4",
       "slot": 0,
       "poh_hash": "567f35021a2fa095f8c1cff2e124f57a0228d0ece2b18bc103e3945efa48a3b4",
       "parent_slot": 0,
@@ -35,23 +35,50 @@
   ],
   "pending_transactions": [],
   "balances": {
-    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": 1000000000.0,
-    "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433": 10000.0,
     "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": 10000.0,
-    "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8": 20000.0,
-    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 20000.0,
     "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC": 100000.0,
-    "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100000.0
+    "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433": 10000.0,
+    "L1_F5C46483E8A28394F5E8687DEADF6BD4E924CED3": 100000.0,
+    "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8": 20000.0,
+    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": 1000000000.0,
+    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": 20000.0
   },
   "mining_reward": 10.0,
   "daily_jackpot": 0.0,
-  "jackpot_last_reset": 1767770126,
+  "jackpot_last_reset": 1767853273,
   "current_slot": 1,
   "current_poh_hash": "9f1f9e5d7484f01aa7f2591f956055ba5201d1bcb73d96b8755ce7859d6afc5b",
   "engagement_stakes": {},
   "username_balances": {},
   "address_to_username": {},
   "accounts": {
+    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": {
+      "lamports": 20000000000,
+      "nonce": 0,
+      "owner": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
+      "data_hash": "",
+      "created_slot": 1,
+      "last_modified_slot": 1,
+      "rent_exempt": true
+    },
+    "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC": {
+      "lamports": 100000000000,
+      "nonce": 0,
+      "owner": "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC",
+      "data_hash": "",
+      "created_slot": 2,
+      "last_modified_slot": 2,
+      "rent_exempt": true
+    },
+    "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": {
+      "lamports": 10000000000,
+      "nonce": 0,
+      "owner": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+      "data_hash": "",
+      "created_slot": 1,
+      "last_modified_slot": 1,
+      "rent_exempt": true
+    },
     "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8": {
       "lamports": 20000000000,
       "nonce": 0,
@@ -61,28 +88,10 @@
       "last_modified_slot": 2,
       "rent_exempt": true
     },
-    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": {
-      "lamports": 1000000000000000,
-      "nonce": 0,
-      "owner": "SYSTEM",
-      "data_hash": "",
-      "created_slot": 0,
-      "last_modified_slot": 0,
-      "rent_exempt": true
-    },
     "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433": {
       "lamports": 10000000000,
       "nonce": 0,
       "owner": "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433",
-      "data_hash": "",
-      "created_slot": 2,
-      "last_modified_slot": 2,
-      "rent_exempt": true
-    },
-    "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC": {
-      "lamports": 100000000000,
-      "nonce": 0,
-      "owner": "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC",
       "data_hash": "",
       "created_slot": 2,
       "last_modified_slot": 2,
@@ -97,22 +106,13 @@
       "last_modified_slot": 1,
       "rent_exempt": true
     },
-    "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9": {
-      "lamports": 10000000000,
+    "L1_TREASURY_MINT_AUTHORITY_GENESIS_V1": {
+      "lamports": 1000000000000000,
       "nonce": 0,
-      "owner": "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9",
+      "owner": "SYSTEM",
       "data_hash": "",
-      "created_slot": 1,
-      "last_modified_slot": 1,
-      "rent_exempt": true
-    },
-    "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD": {
-      "lamports": 20000000000,
-      "nonce": 0,
-      "owner": "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD",
-      "data_hash": "",
-      "created_slot": 1,
-      "last_modified_slot": 1,
+      "created_slot": 0,
+      "last_modified_slot": 0,
       "rent_exempt": true
     }
   },

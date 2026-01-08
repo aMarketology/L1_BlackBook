@@ -39,6 +39,47 @@ const SIGVERIFY_WORKERS: usize = 4;
 const COMMIT_BATCH_SIZE: usize = 64;
 
 // ============================================================================
+// FINALITY CONSTANTS
+// ============================================================================
+
+/// Number of confirmations required for transaction finality
+/// - 2 confirmations = ~2 slots = ~2 seconds for fast finality
+/// - Lower than Ethereum (12 blocks) but secure for our use case
+pub const CONFIRMATIONS_REQUIRED: u64 = 2;
+
+/// Confirmation status for transactions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ConfirmationStatus {
+    /// Transaction submitted but not yet in a block
+    Pending,
+    /// In a block but not enough confirmations
+    Processing { confirmations: u64 },
+    /// Fully confirmed (2+ blocks on top)
+    Confirmed,
+    /// Transaction finalized and irreversible
+    Finalized,
+}
+
+// ============================================================================
+// PRUNING CONSTANTS
+// ============================================================================
+
+/// Number of slots pruned nodes should retain
+/// - 300,000 slots = ~3.5 days at 1 second slots
+/// - Enough for dispute resolution and recent queries
+/// - Archive nodes keep everything, pruned nodes discard older data
+pub const PRUNED_SLOTS_RETENTION: u64 = 300_000;
+
+/// Pruning mode for the node
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodePruningMode {
+    /// Archive node - keeps all historical data
+    Archive,
+    /// Pruned node - keeps only recent slots (PRUNED_SLOTS_RETENTION)
+    Pruned,
+}
+
+// ============================================================================
 // TRANSACTION PIPELINE - 4-Stage Async Processing
 // ============================================================================
 //
@@ -109,7 +150,12 @@ pub struct CommittedPacket {
     pub success: bool,
     pub slot: u64,
     pub total_pipeline_time_us: u64,
+    /// Number of confirmations (increases as more blocks are built on top)
+    pub confirmations: u64,
 }
+
+/// Shared reference to the transaction pipeline
+pub type SharedPipeline = Arc<TransactionPipeline>;
 
 /// Pipeline statistics for monitoring
 #[derive(Debug, Clone, Serialize)]
@@ -360,6 +406,7 @@ impl TransactionPipeline {
                             success: exec.success,
                             slot,
                             total_pipeline_time_us: pipeline_time,
+                            confirmations: 0, // Starts at 0, increases as more blocks built on top
                         };
                         
                         pipeline.packets_committed.fetch_add(1, Ordering::Relaxed);
