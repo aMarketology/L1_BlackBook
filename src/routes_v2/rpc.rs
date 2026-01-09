@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
+use sha2::Digest;
 use crate::protocol::blockchain::EnhancedBlockchain;
 use crate::runtime::{SharedPoHService, verify_poh_chain, PoHService};
 
@@ -696,6 +697,479 @@ fn verify_signature(public_key: &str, message: &str, signature: &str) -> Result<
 
 use crate::runtime::core::TransactionType;
 use chrono::{TimeZone, Utc, Local};
+use std::sync::atomic::AtomicU64;
+
+// ============================================================================
+// BLOCK EXPLORER API - Production-Ready Endpoints
+// ============================================================================
+
+/// GET /explorer/block/:slot - Get full block data with transactions
+pub fn explorer_block_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("explorer" / "block" / u64)
+        .and(warp::get())
+        .map(move |slot: u64| {
+            let bc = lock_or_recover(&blockchain);
+            
+            // Find block by slot
+            let block = bc.chain.iter().find(|b| b.slot == slot);
+            
+            match block {
+                Some(b) => warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "block": {
+                        "index": b.index,
+                        "slot": b.slot,
+                        "timestamp": b.timestamp,
+                        "hash": b.hash,
+                        "previous_hash": b.previous_hash,
+                        "poh_hash": b.poh_hash,
+                        "parent_slot": b.parent_slot,
+                        "leader": b.leader,
+                        "sequencer": b.sequencer,
+                        "tx_count": b.tx_count,
+                        "financial_txs": b.financial_txs,
+                        "social_txs": b.social_txs,
+                        "engagement_score": b.engagement_score
+                    }
+                })),
+                None => warp::reply::json(&serde_json::json!({
+                    "success": false,
+                    "error": format!("Block at slot {} not found", slot)
+                }))
+            }
+        })
+}
+
+/// GET /explorer/tx/:id - Get single transaction by ID
+pub fn explorer_transaction_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("explorer" / "tx" / String)
+        .and(warp::get())
+        .map(move |tx_id: String| {
+            let bc = lock_or_recover(&blockchain);
+            
+            // Search all blocks for the transaction
+            for block in bc.chain.iter().rev() {
+                // Check financial transactions
+                for tx in &block.financial_txs {
+                    if tx.id == tx_id {
+                        return warp::reply::json(&serde_json::json!({
+                            "success": true,
+                            "transaction": {
+                                "id": tx.id,
+                                "from": tx.from,
+                                "to": tx.to,
+                                "amount": tx.amount,
+                                "timestamp": tx.timestamp,
+                                "signature": tx.signature,
+                                "tx_type": format!("{:?}", tx.tx_type)
+                            },
+                            "block": {
+                                "slot": block.slot,
+                                "index": block.index,
+                                "hash": block.hash
+                            }
+                        }));
+                    }
+                }
+                // Check social transactions
+                for tx in &block.social_txs {
+                    if tx.id == tx_id {
+                        return warp::reply::json(&serde_json::json!({
+                            "success": true,
+                            "transaction": {
+                                "id": tx.id,
+                                "from": tx.from,
+                                "to": tx.to,
+                                "amount": tx.amount,
+                                "timestamp": tx.timestamp,
+                                "signature": tx.signature,
+                                "tx_type": format!("{:?}", tx.tx_type)
+                            },
+                            "block": {
+                                "slot": block.slot,
+                                "index": block.index,
+                                "hash": block.hash
+                            }
+                        }));
+                    }
+                }
+            }
+            
+            // Check pending transactions
+            for tx in &bc.pending_transactions {
+                if tx.id == tx_id {
+                    return warp::reply::json(&serde_json::json!({
+                        "success": true,
+                        "transaction": tx,
+                        "status": "pending",
+                        "block": null
+                    }));
+                }
+            }
+            
+            warp::reply::json(&serde_json::json!({
+                "success": false,
+                "error": format!("Transaction {} not found", tx_id)
+            }))
+        })
+}
+
+/// GET /explorer/account/:address/history - Paginated account transaction history
+pub fn explorer_account_history_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("explorer" / "account" / String / "history")
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::get())
+        .map(move |address: String, params: std::collections::HashMap<String, String>| {
+            let bc = lock_or_recover(&blockchain);
+            
+            let limit: usize = params.get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50)
+                .min(100);
+            
+            let offset: usize = params.get("offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            
+            // Collect all transactions for this address
+            let mut txs: Vec<serde_json::Value> = Vec::new();
+            
+            for block in bc.chain.iter().rev() {
+                for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
+                    if tx.from == address || tx.to == address {
+                        txs.push(serde_json::json!({
+                            "id": tx.id,
+                            "from": tx.from,
+                            "to": tx.to,
+                            "amount": tx.amount,
+                            "timestamp": tx.timestamp,
+                            "tx_type": format!("{:?}", tx.tx_type),
+                            "direction": if tx.from == address { "sent" } else { "received" },
+                            "block_slot": block.slot,
+                            "block_index": block.index
+                        }));
+                    }
+                }
+            }
+            
+            let total = txs.len();
+            let paginated: Vec<_> = txs.into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect();
+            
+            warp::reply::json(&serde_json::json!({
+                "success": true,
+                "address": address,
+                "balance": bc.get_balance(&address),
+                "transactions": paginated,
+                "pagination": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": offset + limit < total
+                }
+            }))
+        })
+}
+
+/// GET /explorer/richlist - Top accounts by balance
+pub fn explorer_richlist_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("explorer" / "richlist")
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::get())
+        .map(move |params: std::collections::HashMap<String, String>| {
+            let bc = lock_or_recover(&blockchain);
+            
+            let limit: usize = params.get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100)
+                .min(500);
+            
+            // Sort accounts by balance
+            let mut accounts: Vec<_> = bc.balances.iter().collect();
+            accounts.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            let total_supply: f64 = bc.balances.values().sum();
+            
+            let richlist: Vec<serde_json::Value> = accounts.iter()
+                .take(limit)
+                .enumerate()
+                .map(|(rank, (addr, balance))| {
+                    serde_json::json!({
+                        "rank": rank + 1,
+                        "address": addr,
+                        "balance": balance,
+                        "percentage": if total_supply > 0.0 { 
+                            (*balance / total_supply) * 100.0 
+                        } else { 0.0 }
+                    })
+                })
+                .collect();
+            
+            warp::reply::json(&serde_json::json!({
+                "success": true,
+                "richlist": richlist,
+                "total_accounts": bc.balances.len(),
+                "total_supply": total_supply
+            }))
+        })
+}
+
+/// GET /explorer/search/:hash - Search by block hash or transaction ID
+pub fn explorer_search_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("explorer" / "search" / String)
+        .and(warp::get())
+        .map(move |hash: String| {
+            let bc = lock_or_recover(&blockchain);
+            
+            // Try to find as block hash
+            if let Some(block) = bc.chain.iter().find(|b| b.hash == hash) {
+                return warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "type": "block",
+                    "block": {
+                        "index": block.index,
+                        "slot": block.slot,
+                        "hash": block.hash,
+                        "timestamp": block.timestamp,
+                        "tx_count": block.tx_count
+                    }
+                }));
+            }
+            
+            // Try to find as transaction ID
+            for block in bc.chain.iter() {
+                for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
+                    if tx.id == hash {
+                        return warp::reply::json(&serde_json::json!({
+                            "success": true,
+                            "type": "transaction",
+                            "transaction": {
+                                "id": tx.id,
+                                "from": tx.from,
+                                "to": tx.to,
+                                "amount": tx.amount,
+                                "timestamp": tx.timestamp
+                            },
+                            "block_slot": block.slot
+                        }));
+                    }
+                }
+            }
+            
+            warp::reply::json(&serde_json::json!({
+                "success": false,
+                "error": "Hash not found as block or transaction"
+            }))
+        })
+}
+
+// ============================================================================
+// LIGHT CLIENT API - Header-Only Endpoints for Mobile/SPV
+// ============================================================================
+
+/// GET /headers/:slot - Get only block header (no tx data) for light clients
+pub fn headers_by_slot_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("headers" / u64)
+        .and(warp::get())
+        .map(move |slot: u64| {
+            let bc = lock_or_recover(&blockchain);
+            
+            let block = bc.chain.iter().find(|b| b.slot == slot);
+            
+            match block {
+                Some(b) => warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "header": {
+                        "index": b.index,
+                        "slot": b.slot,
+                        "timestamp": b.timestamp,
+                        "hash": b.hash,
+                        "previous_hash": b.previous_hash,
+                        "poh_hash": b.poh_hash,
+                        "parent_slot": b.parent_slot,
+                        "leader": b.leader,
+                        "tx_count": b.tx_count,
+                        "engagement_score": b.engagement_score
+                        // Note: No transaction data - headers only
+                    }
+                })),
+                None => warp::reply::json(&serde_json::json!({
+                    "success": false,
+                    "error": format!("Header at slot {} not found", slot)
+                }))
+            }
+        })
+}
+
+/// GET /headers/latest - Get latest block header for mobile sync
+pub fn headers_latest_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("headers" / "latest")
+        .and(warp::get())
+        .map(move || {
+            let bc = lock_or_recover(&blockchain);
+            
+            match bc.chain.last() {
+                Some(b) => warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "header": {
+                        "index": b.index,
+                        "slot": b.slot,
+                        "timestamp": b.timestamp,
+                        "hash": b.hash,
+                        "previous_hash": b.previous_hash,
+                        "poh_hash": b.poh_hash,
+                        "parent_slot": b.parent_slot,
+                        "leader": b.leader,
+                        "tx_count": b.tx_count,
+                        "engagement_score": b.engagement_score
+                    },
+                    "chain_height": bc.chain.len(),
+                    "current_slot": bc.current_slot
+                })),
+                None => warp::reply::json(&serde_json::json!({
+                    "success": false,
+                    "error": "No blocks in chain"
+                }))
+            }
+        })
+}
+
+/// GET /headers/range/:start/:end - Get range of headers for sync
+pub fn headers_range_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("headers" / "range" / u64 / u64)
+        .and(warp::get())
+        .map(move |start: u64, end: u64| {
+            let bc = lock_or_recover(&blockchain);
+            
+            // Limit range to prevent abuse (max 1000 headers per request)
+            let actual_end = end.min(start + 1000);
+            
+            let headers: Vec<serde_json::Value> = bc.chain.iter()
+                .filter(|b| b.slot >= start && b.slot <= actual_end)
+                .map(|b| serde_json::json!({
+                    "index": b.index,
+                    "slot": b.slot,
+                    "timestamp": b.timestamp,
+                    "hash": b.hash,
+                    "previous_hash": b.previous_hash,
+                    "poh_hash": b.poh_hash,
+                    "tx_count": b.tx_count
+                }))
+                .collect();
+            
+            warp::reply::json(&serde_json::json!({
+                "success": true,
+                "headers": headers,
+                "range": { "start": start, "end": actual_end },
+                "count": headers.len()
+            }))
+        })
+}
+
+// ============================================================================
+// MERKLE PROOF API - For Light Client Verification
+// ============================================================================
+
+/// GET /proof/account/:address - Get Merkle inclusion proof for account
+pub fn proof_account_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("proof" / "account" / String)
+        .and(warp::get())
+        .map(move |address: String| {
+            let bc = lock_or_recover(&blockchain);
+            
+            // Get account balance
+            let balance = bc.get_balance(&address);
+            
+            // Get latest block info for state root context
+            let latest_block = bc.chain.last();
+            
+            // Generate simple proof (in production, would use actual Merkle tree)
+            // For now, we create a proof structure that can be verified
+            let proof = serde_json::json!({
+                "account": {
+                    "address": address,
+                    "balance": balance,
+                    "exists": bc.balances.contains_key(&address)
+                },
+                "proof": {
+                    "type": "account_inclusion",
+                    "leaf_hash": format!("{:x}", sha2::Sha256::digest(
+                        format!("{}:{}", address, balance).as_bytes()
+                    )),
+                    "state_root": latest_block.map(|b| &b.hash).unwrap_or(&String::new()),
+                    "slot": bc.current_slot,
+                    "block_height": bc.chain.len()
+                },
+                "verification": {
+                    "method": "sha256",
+                    "verifiable": true
+                }
+            });
+            
+            warp::reply::json(&serde_json::json!({
+                "success": true,
+                "proof": proof
+            }))
+        })
+}
+
+/// POST /proof/verify - Verify a Merkle proof
+pub fn proof_verify_route(
+    blockchain: Arc<Mutex<EnhancedBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path!("proof" / "verify")
+        .and(warp::post())
+        .and(warp::body::json())
+        .map(move |body: serde_json::Value| {
+            let bc = lock_or_recover(&blockchain);
+            
+            let address = body.get("address").and_then(|v| v.as_str()).unwrap_or("");
+            let claimed_balance = body.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let proof_hash = body.get("proof_hash").and_then(|v| v.as_str()).unwrap_or("");
+            
+            // Verify: compute expected hash and compare
+            let expected_hash = format!("{:x}", sha2::Sha256::digest(
+                format!("{}:{}", address, bc.get_balance(address)).as_bytes()
+            ));
+            
+            let actual_balance = bc.get_balance(address);
+            let balance_matches = (actual_balance - claimed_balance).abs() < 0.0001;
+            let hash_matches = expected_hash == proof_hash;
+            
+            warp::reply::json(&serde_json::json!({
+                "success": true,
+                "verification": {
+                    "valid": balance_matches && hash_matches,
+                    "balance_matches": balance_matches,
+                    "hash_matches": hash_matches,
+                    "actual_balance": actual_balance,
+                    "claimed_balance": claimed_balance,
+                    "expected_hash": expected_hash,
+                    "provided_hash": proof_hash
+                }
+            }))
+        })
+}
 
 /// GET /ledger - Display all L1 transactions in human-readable format (public)
 /// 

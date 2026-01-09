@@ -8,8 +8,38 @@
  * 
  * Server stores bcrypt(auth_key) but CANNOT decrypt vault.
  * 
- * Dependencies: tweetnacl, argon2-browser
+ * Dependencies: tweetnacl, argon2-browser (browser), tweetnacl (node)
+ * 
+ * Usage (Browser):
+ *   <script src="https://cdn.jsdelivr.net/npm/tweetnacl/nacl-fast.min.js"></script>
+ *   <script src="blackbook-wallet-sdk.js"></script>
+ * 
+ * Usage (Node.js):
+ *   const { BlackBookWallet } = require('./blackbook-wallet-sdk.js');
  */
+
+// ═══════════════════════════════════════════════════════════════
+// ENVIRONMENT DETECTION & POLYFILLS
+// ═══════════════════════════════════════════════════════════════
+
+// Node.js compatibility - load tweetnacl if not already global
+let nacl;
+if (typeof window === 'undefined' && typeof require !== 'undefined') {
+  // Node.js environment
+  try {
+    nacl = require('tweetnacl');
+    // Use Node.js crypto for Web Crypto API compatibility
+    const nodeCrypto = require('crypto');
+    if (typeof globalThis.crypto === 'undefined') {
+      globalThis.crypto = nodeCrypto.webcrypto;
+    }
+  } catch (e) {
+    console.warn('tweetnacl not found. Install with: npm install tweetnacl');
+  }
+} else if (typeof window !== 'undefined' && window.nacl) {
+  // Browser with global nacl
+  nacl = window.nacl;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CONSTANTS & CONFIGURATION
@@ -317,7 +347,7 @@ function hexToBytes(hex) {
 }
 
 /**
- * SHA-256 hash
+ * SHA-256 hash (async)
  */
 async function sha256(data) {
   const encoder = new TextEncoder();
@@ -521,8 +551,17 @@ async function signRequest(privateKey, operationType, payloadFields, requestPath
 // ═══════════════════════════════════════════════════════════════
 
 class BlackBookWallet {
-  constructor(apiUrl = 'http://localhost:8080') {
-    this.apiUrl = apiUrl;
+  /**
+   * Create a new BlackBook wallet instance
+   * 
+   * @param {string} l1Url - L1 blockchain server URL (default: localhost:8080)
+   * @param {string} supabaseUrl - Supabase project URL for auth/vault storage
+   * @param {string} supabaseKey - Supabase anon key
+   */
+  constructor(l1Url = 'http://localhost:8080', supabaseUrl = null, supabaseKey = null) {
+    this.apiUrl = l1Url;  // L1 blockchain server (balance, transfer, bridge)
+    this.supabaseUrl = supabaseUrl;  // Supabase (register, login, vault)
+    this.supabaseKey = supabaseKey;
     this.mnemonic = null;
     this.privateKey = null;
     this.publicKey = null;
@@ -532,6 +571,9 @@ class BlackBookWallet {
 
   /**
    * Register new wallet with Fork Architecture V2
+   * 
+   * NOTE: This stores the encrypted vault in Supabase, NOT the L1 server.
+   * The L1 server only handles blockchain operations (balances, transfers).
    * 
    * @param {string} username - Username
    * @param {string} password - Password
@@ -696,12 +738,101 @@ class BlackBookWallet {
   }
 
   /**
-   * Get wallet balance
+   * Get wallet balance (PUBLIC - no auth required)
    */
   async getBalance() {
     if (!this.address) throw new Error('Wallet not initialized');
     
-    const response = await fetch(`${this.apiUrl}/wallet/balance?address=${this.address}`);
+    // Use public balance endpoint - no signature required
+    const response = await fetch(`${this.apiUrl}/balance/${this.address}`);
+    return await response.json();
+  }
+
+  /**
+   * Get balance for any address (static method)
+   */
+  static async getBalanceFor(apiUrl, address) {
+    const response = await fetch(`${apiUrl}/balance/${address}`);
+    return await response.json();
+  }
+
+  /**
+   * Bridge tokens to L2 (lock on L1)
+   */
+  async bridgeToL2(amount) {
+    if (!this.privateKey) throw new Error('Wallet not initialized');
+    
+    const signedRequest = await signRequest(
+      this.privateKey,
+      'bridge_deposit',
+      { from: this.address, amount },
+      '/bridge/initiate',
+      CHAIN_ID_L1
+    );
+    
+    const response = await fetch(`${this.apiUrl}/bridge/initiate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...signedRequest,
+        target_layer: 'L2',
+      })
+    });
+    
+    return await response.json();
+  }
+
+  /**
+   * Get bridge status
+   */
+  async getBridgeStatus(lockId) {
+    const response = await fetch(`${this.apiUrl}/bridge/status/${lockId}`);
+    return await response.json();
+  }
+
+  /**
+   * Get transaction by ID from explorer
+   */
+  async getTransaction(txId) {
+    const response = await fetch(`${this.apiUrl}/explorer/tx/${txId}`);
+    return await response.json();
+  }
+
+  /**
+   * Get account transaction history from explorer
+   */
+  async getAccountHistory(limit = 50, offset = 0) {
+    if (!this.address) throw new Error('Wallet not initialized');
+    
+    const response = await fetch(
+      `${this.apiUrl}/explorer/account/${this.address}/history?limit=${limit}&offset=${offset}`
+    );
+    return await response.json();
+  }
+
+  /**
+   * Get block by slot from explorer
+   */
+  async getBlock(slot) {
+    const response = await fetch(`${this.apiUrl}/explorer/block/${slot}`);
+    return await response.json();
+  }
+
+  /**
+   * Get latest block header (for light clients)
+   */
+  async getLatestHeader() {
+    const response = await fetch(`${this.apiUrl}/headers/latest`);
+    return await response.json();
+  }
+
+  /**
+   * Get Merkle proof for account (for light client verification)
+   */
+  async getAccountProof() {
+    if (!this.address) throw new Error('Wallet not initialized');
+    
+    const response = await fetch(`${this.apiUrl}/proof/account/${this.address}`);
     return await response.json();
   }
 
@@ -878,6 +1009,66 @@ class BlackBookWallet {
     });
     
     return await response.json();
+  }
+
+  /**
+   * Initialize wallet directly from a seed (for test accounts)
+   * 
+   * @param {string} seedHex - 32-byte seed as 64 hex characters
+   * @param {string} knownAddress - Pre-computed address (optional)
+   * @returns {object} - Wallet info { address, publicKey }
+   */
+  initFromSeed(seedHex, knownAddress = null) {
+    const seedBytes = hexToBytes(seedHex);
+    if (seedBytes.length !== 32) {
+      throw new Error('Seed must be exactly 32 bytes (64 hex chars)');
+    }
+    
+    const keyPair = nacl.sign.keyPair.fromSeed(seedBytes);
+    
+    this.privateKey = keyPair.secretKey;
+    this.publicKey = keyPair.publicKey;
+    
+    // Use known address if provided, otherwise derive it
+    if (knownAddress) {
+      this.address = knownAddress;
+    } else {
+      // Derive L1 address from public key (async would be needed for proper SHA256)
+      // For now, require the address to be passed in for seed-based init
+      throw new Error('knownAddress is required for initFromSeed. Use initFromTestAccount() for test accounts.');
+    }
+    
+    return {
+      address: this.address,
+      publicKey: bytesToHex(this.publicKey)
+    };
+  }
+
+  /**
+   * Initialize from a test account (Alice, Bob, or Dealer)
+   * 
+   * @param {string} accountName - 'alice', 'bob', or 'dealer'
+   * @returns {object} - Wallet info { address, publicKey, balance }
+   */
+  initFromTestAccount(accountName) {
+    const account = TEST_ACCOUNTS[accountName.toUpperCase()];
+    if (!account) {
+      throw new Error(`Unknown test account: ${accountName}. Use 'alice', 'bob', or 'dealer'`);
+    }
+    
+    const seedBytes = hexToBytes(account.seed);
+    const keyPair = nacl.sign.keyPair.fromSeed(seedBytes);
+    
+    this.privateKey = keyPair.secretKey;
+    this.publicKey = keyPair.publicKey;
+    this.address = account.address;
+    this.username = account.username;
+    
+    return {
+      address: this.address,
+      publicKey: bytesToHex(this.publicKey),
+      expectedBalance: account.startingBalance
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════

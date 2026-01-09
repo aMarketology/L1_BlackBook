@@ -718,7 +718,7 @@ pub async fn run_poh_clock(poh_service: SharedPoHService) {
             // Log every 10 slots to avoid spam
             if new_slot - last_slot_log >= 10 {
                 let poh = poh_service.read();
-                println!("⏰ PoH: Slot {} | Epoch {} | {} hashes | {} entries", 
+                println!("🎟️ PoH: Slot {} | Epoch {} | {} hashes | {} entries", 
                          new_slot, poh.current_epoch, poh.num_hashes, poh.current_entries.len());
                 last_slot_log = new_slot;
             }

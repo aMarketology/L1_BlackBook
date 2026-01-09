@@ -394,7 +394,7 @@ async fn main() {
     tokio::spawn(async move {
         run_poh_clock(poh_runner).await;
     });
-    println!("⏰ Continuous PoH clock started (Solana-style Proof of History)");
+    println!("🎟️ Continuous PoH clock started (Solana-style Proof of History)");
     
     // ============================================================================
     // INITIALIZE BLOCKCHAIN (Sled or JSON mode)
