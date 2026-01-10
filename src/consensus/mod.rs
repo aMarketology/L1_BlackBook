@@ -26,17 +26,17 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// TODO: Implement these consensus modules
-// pub mod validator_selection;
-// pub mod block_proposal;
-// pub mod p2p;
+// Consensus modules
+pub mod block_proposal;
+pub mod fork_choice;
 pub mod hot_upgrades;
+pub mod p2p;
 
 // Re-export main types
-// pub use validator_selection::{ValidatorSelector, ValidatorInfo, ValidatorStatus};
-// pub use block_proposal::{BlockProposer, ProposedBlock, BlockVote};
-// pub use p2p::{P2PNetwork, NetworkConfig, PeerInfo};
+pub use block_proposal::{BlockProposer, ProposedBlock, BlockVote};
+pub use fork_choice::{ForkChoiceManager, BlockMeta, FinalityStatus, ForkChoiceStats};
 pub use hot_upgrades::{UpgradeManager, UpgradeProposal, ProtocolVersion, FeatureFlags};
+pub use p2p::{P2PNetwork, NetworkConfig, PeerInfo};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -91,10 +91,9 @@ impl Default for ConsensusConfig {
 pub struct ConsensusEngine {
     pub config: ConsensusConfig,
     pub node_type: NodeType,
-    // TODO: Enable when modules are implemented
-    // pub validator_selector: Arc<RwLock<ValidatorSelector>>,
-    // pub block_proposer: Arc<RwLock<BlockProposer>>,
-    // pub p2p_network: Arc<RwLock<P2PNetwork>>,
+    pub fork_choice: Arc<RwLock<ForkChoiceManager>>,
+    pub block_proposer: Arc<RwLock<BlockProposer>>,
+    pub p2p_network: Arc<RwLock<P2PNetwork>>,
     pub current_epoch: u64,
     pub current_slot: u64,
 }
@@ -102,27 +101,26 @@ pub struct ConsensusEngine {
 impl ConsensusEngine {
     /// Create a new consensus engine
     pub fn new(config: ConsensusConfig, node_type: NodeType) -> Self {
-        // TODO: Initialize when modules are ready
-        // let validator_selector = ValidatorSelector::new(
-        //     config.min_engagement_score,
-        //     config.min_stake,
-        //     config.validator_set_size,
-        // );
+        // Initialize fork choice with genesis
+        let genesis_hash = "0".repeat(64);
+        let fork_choice = ForkChoiceManager::new(genesis_hash.clone(), "genesis_state".to_string());
         
-        // let block_proposer = BlockProposer::new(
-        //     config.block_time_ms,
-        //     config.finality_threshold,
-        // );
+        // Initialize block proposer
+        let block_proposer = BlockProposer::new(
+            config.block_time_ms,
+            config.finality_threshold,
+        );
         
-        // let network_config = NetworkConfig::default();
-        // let p2p_network = P2PNetwork::new(network_config);
+        // Initialize P2P network
+        let network_config = NetworkConfig::default();
+        let p2p_network = P2PNetwork::new(network_config);
         
         Self {
             config,
             node_type,
-            // validator_selector: Arc::new(RwLock::new(validator_selector)),
-            // block_proposer: Arc::new(RwLock::new(block_proposer)),
-            // p2p_network: Arc::new(RwLock::new(p2p_network)),
+            fork_choice: Arc::new(RwLock::new(fork_choice)),
+            block_proposer: Arc::new(RwLock::new(block_proposer)),
+            p2p_network: Arc::new(RwLock::new(p2p_network)),
             current_epoch: 0,
             current_slot: 0,
         }
@@ -130,23 +128,49 @@ impl ConsensusEngine {
     
     /// Check if this node is eligible to be a validator
     pub async fn is_validator_eligible(&self, _address: &str) -> bool {
-        // TODO: Implement when validator_selector is ready
-        false
+        matches!(self.node_type, NodeType::Validator)
     }
     
     /// Get the current validator set
     pub async fn get_validator_set(&self) -> Vec<String> {
-        // TODO: Return ValidatorInfo when module is ready
-        vec![]
+        // Return active validators from P2P network
+        let network = self.p2p_network.read().await;
+        network.get_peer_addresses()
     }
     
     /// Process a new epoch (recalculate validator set)
     pub async fn process_epoch(&mut self, new_epoch: u64) {
         self.current_epoch = new_epoch;
-        
-        // TODO: Recalculate validator set when module is ready
-        // let mut selector = self.validator_selector.write().await;
-        // selector.recalculate_validator_set();
+    }
+    
+    /// Import a new block into the fork choice
+    pub async fn import_block(&self, block: BlockMeta) -> Result<bool, String> {
+        let mut fc = self.fork_choice.write().await;
+        fc.add_block(block)
+    }
+    
+    /// Get the best chain head
+    pub async fn best_head(&self) -> String {
+        let fc = self.fork_choice.read().await;
+        fc.best_head().to_string()
+    }
+    
+    /// Get finalized head
+    pub async fn finalized_head(&self) -> String {
+        let fc = self.fork_choice.read().await;
+        fc.finalized_head().to_string()
+    }
+    
+    /// Check if a block is finalized
+    pub async fn is_finalized(&self, block_hash: &str) -> bool {
+        let fc = self.fork_choice.read().await;
+        fc.is_finalized(block_hash)
+    }
+    
+    /// Broadcast a message to the network
+    pub async fn broadcast(&self, message: p2p::NetworkMessage) {
+        let mut network = self.p2p_network.write().await;
+        network.broadcast(message);
     }
     
     /// Get consensus statistics
@@ -158,6 +182,12 @@ impl ConsensusEngine {
             block_time_ms: self.config.block_time_ms,
             validator_set_size: self.config.validator_set_size,
         }
+    }
+    
+    /// Get fork choice stats
+    pub async fn get_fork_choice_stats(&self) -> ForkChoiceStats {
+        let fc = self.fork_choice.read().await;
+        fc.stats()
     }
 }
 

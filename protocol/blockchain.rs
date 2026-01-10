@@ -370,6 +370,8 @@ impl EnhancedBlockchain {
             slot: 0,
             poh_hash: poh_hash.clone(),
             parent_slot: 0,
+            state_root: "0".repeat(64),    // Genesis has empty state
+            transactions_root: "0".repeat(64),
             sequencer: "GENESIS_AUTHORITY".to_string(),
             leader: "GENESIS_VALIDATOR".to_string(),
             financial_txs: Vec::new(),
@@ -414,11 +416,17 @@ impl EnhancedBlockchain {
     }
     
     /// Create a transaction with a specific type (Transfer, Mint, Burn, etc.)
+    /// Nonce is auto-assigned based on account state
     pub fn create_transaction_typed(&mut self, from: String, to: String, amount: f64, tx_type: TransactionType) -> String {
         let transaction_id = Uuid::new_v4().to_string();
         
         let read_accounts = vec![from.clone()];
         let write_accounts = vec![from.clone(), to.clone()];
+        
+        // Get next nonce for sender (current nonce + 1)
+        let next_nonce = self.accounts.get(&from)
+            .map(|a| a.nonce + 1)
+            .unwrap_or(1);
         
         let transaction = Transaction {
             id: transaction_id.clone(),
@@ -427,6 +435,7 @@ impl EnhancedBlockchain {
             amount,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             signature: String::new(),
+            nonce: next_nonce,
             read_accounts,
             write_accounts,
             tx_type,
@@ -860,6 +869,9 @@ impl EnhancedBlockchain {
             let mut all_txs = financial_txs.clone();
             all_txs.extend(social_txs.clone());
             
+            // Compute transactions root
+            let transactions_root = Block::compute_transactions_root(&all_txs);
+            
             let mut new_block = Block {
                 index: self.chain.len() as u64,
                 timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -868,6 +880,8 @@ impl EnhancedBlockchain {
                 slot: self.current_slot,
                 poh_hash: self.current_poh_hash.clone(),
                 parent_slot,
+                state_root: String::new(), // Set after balance updates
+                transactions_root,
                 sequencer: sequencer.clone(),
                 leader: sequencer.clone(),
                 financial_txs: financial_txs.clone(),
@@ -893,11 +907,19 @@ impl EnhancedBlockchain {
                 if tx.from != "system" && tx.from != "reward_system" && tx.from != "signup_bonus" {
                     self.balances.entry(tx.from.clone())
                         .and_modify(|b| *b -= tx.amount);
+                    // Update sender's nonce
+                    self.update_account_nonce(&tx.from, tx.nonce);
                 }
                 self.balances.entry(tx.to.clone())
                     .and_modify(|b| *b += tx.amount)
                     .or_insert(tx.amount);
             }
+            
+            // Compute state root after balance updates
+            let state_root = self.compute_balances_hash();
+            new_block.state_root = state_root;
+            // Recompute hash with state root
+            new_block.hash = new_block.calculate_hash();
             
             self.chain.push(new_block.clone());
             
@@ -933,6 +955,80 @@ impl EnhancedBlockchain {
             if current.previous_hash != previous.hash { return false; }
         }
         true
+    }
+    
+    /// Compute Merkle root of all account balances (state root)
+    pub fn compute_balances_hash(&self) -> String {
+        // Sort addresses for deterministic ordering
+        let mut sorted_balances: Vec<_> = self.balances.iter().collect();
+        sorted_balances.sort_by(|a, b| a.0.cmp(b.0));
+        
+        if sorted_balances.is_empty() {
+            return "0".repeat(64);
+        }
+        
+        // Hash each account balance
+        let account_hashes: Vec<String> = sorted_balances.iter()
+            .map(|(addr, balance)| {
+                let nonce = self.accounts.get(*addr)
+                    .map(|a| a.nonce)
+                    .unwrap_or(0);
+                let data = format!("{}:{}:{}", addr, balance, nonce);
+                format!("{:x}", Sha256::digest(data.as_bytes()))
+            })
+            .collect();
+        
+        // Build merkle root
+        Self::merkle_root_from_hashes(&account_hashes)
+    }
+    
+    /// Build merkle root from list of hashes
+    fn merkle_root_from_hashes(hashes: &[String]) -> String {
+        if hashes.is_empty() {
+            return "0".repeat(64);
+        }
+        if hashes.len() == 1 {
+            return hashes[0].clone();
+        }
+        
+        let mut next_level = Vec::new();
+        for chunk in hashes.chunks(2) {
+            let combined = if chunk.len() > 1 {
+                format!("{}{}", chunk[0], chunk[1])
+            } else {
+                format!("{}{}", chunk[0], chunk[0])
+            };
+            next_level.push(format!("{:x}", Sha256::digest(combined.as_bytes())));
+        }
+        
+        Self::merkle_root_from_hashes(&next_level)
+    }
+    
+    /// Submit an external transaction with nonce validation
+    pub fn submit_transaction(&mut self, tx: Transaction) -> Result<String, String> {
+        // Validate nonce
+        self.validate_account_nonce(&tx.from, tx.nonce)?;
+        
+        // Validate balance for non-system transactions
+        if tx.from != "system" && tx.from != "reward_system" && tx.from != "signup_bonus" {
+            let balance = self.get_balance(&tx.from);
+            if balance < tx.amount {
+                return Err(format!(
+                    "Insufficient balance: have {}, need {}", balance, tx.amount
+                ));
+            }
+        }
+        
+        let tx_id = tx.id.clone();
+        self.pending_transactions.push(tx);
+        Ok(tx_id)
+    }
+    
+    /// Get next nonce for an address
+    pub fn get_next_nonce(&self, address: &str) -> u64 {
+        self.accounts.get(address)
+            .map(|a| a.nonce + 1)
+            .unwrap_or(1)
     }
 }
 

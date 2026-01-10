@@ -185,6 +185,9 @@ pub struct Transaction {
     pub amount: f64,
     pub timestamp: u64,
     pub signature: String,
+    /// Per-account nonce for replay protection (must be > sender's last nonce)
+    #[serde(default)]
+    pub nonce: u64,
     /// Accounts this transaction reads from (for parallel scheduling)
     #[serde(default)]
     pub read_accounts: Vec<String>,
@@ -271,11 +274,19 @@ impl Transaction {
             amount,
             timestamp,
             signature: format!("sig_{}", &id[..8]),
+            nonce: 0, // Must be set by caller based on account state
             read_accounts,
             write_accounts,
             tx_type,
             id,
         }
+    }
+    
+    /// Create transaction with explicit nonce
+    pub fn with_nonce(from: String, to: String, amount: f64, tx_type: TransactionType, nonce: u64) -> Self {
+        let mut tx = Self::new(from, to, amount, tx_type);
+        tx.nonce = nonce;
+        tx
     }
     
     /// Check if this transaction conflicts with another (for parallel scheduling)
@@ -660,6 +671,14 @@ pub struct Block {
     #[serde(default)]
     pub parent_slot: u64,
     
+    // ========== STATE ROOT ==========
+    /// Merkle root of all account states after this block
+    #[serde(default)]
+    pub state_root: String,
+    /// Merkle root of all transactions in this block
+    #[serde(default)]
+    pub transactions_root: String,
+    
     // ========== SEQUENCER ==========
     /// The sequencer (validator) who committed this block
     #[serde(default)]
@@ -703,6 +722,7 @@ impl Block {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let tx_count = (financial_txs.len() + social_txs.len()) as u64;
         let transactions = [financial_txs.clone(), social_txs.clone()].concat();
+        let transactions_root = Self::compute_transactions_root(&transactions);
         
         let mut block = Block {
             index,
@@ -712,6 +732,8 @@ impl Block {
             slot: 0,
             poh_hash: String::new(),
             parent_slot: 0,
+            state_root: String::new(), // Set after execution
+            transactions_root,
             sequencer: sequencer.clone(),
             leader: sequencer,
             financial_txs,
@@ -742,6 +764,7 @@ impl Block {
         let parent_slot = if slot > 0 { slot - 1 } else { 0 };
         let tx_count = (financial_txs.len() + social_txs.len()) as u64;
         let transactions = [financial_txs.clone(), social_txs.clone()].concat();
+        let transactions_root = Self::compute_transactions_root(&transactions);
         
         let mut block = Block {
             index,
@@ -751,6 +774,8 @@ impl Block {
             slot,
             poh_hash,
             parent_slot,
+            state_root: String::new(), // Set after execution
+            transactions_root,
             sequencer: sequencer.clone(),
             leader: sequencer,
             financial_txs,
@@ -788,6 +813,57 @@ impl Block {
         all.extend(self.social_txs.clone());
         all
     }
+    
+    /// Compute Merkle root of transactions
+    pub fn compute_transactions_root(transactions: &[Transaction]) -> String {
+        if transactions.is_empty() {
+            return "0".repeat(64);
+        }
+        
+        // Hash each transaction
+        let hashes: Vec<String> = transactions.iter()
+            .map(|tx| {
+                let mut hasher = Sha256::new();
+                hasher.update(&tx.id);
+                hasher.update(&tx.from);
+                hasher.update(&tx.to);
+                hasher.update(tx.amount.to_le_bytes());
+                format!("{:x}", hasher.finalize())
+            })
+            .collect();
+        
+        Self::merkle_root(&hashes)
+    }
+    
+    /// Compute Merkle root from hashes
+    fn merkle_root(hashes: &[String]) -> String {
+        if hashes.is_empty() {
+            return "0".repeat(64);
+        }
+        if hashes.len() == 1 {
+            return hashes[0].clone();
+        }
+        
+        let mut next_level = Vec::new();
+        for chunk in hashes.chunks(2) {
+            let mut hasher = Sha256::new();
+            hasher.update(&chunk[0]);
+            if chunk.len() > 1 {
+                hasher.update(&chunk[1]);
+            } else {
+                hasher.update(&chunk[0]); // Duplicate if odd
+            }
+            next_level.push(format!("{:x}", hasher.finalize()));
+        }
+        
+        Self::merkle_root(&next_level)
+    }
+    
+    /// Set state root after block execution
+    pub fn set_state_root(&mut self, state_root: String) {
+        self.state_root = state_root;
+        self.hash = self.calculate_hash();
+    }
 
     /// Calculate block hash (includes both lanes and PoH data)
     /// 
@@ -797,7 +873,7 @@ impl Block {
         let financial_data = serde_json::to_string(&self.financial_txs).unwrap_or_default();
         let social_data = serde_json::to_string(&self.social_txs).unwrap_or_default();
         
-        let input = format!("{}{}{}{}{}{}{}{}{}{}{}",
+        let input = format!("{}{}{}{}{}{}{}{}{}{}{}{}{}",
             self.index, 
             self.timestamp, 
             financial_data,
@@ -808,7 +884,9 @@ impl Block {
             self.sequencer, 
             self.engagement_score,
             self.tx_count,
-            self.parent_slot
+            self.parent_slot,
+            self.state_root,
+            self.transactions_root
         );
         
         let mut hasher = Sha256::new();

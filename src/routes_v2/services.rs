@@ -193,6 +193,8 @@ impl BlockProducer {
                     slot,
                     poh_hash: poh_hash.clone(),
                     parent_slot: slot.saturating_sub(1),
+                    state_root: String::new(),
+                    transactions_root: "0".repeat(64),
                     sequencer: self.leader_id.clone(),
                     leader: self.leader_id.clone(),
                     financial_txs: Vec::new(),
@@ -222,6 +224,8 @@ impl BlockProducer {
                     slot,
                     poh_hash: poh_hash.clone(),
                     parent_slot: slot.saturating_sub(1),
+                    state_root: String::new(),
+                    transactions_root: "0".repeat(64),
                     sequencer: self.leader_id.clone(),
                     leader: self.leader_id.clone(),
                     financial_txs: Vec::new(),
@@ -438,6 +442,7 @@ pub fn submit_transfer_to_gulf_stream(
             .unwrap()
             .as_secs(),
         signature: String::new(), // Already verified before this point
+        nonce: 0, // Set by caller or blockchain
         read_accounts: vec![from.clone()],
         write_accounts: vec![from.clone(), to.clone()],
     };

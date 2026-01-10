@@ -166,6 +166,11 @@ impl P2PNetwork {
 
     pub fn get_peers(&self) -> Vec<&PeerInfo> { self.peers.values().collect() }
     pub fn get_peer(&self, id: &str) -> Option<&PeerInfo> { self.peers.get(id) }
+    pub fn get_peer_addresses(&self) -> Vec<String> { 
+        self.peers.values()
+            .filter_map(|p| p.validator_address.clone())
+            .collect() 
+    }
     pub fn has_enough_peers(&self) -> bool { self.peers.len() >= self.config.min_peers }
     pub fn get_stats(&self) -> &NetworkStats { &self.stats }
     pub fn local_peer_id(&self) -> Option<&String> { self.local_peer_id.as_ref() }

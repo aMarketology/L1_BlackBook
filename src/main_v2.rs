@@ -434,6 +434,15 @@ async fn main() {
         schedule.generate_schedule(0, 432000);
     }
     
+    // ============================================================================
+    // CONSENSUS ENGINE - Fork Choice, Block Proposal, P2P
+    // ============================================================================
+    let consensus_config = consensus::ConsensusConfig::default();
+    let consensus_engine = Arc::new(tokio::sync::RwLock::new(
+        consensus::ConsensusEngine::new(consensus_config, consensus::NodeType::Validator)
+    ));
+    println!("🔗 Consensus Engine initialized (Fork Choice + P2P ready)");
+    
     // 1. Transaction Pipeline (4-stage async processing)
     let (pipeline, _commit_rx) = TransactionPipeline::new();
     pipeline.start(current_slot.clone());
