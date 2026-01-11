@@ -5,6 +5,7 @@
 //! - Borsh binary serialization (Solana-compatible, NOT JSON)
 //! - Atomic batch writes with crash recovery
 //! - Merkle state roots for light client verification
+//! - Snapshot service for fast node bootstrap
 //!
 //! WHY SLED OVER ROCKSDB:
 //! - Pure Rust (no C toolchain required, compiles on Windows/Linux/Mac)
@@ -29,6 +30,7 @@
 pub mod merkle;
 pub mod bridge;
 pub mod persistent;
+pub mod snapshot;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -38,7 +40,12 @@ use sha2::{Sha256, Digest};
 
 pub use merkle::{MerkleState, AccountProof};
 pub use bridge::StorageBridge;
-pub use persistent::{PersistentBlockchain, PersistentConfig};
+pub use persistent::{PersistentBlockchain, PROTOCOL_VERSION, UpgradeHook};
+pub use snapshot::{
+    SnapshotService, SnapshotManifest, SnapshotReader, SnapshotWriter, 
+    SnapshotChunk, AccountSnapshot, SnapshotType, SnapshotError,
+    FULL_SNAPSHOT_INTERVAL_SLOTS, INCREMENTAL_SNAPSHOT_INTERVAL_SLOTS,
+};
 
 // ============================================================================
 // TREE NAMES (Sled's "Column Families")

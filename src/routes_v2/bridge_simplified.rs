@@ -13,14 +13,15 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use warp::Filter;
 use serde::{Deserialize, Serialize};
-use crate::protocol::blockchain::{EnhancedBlockchain, LockPurpose};
+use crate::storage::PersistentBlockchain;
+use crate::protocol::blockchain::LockPurpose;
 use crate::integration::unified_auth::SignedRequest;
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -108,7 +109,7 @@ impl BridgeState {
 // ============================================================================
 
 pub fn bridge_initiate_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("bridge")
@@ -213,7 +214,7 @@ pub fn bridge_status_route(
 // ============================================================================
 
 pub fn credit_approve_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")
@@ -329,7 +330,7 @@ pub fn credit_approve_route(
 // ============================================================================
 
 pub fn credit_status_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")
@@ -454,7 +455,7 @@ fn verify_ed25519_signature(public_key: &str, message: &str, signature: &str) ->
 // ============================================================================
 
 pub fn credit_draw_route(
-    _blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    _blockchain: Arc<Mutex<PersistentBlockchain>>,
     _bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")
@@ -472,7 +473,7 @@ pub fn credit_draw_route(
 }
 
 pub fn credit_settle_route(
-    _blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    _blockchain: Arc<Mutex<PersistentBlockchain>>,
     _bridge_state: Arc<Mutex<BridgeState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("credit")

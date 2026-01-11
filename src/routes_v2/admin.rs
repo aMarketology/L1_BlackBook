@@ -5,12 +5,12 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
 use serde::{Deserialize, Serialize};
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 // TODO: Re-enable when upgrade_manager is added to blockchain
 // use crate::consensus::hot_upgrades::{ProtocolVersion, UpgradeStatus};
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -60,7 +60,7 @@ pub struct BurnRequest {
 /// }
 /// ```
 pub fn mint_tokens_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "mint")
         .and(warp::post())
@@ -159,7 +159,7 @@ pub fn mint_tokens_route(
 /// }
 /// ```
 pub fn burn_tokens_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "burn")
         .and(warp::post())
@@ -259,7 +259,7 @@ pub struct VoteUpgradeRequest {
 
 /// POST /admin/upgrades/propose - Propose a protocol upgrade
 pub fn propose_upgrade_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "upgrades" / "propose")
         .and(warp::post())
@@ -329,7 +329,7 @@ pub fn propose_upgrade_route(
 
 /// POST /admin/upgrades/vote - Vote on a protocol upgrade
 pub fn vote_upgrade_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "upgrades" / "vote")
         .and(warp::post())
@@ -380,7 +380,7 @@ pub fn vote_upgrade_route(
 
 /// GET /admin/upgrades - List all upgrade proposals
 pub fn list_upgrades_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "upgrades")
         .and(warp::get())
@@ -430,7 +430,7 @@ pub fn list_upgrades_route(
 
 /// GET /admin/upgrades/status - Get current protocol status
 pub fn upgrade_status_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("admin" / "upgrades" / "status")
         .and(warp::get())
@@ -443,7 +443,7 @@ pub fn upgrade_status_route(
                     "success": true,
                     "version": bc.upgrade_manager.version.to_string(),
                     "features": bc.upgrade_manager.features.enabled_list(),
-                    "current_block": bc.chain.len(),
+                    "current_block": bc.chain().len(),
                     "pending_proposals": bc.upgrade_manager.pending().len(),
                 })))
             }

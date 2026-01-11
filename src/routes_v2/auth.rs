@@ -16,13 +16,13 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 use crate::integration::unified_auth::{
     SignedRequest, with_signature_auth, generate_keypair,
 };
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -113,7 +113,7 @@ pub fn test_accounts_route() -> impl Filter<Extract = impl warp::Reply, Error = 
 /// Requires: SignedRequest with valid Ed25519 signature
 /// Returns: wallet address, balance, transaction count
 pub fn profile_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("profile")
         .and(warp::post())
@@ -124,7 +124,7 @@ pub fn profile_route(
                 let (balance, tx_count) = {
                     let bc = lock_or_recover(&blockchain);
                     let balance = bc.get_balance(&wallet_address);
-                    let tx_count = bc.chain.iter()
+                    let tx_count = bc.chain().iter()
                         .flat_map(|block| block.financial_txs.iter().chain(block.social_txs.iter()))
                         .filter(|tx| tx.from == wallet_address || tx.to == wallet_address)
                         .count();

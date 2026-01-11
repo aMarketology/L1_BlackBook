@@ -145,7 +145,36 @@ pub const LAMPORTS_PER_BB: u64 = 1_000_000;
 /// Minimum lamports for rent exemption (0.001 BB)
 pub const RENT_EXEMPT_MINIMUM: u64 = 1_000;
 
+/// Account type for categorization
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default, PartialEq)]
+pub enum AccountType {
+    /// Standard user wallet account
+    #[default]
+    User,
+    /// Executable program account
+    Program,
+    /// Program-derived data account (owned by a program)
+    ProgramData,
+    /// NFT token account
+    NFT,
+    /// NFT collection account
+    NFTCollection,
+    /// L3 Document Validator account
+    DocumentValidator,
+    /// Staking account
+    Stake,
+    /// Vote account (for Tower BFT)
+    Vote,
+    /// System account (treasury, fees, etc.)
+    System,
+}
+
 /// Solana-style Account structure
+/// 
+/// Enhanced for smart contracts and L3 NFT Document Validator integration:
+/// - executable: marks program accounts that can be invoked
+/// - program_id: for data accounts, the program that owns them
+/// - data: arbitrary program data (NFT metadata, validator state, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Account {
     /// Balance in lamports (1 BB = 1_000_000 lamports)
@@ -169,6 +198,31 @@ pub struct Account {
     
     /// Is this account rent-exempt? (has minimum balance)
     pub rent_exempt: bool,
+    
+    // ========== SMART CONTRACT FIELDS (L3 Integration) ==========
+    
+    /// Is this an executable program account?
+    /// Program accounts can be invoked by transactions.
+    #[serde(default)]
+    pub executable: bool,
+    
+    /// Program ID that owns this account's data.
+    /// For user accounts, this is empty (self-owned).
+    /// For program data accounts (PDAs), this is the owning program.
+    #[serde(default)]
+    pub program_id: Option<String>,
+    
+    /// Arbitrary data stored in this account.
+    /// - For NFT accounts: token metadata, URI, collection info
+    /// - For validator accounts: validation state, proof history
+    /// - For program accounts: compiled bytecode or native reference
+    #[serde(default)]
+    #[borsh(skip)]
+    pub data: Vec<u8>,
+    
+    /// Account type for quick categorization
+    #[serde(default)]
+    pub account_type: AccountType,
 }
 
 impl Account {
@@ -183,7 +237,69 @@ impl Account {
             created_slot: current_slot,
             last_modified_slot: current_slot,
             rent_exempt,
+            executable: false,
+            program_id: None,
+            data: Vec::new(),
+            account_type: AccountType::User,
         }
+    }
+    
+    /// Create a program account
+    pub fn new_program(owner: String, lamports: u64, current_slot: u64, bytecode: Vec<u8>) -> Self {
+        let mut account = Self::new(owner, lamports, current_slot);
+        account.executable = true;
+        account.account_type = AccountType::Program;
+        account.data = bytecode;
+        account.update_data_hash();
+        account
+    }
+    
+    /// Create an NFT account
+    pub fn new_nft(owner: String, lamports: u64, current_slot: u64, metadata: Vec<u8>) -> Self {
+        let mut account = Self::new(owner, lamports, current_slot);
+        account.account_type = AccountType::NFT;
+        account.data = metadata;
+        account.update_data_hash();
+        account
+    }
+    
+    /// Create a document validator account (for L3 integration)
+    pub fn new_document_validator(
+        owner: String, 
+        lamports: u64, 
+        current_slot: u64, 
+        validator_config: Vec<u8>
+    ) -> Self {
+        let mut account = Self::new(owner, lamports, current_slot);
+        account.account_type = AccountType::DocumentValidator;
+        account.data = validator_config;
+        account.update_data_hash();
+        account
+    }
+    
+    /// Create a vote account (for Tower BFT)
+    pub fn new_vote_account(owner: String, lamports: u64, current_slot: u64) -> Self {
+        let mut account = Self::new(owner, lamports, current_slot);
+        account.account_type = AccountType::Vote;
+        account
+    }
+    
+    /// Update data hash after modifying data
+    pub fn update_data_hash(&mut self) {
+        use sha2::{Sha256, Digest};
+        if self.data.is_empty() {
+            self.data_hash = String::new();
+        } else {
+            let hash = Sha256::digest(&self.data);
+            self.data_hash = hex::encode(hash);
+        }
+    }
+    
+    /// Set account data and update hash
+    pub fn set_data(&mut self, data: Vec<u8>, slot: u64) {
+        self.data = data;
+        self.last_modified_slot = slot;
+        self.update_data_hash();
     }
     
     /// Create account from BB balance (converts to lamports)
@@ -439,6 +555,7 @@ impl EnhancedBlockchain {
             read_accounts,
             write_accounts,
             tx_type,
+            payload_data: None,
         };
         
         // Balance changes now happen ONLY during mining, not here

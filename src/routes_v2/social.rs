@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 use crate::integration::unified_auth::SignedRequest;
 use crate::social_mining::{SocialMiningSystem, SocialActionType};
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -34,7 +34,7 @@ pub struct InteractPayload {
 
 /// POST /social/post - Create a social post (authenticated)
 pub fn create_post_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     social_system: Arc<TokioMutex<SocialMiningSystem>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("social")
@@ -121,7 +121,7 @@ pub fn create_post_route(
 
 /// POST /social/like - Like a post (authenticated)
 pub fn like_post_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     social_system: Arc<TokioMutex<SocialMiningSystem>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("social")

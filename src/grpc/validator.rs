@@ -2,7 +2,8 @@ use tonic::{Request, Response, Status};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
-use crate::protocol::blockchain::{EnhancedBlockchain, LockPurpose};
+use crate::storage::PersistentBlockchain;
+use crate::protocol::blockchain::LockPurpose;
 use ed25519_dalek::{Signature, VerifyingKey, Verifier};
 use sha2::{Sha256, Digest};
 
@@ -31,7 +32,7 @@ pub struct BridgeLock {
 }
 
 pub struct L1BankService {
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     start_time: SystemTime,
     /// Track active bridge locks
     active_locks: Arc<Mutex<HashMap<String, BridgeLock>>>,
@@ -40,7 +41,7 @@ pub struct L1BankService {
 }
 
 impl L1BankService {
-    pub fn new(blockchain: Arc<Mutex<EnhancedBlockchain>>) -> Self {
+    pub fn new(blockchain: Arc<Mutex<PersistentBlockchain>>) -> Self {
         Self {
             blockchain,
             start_time: SystemTime::now(),
@@ -175,7 +176,7 @@ impl SettlementNode for L1BankService {
         );
 
         let _block_hash = bc.mine_pending_transactions("grpc_settlement".to_string());
-        let block_height = bc.chain.len() as u64;
+        let block_height = bc.chain().len() as u64;
 
         let dealer_balance = Self::bb_to_microtokens(bc.get_balance(&req.dealer_address));
         let user_balance = Self::bb_to_microtokens(bc.get_balance(&req.beneficiary));
@@ -522,10 +523,10 @@ impl SettlementNode for L1BankService {
 
         Ok(Response::new(HealthResponse {
             status: "healthy".to_string(),
-            block_height: bc.chain.len() as u64,
+            block_height: bc.chain().len() as u64,
             version: "0.2.0".to_string(),
             uptime_seconds: uptime,
-            pending_settlements: bc.pending_transactions.len() as u32,
+            pending_settlements: bc.pending_transactions().len() as u32,
             active_locks: active_lock_count,
             total_locked_amount: total_locked,
         }))
@@ -536,8 +537,8 @@ impl SettlementNode for L1BankService {
         _request: Request<BlockHeightRequest>,
     ) -> Result<Response<BlockHeightResponse>, Status> {
         let bc = self.blockchain.lock().unwrap();
-        let height = bc.chain.len() as u64;
-        let last_block = bc.chain.last();
+        let height = bc.chain().len() as u64;
+        let last_block = bc.chain().last();
 
         let (blockhash, timestamp) = if let Some(block) = last_block {
             (block.hash.clone(), block.timestamp)
@@ -545,8 +546,8 @@ impl SettlementNode for L1BankService {
             ("genesis".to_string(), 0)
         };
 
-        let previous_blockhash = if bc.chain.len() > 1 {
-            bc.chain.iter().rev().nth(1)
+        let previous_blockhash = if bc.chain().len() > 1 {
+            bc.chain().iter().rev().nth(1)
                 .map(|b| b.hash.clone())
                 .unwrap_or_else(|| "genesis".to_string())
         } else {

@@ -200,15 +200,118 @@ pub struct Transaction {
     /// Unique transaction ID
     #[serde(default)]
     pub id: String,
+    
+    /// Transaction payload data (for NFT, Document validation, etc.)
+    #[serde(default)]
+    #[borsh(skip)]
+    pub payload_data: Option<TransactionPayload>,
+}
+
+/// Transaction payload for complex operations (NFT, Document validation, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TransactionPayload {
+    /// NFT metadata (for NFTMint)
+    pub nft_metadata: Option<NFTMetadata>,
+    
+    /// Document validation data (for DocumentValidation)
+    pub document_validation: Option<DocumentValidationData>,
+    
+    /// Program invocation data (for ProgramInvoke)
+    pub program_invoke: Option<ProgramInvokeData>,
+    
+    /// Vote data (for TowerBFT voting)
+    pub vote: Option<VoteData>,
+    
+    /// Raw bytes for custom payloads
+    pub raw: Option<Vec<u8>>,
+}
+
+/// NFT metadata for minting
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NFTMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+    pub collection_id: Option<String>,
+    pub attributes: HashMap<String, String>,
+    pub royalty_basis_points: u16,  // 100 = 1%
+    pub creators: Vec<NFTCreator>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NFTCreator {
+    pub address: String,
+    pub share: u8,  // Percentage (0-100)
+    pub verified: bool,
+}
+
+/// Document validation data for L3 integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentValidationData {
+    /// NFT ID representing the document
+    pub nft_id: String,
+    
+    /// SHA256 hash of the document
+    pub document_hash: String,
+    
+    /// L3 validator's proof (signature or ZK proof)
+    pub l3_proof: String,
+    
+    /// Validator's address on L3
+    pub validator_address: String,
+    
+    /// Validation timestamp (L3 time)
+    pub validated_at: u64,
+    
+    /// Validation status
+    pub status: ValidationStatus,
+    
+    /// Optional callback URL for async validation
+    pub callback_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum ValidationStatus {
+    #[default]
+    Pending,
+    Valid,
+    Invalid,
+    Expired,
+}
+
+/// Program invocation data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramInvokeData {
+    pub program_id: String,
+    pub instruction_data: Vec<u8>,
+    pub accounts: Vec<AccountMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountMeta {
+    pub pubkey: String,
+    pub is_signer: bool,
+    pub is_writable: bool,
+}
+
+/// Vote data for Tower BFT
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteData {
+    pub slot: u64,
+    pub block_hash: String,
+    pub validator_pubkey: String,
+    pub timestamp: u64,
 }
 
 /// Transaction type for categorization (Two-Lane Model)
 /// - Financial Lane: Transfer, BetPlacement, BetResolution, StakeDeposit, StakeWithdraw
 /// - Social Lane: SocialAction
+/// - NFT Lane: NFTMint, NFTTransfer, NFTBurn (new)
+/// - L3 Integration: DocumentValidation, ProgramInvoke (new)
+/// - Consensus: Vote (for Tower BFT)
 /// - System: SystemReward (internal)
 /// - Admin: Mint, Burn (treasury operations)
 /// 
-/// NOTE: No ContractCall - we use native logic, no VM execution needed.
 /// Implements both Serde and Borsh for hybrid serialization
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default, PartialEq)]
 pub enum TransactionType {
@@ -222,6 +325,34 @@ pub enum TransactionType {
     SystemReward,
     Mint,
     Burn,
+    
+    // ========== NFT OPERATIONS (New) ==========
+    /// Mint a new NFT
+    NFTMint,
+    /// Transfer NFT ownership
+    NFTTransfer,
+    /// Burn an NFT
+    NFTBurn,
+    /// Update NFT metadata
+    NFTUpdate,
+    
+    // ========== L3 DOCUMENT VALIDATION (New) ==========
+    /// Submit document for L3 validation
+    DocumentValidation,
+    /// L3 validator responds with proof
+    DocumentValidationResponse,
+    
+    // ========== PROGRAM OPERATIONS (New) ==========
+    /// Invoke a program (smart contract call)
+    ProgramInvoke,
+    /// Deploy a new program
+    ProgramDeploy,
+    /// Upgrade an existing program
+    ProgramUpgrade,
+    
+    // ========== CONSENSUS (Tower BFT) ==========
+    /// Vote for a block (Tower BFT)
+    Vote,
 }
 
 impl TransactionType {
@@ -239,6 +370,32 @@ impl TransactionType {
     /// Returns true if this is a social lane transaction
     pub fn is_social(&self) -> bool {
         matches!(self, TransactionType::SocialAction)
+    }
+    
+    /// Returns true if this is an NFT lane transaction
+    pub fn is_nft(&self) -> bool {
+        matches!(self,
+            TransactionType::NFTMint |
+            TransactionType::NFTTransfer |
+            TransactionType::NFTBurn |
+            TransactionType::NFTUpdate
+        )
+    }
+    
+    /// Returns true if this is an L3/program transaction
+    pub fn is_program(&self) -> bool {
+        matches!(self,
+            TransactionType::DocumentValidation |
+            TransactionType::DocumentValidationResponse |
+            TransactionType::ProgramInvoke |
+            TransactionType::ProgramDeploy |
+            TransactionType::ProgramUpgrade
+        )
+    }
+    
+    /// Returns true if this is a consensus transaction
+    pub fn is_consensus(&self) -> bool {
+        matches!(self, TransactionType::Vote)
     }
 }
 
@@ -279,6 +436,7 @@ impl Transaction {
             write_accounts,
             tx_type,
             id,
+            payload_data: None,
         }
     }
     

@@ -42,6 +42,7 @@ impl From<&Account> for StoredAccount {
 
 impl From<&StoredAccount> for Account {
     fn from(stored: &StoredAccount) -> Self {
+        use crate::protocol::blockchain::AccountType;
         Account {
             lamports: stored.lamports,
             nonce: stored.nonce,
@@ -50,6 +51,10 @@ impl From<&StoredAccount> for Account {
             created_slot: stored.created_slot,
             last_modified_slot: stored.last_modified_slot,
             rent_exempt: stored.rent_exempt,
+            executable: false,
+            program_id: None,
+            data: Vec::new(),
+            account_type: AccountType::User,
         }
     }
 }

@@ -18,13 +18,14 @@ use std::time::Duration;
 use sha2::Digest;  // For sha2::Sha256::digest
 use parking_lot::RwLock;  // Use parking_lot::RwLock to match GulfStreamService
 
-use crate::protocol::blockchain::{EnhancedBlockchain, Block, TurbineService, Transaction as BlockchainTransaction, TransactionType as BlockchainTxType};
+use crate::storage::PersistentBlockchain;
+use crate::protocol::blockchain::{Block, TurbineService, Transaction as BlockchainTransaction, TransactionType as BlockchainTxType};
 use crate::protocol::blockchain_state::ArchiveService;
 use crate::protocol::persistence::CloudbreakAccountDB;
 use crate::runtime::{GulfStreamService, SharedPoHService};
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -45,7 +46,7 @@ fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, E
 /// 5. Updates Cloudbreak with new account states
 pub struct BlockProducer {
     /// Blockchain state
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     
     /// Gulf Stream for transaction collection
     gulf_stream: Arc<GulfStreamService>,
@@ -83,7 +84,7 @@ pub struct BlockProducer {
 impl BlockProducer {
     /// Create a new block producer
     pub fn new(
-        blockchain: Arc<Mutex<EnhancedBlockchain>>,
+        blockchain: Arc<Mutex<PersistentBlockchain>>,
         gulf_stream: Arc<GulfStreamService>,
         turbine: Arc<TurbineService>,
         cloudbreak: Arc<CloudbreakAccountDB>,
@@ -145,7 +146,7 @@ impl BlockProducer {
         // 2. Also get any pending from blockchain itself (direct submissions)
         let direct_pending = {
             let bc = lock_or_recover(&self.blockchain);
-            bc.pending_transactions.clone()
+            bc.pending_transactions().clone()
         };
         
         let total_txs = pending_txs.len() + direct_pending.len();
@@ -174,19 +175,19 @@ impl BlockProducer {
                     tx.amount,
                     BlockchainTxType::Transfer,
                 );
-                bc.pending_transactions.push(blockchain_tx);
+                bc.add_pending_transaction(blockchain_tx);
             }
             
             // Mine the block
-            if bc.pending_transactions.is_empty() {
+            if bc.pending_transactions().is_empty() {
                 // Create empty block for chain continuity
                 let mut block = Block {
-                    index: bc.chain.len() as u64,
+                    index: bc.chain().len() as u64,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs(),
-                    previous_hash: bc.chain.last()
+                    previous_hash: bc.chain().last()
                         .map(|b| b.hash.clone())
                         .unwrap_or_default(),
                     hash: String::new(),
@@ -204,19 +205,19 @@ impl BlockProducer {
                     tx_count: 0,
                 };
                 
-                // Compute hash and add to chain
+                // Compute hash and add to chain with persistence
                 block.hash = format!("{:x}", sha2::Sha256::digest(
                     format!("{}{}{}", block.index, block.timestamp, block.previous_hash).as_bytes()
                 ));
-                bc.chain.push(block.clone());
-                bc.current_slot = slot + 1;
+                let _ = bc.add_empty_block(block.clone());
+                bc.set_current_slot(slot + 1);
                 block
             } else {
                 // Mine with transactions (this modifies bc and adds block to chain)
                 let _ = bc.mine_pending_transactions(self.leader_id.clone());
                 
                 // Get the block that was just added
-                let block = bc.chain.last().cloned().unwrap_or_else(|| Block {
+                let block = bc.chain().last().cloned().unwrap_or_else(|| Block {
                     index: 0,
                     timestamp: 0,
                     previous_hash: String::new(),
@@ -236,12 +237,12 @@ impl BlockProducer {
                 });
                 
                 // Update slot info on the block
-                if let Some(last_block) = bc.chain.last_mut() {
+                if let Some(last_block) = bc.chain_mut().last_mut() {
                     last_block.slot = slot;
                     last_block.poh_hash = poh_hash.clone();
                 }
                 
-                bc.current_slot = slot + 1;
+                bc.set_current_slot(slot + 1);
                 block
             }
         };
@@ -278,7 +279,7 @@ impl BlockProducer {
     fn sync_cloudbreak_state(&self) {
         let balances = {
             let bc = lock_or_recover(&self.blockchain);
-            bc.balances.clone()
+            bc.balances().clone()
         };
         
         for (address, balance) in &balances {
@@ -327,7 +328,7 @@ pub struct ServiceCoordinator {
 impl ServiceCoordinator {
     /// Create and initialize all services
     pub fn new(
-        blockchain: Arc<Mutex<EnhancedBlockchain>>,
+        blockchain: Arc<Mutex<PersistentBlockchain>>,
         poh_service: SharedPoHService,
         current_slot: Arc<AtomicU64>,
         leader_schedule: Arc<RwLock<crate::runtime::LeaderSchedule>>,
@@ -354,8 +355,8 @@ impl ServiceCoordinator {
         // Initial sync: Load existing balances into Cloudbreak
         {
             let bc = lock_or_recover(&blockchain);
-            cloudbreak.load_from_hashmap(&bc.balances);
-            println!("💎 Cloudbreak synced with {} accounts", bc.balances.len());
+            cloudbreak.load_from_hashmap(&bc.balances());
+            println!("💎 Cloudbreak synced with {} accounts", bc.balances().len());
         }
         
         Self {
@@ -445,6 +446,7 @@ pub fn submit_transfer_to_gulf_stream(
         nonce: 0, // Set by caller or blockchain
         read_accounts: vec![from.clone()],
         write_accounts: vec![from.clone(), to.clone()],
+        payload_data: None,
     };
     
     let tx_id = tx.id.clone();

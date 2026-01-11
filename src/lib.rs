@@ -41,7 +41,7 @@ pub use runtime::core::{TransactionType, Transaction, Block};
 pub use storage::{
     StorageEngine, StorageBridge, StoredAccount, StoredBlockHeader, 
     StoredSocialData, TxLocation, DbStats, StorageError, StorageResult,
-    MerkleState, AccountProof, PersistentBlockchain, PersistentConfig,
+    MerkleState, AccountProof, PersistentBlockchain, PROTOCOL_VERSION, UpgradeHook,
 };
 
 // Social mining (used by tests)

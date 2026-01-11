@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use warp::Filter;
 use serde::{Deserialize, Serialize};
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -120,7 +120,7 @@ pub struct LiquidityPool {
 /// }
 /// ```
 pub fn initial_liquidity_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("markets" / "initial-liquidity" / String)
         .and(warp::post())
@@ -151,7 +151,7 @@ pub struct LiquidityBody {
 }
 
 async fn handle_initial_liquidity(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     request: InitialLiquidityRequest,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     // Validate input

@@ -89,6 +89,17 @@ impl From<TransactionType> for SignedTxType {
             TransactionType::BetResolution => SignedTxType::BetResolution,
             TransactionType::Mint => SignedTxType::Mint,
             TransactionType::Burn => SignedTxType::Burn,
+            // L3 NFT/Document/Program transaction types map to System for now
+            TransactionType::NFTMint |
+            TransactionType::NFTTransfer |
+            TransactionType::NFTBurn |
+            TransactionType::NFTUpdate |
+            TransactionType::DocumentValidation |
+            TransactionType::DocumentValidationResponse |
+            TransactionType::ProgramInvoke |
+            TransactionType::ProgramDeploy |
+            TransactionType::ProgramUpgrade |
+            TransactionType::Vote => SignedTxType::System,
         }
     }
 }

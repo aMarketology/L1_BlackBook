@@ -1,26 +1,17 @@
 // ============================================================================
-// LAYER1 BLOCKCHAIN SERVER V2 - Pure Signature-Based Authentication
+// LAYER1 BLOCKCHAIN SERVER V2 - Sled-Only Immutable Persistence
 // ============================================================================
 //
-// Clean, streamlined server with:
+// BlackBook L1 - Production Blockchain Server
 // - Ed25519 signature-based authentication (NO JWT!)
-// - Proof of History (PoH) continuous clock for Solana-style timestamping
+// - Proof of History (PoH) continuous clock (Solana-style)
 // - Two-lane transaction architecture (Financial + Social)
-// - Modular route handlers in routes_v2/
-// - Alice & Bob test accounts for development
-// - Uses protocol::blockchain for EnhancedBlockchain
+// - SLED-ONLY: All blocks persisted immediately, true immutability
+// - Hot upgrade ready: Version tracking and migration hooks
 //
-// STORAGE OPTIONS:
-// - --sled : Use Sled + Borsh persistence (production, default)
-// - --json : Use JSON file persistence (legacy, for debugging)
-//
-// SOLANA-STYLE PERFORMANCE FEATURES:
-// - Pipeline: 4-stage async transaction processing
-// - Gulf Stream: Transaction forwarding to upcoming leaders
-// - Turbine: Block propagation via shreds
-// - Cloudbreak: High-performance account database
-// - Archivers: Distributed ledger storage
-// - Enhanced Sealevel: Parallel execution with fine-grained locking
+// PERSISTENCE IS INNATE:
+// Every transaction, every block, every state change is persisted to Sled.
+// There is NO in-memory-only mode. Crash recovery is automatic.
 //
 // Run: cargo run
 // Test: curl http://localhost:3030/health
@@ -30,7 +21,6 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 use std::fs;
-use std::env;
 
 use warp::Filter;
 use tokio::sync::Mutex as TokioMutex;
@@ -40,10 +30,10 @@ use parking_lot::RwLock;
 mod social_mining;
 mod integration;
 mod routes_v2;
-mod unified_wallet;  // Unified wallet system (L1/L2 address logic)
-mod consensus;       // Consensus mechanisms (hot upgrades, validator selection, etc.)
-mod grpc;            // gRPC Settlement (L1 ↔ L2 internal communication)
-mod storage;         // Sled + Borsh persistence (production storage)
+mod unified_wallet;
+mod consensus;
+mod grpc;
+mod storage;
 
 // Root-level modules
 #[path = "../protocol/mod.rs"]
@@ -54,9 +44,7 @@ mod runtime;
 // Re-exports
 use social_mining::SocialMiningSystem;
 
-// Use EnhancedBlockchain from protocol
-use protocol::blockchain::EnhancedBlockchain;
-// Use PersistentBlockchain from storage
+// Use PersistentBlockchain - the ONLY blockchain type for production
 use storage::PersistentBlockchain;
 
 // PoH Service imports - Proof of History for continuous timestamping
@@ -69,28 +57,14 @@ use runtime::{
 pub use runtime::core::TransactionType;
 
 // ============================================================================
-// PERSISTENCE - JSON (Legacy) or Sled (Production)
+// SLED-ONLY PERSISTENCE - No JSON mode, no in-memory only
 // ============================================================================
 
-const BLOCKCHAIN_FILE: &str = "blockchain_data.json";
 const SOCIAL_DATA_FILE: &str = "social_mining_data.json";
 const SLED_DATA_PATH: &str = "./blockchain_sled";
 
-/// Check if we should use Sled persistence (default) or JSON (legacy)
-fn use_sled_storage() -> bool {
-    let args: Vec<String> = env::args().collect();
-    
-    // --json flag forces legacy JSON mode
-    if args.iter().any(|a| a == "--json") {
-        return false;
-    }
-    
-    // Default to Sled (production)
-    true
-}
-
-/// Load blockchain using Sled persistence (production)
-fn load_blockchain_sled() -> PersistentBlockchain {
+/// Load blockchain from Sled (the ONLY storage mode)
+fn load_blockchain() -> PersistentBlockchain {
     match PersistentBlockchain::new(SLED_DATA_PATH) {
         Ok(mut bc) => {
             // Check if we need to seed test accounts
@@ -100,30 +74,13 @@ fn load_blockchain_sled() -> PersistentBlockchain {
                 println!("🧪 Seeding test accounts...");
                 seed_test_accounts(&mut bc);
             }
-            println!("📂 Loaded blockchain from Sled ({})", SLED_DATA_PATH);
+            println!("✅ Blockchain loaded from Sled ({})", SLED_DATA_PATH);
             bc
         }
         Err(e) => {
-            eprintln!("❌ Failed to initialize Sled storage: {:?}", e);
-            eprintln!("   Falling back to in-memory blockchain");
-            // Create fresh blockchain wrapped in storage
-            PersistentBlockchain::new(SLED_DATA_PATH)
-                .expect("Failed to create fallback storage")
+            panic!("❌ FATAL: Failed to initialize Sled storage: {:?}", e);
         }
     }
-}
-
-fn load_blockchain_json() -> EnhancedBlockchain {
-    if let Ok(data) = fs::read_to_string(BLOCKCHAIN_FILE) {
-        if let Ok(bc) = serde_json::from_str(&data) {
-            println!("📂 Loaded blockchain from {}", BLOCKCHAIN_FILE);
-            return bc;
-        }
-    }
-    println!("🆕 Creating new blockchain with test accounts");
-    let mut bc = EnhancedBlockchain::new();
-    seed_test_accounts_enhanced(&mut bc);
-    bc
 }
 
 fn seed_test_accounts(bc: &mut PersistentBlockchain) {
@@ -199,9 +156,9 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     
     println!("   └─────────────────────────────────────────────────────────┘");
     
-    // Only mine if we funded any accounts
+    // Mine if we funded any accounts - THIS WILL PERSIST
     if funded_any {
-        if let Err(e) = bc.mine_and_persist("genesis_airdrop".to_string()) {
+        if let Err(e) = bc.mine_pending_transactions("genesis_airdrop".to_string()) {
             eprintln!("⚠️  Mining airdrop failed: {}", e);
         }
         println!("✅ New accounts funded from Treasury (persisted to Sled)");
@@ -210,127 +167,15 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     }
 }
 
-fn seed_test_accounts_enhanced(bc: &mut EnhancedBlockchain) {
-    // ========================================================================
-    // TEST ACCOUNT INITIALIZATION (Development Only)
-    // ========================================================================
-    // Real Ed25519 derived addresses for Alice, Bob, and Dealer
-    // These match the SDK TEST_ACCOUNTS for consistent testing
-    // 
-    // PERSISTENCE: Only fund accounts if they have zero balance.
-    // Real crypto addresses persist their balances across sessions.
-    // ========================================================================
-    
-    use crate::protocol::blockchain::TREASURY_ADDRESS;
-    
-    // Real cryptographic test accounts (Ed25519 derived from seeds)
-    // Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
-    let alice_address = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";  // seed: 18f2c2e3...
-    let bob_address = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";    // seed: e4ac49e5...
-    let dealer_address = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC"; // seed: d4e5f6a7...
-    
-    // Initial funding amounts (only applied if balance is 0)
-    let alice_initial = 20000.0;
-    let bob_initial = 10000.0;
-    let dealer_initial = 100000.0;
-    
-    // Check existing balances (persistence!)
-    let alice_bal = bc.get_balance(alice_address);
-    let bob_bal = bc.get_balance(bob_address);
-    let dealer_bal = bc.get_balance(dealer_address);
-    
-    println!("🧪 Test Account Status (Real Ed25519 Addresses):");
-    println!("   ┌─────────────────────────────────────────────────────────┐");
-    
-    let mut funded_any = false;
-    
-    // Only fund if balance is zero (first run)
-    if alice_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            alice_address.to_string(),
-            alice_initial,
-        );
-        println!("   │ 💸 Alice:  {} BB ← Treasury (NEW)         │", alice_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 👛 Alice:  {} BB (persisted)                   │", alice_bal);
-    }
-    
-    if bob_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            bob_address.to_string(),
-            bob_initial,
-        );
-        println!("   │ 💸 Bob:    {} BB ← Treasury (NEW)          │", bob_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 👛 Bob:    {} BB (persisted)                    │", bob_bal);
-    }
-    
-    if dealer_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            dealer_address.to_string(),
-            dealer_initial,
-        );
-        println!("   │ 💸 Dealer: {} BB ← Treasury (NEW)       │", dealer_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 🎰 Dealer: {} BB (persisted)                 │", dealer_bal);
-    }
-    
-    println!("   └─────────────────────────────────────────────────────────┘");
-    
-    // Only mine if we funded any accounts
-    if funded_any {
-        let _ = bc.mine_pending_transactions("genesis_airdrop".to_string());
-        println!("✅ New accounts funded from Treasury");
-    } else {
-        println!("✅ All accounts loaded from persistent storage");
-    }
-}
-
-fn save_blockchain(blockchain: &EnhancedBlockchain) {
-    if let Ok(data) = serde_json::to_string_pretty(blockchain) {
-        if fs::write(BLOCKCHAIN_FILE, data).is_ok() {
-            println!("💾 Saved blockchain to {}", BLOCKCHAIN_FILE);
-        }
-    }
+fn seed_test_accounts_legacy(_bc: &mut protocol::blockchain::EnhancedBlockchain) {
+    // REMOVED - Sled-only mode, no JSON fallback
+    unimplemented!("JSON mode removed - use Sled persistence only")
 }
 
 fn save_social_system(social_system: &SocialMiningSystem) {
     if let Ok(data) = serde_json::to_string_pretty(social_system) {
         let _ = fs::write(SOCIAL_DATA_FILE, data);
-        // Silent save - no console spam
     }
-}
-
-fn emergency_save(blockchain: &EnhancedBlockchain, social_system: &SocialMiningSystem) {
-    println!("\n🚨 EMERGENCY SAVE INITIATED...");
-    
-    // Save blockchain
-    if let Ok(data) = serde_json::to_string_pretty(blockchain) {
-        if fs::write(BLOCKCHAIN_FILE, &data).is_ok() {
-            // Also create backup
-            let _ = fs::write("blockchain_backup.json", data);
-            println!("✅ Blockchain saved successfully");
-        } else {
-            eprintln!("❌ Failed to save blockchain!");
-        }
-    }
-    
-    // Save social mining data
-    if let Ok(data) = serde_json::to_string_pretty(social_system) {
-        if fs::write(SOCIAL_DATA_FILE, data).is_ok() {
-            println!("✅ Social mining data saved successfully");
-        } else {
-            eprintln!("❌ Failed to save social mining data!");
-        }
-    }
-    
-    println!("✅ Emergency save complete - all user funds protected\n");
 }
 
 fn load_social_system() -> SocialMiningSystem {
@@ -345,25 +190,18 @@ fn load_social_system() -> SocialMiningSystem {
 }
 
 // ============================================================================
-// MAIN SERVER
+// MAIN SERVER - SLED-ONLY PERSISTENCE
 // ============================================================================
 
 #[tokio::main]
 async fn main() {
-    // Check storage mode first
-    let use_sled = use_sled_storage();
-    
     println!("╔═══════════════════════════════════════════════════════════════╗");
-    println!("║         LAYER1 BLOCKCHAIN V2 - Signature-Based Auth           ║");
+    println!("║     BLACKBOOK L1 - Immutable Blockchain (Sled Persistence)    ║");
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!("║  Auth: Ed25519 Signatures (NO JWT!)                           ║");
     println!("║  PoH:  Continuous Proof of History Clock (Solana-style)       ║");
     println!("║  Arch: Two-Lane Transactions (Financial + Social)             ║");
-    if use_sled {
-        println!("║  Storage: Sled + Borsh (PRODUCTION)                           ║");
-    } else {
-        println!("║  Storage: JSON files (LEGACY MODE - use --sled for prod)      ║");
-    }
+    println!("║  Storage: Sled + Borsh (IMMUTABLE, CRASH-SAFE)                ║");
     println!("║  Test: GET /auth/test-accounts for Alice & Bob                ║");
     println!("║  Admin: POST /admin/mint to mint tokens (OPEN ACCESS)         ║");
     println!("║  Bridge: POST /bridge/initiate for L1→L2 transfers            ║");
@@ -397,25 +235,15 @@ async fn main() {
     println!("🎟️ Continuous PoH clock started (Solana-style Proof of History)");
     
     // ============================================================================
-    // INITIALIZE BLOCKCHAIN (Sled or JSON mode)
+    // INITIALIZE BLOCKCHAIN (SLED-ONLY - Mandatory Persistence)
     // ============================================================================
-    // In Sled mode: Uses PersistentBlockchain which wraps EnhancedBlockchain
-    // In JSON mode: Uses EnhancedBlockchain directly with autosave
+    // PersistentBlockchain is the ONLY blockchain type for production.
+    // Every transaction, every block is persisted immediately to Sled.
+    // There is NO in-memory-only mode. Crash recovery is automatic.
     // ============================================================================
     
-    // For now, we use EnhancedBlockchain directly and manually call persist
-    // This maintains API compatibility while adding Sled persistence
-    let (blockchain, persistent_storage) = if use_sled {
-        println!("🗄️  Initializing Sled storage at {}", SLED_DATA_PATH);
-        let pbc = load_blockchain_sled();
-        // Extract the inner blockchain for route handlers
-        let inner: EnhancedBlockchain = (*pbc).clone();
-        let storage = Some(pbc);
-        (Arc::new(Mutex::new(inner)), storage)
-    } else {
-        println!("📁 Using JSON file persistence");
-        (Arc::new(Mutex::new(load_blockchain_json())), None)
-    };
+    println!("🗄️  Initializing Sled storage at {}", SLED_DATA_PATH);
+    let blockchain = Arc::new(Mutex::new(load_blockchain()));
     
     let social_system = Arc::new(TokioMutex::new(load_social_system()));
     
@@ -672,35 +500,21 @@ async fn main() {
                 ])
         );
     
-    // Autosave every 30 seconds
-    // In Sled mode: Flush Sled to disk (data is already persisted per-transaction)
-    // In JSON mode: Write entire state to JSON file
+    // Autosave every 30 seconds (Sled-only mode)
+    // Sled persists on every transaction, but we flush periodically for safety
     let bc_save = blockchain.clone();
     let social_save = social_system.clone();
-    let use_sled_for_save = use_sled;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             
-            // Clone data for saving (avoid holding locks across await)
-            let bc_data = match bc_save.lock() {
-                Ok(bc) => bc.clone(),
-                Err(poisoned) => poisoned.into_inner().clone()
-            };
-            
-            if use_sled_for_save {
-                // Sled mode: sync accounts to storage periodically
-                // Note: Block data is persisted immediately during mining
-                if let Ok(bridge) = storage::StorageBridge::new(SLED_DATA_PATH) {
-                    let slot = bc_data.current_slot;
-                    match bridge.sync_accounts_from_hashmap(&bc_data.accounts, slot) {
-                        Ok(count) => println!("💾 Synced {} accounts to Sled (slot {})", count, slot),
-                        Err(e) => eprintln!("⚠️ Sled sync error: {:?}", e),
-                    }
+            // Flush Sled storage
+            if let Ok(bc) = bc_save.lock() {
+                if let Err(e) = bc.flush() {
+                    eprintln!("⚠️ Sled flush error: {:?}", e);
+                } else {
+                    println!("💾 Sled flushed (slot {})", bc.current_slot());
                 }
-            } else {
-                // JSON mode: write entire state
-                save_blockchain(&bc_data);
             }
             
             let social_data = {
@@ -714,34 +528,26 @@ async fn main() {
     // Graceful shutdown handler (Ctrl+C)
     let bc_shutdown = blockchain.clone();
     let social_shutdown = social_system.clone();
-    let use_sled_for_shutdown = use_sled;
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
         
         println!("\n\n🛑 Shutdown signal received (Ctrl+C)");
         
-        // Emergency save (clone data to avoid lock issues)
-        let bc_data = match bc_shutdown.lock() {
-            Ok(bc) => bc.clone(),
-            Err(poisoned) => poisoned.into_inner().clone()
-        };
-        
-        let social_data = {
-            let social = social_shutdown.lock().await;
-            social.clone()
-        };
-        
-        if use_sled_for_shutdown {
-            // Sled mode: final flush
-            if let Ok(bridge) = storage::StorageBridge::new(SLED_DATA_PATH) {
-                let _ = bridge.sync_accounts_from_hashmap(&bc_data.accounts, bc_data.current_slot);
-                let _ = bridge.flush();
+        // Final flush
+        if let Ok(bc) = bc_shutdown.lock() {
+            if let Err(e) = bc.flush() {
+                eprintln!("⚠️ Final flush error: {:?}", e);
+            } else {
                 println!("✅ Sled storage flushed");
             }
         }
         
-        // Always save to JSON as backup
-        emergency_save(&bc_data, &social_data);
+        // Save social data
+        let social_data = {
+            let social = social_shutdown.lock().await;
+            social.clone()
+        };
+        save_social_system(&social_data);
         
         println!("👋 Good bye, chosen one. Server is shutting down gracefully 👋");
         std::process::exit(0);

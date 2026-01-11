@@ -4,12 +4,12 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 use crate::integration::unified_auth::with_signature_auth;
 use crate::unified_wallet::{to_l1_address, to_l2_address, strip_prefix};
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -21,7 +21,7 @@ fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, E
 /// Request: SignedRequest with empty payload {}
 /// Returns: balance in L1 tokens with L1/L2 addresses
 pub fn balance_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("wallet")
         .and(warp::path("balance"))
@@ -67,7 +67,7 @@ pub fn balance_route(
 /// Request: SignedRequest with empty payload {}
 /// Returns: balance, transaction history summary, L1/L2 addresses
 pub fn wallet_info_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("wallet")
         .and(warp::path("info"))
@@ -93,7 +93,7 @@ pub fn wallet_info_route(
                     let mut total_sent = 0.0;
                     let mut total_received = 0.0;
                     
-                    for block in &bc.chain {
+                    for block in bc.chain() {
                         for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
                             // Match by base address (strip any prefix from stored addresses)
                             let tx_from = strip_prefix(&tx.from);

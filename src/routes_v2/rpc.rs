@@ -5,15 +5,15 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use warp::Filter;
 use sha2::Digest;
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 use crate::runtime::{SharedPoHService, verify_poh_chain, PoHService};
 
 /// Helper to recover from poisoned locks
 /// When a thread panics while holding a Mutex, the lock becomes "poisoned"
 /// This helper recovers by extracting the inner data
 fn lock_or_recover<'a>(
-    mutex: &'a Mutex<EnhancedBlockchain>
-) -> MutexGuard<'a, EnhancedBlockchain> {
+    mutex: &'a Mutex<PersistentBlockchain>
+) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -133,7 +133,7 @@ pub fn poh_verify_route(
 
 /// GET /stats - Blockchain statistics (public)
 pub fn stats_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("stats")
         .and(warp::get())
@@ -143,12 +143,12 @@ pub fn stats_route(
                 let stats = {
                     let bc = lock_or_recover(&blockchain);
                     serde_json::json!({
-                        "total_blocks": bc.chain.len(),
-                        "pending_transactions": bc.pending_transactions.len(),
-                        "total_wallets": bc.balances.len(),
-                        "total_supply": bc.balances.values().sum::<f64>(),
-                        "mining_reward": bc.mining_reward,
-                        "daily_jackpot": bc.daily_jackpot,
+                        "total_blocks": bc.chain().len(),
+                        "pending_transactions": bc.pending_transactions().len(),
+                        "total_wallets": bc.balances().len(),
+                        "total_supply": bc.balances().values().sum::<f64>(),
+                        "mining_reward": bc.mining_reward(),
+                        "daily_jackpot": bc.daily_jackpot(),
                         "chain_valid": bc.is_chain_valid()
                     })
                 };
@@ -175,7 +175,7 @@ pub fn stats_route(
 /// - L1 server = L1 balances only (real money)
 /// - L2 server = L2 balances only (gaming/betting)
 pub fn public_balance_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     use crate::unified_wallet::strip_prefix;
     
@@ -239,7 +239,7 @@ pub fn public_balance_route(
 
 /// POST /rpc - JSON-RPC endpoint
 pub fn rpc_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("rpc")
         .and(warp::path::end()) // Ensure exact match for /rpc
@@ -262,12 +262,12 @@ pub fn rpc_route(
                     // ============ Basic Chain Methods ============
                     "getBlockHeight" => {
                         let bc = lock_or_recover(&blockchain);
-                        let latest_block = bc.chain.last();
+                        let latest_block = bc.chain().last();
                         match latest_block {
                             Some(block) => serde_json::json!({
-                                "height": bc.chain.len(),
+                                "height": bc.chain().len(),
                                 "blockhash": block.hash.clone(),
-                                "slot": bc.current_slot,
+                                "slot": bc.current_slot(),
                                 "timestamp": block.timestamp
                             }),
                             None => serde_json::json!({
@@ -287,19 +287,19 @@ pub fn rpc_route(
                     },
                     "getTotalSupply" => {
                         let bc = lock_or_recover(&blockchain);
-                        serde_json::json!(bc.balances.values().sum::<f64>())
+                        serde_json::json!(bc.balances().values().sum::<f64>())
                     },
                     "getWalletCount" => {
                         let bc = lock_or_recover(&blockchain);
-                        serde_json::json!(bc.balances.len())
+                        serde_json::json!(bc.balances().len())
                     },
                     "getChainStats" => {
                         let bc = lock_or_recover(&blockchain);
                         serde_json::json!({
-                            "block_height": bc.chain.len(),
-                            "wallet_count": bc.balances.len(),
-                            "total_supply": bc.balances.values().sum::<f64>(),
-                            "pending_tx": bc.pending_transactions.len(),
+                            "block_height": bc.chain().len(),
+                            "wallet_count": bc.balances().len(),
+                            "total_supply": bc.balances().values().sum::<f64>(),
+                            "pending_tx": bc.pending_transactions().len(),
                             "chain_valid": bc.is_chain_valid()
                         })
                     },
@@ -307,7 +307,7 @@ pub fn rpc_route(
                     // ============ Account Methods ============
                     "getAccounts" => {
                         let bc = lock_or_recover(&blockchain);
-                        let accounts: Vec<_> = bc.balances.iter()
+                        let accounts: Vec<_> = bc.balances().iter()
                             .map(|(addr, bal)| serde_json::json!({
                                 "address": addr,
                                 "balance": bal
@@ -321,12 +321,12 @@ pub fn rpc_route(
                             .unwrap_or("");
                         let bc = lock_or_recover(&blockchain);
                         let balance = bc.get_balance(address);
-                        let username = bc.address_to_username.get(address).cloned();
+                        let username = bc.address_to_username().get(address).cloned();
                         serde_json::json!({
                             "address": address,
                             "balance": balance,
                             "username": username,
-                            "exists": bc.balances.contains_key(address)
+                            "exists": bc.balances().contains_key(address)
                         })
                     },
                     
@@ -336,7 +336,7 @@ pub fn rpc_route(
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let bc = lock_or_recover(&blockchain);
-                        let txs: Vec<_> = bc.chain.iter()
+                        let txs: Vec<_> = bc.chain().iter()
                             .flat_map(|b| b.financial_txs.iter().chain(b.social_txs.iter()))
                             .filter(|tx| tx.from == address || tx.to == address)
                             .cloned()
@@ -345,7 +345,7 @@ pub fn rpc_route(
                     },
                     "getPendingTransactions" => {
                         let bc = lock_or_recover(&blockchain);
-                        serde_json::json!(bc.pending_transactions)
+                        serde_json::json!(bc.pending_transactions())
                     },
                     
                     // ============ Block Methods ============
@@ -354,7 +354,7 @@ pub fn rpc_route(
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as usize;
                         let bc = lock_or_recover(&blockchain);
-                        if let Some(block) = bc.chain.get(index) {
+                        if let Some(block) = bc.chain().get(index) {
                             serde_json::json!(block)
                         } else {
                             serde_json::json!(null)
@@ -362,7 +362,7 @@ pub fn rpc_route(
                     },
                     "getLatestBlock" => {
                         let bc = lock_or_recover(&blockchain);
-                        if let Some(block) = bc.chain.last() {
+                        if let Some(block) = bc.chain().last() {
                             serde_json::json!(block)
                         } else {
                             serde_json::json!(null)
@@ -373,7 +373,7 @@ pub fn rpc_route(
                     // Solana-compatible: getRecentBlockhash returns hash client uses in tx
                     "getRecentBlockhash" => {
                         let bc = lock_or_recover(&blockchain);
-                        let latest_block = bc.chain.last();
+                        let latest_block = bc.chain().last();
                         match latest_block {
                             Some(block) => serde_json::json!({
                                 "blockhash": block.hash.clone(),
@@ -391,8 +391,8 @@ pub fn rpc_route(
                     // getLatestBlockhash (Solana v1.9+) - returns blockhash + last valid slot
                     "getLatestBlockhash" => {
                         let bc = lock_or_recover(&blockchain);
-                        let latest_block = bc.chain.last();
-                        let current_slot = bc.current_slot;
+                        let latest_block = bc.chain().last();
+                        let current_slot = bc.current_slot();
                         match latest_block {
                             Some(block) => serde_json::json!({
                                 "value": {
@@ -416,34 +416,34 @@ pub fn rpc_route(
                         let bc = lock_or_recover(&blockchain);
                         
                         // Find the slot for this blockhash
-                        let slot_for_hash = bc.recent_blockhashes.iter()
+                        let slot_for_hash = bc.recent_blockhashes().iter()
                             .find(|(_, hash)| *hash == blockhash)
                             .map(|(slot, _)| *slot);
                         
                         match slot_for_hash {
                             Some(slot) => {
-                                let is_valid = bc.current_slot.saturating_sub(slot) <= 150; // 150 slot window
+                                let is_valid = bc.current_slot().saturating_sub(slot) <= 150; // 150 slot window
                                 serde_json::json!({
                                     "value": is_valid,
                                     "context": {
-                                        "slot": bc.current_slot
+                                        "slot": bc.current_slot()
                                     }
                                 })
                             },
                             None => {
                                 // Also check chain blocks if not in recent_blockhashes
-                                let found_in_chain = bc.chain.iter()
+                                let found_in_chain = bc.chain().iter()
                                     .rev()
                                     .take(150)  // Only check last 150 blocks
                                     .find(|b| b.hash == blockhash);
                                 
                                 match found_in_chain {
                                     Some(block) => {
-                                        let is_valid = bc.current_slot.saturating_sub(block.slot) <= 150;
+                                        let is_valid = bc.current_slot().saturating_sub(block.slot) <= 150;
                                         serde_json::json!({
                                             "value": is_valid,
                                             "context": {
-                                                "slot": bc.current_slot,
+                                                "slot": bc.current_slot(),
                                                 "blockhash_slot": block.slot
                                             }
                                         })
@@ -451,7 +451,7 @@ pub fn rpc_route(
                                     None => serde_json::json!({
                                         "value": false,
                                         "context": {
-                                            "slot": bc.current_slot,
+                                            "slot": bc.current_slot(),
                                             "error": "Blockhash not found or too old"
                                         }
                                     })
@@ -483,14 +483,14 @@ pub fn rpc_route(
                         let bc = lock_or_recover(&blockchain);
                         
                         // Find blockhash in chain
-                        let block_info = bc.chain.iter()
+                        let block_info = bc.chain().iter()
                             .rev()
                             .take(200)  // Search last 200 blocks
                             .find(|b| b.hash == blockhash);
                         
                         match block_info {
                             Some(block) => {
-                                let age_slots = bc.current_slot.saturating_sub(block.slot);
+                                let age_slots = bc.current_slot().saturating_sub(block.slot);
                                 let remaining_slots = if age_slots <= 150 { 150 - age_slots } else { 0 };
                                 let is_valid = age_slots <= 150;
                                 let expires_at_slot = block.slot + 150;
@@ -504,7 +504,7 @@ pub fn rpc_route(
                                     "remainingSlots": remaining_slots,
                                     "expiresAtSlot": expires_at_slot,
                                     "expiresAtBlockHeight": block.index + 150,
-                                    "currentSlot": bc.current_slot,
+                                    "currentSlot": bc.current_slot(),
                                     "maxAgeSlots": 150
                                 })
                             },
@@ -512,7 +512,7 @@ pub fn rpc_route(
                                 "blockhash": blockhash,
                                 "isValid": false,
                                 "error": "Blockhash not found (may have expired or never existed)",
-                                "currentSlot": bc.current_slot,
+                                "currentSlot": bc.current_slot(),
                                 "maxAgeSlots": 150
                             })
                         }
@@ -526,7 +526,7 @@ pub fn rpc_route(
                         match slot {
                             Some(s) => {
                                 // Find leader from block at that slot, or indicate it's future
-                                let block = bc.chain.iter().find(|b| b.slot == s);
+                                let block = bc.chain().iter().find(|b| b.slot == s);
                                 match block {
                                     Some(b) => serde_json::json!({
                                         "slot": s,
@@ -538,13 +538,13 @@ pub fn rpc_route(
                                         "slot": s,
                                         "leader": null,
                                         "blockProduced": false,
-                                        "status": if s > bc.current_slot { "future" } else { "skipped_or_missing" }
+                                        "status": if s > bc.current_slot() { "future" } else { "skipped_or_missing" }
                                     })
                                 }
                             },
                             None => {
                                 // Return current slot leader
-                                let latest = bc.chain.last();
+                                let latest = bc.chain().last();
                                 match latest {
                                     Some(b) => serde_json::json!({
                                         "slot": b.slot,
@@ -705,7 +705,7 @@ use std::sync::atomic::AtomicU64;
 
 /// GET /explorer/block/:slot - Get full block data with transactions
 pub fn explorer_block_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("explorer" / "block" / u64)
         .and(warp::get())
@@ -713,7 +713,7 @@ pub fn explorer_block_route(
             let bc = lock_or_recover(&blockchain);
             
             // Find block by slot
-            let block = bc.chain.iter().find(|b| b.slot == slot);
+            let block = bc.chain().iter().find(|b| b.slot == slot);
             
             match block {
                 Some(b) => warp::reply::json(&serde_json::json!({
@@ -744,7 +744,7 @@ pub fn explorer_block_route(
 
 /// GET /explorer/tx/:id - Get single transaction by ID
 pub fn explorer_transaction_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("explorer" / "tx" / String)
         .and(warp::get())
@@ -752,7 +752,7 @@ pub fn explorer_transaction_route(
             let bc = lock_or_recover(&blockchain);
             
             // Search all blocks for the transaction
-            for block in bc.chain.iter().rev() {
+            for block in bc.chain().iter().rev() {
                 // Check financial transactions
                 for tx in &block.financial_txs {
                     if tx.id == tx_id {
@@ -800,7 +800,7 @@ pub fn explorer_transaction_route(
             }
             
             // Check pending transactions
-            for tx in &bc.pending_transactions {
+            for tx in bc.pending_transactions() {
                 if tx.id == tx_id {
                     return warp::reply::json(&serde_json::json!({
                         "success": true,
@@ -820,7 +820,7 @@ pub fn explorer_transaction_route(
 
 /// GET /explorer/account/:address/history - Paginated account transaction history
 pub fn explorer_account_history_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("explorer" / "account" / String / "history")
         .and(warp::query::<std::collections::HashMap<String, String>>())
@@ -840,7 +840,7 @@ pub fn explorer_account_history_route(
             // Collect all transactions for this address
             let mut txs: Vec<serde_json::Value> = Vec::new();
             
-            for block in bc.chain.iter().rev() {
+            for block in bc.chain().iter().rev() {
                 for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
                     if tx.from == address || tx.to == address {
                         txs.push(serde_json::json!({
@@ -881,7 +881,7 @@ pub fn explorer_account_history_route(
 
 /// GET /explorer/richlist - Top accounts by balance
 pub fn explorer_richlist_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("explorer" / "richlist")
         .and(warp::query::<std::collections::HashMap<String, String>>())
@@ -895,10 +895,10 @@ pub fn explorer_richlist_route(
                 .min(500);
             
             // Sort accounts by balance
-            let mut accounts: Vec<_> = bc.balances.iter().collect();
+            let mut accounts: Vec<_> = bc.balances().iter().collect();
             accounts.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
             
-            let total_supply: f64 = bc.balances.values().sum();
+            let total_supply: f64 = bc.balances().values().sum();
             
             let richlist: Vec<serde_json::Value> = accounts.iter()
                 .take(limit)
@@ -918,7 +918,7 @@ pub fn explorer_richlist_route(
             warp::reply::json(&serde_json::json!({
                 "success": true,
                 "richlist": richlist,
-                "total_accounts": bc.balances.len(),
+                "total_accounts": bc.balances().len(),
                 "total_supply": total_supply
             }))
         })
@@ -926,7 +926,7 @@ pub fn explorer_richlist_route(
 
 /// GET /explorer/search/:hash - Search by block hash or transaction ID
 pub fn explorer_search_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("explorer" / "search" / String)
         .and(warp::get())
@@ -934,7 +934,7 @@ pub fn explorer_search_route(
             let bc = lock_or_recover(&blockchain);
             
             // Try to find as block hash
-            if let Some(block) = bc.chain.iter().find(|b| b.hash == hash) {
+            if let Some(block) = bc.chain().iter().find(|b| b.hash == hash) {
                 return warp::reply::json(&serde_json::json!({
                     "success": true,
                     "type": "block",
@@ -949,7 +949,7 @@ pub fn explorer_search_route(
             }
             
             // Try to find as transaction ID
-            for block in bc.chain.iter() {
+            for block in bc.chain().iter() {
                 for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
                     if tx.id == hash {
                         return warp::reply::json(&serde_json::json!({
@@ -981,14 +981,14 @@ pub fn explorer_search_route(
 
 /// GET /headers/:slot - Get only block header (no tx data) for light clients
 pub fn headers_by_slot_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("headers" / u64)
         .and(warp::get())
         .map(move |slot: u64| {
             let bc = lock_or_recover(&blockchain);
             
-            let block = bc.chain.iter().find(|b| b.slot == slot);
+            let block = bc.chain().iter().find(|b| b.slot == slot);
             
             match block {
                 Some(b) => warp::reply::json(&serde_json::json!({
@@ -1017,14 +1017,14 @@ pub fn headers_by_slot_route(
 
 /// GET /headers/latest - Get latest block header for mobile sync
 pub fn headers_latest_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("headers" / "latest")
         .and(warp::get())
         .map(move || {
             let bc = lock_or_recover(&blockchain);
             
-            match bc.chain.last() {
+            match bc.chain().last() {
                 Some(b) => warp::reply::json(&serde_json::json!({
                     "success": true,
                     "header": {
@@ -1039,7 +1039,7 @@ pub fn headers_latest_route(
                         "tx_count": b.tx_count,
                         "engagement_score": b.engagement_score
                     },
-                    "chain_height": bc.chain.len(),
+                    "chain_height": bc.chain().len(),
                     "current_slot": bc.current_slot
                 })),
                 None => warp::reply::json(&serde_json::json!({
@@ -1052,7 +1052,7 @@ pub fn headers_latest_route(
 
 /// GET /headers/range/:start/:end - Get range of headers for sync
 pub fn headers_range_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("headers" / "range" / u64 / u64)
         .and(warp::get())
@@ -1062,7 +1062,7 @@ pub fn headers_range_route(
             // Limit range to prevent abuse (max 1000 headers per request)
             let actual_end = end.min(start + 1000);
             
-            let headers: Vec<serde_json::Value> = bc.chain.iter()
+            let headers: Vec<serde_json::Value> = bc.chain().iter()
                 .filter(|b| b.slot >= start && b.slot <= actual_end)
                 .map(|b| serde_json::json!({
                     "index": b.index,
@@ -1090,7 +1090,7 @@ pub fn headers_range_route(
 
 /// GET /proof/account/:address - Get Merkle inclusion proof for account
 pub fn proof_account_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("proof" / "account" / String)
         .and(warp::get())
@@ -1101,7 +1101,7 @@ pub fn proof_account_route(
             let balance = bc.get_balance(&address);
             
             // Get latest block info for state root context
-            let latest_block = bc.chain.last();
+            let latest_block = bc.chain().last();
             
             // Generate simple proof (in production, would use actual Merkle tree)
             // For now, we create a proof structure that can be verified
@@ -1109,7 +1109,7 @@ pub fn proof_account_route(
                 "account": {
                     "address": address,
                     "balance": balance,
-                    "exists": bc.balances.contains_key(&address)
+                    "exists": bc.balances().contains_key(&address)
                 },
                 "proof": {
                     "type": "account_inclusion",
@@ -1117,8 +1117,8 @@ pub fn proof_account_route(
                         format!("{}:{}", address, balance).as_bytes()
                     )),
                     "state_root": latest_block.map(|b| &b.hash).unwrap_or(&String::new()),
-                    "slot": bc.current_slot,
-                    "block_height": bc.chain.len()
+                    "slot": bc.current_slot(),
+                    "block_height": bc.chain().len()
                 },
                 "verification": {
                     "method": "sha256",
@@ -1135,7 +1135,7 @@ pub fn proof_account_route(
 
 /// POST /proof/verify - Verify a Merkle proof
 pub fn proof_verify_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("proof" / "verify")
         .and(warp::post())
@@ -1175,7 +1175,7 @@ pub fn proof_verify_route(
 /// 
 /// Returns a text/plain response with formatted transaction history
 pub fn ledger_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("ledger")
         .and(warp::get())
@@ -1201,7 +1201,7 @@ pub fn ledger_route(
 }
 
 /// Format the entire blockchain ledger as human-readable text
-fn format_ledger(bc: &EnhancedBlockchain) -> String {
+fn format_ledger(bc: &PersistentBlockchain) -> String {
     let mut output = String::new();
     
     // Header
@@ -1212,7 +1212,7 @@ fn format_ledger(bc: &EnhancedBlockchain) -> String {
     // Collect all transactions from all blocks
     let mut all_txs: Vec<(u64, &crate::runtime::core::Transaction, u64)> = Vec::new(); // (block_index, tx, block_timestamp)
     
-    for block in &bc.chain {
+    for block in bc.chain() {
         // Skip genesis block (no transactions)
         if block.index == 0 && block.financial_txs.is_empty() && block.social_txs.is_empty() && block.transactions.is_empty() {
             continue;
@@ -1250,14 +1250,14 @@ fn format_ledger(bc: &EnhancedBlockchain) -> String {
     
     // Summary
     let total_txs = all_txs.len();
-    let total_blocks = bc.chain.len();
-    let total_supply: f64 = bc.balances.values().sum();
+    let total_blocks = bc.chain().len();
+    let total_supply: f64 = bc.balances().values().sum();
     
     // Get Alice and Bob balances (test accounts)
     let alice_addr = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
     let bob_addr = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
-    let alice_bal = *bc.balances.get(alice_addr).unwrap_or(&0.0);
-    let bob_bal = *bc.balances.get(bob_addr).unwrap_or(&0.0);
+    let alice_bal = *bc.balances().get(alice_addr).unwrap_or(&0.0);
+    let bob_bal = *bc.balances().get(bob_addr).unwrap_or(&0.0);
     
     // Format supply with commas manually
     let supply_str = format_with_commas(total_supply);
@@ -1310,6 +1310,16 @@ fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
         TransactionType::SystemReward => "SYS_REWARD",
         TransactionType::Mint => "MINT",
         TransactionType::Burn => "BURN",
+        TransactionType::NFTMint => "NFT_MINT",
+        TransactionType::NFTTransfer => "NFT_TRANSFER",
+        TransactionType::NFTBurn => "NFT_BURN",
+        TransactionType::NFTUpdate => "NFT_UPDATE",
+        TransactionType::DocumentValidation => "DOC_VALIDATE",
+        TransactionType::DocumentValidationResponse => "DOC_RESPONSE",
+        TransactionType::ProgramInvoke => "PROG_INVOKE",
+        TransactionType::ProgramDeploy => "PROG_DEPLOY",
+        TransactionType::ProgramUpgrade => "PROG_UPGRADE",
+        TransactionType::Vote => "VOTE",
     };
     
     // Build description based on type
@@ -1323,6 +1333,16 @@ fn format_transaction(tx: &crate::runtime::core::Transaction) -> String {
         TransactionType::SystemReward => format!("{:.2} $BC reward", tx.amount),
         TransactionType::Mint => format!("{:.2} $BC minted", tx.amount),
         TransactionType::Burn => format!("{:.2} $BC burned", tx.amount),
+        TransactionType::NFTMint => "NFT minted".to_string(),
+        TransactionType::NFTTransfer => format!("NFT → {}", to_abbr),
+        TransactionType::NFTBurn => "NFT burned".to_string(),
+        TransactionType::NFTUpdate => "NFT metadata updated".to_string(),
+        TransactionType::DocumentValidation => "document validation".to_string(),
+        TransactionType::DocumentValidationResponse => "validation response".to_string(),
+        TransactionType::ProgramInvoke => "program invocation".to_string(),
+        TransactionType::ProgramDeploy => "program deployed".to_string(),
+        TransactionType::ProgramUpgrade => "program upgraded".to_string(),
+        TransactionType::Vote => "consensus vote".to_string(),
     };
     
     // Abbreviate tx id

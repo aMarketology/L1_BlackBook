@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::sync::atomic::AtomicU64;
 use warp::Filter;
 use serde::{Deserialize, Serialize};
-use crate::protocol::blockchain::EnhancedBlockchain;
+use crate::storage::PersistentBlockchain;
 use crate::integration::unified_auth::SignedRequest;
 use crate::runtime::{
     SharedPoHService, SharedPipeline, PipelinePacket, 
@@ -23,7 +23,7 @@ use crate::runtime::{
 };
 
 /// Helper to recover from poisoned locks
-fn lock_or_recover<'a>(mutex: &'a Mutex<EnhancedBlockchain>) -> MutexGuard<'a, EnhancedBlockchain> {
+fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner()
@@ -52,7 +52,7 @@ pub struct TransferPayload {
 /// }
 /// ```
 pub fn transfer_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("transfer")
         .and(warp::post())
@@ -192,7 +192,7 @@ pub fn transfer_route(
 /// Returns immediately with pending status, transaction commits in background.
 /// Use GET /transfer/status/:tx_id to check confirmation status.
 pub fn transfer_pipeline_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     pipeline: SharedPipeline,
     current_slot: Arc<AtomicU64>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
@@ -300,7 +300,7 @@ pub fn transfer_pipeline_route(
 
 /// GET /transfer/status/:tx_id - Check transaction confirmation status
 pub fn transfer_status_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     current_slot: Arc<AtomicU64>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("transfer" / "status" / String)
@@ -310,7 +310,7 @@ pub fn transfer_status_route(
             let current = current_slot.load(std::sync::atomic::Ordering::Relaxed);
             
             // Find transaction in chain
-            for block in bc.chain.iter().rev() {
+            for block in bc.chain().iter().rev() {
                 for tx in block.financial_txs.iter().chain(block.social_txs.iter()) {
                     if tx.id == tx_id {
                         let tx_slot = block.slot;
@@ -345,7 +345,7 @@ pub fn transfer_status_route(
             }
             
             // Check pending transactions
-            for tx in &bc.pending_transactions {
+            for tx in bc.pending_transactions() {
                 if tx.id == tx_id {
                     return warp::reply::json(&serde_json::json!({
                         "found": true,
@@ -378,7 +378,7 @@ pub fn transfer_status_route(
 /// Enhanced version that records the transaction in the PoH clock
 /// for cryptographic ordering proof.
 pub fn transfer_poh_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>,
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
     poh_service: SharedPoHService,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path!("transfer" / "poh")
@@ -479,7 +479,7 @@ pub fn transfer_poh_route(
 /// 
 /// Request: SignedRequest with empty payload {}
 pub fn transactions_route(
-    blockchain: Arc<Mutex<EnhancedBlockchain>>
+    blockchain: Arc<Mutex<PersistentBlockchain>>
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     warp::path("transactions")
         .and(warp::post())
@@ -500,7 +500,7 @@ pub fn transactions_route(
                 
                 let transactions: Vec<serde_json::Value> = {
                     let bc = lock_or_recover(&blockchain);
-                    bc.chain.iter()
+                    bc.chain().iter()
                         .flat_map(|block| {
                             block.financial_txs.iter()
                                 .chain(block.social_txs.iter())

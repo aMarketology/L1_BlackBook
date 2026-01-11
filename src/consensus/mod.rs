@@ -1,10 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 9: DISTRIBUTED NETWORK - PROOF OF ENGAGEMENT CONSENSUS
+// PHASE 9: DISTRIBUTED NETWORK - PROOF OF ENGAGEMENT + TOWER BFT CONSENSUS
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// Hybrid consensus combining:
+// 1. Proof of Engagement: Validator selection based on community participation
+// 2. Tower BFT: Solana-style optimistic confirmation with vote lockouts
 //
 // Unlike PoW (mining power) or PoS (money stake), Proof of Engagement rewards
 // active community participation. Validators are selected based on their
 // engagement score, not their wealth or computational resources.
+//
+// Tower BFT provides fast finality:
+// - Vote towers with exponential lockouts (2^n slots)
+// - Stake-weighted voting for supermajority (>2/3)
+// - Optimistic confirmation at 2/3 stake
+// - Slashing for equivocation
 //
 // Architecture:
 //   ┌─────────────────────────────────────────────────────────────────────┐
@@ -31,12 +41,24 @@ pub mod block_proposal;
 pub mod fork_choice;
 pub mod hot_upgrades;
 pub mod p2p;
+pub mod tower_bft;
+pub mod sync;
 
 // Re-export main types
 pub use block_proposal::{BlockProposer, ProposedBlock, BlockVote};
 pub use fork_choice::{ForkChoiceManager, BlockMeta, FinalityStatus, ForkChoiceStats};
 pub use hot_upgrades::{UpgradeManager, UpgradeProposal, ProtocolVersion, FeatureFlags};
 pub use p2p::{P2PNetwork, NetworkConfig, PeerInfo};
+pub use tower_bft::{
+    TowerBFT, VoteTower, TowerVote, VoteState, 
+    StakeWeightedVotes, OptimisticConfirmationTracker, OptimisticConfirmationEvent,
+    EquivocationDetector, EquivocationEvidence, TowerError,
+    SUPERMAJORITY_THRESHOLD, SLASHING_PENALTY_PERCENT,
+};
+pub use sync::{
+    SyncManager, SyncState, SyncStatus, SyncPeer, SyncEvent, SyncError,
+    SyncRequest, SyncResponse, SyncBlock, SyncTransaction,
+};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
