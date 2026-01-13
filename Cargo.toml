@@ -2,6 +2,7 @@
 name = "layer1"
 version = "0.2.0"
 edition = "2021"
+default-run = "layer1"
 
 [dependencies]
 # Core async runtime
@@ -144,6 +145,10 @@ path = "src/main_v2.rs"
 debug = 0
 # Enable optimizations even in debug (faster builds, smaller binaries)
 opt-level = 1
+# DISABLE incremental compilation to avoid linker errors
+incremental = false
+# Use more codegen units to avoid symbol conflicts
+codegen-units = 256
 
 [profile.dev.package."*"]
 # Optimize all dependencies in debug mode

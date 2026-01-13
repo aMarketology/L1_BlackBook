@@ -72,8 +72,8 @@ const CHAIN_ID_L2 = 0x02;  // Layer 2 (Gaming) - Fast bets
 const CONFIG = {
   L1_URL: process.env.L1_URL || "http://localhost:8080",
   L2_URL: process.env.L2_URL || "http://localhost:1234",
-  // FROM unified-wallet-sdk.js (GOSPEL)
-  DEALER_ADDRESS: "L2_F5C46483E8A28394F5E8687DEADF6BD4E924CED3",
+  // Dealer/Oracle - derived from DEALER_PRIVATE_KEY mnemonic
+  DEALER_ADDRESS: "L2_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D",
   DEALER_PUBLIC_KEY: "07943256765557e704e4945aa4d1d56a1b0aac60bd8cc328faa99572aee5e84a",
   DEALER_PRIVATE_KEY: process.env.DEALER_PRIVATE_KEY || process.env.dealer_private_key,
 };

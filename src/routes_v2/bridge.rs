@@ -301,30 +301,47 @@ pub fn bridge_initiate_route(
             async move {
                 let start_time = std::time::Instant::now();
                 
+                // === BRIDGE LOCK REQUEST RECEIVED ===
+                println!("\n============================================================");
+                println!("🌉 BRIDGE LOCK REQUEST RECEIVED");
+                println!("============================================================");
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                println!("   ⏰ Timestamp: {}", now);
+                println!("   📦 Payload: {}", request.payload.as_deref().unwrap_or("<none>"));
+                println!("   🔑 Public Key: {}...", &request.public_key[..16.min(request.public_key.len())]);
+                
                 // Verify signature (fast)
                 let wallet_address = match request.verify() {
                     Ok(addr) => addr,
                     Err(e) => {
+                        println!("   ❌ Signature verification FAILED: {}", e);
                         return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                             "success": false,
                             "error": format!("Signature verification failed: {}", e)
                         })));
                     }
                 };
+                
+                println!("   ✅ Signature verified for: {}", wallet_address);
 
                 // Parse payload (fast)
                 let payload: BridgeInitiatePayload = match request.parse_payload() {
                     Ok(p) => p,
                     Err(_) => {
+                        println!("   ❌ Invalid bridge payload");
                         return Ok(warp::reply::json(&serde_json::json!({
                             "success": false,
                             "error": "Invalid bridge payload"
                         })));
                     }
                 };
+                
+                println!("   💰 Amount: {} $BC → $BB", payload.amount);
+                println!("   🎯 Target: {}", payload.target_layer);
 
                 // Validate
                 if payload.amount <= 0.0 {
+                    println!("   ❌ Invalid amount: must be positive");
                     return Ok(warp::reply::json(&serde_json::json!({
                         "success": false,
                         "error": "Amount must be positive"
@@ -334,15 +351,21 @@ pub fn bridge_initiate_route(
                 // Lock tokens on L1 (fast Sled write)
                 let lock_id = {
                     let mut bc = lock_or_recover(&blockchain);
-                    let internal_address = strip_prefix(&wallet_address);
+                    
+                    // Check balance first
+                    let current_balance = bc.balances.get(&wallet_address).copied().unwrap_or(0.0);
+                    println!("   📊 Current L1 balance: {} $BC", current_balance);
+                    
+                    // Use full wallet_address with L1_ prefix (balances stored with prefix)
                     match bc.lock_tokens(
-                        &internal_address,
+                        &wallet_address,
                         payload.amount,
                         LockPurpose::BridgeToL2,
                         None,
                     ) {
                         Ok(id) => id,
                         Err(e) => {
+                            println!("   ❌ Lock FAILED: {}", e);
                             return Ok(warp::reply::json(&serde_json::json!({
                                 "success": false,
                                 "error": format!("Lock failed: {}", e)
@@ -352,7 +375,8 @@ pub fn bridge_initiate_route(
                 };
 
                 let l1_lock_time = start_time.elapsed();
-                println!("🔒 L1 lock completed in {:?}", l1_lock_time);
+                println!("   ✅ Lock ID: {}", lock_id);
+                println!("   ⏱️  Lock time: {:?}", l1_lock_time);
 
                 // ============================================================
                 // ASYNC L2 CREDIT - Fire and await (fast HTTP)
@@ -360,15 +384,21 @@ pub fn bridge_initiate_route(
                 let l2_url = format!("{}/bridge/credit", L2_BASE_URL);
                 let l2_wallet = wallet_address.replace("L1_", "L2_");
                 
+                println!("   📤 Sending credit to L2: {}", l2_wallet);
+                
                 // Sign the bridge lock message for L2 verification
                 let (l1_signature, l1_public_key) = match sign_bridge_lock_message(
                     &l2_wallet,
                     payload.amount,
                     &lock_id
                 ) {
-                    Some((sig, pk)) => (sig, pk),
+                    Some((sig, pk)) => {
+                        println!("   🔐 L1 signature: {}...", &sig[..32.min(sig.len())]);
+                        println!("   🔑 L1 pubkey: {}...", &pk[..32.min(pk.len())]);
+                        (sig, pk)
+                    },
                     None => {
-                        println!("⚠️ L1 signing failed, proceeding without signature");
+                        println!("   ⚠️ L1 signing FAILED (DEALER_PRIVATE_KEY not set?)");
                         (String::new(), String::new())
                     }
                 };

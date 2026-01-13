@@ -17,7 +17,7 @@
 //! blockchain.mine_pending_transactions("validator")?; // Persists automatically
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::protocol::blockchain::{
     EnhancedBlockchain, Account, Block, Transaction,
@@ -134,7 +134,8 @@ impl PersistentBlockchain {
         
         // Load balances
         let balances = storage.load_balances_to_hashmap()?;
-        bc.balances = balances;
+        let balance_count = balances.len();
+        bc.balances = balances.clone();
         
         // Load latest slot
         bc.current_slot = storage.get_latest_slot()?;
@@ -145,8 +146,17 @@ impl PersistentBlockchain {
         }
         
         let state_root = storage.get_state_root()?;
-        println!("   ✓ {} accounts, slot {}", account_count, bc.current_slot);
+        println!("   ✓ {} accounts, {} balances, slot {}", account_count, balance_count, bc.current_slot);
         println!("   ✓ State root: {}...", &state_root[..16.min(state_root.len())]);
+        
+        // Debug: Print top balances loaded from storage
+        let mut sorted_balances: Vec<_> = balances.iter().collect();
+        sorted_balances.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        println!("   📊 Top balances loaded from Sled:");
+        for (addr, bal) in sorted_balances.iter().take(5) {
+            let short_addr = if addr.len() > 20 { &addr[..20] } else { addr };
+            println!("      {} = {} BB", short_addr, bal);
+        }
         
         Ok(bc)
     }
@@ -312,13 +322,13 @@ impl PersistentBlockchain {
             return Err("No pending transactions to mine".to_string());
         }
 
-        // Capture accounts that will be modified
+        // Capture accounts that will be modified BEFORE mining
         let pending_accounts: Vec<String> = self.inner.pending_transactions
             .iter()
             .flat_map(|tx| vec![tx.from.clone(), tx.to.clone()])
             .collect();
 
-        // Mine the block in memory
+        // Mine the block in memory (this updates self.inner.balances)
         self.inner.mine_pending_transactions(sequencer)?;
 
         // Get the new block's data
@@ -328,27 +338,35 @@ impl PersistentBlockchain {
             (block.slot, block.financial_txs.clone())
         };
 
-        // Collect all account updates
+        // =====================================================================
+        // CRITICAL: Build account updates with CURRENT balances from inner.balances
+        // The inner.mine_pending_transactions() updated balances HashMap,
+        // so we must create Account objects with these new balance values.
+        // =====================================================================
         let mut account_updates: Vec<(String, Account)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         
-        for pubkey in &pending_accounts {
-            if let Some(account) = self.inner.accounts.get(pubkey) {
-                account_updates.push((pubkey.clone(), account.clone()));
+        // Process all accounts involved in transactions
+        for pubkey in pending_accounts.iter().chain(
+            block_txs.iter().flat_map(|tx| vec![&tx.from, &tx.to])
+        ) {
+            if seen.contains(pubkey) {
+                continue;
             }
-        }
-
-        // Ensure all tx participants have accounts
-        for tx in &block_txs {
-            if !account_updates.iter().any(|(k, _)| k == &tx.from) {
-                let balance = self.inner.get_balance(&tx.from);
-                let account = Account::from_bb_balance(tx.from.clone(), balance, block_slot);
-                account_updates.push((tx.from.clone(), account));
-            }
-            if !account_updates.iter().any(|(k, _)| k == &tx.to) {
-                let balance = self.inner.get_balance(&tx.to);
-                let account = Account::from_bb_balance(tx.to.clone(), balance, block_slot);
-                account_updates.push((tx.to.clone(), account));
-            }
+            seen.insert(pubkey.clone());
+            
+            // Get the CURRENT balance from inner.balances (updated by mining)
+            let current_balance = self.inner.get_balance(pubkey);
+            
+            // Create Account with correct lamports value
+            let account = Account::from_bb_balance(pubkey.clone(), current_balance, block_slot);
+            account_updates.push((pubkey.clone(), account));
+            
+            // Also update inner.accounts to keep in-memory state consistent
+            self.inner.accounts.insert(
+                pubkey.clone(), 
+                Account::from_bb_balance(pubkey.clone(), current_balance, block_slot)
+            );
         }
 
         // Persist block and accounts
@@ -398,7 +416,8 @@ impl PersistentBlockchain {
         let current = self.inner.balances.get(to).copied().unwrap_or(0.0);
         self.inner.balances.insert(to.to_string(), current + amount);
         
-        // Create/update account
+        // Create/update account - increment slot to track mint operations
+        self.inner.current_slot += 1;
         let slot = self.inner.current_slot;
         let account = Account::from_bb_balance(to.to_string(), current + amount, slot);
         self.inner.accounts.insert(to.to_string(), account.clone());
@@ -408,10 +427,15 @@ impl PersistentBlockchain {
             .map_err(|e| format!("Persist error: {:?}", e))?;
         self.storage.save_balance(to, current + amount, slot)
             .map_err(|e| format!("Balance persist error: {:?}", e))?;
+        
+        // CRITICAL: Update latest_slot metadata so data is loaded on restart
+        self.storage.engine().set_latest_slot(slot)
+            .map_err(|e| format!("Metadata error: {:?}", e))?;
+        
         self.storage.flush()
             .map_err(|e| format!("Flush error: {:?}", e))?;
         
-        println!("🪙 Minted {} BB to {} (persisted)", amount, &to[..14.min(to.len())]);
+        println!("🪙 Minted {} BB to {} (persisted at slot {})", amount, &to[..14.min(to.len())], slot);
         Ok(())
     }
 
@@ -426,6 +450,8 @@ impl PersistentBlockchain {
         let new_balance = current - amount;
         self.inner.balances.insert(from.to_string(), new_balance);
         
+        // Increment slot to track burn operations
+        self.inner.current_slot += 1;
         let slot = self.inner.current_slot;
         let account = Account::from_bb_balance(from.to_string(), new_balance, slot);
         self.inner.accounts.insert(from.to_string(), account.clone());
@@ -434,10 +460,15 @@ impl PersistentBlockchain {
             .map_err(|e| format!("Persist error: {:?}", e))?;
         self.storage.save_balance(from, new_balance, slot)
             .map_err(|e| format!("Balance persist error: {:?}", e))?;
+        
+        // CRITICAL: Update latest_slot metadata so data is loaded on restart
+        self.storage.engine().set_latest_slot(slot)
+            .map_err(|e| format!("Metadata error: {:?}", e))?;
+        
         self.storage.flush()
             .map_err(|e| format!("Flush error: {:?}", e))?;
         
-        println!("🔥 Burned {} BB from {} (persisted)", amount, &from[..14.min(from.len())]);
+        println!("🔥 Burned {} BB from {} (persisted at slot {})", amount, &from[..14.min(from.len())], slot);
         Ok(())
     }
 

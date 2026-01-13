@@ -11,7 +11,8 @@
 // - transfer.rs: Token transfers (authenticated)
 // - social.rs:   Social mining actions (authenticated)
 // - rpc.rs:      Health, stats, JSON-RPC (public + authenticated)
-// - bridge.rs:   Cross-layer L1 ↔ L2 bridge operations
+// - bridge.rs:   Cross-layer L1 ↔ L2 bridge operations (LEGACY)
+// - credit.rs:   L2 Credit Line System (RECOMMENDED)
 // - admin.rs:    Admin token minting (OPEN ACCESS - DEVELOPMENT)
 // - markets.rs:  L2 market/event initial liquidity management
 
@@ -21,6 +22,7 @@ pub mod transfer;
 pub mod social;
 pub mod rpc;
 pub mod bridge;
+pub mod credit;
 pub mod admin;
 pub mod markets;
 pub mod services;

@@ -85,85 +85,44 @@ fn load_blockchain() -> PersistentBlockchain {
 
 fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     // ========================================================================
-    // TEST ACCOUNT INITIALIZATION (Development Only)
+    // ACCOUNT STATUS DISPLAY (NO AUTO-SEEDING)
     // ========================================================================
-    // Real Ed25519 derived addresses for Alice, Bob, and Dealer
-    // These match the SDK TEST_ACCOUNTS for consistent testing
-    // 
-    // PERSISTENCE: Only fund accounts if they have zero balance.
-    // Real crypto addresses persist their balances across sessions.
+    // Tokens are ONLY created through:
+    // 1. Genesis block (Treasury initial supply)
+    // 2. Admin mint endpoint (requires authorization)
+    // 3. USDC deposit (1:1 backed minting)
+    //
+    // This ensures the blockchain maintains 1:1 integrity at all times.
+    // NO automatic seeding - balances are persistent and immutable.
     // ========================================================================
     
     use crate::protocol::blockchain::TREASURY_ADDRESS;
     
-    // Real cryptographic test accounts (Ed25519 derived from seeds)
-    // Address = L1_ + SHA256(pubkey)[0..20].toUpperCase()
-    let alice_address = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";  // seed: 18f2c2e3...
-    let bob_address = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";    // seed: e4ac49e5...
-    let dealer_address = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC"; // seed: d4e5f6a7...
+    // Display known account addresses for reference
+    let alice_address = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";
+    let bob_address = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";
+    let dealer_address = "L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D";
     
-    // Initial funding amounts (only applied if balance is 0)
-    let alice_initial = 20000.0;
-    let bob_initial = 10000.0;
-    let dealer_initial = 100000.0;
-    
-    // Check existing balances (persistence!)
+    // Read-only balance check (no mutations!)
     let alice_bal = bc.get_balance(alice_address);
     let bob_bal = bc.get_balance(bob_address);
     let dealer_bal = bc.get_balance(dealer_address);
+    let treasury_bal = bc.get_balance(TREASURY_ADDRESS);
     
-    println!("🧪 Test Account Status (Real Ed25519 Addresses):");
+    println!("📊 Account Balances (Read-Only - No Auto-Seeding):");
     println!("   ┌─────────────────────────────────────────────────────────┐");
-    
-    let mut funded_any = false;
-    
-    // Only fund if balance is zero (first run)
-    if alice_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            alice_address.to_string(),
-            alice_initial,
-        );
-        println!("   │ 💸 Alice:  {} BB ← Treasury (NEW)         │", alice_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 👛 Alice:  {} BB (persisted)                   │", alice_bal);
-    }
-    
-    if bob_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            bob_address.to_string(),
-            bob_initial,
-        );
-        println!("   │ 💸 Bob:    {} BB ← Treasury (NEW)          │", bob_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 👛 Bob:    {} BB (persisted)                    │", bob_bal);
-    }
-    
-    if dealer_bal == 0.0 {
-        let _ = bc.create_transaction(
-            TREASURY_ADDRESS.to_string(),
-            dealer_address.to_string(),
-            dealer_initial,
-        );
-        println!("   │ 💸 Dealer: {} BB ← Treasury (NEW)       │", dealer_initial);
-        funded_any = true;
-    } else {
-        println!("   │ 🎰 Dealer: {} BB (persisted)                 │", dealer_bal);
-    }
-    
+    println!("   │ 🏦 Treasury: {:>15.2} BB                       │", treasury_bal);
+    println!("   │ 👛 Alice:    {:>15.2} BB                       │", alice_bal);
+    println!("   │ 👛 Bob:      {:>15.2} BB                       │", bob_bal);
+    println!("   │ 🎰 Dealer:   {:>15.2} BB                       │", dealer_bal);
     println!("   └─────────────────────────────────────────────────────────┘");
     
-    // Mine if we funded any accounts - THIS WILL PERSIST
-    if funded_any {
-        if let Err(e) = bc.mine_pending_transactions("genesis_airdrop".to_string()) {
-            eprintln!("⚠️  Mining airdrop failed: {}", e);
-        }
-        println!("✅ New accounts funded from Treasury (persisted to Sled)");
+    if alice_bal == 0.0 && bob_bal == 0.0 && dealer_bal == 0.0 {
+        println!("   ⚠️  All accounts have 0 balance.");
+        println!("   💡 To mint tokens, use POST /admin/mint with proper authorization");
+        println!("   💡 Or deposit USDC to mint 1:1 backed $BC tokens");
     } else {
-        println!("✅ All accounts loaded from persistent storage");
+        println!("   ✅ Balances loaded from PERSISTENT STORAGE (Sled)");
     }
 }
 
@@ -297,28 +256,31 @@ async fn main() {
     let archivers_stats = service_coordinator.archive.clone();
     let block_producer_stats = service_coordinator.block_producer.clone();
     
-    // Initialize bridge state
+    // Initialize bridge state (LEGACY - kept for backwards compatibility)
     let bridge_state = Arc::new(Mutex::new(routes_v2::bridge::BridgeState::new()));
+    
+    // Initialize credit state (RECOMMENDED - simplified L2 credit line model)
+    let credit_state = Arc::new(Mutex::new(routes_v2::credit::CreditState::new()));
     
     // Real Ed25519 test account addresses (derived from seeds)
     let alice_l1 = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";
     let bob_l1 = "L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433";
-    let dealer_l1 = "L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC";
+    let dealer_l1 = "L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D";
     
-    // Get actual balances for display
+    // Get actual balances for display (READ-ONLY)
     let (alice_bal, bob_bal, dealer_bal) = {
         let bc = blockchain.lock().unwrap();
         (bc.get_balance(alice_l1), bc.get_balance(bob_l1), bc.get_balance(dealer_l1))
     };
     
-    println!("\n🧪 TEST ACCOUNTS (Real Ed25519 Addresses):");
+    println!("\n📊 ACCOUNT BALANCES (Persistent - No Auto-Seeding):");
     println!("┌────────────────────────────────────────────────────────────────────────────┐");
-    println!("│ 👛 ALICE:  {}  {:>10} BB │", alice_l1, alice_bal);
-    println!("│ 👛 BOB:    {}  {:>10} BB │", bob_l1, bob_bal);
-    println!("│ 🎰 DEALER: {}  {:>10} BB │", dealer_l1, dealer_bal);
+    println!("│ 👛 ALICE:  {}  {:>12.2} BB │", alice_l1, alice_bal);
+    println!("│ 👛 BOB:    {}  {:>12.2} BB │", bob_l1, bob_bal);
+    println!("│ 🎰 DEALER: {}  {:>12.2} BB │", dealer_l1, dealer_bal);
     println!("└────────────────────────────────────────────────────────────────────────────┘");
-    println!("  💡 Use /balance/<address> to check balances");
-    println!("  💡 Use /transfer with SignedRequest to transfer BB tokens");
+    println!("  💡 Tokens only created via: POST /admin/mint (authorized)");
+    println!("  💡 Or via USDC deposit (1:1 backed minting)");
     
     // Clone for routes
     let bc1 = blockchain.clone();
@@ -379,11 +341,23 @@ async fn main() {
     let l2_latest_state = routes_v2::bridge::l2_latest_state_root_route(bridge_state.clone());
     let l2_all_states = routes_v2::bridge::l2_all_state_roots_route(bridge_state.clone());
     
-    // CREDIT LINE ROUTES (Casino Bank Model) - CORE FUNCTIONALITY
+    // CREDIT LINE ROUTES (Casino Bank Model) - LEGACY bridge-based
     let credit_approve = routes_v2::bridge::credit_approve_route(blockchain.clone(), bridge_state.clone());
     let credit_draw = routes_v2::bridge::credit_draw_route(blockchain.clone(), bridge_state.clone());
-    let credit_settle = routes_v2::bridge::credit_settle_route(blockchain.clone(), bridge_state.clone());
-    let credit_status = routes_v2::bridge::credit_status_route(blockchain.clone(), bridge_state.clone());
+    let credit_status_legacy = routes_v2::bridge::credit_status_route(blockchain.clone(), bridge_state.clone());
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // NEW SIMPLIFIED CREDIT ROUTES - RECOMMENDED FOR L2
+    // ═══════════════════════════════════════════════════════════════════════════
+    // POST /credit/open - Reserve funds from L1 for L2 gaming session
+    // POST /credit/settle - Apply P&L back to L1 balances
+    // GET  /credit/status/{wallet} - Check active credit line
+    // GET  /credit/balance/{wallet} - Query L1 balance
+    // ═══════════════════════════════════════════════════════════════════════════
+    let credit_open = routes_v2::credit::open_credit_route(blockchain.clone(), credit_state.clone());
+    let credit_settle_new = routes_v2::credit::settle_credit_route(blockchain.clone(), credit_state.clone());
+    let credit_status_new = routes_v2::credit::credit_status_route(blockchain.clone(), credit_state.clone());
+    let credit_balance = routes_v2::credit::credit_balance_route(blockchain.clone());
     
     // Admin routes (OPEN ACCESS - DEVELOPMENT ONLY)
     let admin_mint = routes_v2::admin::mint_tokens_route(blockchain.clone());
@@ -454,7 +428,7 @@ async fn main() {
         .or(like)
         .or(social_stats)
         // ═══════════════════════════════════════════════════════════════
-        // BRIDGE ROUTES (Simplified - Core L1↔L2 bridge functionality)
+        // BRIDGE ROUTES (Legacy - Core L1↔L2 bridge functionality)
         // ═══════════════════════════════════════════════════════════════
         .or(bridge_initiate)
         .or(bridge_status)
@@ -467,13 +441,19 @@ async fn main() {
         .or(l2_latest_state)
         .or(l2_all_states)
         // ═══════════════════════════════════════════════════════════════
-        // CREDIT LINE (Casino Bank Model)
-        // One-time approval, auto-draw, session settlement
+        // CREDIT LINE - LEGACY (Casino Bank Model via Bridge)
         // ═══════════════════════════════════════════════════════════════
         .or(credit_approve)
         .or(credit_draw)
-        .or(credit_settle)
-        .or(credit_status)
+        .or(credit_status_legacy)
+        // ═══════════════════════════════════════════════════════════════
+        // CREDIT LINE - NEW SIMPLIFIED (RECOMMENDED)
+        // POST /credit/open, POST /credit/settle, GET /credit/status/{w}
+        // ═══════════════════════════════════════════════════════════════
+        .or(credit_open)
+        .or(credit_settle_new)
+        .or(credit_status_new)
+        .or(credit_balance)
         // Admin routes
         .or(admin_mint)
         .or(admin_burn)

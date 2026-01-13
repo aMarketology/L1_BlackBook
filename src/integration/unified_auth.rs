@@ -141,32 +141,65 @@ impl SignedRequest {
         let mut signed_bytes = vec![self.chain_id];
         signed_bytes.extend_from_slice(message.as_bytes());
 
+        println!("   🔍 Signature Verification Debug:");
+        println!("      Chain ID: 0x{:02x}", self.chain_id);
+        println!("      Payload: {}", if payload.len() > 50 { format!("{}...", &payload[..50]) } else { payload.to_string() });
+        println!("      Timestamp: {}", self.timestamp);
+        println!("      Nonce: {}", &self.nonce[..self.nonce.len().min(16)]);
+        println!("      Message: {}", if message.len() > 80 { format!("{}...", &message[..80]) } else { message.clone() });
+        println!("      Signed bytes length: {} (chain_id + message)", signed_bytes.len());
+
         // 6. Decode public key
         let pubkey_bytes = hex::decode(&self.public_key)
-            .map_err(|_| "Invalid public key hex")?;
+            .map_err(|e| {
+                println!("      ❌ Public key hex decode failed: {}", e);
+                format!("Invalid public key hex: {}", e)
+            })?;
         
         if pubkey_bytes.len() != 32 {
-            return Err(format!("Invalid public key length: {}", pubkey_bytes.len()));
+            println!("      ❌ Public key wrong length: {} bytes (expected 32)", pubkey_bytes.len());
+            return Err(format!("Invalid public key length: {} (expected 32)", pubkey_bytes.len()));
         }
+        println!("      ✓ Public key: {}... (32 bytes)", &self.public_key[..16]);
 
         let verifying_key = VerifyingKey::from_bytes(
             pubkey_bytes.as_slice().try_into().unwrap()
-        ).map_err(|e| format!("Invalid public key: {}", e))?;
+        ).map_err(|e| {
+            println!("      ❌ Public key parsing failed: {}", e);
+            format!("Invalid public key: {}", e)
+        })?;
 
         // 7. Decode signature
         let sig_bytes = hex::decode(&self.signature)
-            .map_err(|_| "Invalid signature hex")?;
+            .map_err(|e| {
+                println!("      ❌ Signature hex decode failed: {}", e);
+                format!("Invalid signature hex: {}", e)
+            })?;
         
         if sig_bytes.len() != 64 {
-            return Err(format!("Invalid signature length: {}", sig_bytes.len()));
+            println!("      ❌ Signature wrong length: {} bytes (expected 64)", sig_bytes.len());
+            return Err(format!("Invalid signature length: {} (expected 64)", sig_bytes.len()));
         }
+        println!("      ✓ Signature: {}... (64 bytes)", &self.signature[..32]);
 
         let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
 
         // 8. Verify signature
+        println!("      🔐 Verifying Ed25519 signature...");
         verifying_key
             .verify(&signed_bytes, &signature)
-            .map_err(|_| format!("Invalid signature for chain 0x{:02x}", self.chain_id))?;
+            .map_err(|e| {
+                println!("      ❌ SIGNATURE VERIFICATION FAILED");
+                println!("      Expected format: chain_id_byte + \"{{payload}}\\n{{timestamp}}\\n{{nonce}}\"");
+                println!("      Got: 0x{:02x} + \"{}\\n{}\\n{}\"", 
+                    self.chain_id, 
+                    if payload.len() > 40 { format!("{}...", &payload[..40]) } else { payload.to_string() },
+                    self.timestamp, 
+                    &self.nonce[..self.nonce.len().min(16)]
+                );
+                println!("      Crypto error: {}", e);
+                format!("Invalid signature for chain 0x{:02x} - message format may be incorrect", self.chain_id)
+            })?;
 
         // 9. Return wallet address
         let address = self.get_wallet_address();
