@@ -79,19 +79,36 @@ impl std::ops::Deref for PersistentBlockchain {
 impl PersistentBlockchain {
     /// Create or load a persistent blockchain at the given path
     /// 
-    /// If existing data is found, it will be loaded and verified.
-    /// Otherwise, genesis state is initialized and persisted.
+    /// PRODUCTION-READY: Bulletproof persistence detection.
+    /// - Checks for genesis hash (primary indicator)
+    /// - Falls back to account count (backup indicator)
+    /// - NEVER overwrites existing data
     pub fn new(data_path: &str) -> StorageResult<Self> {
+        println!("\n🗄️  Opening Sled database at: {}", data_path);
         let storage = StorageBridge::new(data_path)?;
         
-        // Check for existing state
-        let latest_slot = storage.get_latest_slot()?;
+        // ================================================================
+        // CRITICAL: Detect existing blockchain data
+        // Primary check: Genesis hash exists?
+        // Backup check: Account count > 0?
+        // ================================================================
+        let has_genesis = storage.has_genesis()?;
+        let account_count = storage.engine().count_accounts();
+        let raw_slot = storage.engine().get_latest_slot()?;
         
-        let inner = if latest_slot > 0 {
-            println!("📂 Loading blockchain from Sled (slot {})...", latest_slot);
+        println!("📊 Database state:");
+        println!("   ├─ Genesis hash exists: {}", has_genesis);
+        println!("   ├─ Accounts in DB: {}", account_count);
+        println!("   └─ Latest slot: {:?}", raw_slot);
+        
+        // Existing data = genesis hash OR accounts exist
+        let has_existing_data = has_genesis || account_count > 0;
+        
+        let inner = if has_existing_data {
+            println!("\n📂 LOADING existing blockchain from Sled...");
             Self::load_from_storage(&storage)?
         } else {
-            println!("🌱 Initializing genesis block...");
+            println!("🌱 Initializing genesis block (fresh database)...");
             let bc = EnhancedBlockchain::new();
             
             // Persist genesis state
@@ -422,18 +439,27 @@ impl PersistentBlockchain {
         let account = Account::from_bb_balance(to.to_string(), current + amount, slot);
         self.inner.accounts.insert(to.to_string(), account.clone());
         
-        // Persist immediately
+        // Persist immediately to state_tree
         self.storage.save_account(to, &account)
             .map_err(|e| format!("Persist error: {:?}", e))?;
         self.storage.save_balance(to, current + amount, slot)
             .map_err(|e| format!("Balance persist error: {:?}", e))?;
         
         // CRITICAL: Update latest_slot metadata so data is loaded on restart
+        // This is the key to persistence - if this fails, we lose everything on restart!
         self.storage.engine().set_latest_slot(slot)
-            .map_err(|e| format!("Metadata error: {:?}", e))?;
+            .map_err(|e| format!("CRITICAL: Metadata slot error: {:?}", e))?;
         
+        // Force immediate sync to disk (don't trust background flush)
         self.storage.flush()
             .map_err(|e| format!("Flush error: {:?}", e))?;
+        
+        // Verify the write succeeded by reading it back
+        let verify_slot = self.storage.engine().get_latest_slot()
+            .map_err(|e| format!("Verify error: {:?}", e))?;
+        if verify_slot != Some(slot) {
+            return Err(format!("CRITICAL: Slot verification failed! Wrote {} but read back {:?}", slot, verify_slot));
+        }
         
         println!("🪙 Minted {} BB to {} (persisted at slot {})", amount, &to[..14.min(to.len())], slot);
         Ok(())

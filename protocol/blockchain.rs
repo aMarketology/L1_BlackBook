@@ -390,6 +390,7 @@ pub enum LockPurpose {
     BridgeToL2,          // User bridging to L2 for gaming
     MarketEscrow,        // Funds locked for an active market/bet
     SettlementPending,   // Market resolved, awaiting payout
+    CreditLine,          // L1 tokens locked for L2 credit line (maintains 1:1 peg)
 }
 
 /// Proof from L2 that a settlement is valid

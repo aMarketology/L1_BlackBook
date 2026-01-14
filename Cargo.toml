@@ -129,11 +129,6 @@ path = "src/lib.rs"
 name = "layer1"
 path = "src/main_v2.rs"
 
-# Keep old main.rs available as a separate binary (deprecated)
-# [[bin]]
-# name = "layer1-legacy"
-# path = "src/main.rs"
-
 # ═══════════════════════════════════════════════════════════════
 # PROFILE CONFIGURATION - Fix Windows linker crashes
 # ═══════════════════════════════════════════════════════════════

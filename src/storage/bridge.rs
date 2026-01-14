@@ -227,16 +227,40 @@ impl StorageBridge {
     // METADATA OPERATIONS
     // ========================================================================
 
-    /// Initialize genesis state
+    /// Check if genesis has already been initialized
+    pub fn has_genesis(&self) -> StorageResult<bool> {
+        Ok(self.engine.get_genesis_hash()?.is_some())
+    }
+
+    /// Initialize genesis state - ONLY called for fresh databases
+    /// This sets the initial state and should NEVER be called on existing data
     pub fn init_genesis(&self, genesis_hash: &str, total_supply_bb: f64) -> StorageResult<()> {
-        // Try to set genesis hash (will fail if already set - that's OK)
-        let _ = self.engine.set_genesis_hash(genesis_hash);
+        // SAFETY: Check if genesis already exists - NEVER overwrite!
+        if self.has_genesis()? {
+            println!("⚠️  Genesis already exists - skipping init_genesis (this is normal on restart)");
+            return Ok(());
+        }
         
+        println!("🌱 First-time genesis initialization...");
+        
+        // Set genesis hash (this marks the database as initialized)
+        self.engine.set_genesis_hash(genesis_hash)?;
+        
+        // Set initial supply
         let total_lamports = (total_supply_bb * LAMPORTS_PER_BB as f64) as u64;
         self.engine.set_total_supply(total_lamports)?;
-        self.engine.set_latest_slot(0)?;
+        
+        // Set slot to 1 (not 0!) so we can detect existing data
+        // Slot 0 is reserved for "uninitialized"
+        self.engine.set_latest_slot(1)?;
+        
+        // Initial state root
         self.engine.set_state_root(&"0".repeat(64))?;
         
+        // Force sync to disk
+        self.engine.flush()?;
+        
+        println!("✅ Genesis initialized and flushed to disk");
         Ok(())
     }
 

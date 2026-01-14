@@ -1248,26 +1248,37 @@ fn format_ledger(bc: &PersistentBlockchain) -> String {
     
     output.push_str("╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣\n");
     
-    // Summary
+    // Summary - Real blockchain statistics
     let total_txs = all_txs.len();
     let total_blocks = bc.chain().len();
+    let current_slot = bc.current_slot();
     let total_supply: f64 = bc.balances().values().sum();
+    let total_accounts = bc.balances().len();
     
-    // Get Alice and Bob balances (test accounts)
-    let alice_addr = "L1_BF1565F0D56ED917FDF8263CCCB020706F5FB5DD";
-    let bob_addr = "L1_AE1CA8E0144C2D8DCFAC3748B36AE166D52F71D9";
-    let alice_bal = *bc.balances().get(alice_addr).unwrap_or(&0.0);
-    let bob_bal = *bc.balances().get(bob_addr).unwrap_or(&0.0);
+    // Count transaction types
+    let mut mint_count = 0;
+    let mut transfer_count = 0;
+    let mut bridge_count = 0;
     
-    // Format supply with commas manually
+    for (_idx, tx, _ts) in &all_txs {
+        match tx.tx_type {
+            TransactionType::Mint => mint_count += 1,
+            TransactionType::Transfer => transfer_count += 1,
+            TransactionType::BetPlacement | TransactionType::BetResolution => bridge_count += 1,
+            _ => {}
+        }
+    }
+    
+    // Format supply with commas
     let supply_str = format_with_commas(total_supply);
-    let alice_str = format_with_commas(alice_bal);
-    let bob_str = format_with_commas(bob_bal);
     
-    output.push_str(&format!("║  👛 Alice: {} $BC  |  👛 Bob: {} $BC                                                           ║\n",
-        alice_str, bob_str));
-    output.push_str(&format!("║  Total Transactions: {:5}  |  Blocks: {:5}  |  Circulating Supply: {} $BC                               ║\n", 
-        total_txs, total_blocks, supply_str));
+    output.push_str(&format!("║  📊 Blockchain Stats:                                                                                            ║\n"));
+    output.push_str(&format!("║     • Total Transactions: {}  |  Active Accounts: {}  |  Current Slot: {}                            ║\n", 
+        total_txs, total_accounts, current_slot));
+    output.push_str(&format!("║     • Total Blocks: {}  |  Circulating Supply: {} $BC                                              ║\n", 
+        total_blocks, supply_str));
+    output.push_str(&format!("║     • Mints: {}  |  Transfers: {}  |  Bridge Operations: {}                                          ║\n",
+        mint_count, transfer_count, bridge_count));
     output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
     
     output

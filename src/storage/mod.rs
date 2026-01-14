@@ -639,8 +639,15 @@ impl StorageEngine {
     // UTILITIES
     // ========================================================================
 
-    /// Flush all data to disk immediately
+    /// Flush all data to disk immediately (SYNCHRONOUS - blocks until complete)
     pub fn flush(&self) -> StorageResult<()> {
+        // Flush each tree explicitly first
+        self.state_tree.flush()?;
+        self.blocks_tree.flush()?;
+        self.tx_tree.flush()?;
+        self.social_tree.flush()?;
+        self.metadata_tree.flush()?;
+        // Then flush the main database
         self.db.flush()?;
         Ok(())
     }

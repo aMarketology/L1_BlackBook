@@ -68,6 +68,7 @@ pub struct SettleCreditRequest {
 pub struct CreditState {
     pub active_credits: HashMap<String, CreditLine>,  // session_id -> CreditLine
     pub user_sessions: HashMap<String, String>,       // wallet_address -> session_id
+    pub session_locks: HashMap<String, String>,       // session_id -> lock_id (L1 token locks)
 }
 
 impl CreditState {
@@ -87,7 +88,6 @@ impl CreditState {
             .unwrap_or(false)
     }
 }
-
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
@@ -209,25 +209,46 @@ pub fn open_credit_route(
                     }
                 }
                 
-                // Check L1 balance
-                let l1_balance = {
-                    let bc = lock_blockchain(&blockchain);
-                    bc.get_balance(&request.wallet_address)
+                // Check L1 balance and LOCK tokens
+                let (l1_balance, lock_id) = {
+                    let mut bc = lock_blockchain(&blockchain);
+                    let balance = bc.get_balance(&request.wallet_address);
+                    
+                    println!("   L1 Balance: {} $BC", balance);
+                    
+                    if balance < request.amount {
+                        println!("   ❌ Insufficient L1 balance");
+                        return Ok(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Insufficient balance: {} < {}", balance, request.amount),
+                            "l1_balance": balance,
+                            "requested": request.amount
+                        })));
+                    }
+                    
+                    // CRITICAL: Lock tokens on L1 to maintain 1:1 peg with L2
+                    let lock_id = match bc.lock_tokens(
+                        &request.wallet_address,
+                        request.amount,
+                        crate::protocol::blockchain::LockPurpose::CreditLine,
+                        Some(format!("L2_CREDIT_{}", request.wallet_address))
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            println!("   ❌ Failed to lock tokens: {}", e);
+                            return Ok(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": format!("Failed to lock tokens: {}", e)
+                            })));
+                        }
+                    };
+                    
+                    println!("   🔒 Locked {} $BC (lock_id: {})", request.amount, lock_id);
+                    
+                    (balance, lock_id)
                 };
                 
-                println!("   L1 Balance: {} $BC", l1_balance);
-                
-                if l1_balance < request.amount {
-                    println!("   ❌ Insufficient L1 balance");
-                    return Ok(warp::reply::json(&serde_json::json!({
-                        "success": false,
-                        "error": format!("Insufficient balance: {} < {}", l1_balance, request.amount),
-                        "l1_balance": l1_balance,
-                        "requested": request.amount
-                    })));
-                }
-                
-                // Create credit line
+                // Create credit line with lock reference
                 let session_id = generate_session_id();
                 let credit = CreditLine {
                     session_id: session_id.clone(),
@@ -238,15 +259,17 @@ pub fn open_credit_route(
                     is_active: true,
                 };
                 
-                // Store credit line
+                // Store credit line and lock_id mapping
                 {
                     let mut state = lock_credit_state(&credit_state);
                     state.active_credits.insert(session_id.clone(), credit);
                     state.user_sessions.insert(request.wallet_address.clone(), session_id.clone());
+                    // Store lock_id for settlement (we'll need to add this field to CreditState)
+                    state.session_locks.insert(session_id.clone(), lock_id.clone());
                 }
                 
                 println!("   ✅ Credit line opened: {}", session_id);
-                println!("   Reserved: {} $BC", request.amount);
+                println!("   Reserved: {} $BC (LOCKED on L1)", request.amount);
                 println!("   Available after credit: {} $BC", l1_balance - request.amount);
                 
                 Ok(warp::reply::json(&serde_json::json!({
@@ -255,7 +278,8 @@ pub fn open_credit_route(
                     "credit_amount": request.amount,
                     "l1_balance": l1_balance,
                     "available_after_credit": l1_balance - request.amount,
-                    "message": "Credit line opened. L2 can now track virtual balance."
+                    "lock_id": lock_id,
+                    "message": "Credit line opened. Tokens LOCKED on L1 to maintain 1:1 peg with L2. L2 can now mint equivalent tokens."
                 })))
             }
         })
@@ -416,16 +440,35 @@ pub fn settle_credit_route(
                     }
                     
                     let balance_after = bc.get_balance(&request.wallet_address);
+                    
+                    // CRITICAL: Release the locked tokens
+                    let lock_id = {
+                        let state = lock_credit_state(&credit_state);
+                        state.session_locks.get(&request.session_id).cloned()
+                    };
+                    
+                    if let Some(lock_id) = lock_id {
+                        match bc.release_tokens(&lock_id) {
+                            Ok((addr, amount)) => {
+                                println!("   🔓 Released {} $BC lock for {}", amount, addr);
+                            }
+                            Err(e) => {
+                                println!("   ⚠️ Failed to release lock: {}", e);
+                            }
+                        }
+                    }
+                    
                     (balance_before, balance_after)
                 };
                 
-                // Close the credit line
+                // Close the credit line and remove lock mapping
                 {
                     let mut state = lock_credit_state(&credit_state);
                     if let Some(credit) = state.active_credits.get_mut(&request.session_id) {
                         credit.is_active = false;
                     }
                     state.user_sessions.remove(&request.wallet_address);
+                    state.session_locks.remove(&request.session_id);
                 }
                 
                 println!("   ✅ Settlement complete");
