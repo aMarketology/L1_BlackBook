@@ -10,6 +10,7 @@
 // - TurbineService: Block propagation via shreds  
 // - CloudbreakAccountDB: High-performance account storage
 // - ArchiveService: Distributed ledger storage
+// - ParallelScheduler: Sealevel-style parallel transaction execution
 // ============================================================================
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,7 +23,8 @@ use crate::storage::PersistentBlockchain;
 use crate::protocol::blockchain::{Block, TurbineService, Transaction as BlockchainTransaction, TransactionType as BlockchainTxType};
 use crate::protocol::blockchain_state::ArchiveService;
 use crate::protocol::persistence::CloudbreakAccountDB;
-use crate::runtime::{GulfStreamService, SharedPoHService};
+use crate::runtime::{GulfStreamService, SharedPoHService, ParallelScheduler};
+use dashmap::DashMap;
 
 /// Helper to recover from poisoned locks
 fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a, PersistentBlockchain> {
@@ -41,9 +43,10 @@ fn lock_or_recover<'a>(mutex: &'a Mutex<PersistentBlockchain>) -> MutexGuard<'a,
 /// This is the heart of the system that:
 /// 1. Collects transactions from Gulf Stream (pre-staged by upcoming leader)
 /// 2. Produces blocks at regular intervals (slot duration)
-/// 3. Shreds blocks via Turbine for propagation
-/// 4. Archives blocks via ArchiveService
-/// 5. Updates Cloudbreak with new account states
+/// 3. Executes transactions in PARALLEL using Sealevel-style scheduler
+/// 4. Shreds blocks via Turbine for propagation
+/// 5. Archives blocks via ArchiveService
+/// 6. Updates Cloudbreak with new account states
 pub struct BlockProducer {
     /// Blockchain state
     blockchain: Arc<Mutex<PersistentBlockchain>>,
@@ -63,6 +66,12 @@ pub struct BlockProducer {
     /// PoH service for timing
     poh_service: SharedPoHService,
     
+    /// Parallel scheduler for Sealevel-style execution
+    parallel_scheduler: Arc<ParallelScheduler>,
+    
+    /// DashMap for parallel balance updates
+    balance_cache: Arc<DashMap<String, f64>>,
+    
     /// Current slot tracker
     current_slot: Arc<AtomicU64>,
     
@@ -79,10 +88,11 @@ pub struct BlockProducer {
     blocks_produced: AtomicU64,
     txs_processed: AtomicU64,
     empty_slots: AtomicU64,
+    parallel_batches: AtomicU64,
 }
 
 impl BlockProducer {
-    /// Create a new block producer
+    /// Create a new block producer with parallel execution support
     pub fn new(
         blockchain: Arc<Mutex<PersistentBlockchain>>,
         gulf_stream: Arc<GulfStreamService>,
@@ -93,6 +103,18 @@ impl BlockProducer {
         current_slot: Arc<AtomicU64>,
         slot_duration_ms: u64,
     ) -> Arc<Self> {
+        // Initialize parallel scheduler for Sealevel-style execution
+        let parallel_scheduler = Arc::new(ParallelScheduler::new());
+        
+        // Initialize balance cache for parallel updates (sync from blockchain on start)
+        let balance_cache: Arc<DashMap<String, f64>> = Arc::new(DashMap::new());
+        {
+            let bc = lock_or_recover(&blockchain);
+            for (addr, bal) in bc.balances() {
+                balance_cache.insert(addr.clone(), *bal);
+            }
+        }
+        
         Arc::new(Self {
             blockchain,
             gulf_stream,
@@ -100,6 +122,8 @@ impl BlockProducer {
             cloudbreak,
             archive,
             poh_service,
+            parallel_scheduler,
+            balance_cache,
             current_slot,
             slot_duration_ms,
             is_running: AtomicBool::new(false),
@@ -107,6 +131,7 @@ impl BlockProducer {
             blocks_produced: AtomicU64::new(0),
             txs_processed: AtomicU64::new(0),
             empty_slots: AtomicU64::new(0),
+            parallel_batches: AtomicU64::new(0),
         })
     }
     

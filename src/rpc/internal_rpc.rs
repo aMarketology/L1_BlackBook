@@ -7,12 +7,15 @@
 //! L1 acts as SUBSCRIBER (receives from L2), L2 is PUBLISHER
 
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+#[allow(unused_imports)]  // Reserved for shared-memory IPC (Phase 2)
 use std::fs::{File, OpenOptions};
+#[allow(unused_imports)]  // Reserved for shared-memory IPC (Phase 2)
 use std::path::PathBuf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]  // Reserved for shared-memory IPC (Phase 2)
 use memmap2::{MmapMut, MmapOptions};
 use crate::protocol::blockchain::EnhancedBlockchain;
 

@@ -126,11 +126,6 @@ fn seed_test_accounts(bc: &mut PersistentBlockchain) {
     }
 }
 
-fn seed_test_accounts_legacy(_bc: &mut protocol::blockchain::EnhancedBlockchain) {
-    // REMOVED - Sled-only mode, no JSON fallback
-    unimplemented!("JSON mode removed - use Sled persistence only")
-}
-
 fn save_social_system(social_system: &SocialMiningSystem) {
     if let Ok(data) = serde_json::to_string_pretty(social_system) {
         let _ = fs::write(SOCIAL_DATA_FILE, data);
@@ -225,7 +220,7 @@ async fn main() {
     // CONSENSUS ENGINE - Fork Choice, Block Proposal, P2P
     // ============================================================================
     let consensus_config = consensus::ConsensusConfig::default();
-    let consensus_engine = Arc::new(tokio::sync::RwLock::new(
+    let _consensus_engine = Arc::new(tokio::sync::RwLock::new(
         consensus::ConsensusEngine::new(consensus_config, consensus::NodeType::Validator)
     ));
     println!("🔗 Consensus Engine initialized (Fork Choice + P2P ready)");
@@ -304,6 +299,12 @@ async fn main() {
     let poh_verify = routes_v2::rpc::poh_verify_route(poh_service.clone());
     let ledger = routes_v2::rpc::ledger_route(blockchain.clone());
     
+    // Token validation routes (1:1 backing verification)
+    let validate_supply = routes_v2::rpc::validate_supply_route(blockchain.clone());
+    let validate_token = routes_v2::rpc::validate_token_route(blockchain.clone());
+    let validate_l2_backing = routes_v2::rpc::validate_l2_backing_route(blockchain.clone());
+    let verify_proof = routes_v2::rpc::verify_proof_route();
+    
     // Auth routes
     let keypair = routes_v2::auth::generate_keypair_route();
     let test_accounts = routes_v2::auth::test_accounts_route();
@@ -335,6 +336,7 @@ async fn main() {
     let bridge_status = routes_v2::bridge::bridge_status_route(bridge_state.clone());
     let bridge_pending = routes_v2::bridge::bridge_pending_route(bridge_state.clone());
     let bridge_stats = routes_v2::bridge::bridge_stats_route(bridge_state.clone());
+    let bridge_release = routes_v2::bridge::bridge_release_route(blockchain.clone(), bridge_state.clone());
     
     // L2 STATE ROOT ANCHORING (Optimistic Rollup)
     let l2_state_root = routes_v2::bridge::l2_state_root_route(blockchain.clone(), bridge_state.clone());
@@ -413,6 +415,13 @@ async fn main() {
         .or(poh_status)
         .or(poh_verify)
         .or(ledger)
+        // ═══════════════════════════════════════════════════════════════
+        // TOKEN VALIDATION ROUTES (1:1 Backing Verification)
+        // ═══════════════════════════════════════════════════════════════
+        .or(validate_supply)
+        .or(validate_token)
+        .or(validate_l2_backing)
+        .or(verify_proof)
         .or(keypair)
         .or(test_accounts)
         .or(verify)
@@ -434,6 +443,7 @@ async fn main() {
         .or(bridge_status)
         .or(bridge_pending)
         .or(bridge_stats)
+        .or(bridge_release)
         // ═══════════════════════════════════════════════════════════════
         // L2 STATE ROOT ANCHORING (Optimistic Rollup)
         // ═══════════════════════════════════════════════════════════════

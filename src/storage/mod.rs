@@ -28,6 +28,9 @@
 //! ```
 
 pub mod merkle;
+pub mod token_validator;
+
+pub use token_validator::{TokenValidator, ValidationResult, TokenProof, L2TokenValidation, SupplyAuditor};
 pub mod bridge;
 pub mod persistent;
 pub mod snapshot;

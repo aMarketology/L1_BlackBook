@@ -249,6 +249,11 @@ impl PersistentBlockchain {
         &self.inner.balances
     }
 
+    /// Get locked balances reference (read-only)
+    pub fn locked_balances(&self) -> &HashMap<String, f64> {
+        &self.inner.locked_balances
+    }
+
     /// Set current slot (for consensus layer)
     pub fn set_current_slot(&mut self, slot: u64) {
         self.inner.current_slot = slot;

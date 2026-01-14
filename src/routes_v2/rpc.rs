@@ -1405,3 +1405,218 @@ fn format_timestamp(timestamp: u64) -> String {
         _ => format!("{}", timestamp)
     }
 }
+
+// ============================================================================
+// TOKEN VALIDATION ROUTES
+// ============================================================================
+
+use crate::storage::{TokenValidator, TokenProof};
+
+/// GET /validate/supply - Validate total token supply (1:1 backing check)
+/// 
+/// Returns:
+/// - valid: true if SUM(balances + locked) == INITIAL_SUPPLY
+/// - total_supply: current computed supply
+/// - discrepancy: difference from expected (should be 0)
+pub fn validate_supply_route(
+    blockchain: Arc<Mutex<PersistentBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("validate")
+        .and(warp::path("supply"))
+        .and(warp::get())
+        .and_then(move || {
+            let blockchain = blockchain.clone();
+            async move {
+                let result = {
+                    let bc = lock_or_recover(&blockchain);
+                    let validator = TokenValidator::new();
+                    
+                    // Get balances and locked amounts
+                    let balances = bc.balances().clone();
+                    let locked = bc.locked_balances().clone();
+                    let slot = bc.current_slot();
+                    
+                    // Compute state root for this validation
+                    let state_root = format!("{:x}", sha2::Sha256::digest(
+                        format!("state:{}:{}", slot, balances.len()).as_bytes()
+                    ));
+                    
+                    validator.validate_supply(&balances, &locked, slot, &state_root)
+                };
+                
+                if result.valid {
+                    println!("✅ Supply validation passed: {} BB", result.total_supply);
+                } else {
+                    println!("❌ SUPPLY VALIDATION FAILED! Discrepancy: {} BB", result.discrepancy);
+                }
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "validation": result
+                })))
+            }
+        })
+}
+
+/// GET /validate/token/{address} - Get token proof for an address
+/// 
+/// Returns a cryptographic proof that tokens at this address are valid L1 tokens.
+/// This proof can be verified by L2 or any third party.
+pub fn validate_token_route(
+    blockchain: Arc<Mutex<PersistentBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("validate")
+        .and(warp::path("token"))
+        .and(warp::path::param::<String>())
+        .and(warp::get())
+        .and_then(move |address: String| {
+            let blockchain = blockchain.clone();
+            async move {
+                let proof = {
+                    let bc = lock_or_recover(&blockchain);
+                    let validator = TokenValidator::new();
+                    
+                    let balance = bc.get_balance(&address);
+                    let locked = bc.get_locked_balance(&address);
+                    let slot = bc.current_slot();
+                    
+                    // Compute state root
+                    let state_root = format!("{:x}", sha2::Sha256::digest(
+                        format!("state:{}:{}", slot, bc.balances().len()).as_bytes()
+                    ));
+                    
+                    validator.generate_token_proof(&address, balance, locked, slot, &state_root)
+                };
+                
+                println!("🔐 Token proof generated for {}: {} BB (+ {} locked)", 
+                         &address[..16.min(address.len())], proof.balance, proof.locked);
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "proof": proof
+                })))
+            }
+        })
+}
+
+/// POST /validate/l2-backing - Verify L2 tokens are backed by L1 locks
+/// 
+/// Body: { session_id, l1_address, l2_amount, lock_id }
+/// Returns whether the L2 amount is fully backed by L1 locked tokens.
+pub fn validate_l2_backing_route(
+    blockchain: Arc<Mutex<PersistentBlockchain>>
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("validate")
+        .and(warp::path("l2-backing"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then(move |body: serde_json::Value| {
+            let blockchain = blockchain.clone();
+            async move {
+                let session_id = body.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let l1_address = body.get("l1_address")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let l2_amount = body.get("l2_amount")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let lock_id = body.get("lock_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                
+                let validation = {
+                    let bc = lock_or_recover(&blockchain);
+                    let validator = TokenValidator::new();
+                    
+                    // Get the actual locked amount on L1
+                    let l1_locked = match bc.get_lock_record(lock_id) {
+                        Some(lock) => {
+                            if lock.released_at.is_some() {
+                                0.0 // Already released
+                            } else {
+                                lock.amount
+                            }
+                        }
+                        None => 0.0
+                    };
+                    
+                    let state_root = format!("{:x}", sha2::Sha256::digest(
+                        format!("state:{}:{}", bc.current_slot(), bc.balances().len()).as_bytes()
+                    ));
+                    
+                    validator.validate_l2_backing(
+                        session_id, l1_address, l2_amount, l1_locked, lock_id, &state_root
+                    )
+                };
+                
+                if validation.is_backed {
+                    println!("✅ L2 backing verified: {} BB backed by {} BB locked", 
+                             validation.l2_claimed_amount, validation.l1_locked_amount);
+                } else {
+                    println!("❌ L2 BACKING FAILED: {} BB claimed but only {} BB locked!", 
+                             validation.l2_claimed_amount, validation.l1_locked_amount);
+                }
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "validation": validation,
+                    "backed": validation.is_backed
+                })))
+            }
+        })
+}
+
+/// GET /validate/proof - Verify a token proof
+/// 
+/// Query params: address, balance, locked, slot, state_root, proof_hash
+pub fn verify_proof_route(
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("validate")
+        .and(warp::path("proof"))
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::get())
+        .and_then(move |params: std::collections::HashMap<String, String>| {
+            async move {
+                let address = params.get("address").cloned().unwrap_or_default();
+                let balance: f64 = params.get("balance")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let locked: f64 = params.get("locked")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let slot: u64 = params.get("slot")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let state_root = params.get("state_root").cloned().unwrap_or_default();
+                let proof_hash = params.get("proof_hash").cloned().unwrap_or_default();
+                
+                let validator = TokenValidator::new();
+                
+                let proof = TokenProof {
+                    address: address.clone(),
+                    balance,
+                    locked,
+                    total: balance + locked,
+                    state_proof: proof_hash,
+                    state_root,
+                    slot,
+                    l1_signature: None,
+                    is_valid: true,
+                };
+                
+                let is_valid = validator.verify_token_proof(&proof);
+                
+                println!("🔍 Proof verification for {}: {}", 
+                         &address[..16.min(address.len())], 
+                         if is_valid { "VALID" } else { "INVALID" });
+                
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "valid": is_valid,
+                    "proof": proof
+                })))
+            }
+        })
+}

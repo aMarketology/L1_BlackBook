@@ -17,13 +17,17 @@ pub mod poh_service;
 pub use poh_service::{
     PoHService, SharedPoHService, create_poh_service, run_poh_clock, 
     TransactionPipeline, SharedPipeline, verify_poh_chain,
-    PipelinePacket, CommittedPacket,
+    PipelinePacket,
     // Finality constants
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
-    // Pruning constants
-    PRUNED_SLOTS_RETENTION, NodePruningMode,
 };
 
 // Consensus types (used by main_v2.rs and services.rs)
 pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};
+
+// Parallel Execution (Sealevel-style) - NOW WIRED!
+pub use core::{
+    ParallelScheduler, AccountLockManager, 
+    Transaction as RuntimeTransaction,
+};
 

@@ -749,6 +749,227 @@ pub fn bridge_pending_route(
 }
 
 // ============================================================================
+// ROUTE: Bridge Release - L2 calls this to release locked tokens
+// ============================================================================
+// POST /bridge/release
+// Body: { lock_id, l2_signature, l2_public_key, settlement_data }
+//
+// L2 calls this after verifying settlement on L2 side.
+// L1 verifies the L2 signature, then releases the locked tokens.
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeReleaseRequest {
+    pub lock_id: String,
+    pub l2_signature: String,        // L2 sequencer's signature
+    pub l2_public_key: String,       // L2 sequencer's public key
+    pub wallet_signature: String,    // Wallet owner's signature (REQUIRED)
+    pub wallet_public_key: String,   // Wallet owner's public key
+    pub settlement_data: SettlementData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettlementData {
+    pub wallet_address: String,
+    pub final_balance: f64,          // User's final balance on L2
+    pub pnl: f64,                    // Profit/Loss from session
+    pub session_id: String,
+    pub l2_block_height: u64,
+}
+
+pub fn bridge_release_route(
+    blockchain: Arc<Mutex<PersistentBlockchain>>,
+    bridge_state: Arc<Mutex<BridgeState>>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    warp::path("bridge")
+        .and(warp::path("release"))
+        .and(warp::post())
+        .and(warp::body::json())
+        .and_then(move |request: BridgeReleaseRequest| {
+            let blockchain = blockchain.clone();
+            let bridge_state = bridge_state.clone();
+            async move {
+                println!("🔓 Bridge Release Request:");
+                println!("   Lock ID: {}", &request.lock_id[..16.min(request.lock_id.len())]);
+                println!("   Wallet: {}", request.settlement_data.wallet_address);
+                println!("   Final Balance: {} BB", request.settlement_data.final_balance);
+                println!("   P&L: {:+.2} BB", request.settlement_data.pnl);
+
+                // 1. Verify WALLET signature (wallet owner must approve release)
+                let wallet_message = format!(
+                    "BRIDGE_RELEASE:{}:{}:{}",
+                    request.lock_id,
+                    request.settlement_data.session_id,
+                    request.settlement_data.pnl
+                );
+
+                match verify_ed25519_signature(
+                    &request.wallet_public_key,
+                    &wallet_message,
+                    &request.wallet_signature,
+                ) {
+                    Ok(true) => {
+                        println!("   ✅ Wallet signature verified");
+                        
+                        // Verify wallet public key matches address
+                        let derived_address = crate::unified_wallet::strip_prefix(&request.settlement_data.wallet_address);
+                        if derived_address != request.wallet_public_key {
+                            println!("   ❌ Wallet public key mismatch");
+                            return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": "Wallet public key does not match address"
+                            })));
+                        }
+                    }
+                    Ok(false) => {
+                        println!("   ❌ Invalid wallet signature");
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid wallet signature - only wallet owner can authorize release"
+                        })));
+                    }
+                    Err(e) => {
+                        println!("   ❌ Wallet signature verification error: {}", e);
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Wallet signature verification failed: {}", e)
+                        })));
+                    }
+                }
+
+                // 2. Verify L2 signature (L2 sequencer confirms settlement)
+                let message = format!(
+                    "BRIDGE_RELEASE:{}:{}:{}:{}",
+                    request.lock_id,
+                    request.settlement_data.wallet_address,
+                    request.settlement_data.final_balance,
+                    request.settlement_data.session_id
+                );
+
+                match verify_ed25519_signature(
+                    &request.l2_public_key,
+                    &message,
+                    &request.l2_signature,
+                ) {
+                    Ok(true) => {
+                        println!("   ✅ L2 signature verified");
+                    }
+                    Ok(false) => {
+                        println!("   ❌ Invalid L2 signature");
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": "Invalid L2 signature"
+                        })));
+                    }
+                    Err(e) => {
+                        println!("   ❌ Signature verification error: {}", e);
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Signature verification failed: {}", e)
+                        })));
+                    }
+                }
+
+                // 3. Get lock record and validate
+                let lock_record = {
+                    let bc = lock_or_recover(&blockchain);
+                    match bc.get_lock_record(&request.lock_id) {
+                        Some(lock) => lock.clone(),
+                        None => {
+                            println!("   ❌ Lock not found: {}", request.lock_id);
+                            return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": format!("Lock not found: {}", request.lock_id)
+                            })));
+                        }
+                    }
+                };
+
+                // 4. Check if already released
+                if lock_record.released_at.is_some() {
+                    println!("   ⚠️  Tokens already released");
+                    return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                        "success": false,
+                        "error": "Tokens already released"
+                    })));
+                }
+
+                // 5. Authorize and release tokens
+                let proof = crate::protocol::blockchain::SettlementProof {
+                    market_id: request.settlement_data.session_id.clone(),
+                    outcome: format!("Settlement: P&L = {:+.2}", request.settlement_data.pnl),
+                    l2_block_height: request.settlement_data.l2_block_height,
+                    l2_signature: request.l2_signature.clone(),
+                    verified_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                };
+
+                let (recipient, amount) = {
+                    let mut bc = lock_or_recover(&blockchain);
+                    
+                    // Authorize release
+                    if let Err(e) = bc.authorize_release(&request.lock_id, proof) {
+                        println!("   ❌ Authorization failed: {}", e);
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "success": false,
+                            "error": format!("Authorization failed: {}", e)
+                        })));
+                    }
+
+                    // Release tokens
+                    match bc.release_tokens(&request.lock_id) {
+                        Ok((recipient, amount)) => {
+                            println!("   ✅ Released {} BB to {}", amount, recipient);
+                            
+                            // Flush to disk
+                            if let Err(e) = bc.flush() {
+                                println!("   ⚠️  Flush error: {}", e);
+                            }
+                            
+                            (recipient, amount)
+                        }
+                        Err(e) => {
+                            println!("   ❌ Release failed: {}", e);
+                            return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "success": false,
+                                "error": format!("Release failed: {}", e)
+                            })));
+                        }
+                    }
+                };
+
+                // 6. Update bridge state to mark session as settled
+                {
+                    let mut state = lock_bridge_state(&bridge_state);
+                    if let Some(session) = state.get_session_by_id_mut(&request.settlement_data.session_id) {
+                        session.is_active = false;
+                        session.l2_balance = request.settlement_data.final_balance;
+                        session.total_winnings = request.settlement_data.pnl;
+                    }
+                    if let Some(approval) = state.get_credit_approval_mut(&request.settlement_data.wallet_address) {
+                        approval.is_active = false;
+                    }
+                }
+
+                // 7. Return success
+                Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                    "success": true,
+                    "released": {
+                        "lock_id": request.lock_id,
+                        "recipient": recipient,
+                        "amount": amount,
+                        "pnl": request.settlement_data.pnl,
+                        "session_id": request.settlement_data.session_id,
+                    },
+                    "message": format!("Released {} BB to {} - Verified by both wallet and L2", amount, recipient)
+                })))
+            }
+        })
+}
+
+// ============================================================================
 // SIGNATURE VERIFICATION HELPERS
 // ============================================================================
 
