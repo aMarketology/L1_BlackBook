@@ -1,5 +1,5 @@
 // ============================================================================
-// AUTH ROUTES - Signature Verification & Test Accounts (Supabase-Free)
+// AUTH ROUTES - Signature Verification
 // ============================================================================
 //
 // This module handles signature-based authentication for blockchain operations.

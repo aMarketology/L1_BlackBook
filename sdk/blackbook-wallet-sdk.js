@@ -310,7 +310,7 @@ const TEST_ACCOUNTS = {
   // Dealer: House bankroll account with 100,000 BB
   DEALER: {
     username: 'dealer',
-    address: 'L1_EB8B2F3A7F97A929D3B8C7E449432BC00D5097BC',
+    address: 'L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D',
     seed: 'd4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d',
     publicKey: '65328794ed4a81cc2a92b93738c22a545f066cc6c0b6a72aa878cfa289f0ba32',
     startingBalance: 100000.0,
@@ -524,7 +524,8 @@ async function signRequest(privateKey, operationType, payloadFields, requestPath
   const payloadHash = await createCanonicalPayloadHash(operationType, fullPayload);
   
   // Construct signing message with domain separation
-  const domainPrefix = `BLACKBOOK_L${chainId}_${requestPath}`;
+  // Server expects: BLACKBOOK_L{chain_id}{request_path} (no underscore)
+  const domainPrefix = `BLACKBOOK_L${chainId}${requestPath}`;
   const message = `${domainPrefix}\n${payloadHash}\n${timestamp}\n${nonce}`;
   
   // Sign with Ed25519
@@ -715,7 +716,7 @@ class BlackBookWallet {
   }
 
   /**
-   * Send signed transfer request
+   * Send signed transfer request (V2 canonical format)
    */
   async transfer(to, amount) {
     if (!this.privateKey) throw new Error('Wallet not initialized');
@@ -732,6 +733,57 @@ class BlackBookWallet {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(signedRequest)
+    });
+    
+    return await response.json();
+  }
+
+  /**
+   * Send signed transfer request (simple format - for frontend compatibility)
+   * This uses the /transfer/simple endpoint with a simpler signing scheme
+   */
+  async transferSimple(to, amount) {
+    if (!this.privateKey) throw new Error('Wallet not initialized');
+    
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = generateNonce();
+    const payload = JSON.stringify({ to, amount });
+    
+    // Sign: chain_id byte + payload + newline + timestamp + newline + nonce
+    const chainIdByte = new Uint8Array([CHAIN_ID_L1]);
+    const payloadBytes = new TextEncoder().encode(payload);
+    const timestampBytes = new TextEncoder().encode(`\n${timestamp}\n`);
+    const nonceBytes = new TextEncoder().encode(nonce);
+    
+    // Concatenate all parts
+    const message = new Uint8Array(
+      chainIdByte.length + payloadBytes.length + timestampBytes.length + nonceBytes.length
+    );
+    let offset = 0;
+    message.set(chainIdByte, offset); offset += chainIdByte.length;
+    message.set(payloadBytes, offset); offset += payloadBytes.length;
+    message.set(timestampBytes, offset); offset += timestampBytes.length;
+    message.set(nonceBytes, offset);
+    
+    // Sign with Ed25519
+    const keyPair = nacl.sign.keyPair.fromSecretKey(this.privateKey);
+    const signature = nacl.sign.detached(message, this.privateKey);
+    
+    const request = {
+      public_key: bytesToHex(keyPair.publicKey),
+      wallet_address: this.address,
+      payload: payload,
+      timestamp: timestamp,
+      nonce: nonce,
+      chain_id: CHAIN_ID_L1,
+      schema_version: 1,
+      signature: bytesToHex(signature)
+    };
+    
+    const response = await fetch(`${this.apiUrl}/transfer/simple`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request)
     });
     
     return await response.json();
@@ -758,23 +810,18 @@ class BlackBookWallet {
 
   /**
    * Bridge tokens to L2 (lock on L1)
+   * NOTE: This currently uses a simple unsigned request.
+   * Future versions will add signature verification.
    */
   async bridgeToL2(amount) {
-    if (!this.privateKey) throw new Error('Wallet not initialized');
-    
-    const signedRequest = await signRequest(
-      this.privateKey,
-      'bridge_deposit',
-      { from: this.address, amount },
-      '/bridge/initiate',
-      CHAIN_ID_L1
-    );
+    if (!this.address) throw new Error('Wallet not initialized');
     
     const response = await fetch(`${this.apiUrl}/bridge/initiate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        ...signedRequest,
+        wallet: this.address,
+        amount: amount,
         target_layer: 'L2',
       })
     });

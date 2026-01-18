@@ -1,2 +1,0 @@
-Block_propsal.rs 
-[ currently a PoA need to convert o ]

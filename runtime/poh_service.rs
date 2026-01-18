@@ -636,7 +636,7 @@ impl PoHService {
         
         // Get the starting hash (hash before first entry in this slot)
         // For simplicity, we verify entries are internally consistent
-        let starting_hash = if let Some(first_entry) = self.current_entries.first() {
+        let starting_hash = if let Some(_first_entry) = self.current_entries.first() {
             // Reconstruct what the hash should have been before first entry
             // by working backwards (this is a simplified check)
             Self::compute_genesis_hash() // In production, would track slot boundaries

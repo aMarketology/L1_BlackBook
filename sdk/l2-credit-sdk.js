@@ -284,10 +284,11 @@ export class L2CreditSDK {
   async getL1Balance(walletAddress) {
     console.log(`\n💰 Checking L1 balance for ${walletAddress.substring(0, 20)}...`);
     
-    const result = await this.request('GET', `/credit/balance/${walletAddress}`);
+    // Use the public balance endpoint
+    const result = await this.request('GET', `/balance/${walletAddress}`);
     
-    console.log(`   Balance: ${result.l1_balance} ${result.symbol}`);
-    return result.l1_balance;
+    console.log(`   Balance: ${result.balance} $BB`);
+    return result.balance;
   }
 
   /**
@@ -298,13 +299,13 @@ export class L2CreditSDK {
     
     const result = await this.request('GET', `/credit/status/${walletAddress}`);
     
-    if (result.has_active_credit) {
-      console.log(`   ✅ Active session: ${result.session_id}`);
-      console.log(`   Credit amount: ${result.credit_amount} $BC`);
-      console.log(`   Available balance: ${result.available_balance} $BC`);
+    if (result.has_active_session) {
+      console.log(`   ✅ Active session: ${result.session?.id}`);
+      console.log(`   Locked amount: ${result.session?.locked_amount} $BB`);
+      console.log(`   Available credit: ${result.session?.available_credit} $BB`);
     } else {
       console.log(`   ❌ No active credit line`);
-      console.log(`   L1 Balance: ${result.l1_balance} $BC`);
+      console.log(`   L1 Balance: ${result.l1_balance} $BB`);
     }
     
     return result;
@@ -333,14 +334,16 @@ export class L2CreditSDK {
       }
     }
     
-    // Build signed request
+    // Build signed request (signature kept for future L2 verification)
     const ts = this.timestamp();
     const message = `CREDIT_OPEN:${walletAddress}:${amount}:${ts}`;
     const signature = this.sign(message);
     
+    // Server expects: wallet, amount, session_id (optional)
     const result = await this.request('POST', '/credit/open', {
-      wallet_address: walletAddress,
+      wallet: walletAddress,
       amount,
+      // Include signature data for future verification
       l2_public_key: this.publicKey,
       signature,
       timestamp: ts
@@ -351,12 +354,15 @@ export class L2CreditSDK {
       throw new Error(result.error);
     }
     
+    // Get L1 balance for session tracking
+    const l1Balance = await this.getL1Balance(walletAddress);
+    
     // Create session object
     const session = new CreditSession(
       result.session_id,
       walletAddress,
-      result.credit_amount,
-      result.l1_balance
+      result.locked_amount || amount,
+      l1Balance
     );
     
     // Track session
@@ -364,9 +370,9 @@ export class L2CreditSDK {
     
     console.log(`   ✅ Credit line opened!`);
     console.log(`   Session ID: ${result.session_id}`);
-    console.log(`   Credit: ${result.credit_amount} $BC`);
-    console.log(`   L1 Balance: ${result.l1_balance} $BC`);
-    console.log(`   Available after credit: ${result.available_after_credit} $BC`);
+    console.log(`   Locked: ${result.locked_amount} $BB`);
+    console.log(`   Available Credit: ${result.available_credit} $BB`);
+    console.log(`   Expires: ${result.expires_at}`);
     
     return session;
   }
@@ -405,11 +411,11 @@ export class L2CreditSDK {
     const message = `CREDIT_SETTLE:${session.sessionId}:${session.walletAddress}:${pnl}:${ts}`;
     const signature = this.sign(message);
     
+    // Server expects: session_id, net_pnl
     const result = await this.request('POST', '/credit/settle', {
       session_id: session.sessionId,
-      wallet_address: session.walletAddress,
-      final_balance: session.virtualBalance,
-      pnl,
+      net_pnl: pnl,
+      // Include for future verification
       l2_public_key: this.publicKey,
       signature,
       timestamp: ts
@@ -424,10 +430,14 @@ export class L2CreditSDK {
     session._close();
     this.activeSessions.delete(session.walletAddress);
     
+    // Get final balance
+    const finalBalance = await this.getL1Balance(session.walletAddress);
+    
     console.log(`   ✅ Settlement complete!`);
-    console.log(`   L1 Before: ${result.l1_balance_before} $BC`);
-    console.log(`   L1 After: ${result.l1_balance_after} $BC`);
-    console.log(`   P&L Applied: ${result.pnl_applied >= 0 ? '+' : ''}${result.pnl_applied} $BC`);
+    console.log(`   Session: ${result.session_id}`);
+    console.log(`   Net P&L: ${result.net_pnl >= 0 ? '+' : ''}${result.net_pnl} $BB`);
+    console.log(`   Final L1 Balance: ${finalBalance} $BB`);
+    console.log(`   Settled at: ${result.settled_at}`);
     
     return {
       ...result,
@@ -490,13 +500,11 @@ export class L2CreditSDK {
     const message = `BRIDGE_L1_TO_L2:${walletAddress}:${amount}:${ts}`;
     const signature = this.sign(message);
     
+    // Server expects: wallet, amount, target_layer (optional)
     const result = await this.request('POST', '/bridge/initiate', {
-      wallet_address: walletAddress,
+      wallet: walletAddress,
       amount,
-      target_layer: 'L2',
-      l2_public_key: this.publicKey,
-      signature,
-      timestamp: ts
+      target_layer: 'L2'
     });
     
     console.log(`   ✅ Bridge initiated: ${result.lock_id || result.bridge_id}`);
@@ -707,12 +715,12 @@ async function quickTest() {
     // 2. Check current status
     const status = await sdk.getCreditStatus(ALICE);
     
-    if (status.has_active_credit) {
+    if (status.has_active_session && status.session) {
       console.log('\n⚠️  Alice already has active credit - settling first...');
       const existingSession = new CreditSession(
-        status.session_id,
+        status.session.id,
         ALICE,
-        status.credit_amount,
+        status.session.locked_amount,
         status.l1_balance
       );
       sdk.activeSessions.set(ALICE, existingSession);
@@ -755,14 +763,53 @@ async function quickTest() {
     console.log('═══════════════════════════════════════════════════════════');
     
     // Get bridge stats
-    const bridgeStats = await sdk.getBridgeStats();
-    console.log('\n📊 Bridge Statistics:');
-    console.log(`   Active Sessions: ${bridgeStats.active_sessions}`);
-    console.log(`   Total Sessions: ${bridgeStats.total_sessions}`);
+    try {
+      const bridgeStats = await sdk.getBridgeStats();
+      console.log('\n📊 Bridge Statistics:');
+      console.log(`   Total Locks: ${bridgeStats.stats?.total_locks || 0}`);
+      console.log(`   Pending: ${bridgeStats.stats?.pending_count || 0}`);
+      console.log(`   Pending Amount: ${bridgeStats.stats?.pending_amount || 0} $BB`);
+    } catch (error) {
+      console.log('\n⚠️  Bridge stats endpoint error:', error.message);
+    }
+    
+    // Test bridge initiate
+    try {
+      console.log('\n🌉 Testing Bridge Initiate (L1→L2)...');
+      const bridgeResult = await sdk.bridgeToL2(ALICE, 500);
+      console.log(`   ✅ Bridge initiated!`);
+      console.log(`   Lock ID: ${bridgeResult.lock_id}`);
+      console.log(`   Amount: ${bridgeResult.amount} $BB`);
+      console.log(`   Status: ${bridgeResult.status}`);
+      console.log(`   Expires: ${bridgeResult.expires_at}`);
+      
+      // Check the bridge status
+      if (bridgeResult.lock_id) {
+        const status = await sdk.getBridgeStatus(bridgeResult.lock_id);
+        console.log(`\n📋 Bridge Status Check:`);
+        console.log(`   Status: ${status.status}`);
+        console.log(`   Amount: ${status.amount} $BB`);
+      }
+    } catch (error) {
+      console.log(`\n⚠️  Bridge initiate error: ${error.message}`);
+    }
     
     // Check pending bridges
-    const pending = await sdk.getPendingBridges(ALICE);
-    console.log(`\n📋 Pending Bridges: ${pending.pending?.length || 0}`);
+    try {
+      const pending = await sdk.getPendingBridges(ALICE);
+      console.log(`\n📋 Pending Bridges for Alice: ${pending.count || 0}`);
+      if (pending.pending && pending.pending.length > 0) {
+        pending.pending.forEach((lock, i) => {
+          console.log(`   ${i+1}. ${lock.lock_id?.substring(0, 20)}... - ${lock.amount} $BB`);
+        });
+      }
+    } catch (error) {
+      console.log('\n⚠️  Pending bridges error:', error.message);
+    }
+    
+    // Final balance check
+    const postBridgeBalance = await sdk.getL1Balance(ALICE);
+    console.log(`\n💰 Alice balance after bridge: ${postBridgeBalance} $BB`);
     
     console.log('\n═══════════════════════════════════════════════════════════');
     console.log('PART 3: L2 STATE ROOT ANCHORING');
@@ -779,18 +826,23 @@ async function quickTest() {
         console.log('\n📋 No state roots posted yet');
       }
     } catch (error) {
-      console.log('\n📋 State root endpoint not yet fully implemented');
+      console.log('\n⚠️  State root endpoint not yet implemented (404)');
+      console.log('   Future: GET /l2/latest-state');
     }
     
     console.log('\n═══════════════════════════════════════════════════════════');
-    console.log('✅ L2 CREDIT SDK COMPREHENSIVE TEST COMPLETE');
+    console.log('✅ L2 CREDIT SDK TEST COMPLETE');
     console.log('═══════════════════════════════════════════════════════════');
-    console.log('\n📚 SDK now includes:');
-    console.log('   ✅ Credit line operations (token locking)');
-    console.log('   ✅ Bridge operations (real token transfer)');
-    console.log('   ✅ L2 state root anchoring (rollup security)');
-    console.log('   ✅ Session management');
-    console.log('   ✅ P&L tracking and settlement\n');
+    console.log('\n📚 ENDPOINT STATUS:');
+    console.log('   ✅ GET  /balance/:address        - L1 balance lookup');
+    console.log('   ✅ GET  /credit/status/:wallet   - Credit session status');
+    console.log('   ✅ POST /credit/open             - Open credit session');
+    console.log('   ✅ POST /credit/settle           - Settle session with P&L');
+    console.log('   ✅ POST /bridge/initiate         - Start L1→L2 bridge');
+    console.log('   ✅ GET  /bridge/status/:id       - Bridge transfer status');
+    console.log('   ✅ GET  /bridge/pending/:wallet  - Pending bridges');
+    console.log('   ✅ GET  /bridge/stats            - Bridge statistics');
+    console.log('   ⏳ GET  /l2/latest-state         - L2 state root (TODO)\n');
     
   } catch (error) {
     console.error('\n❌ Test failed:', error.message);

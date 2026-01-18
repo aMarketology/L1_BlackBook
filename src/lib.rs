@@ -1,65 +1,61 @@
-//! Layer1 Blockchain Library
-//! 
-//! Re-exports core types for use in tests and external crates.
+//! BlackBook Layer1 Blockchain
 //!
-//! ## Authentication Model (V2 - Pure Signature-Based)
-//! 
-//! This library uses STATELESS signature-based authentication:
-//! - No JWT tokens
-//! - Every request signed with Ed25519
-//! - 5-minute replay protection via timestamp + nonce
-//! 
-//! See `SignedRequest` for the core authentication primitive.
+//! High-performance blockchain with 1:1 USDC backing.
+//!
+//! ## Architecture (V3)
+//!
+//! - **Storage**: ReDB (ACID) + DashMap (lock-free cache)
+//! - **Server**: Axum (fast, no recursion limits)
+//! - **Auth**: Ed25519 signatures (no JWT)
+//! - **Token**: 1:1 USDC backed (no treasury)
 
 // Core modules
 pub mod social_mining;
-pub mod integration;            // Integration modules (supabase, unified_auth)
-pub mod routes_v2;              // Route handlers (NEW - Pure signature auth)
-pub mod rpc;                    // Internal & Cross-Layer RPC
-pub mod unified_wallet;         // Unified wallet system (L1/L2 address logic)
-pub mod consensus;              // Consensus (hot upgrades, validator selection, P2P)
-pub mod storage;                // RocksDB + Merkle state (production storage layer)
+pub mod storage;
 
-// Note: USDC Reserve System (usdc/) is staged but not integrated yet
-pub mod grpc;                   // gRPC Settlement (L1 ↔ L2 internal communication)
+// Stub modules (simplified for MVP)
+pub mod integration;
+pub mod routes_v2;
+pub mod unified_wallet;
+pub mod consensus;
+pub mod grpc;
+pub mod rpc;
 
-// Root-level modules (infrastructure)
+// Infrastructure
 #[path = "../protocol/mod.rs"]
 pub mod protocol;
 #[path = "../runtime/mod.rs"]
 pub mod runtime;
 
 // ============================================================================
-// PUBLIC API - Exports for tests and external crates
+// PUBLIC API
 // ============================================================================
 
-// Core blockchain types (used by tests)
-pub use protocol::blockchain::EnhancedBlockchain;
-pub use runtime::core::{TransactionType, Transaction, Block};
+// Storage
+pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
 
-// Storage layer (Sled + Borsh - production persistence)
-pub use storage::{
-    StorageEngine, StorageBridge, StoredAccount, StoredBlockHeader, 
-    StoredSocialData, TxLocation, DbStats, StorageError, StorageResult,
-    MerkleState, AccountProof, PersistentBlockchain, PROTOCOL_VERSION, UpgradeHook,
+// Blockchain types
+pub use protocol::blockchain::{
+    Block, Transaction, TxType,
+    Account, AccountType,
+    LockRecord, LockPurpose,
+    SettlementProof,
+    GENESIS_TIMESTAMP, LAMPORTS_PER_BB,
+    compute_genesis_hash,
 };
 
-// Social mining (used by tests)
+// Social mining
 pub use social_mining::{SocialMiningSystem, SocialActionType, SocialAction, DailyLimits};
 
-// Persistence (used by tests) - LEGACY, use StorageBridge for new code
-pub use protocol::EnhancedPersistence;
+// Runtime
+pub use runtime::{
+    PoHConfig, PoHService, SharedPoHService, 
+    create_poh_service, run_poh_clock,
+    TransactionPipeline, LeaderSchedule,
+};
 
-// PoH runtime (used internally and by advanced tests)
-pub use runtime::{PoHConfig, PoHEntry, PoHService, SharedPoHService, create_poh_service, run_poh_clock};
-
-// Authentication (SignedRequest is the core API)
+// Authentication
 pub use integration::unified_auth::{
-    SignedRequest, 
-    with_signature_auth, 
-    AuthError,
-    generate_keypair,
-    // Domain separation for L1/L2 replay attack prevention
-    CHAIN_ID_L1,
-    CHAIN_ID_L2,
+    SignedRequest, AuthError, generate_keypair,
+    CHAIN_ID_L1, CHAIN_ID_L2,
 };

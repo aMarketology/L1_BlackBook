@@ -1,17 +1,28 @@
 [package]
 name = "layer1"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 default-run = "layer1"
+
+[features]
+default = []
+# Enable this feature for development admin endpoints (mint/burn)
+# cargo run --features unsafe_admin
+unsafe_admin = []
 
 [dependencies]
 # Core async runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "signal", "macros", "net", "time", "sync"] }
 
-# Web framework (keeping warp for HTTP, will add QUIC later)
-warp = "0.3"
-tide = "0.16"
-async-std = "1.12"
+# Web framework - Axum (production) + Warp (legacy compatibility)
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util", "timeout"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+warp = "0.3"  # Legacy - kept for gradual migration
+
+# Structured logging (production-grade observability)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -75,11 +86,11 @@ memmap2 = "0.9"
 atomic = "0.6"
 
 # ═══════════════════════════════════════════════════════════════
-# PRODUCTION STORAGE LAYER (Sled + Merkle Trie)
+# PRODUCTION STORAGE LAYER (ReDB + Merkle Trie)
 # ═══════════════════════════════════════════════════════════════
-# Sled - Pure Rust embedded key-value store (no C deps!)
-# Modern, lock-free, concurrent B+ tree with ACID guarantees
-sled = "0.34"
+# ReDB - Pure Rust embedded key-value store with MVCC
+# ACID transactions, single-writer/multi-reader, zero-copy reads
+redb = "2.4"
 
 # Merkle Tree for state roots and light client proofs
 rs_merkle = "1.4"
@@ -127,7 +138,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "layer1"
-path = "src/main_v2.rs"
+path = "src/main_v3.rs"
 
 # ═══════════════════════════════════════════════════════════════
 # PROFILE CONFIGURATION - Fix Windows linker crashes

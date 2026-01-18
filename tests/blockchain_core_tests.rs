@@ -11,7 +11,7 @@
 
 use layer1::{EnhancedBlockchain, Transaction, TransactionType, Block};
 use layer1::protocol::blockchain::{
-    compute_genesis_hash, TREASURY_ADDRESS, INITIAL_SUPPLY,
+    compute_genesis_hash,
     GENESIS_TIMESTAMP, LAMPORTS_PER_BB, Account,
 };
 
@@ -53,12 +53,15 @@ fn test_genesis_previous_hash() {
 }
 
 #[test]
-fn test_treasury_initialized() {
+fn test_zero_supply_at_genesis() {
     let blockchain = EnhancedBlockchain::new();
     
-    let treasury_balance = blockchain.get_balance(TREASURY_ADDRESS);
-    assert_eq!(treasury_balance, INITIAL_SUPPLY, 
-        "Treasury should have initial supply of {} BB", INITIAL_SUPPLY);
+    // In 1:1 USDC-backed model, all balances start at 0
+    // Tokens are only created when USDC is deposited
+    assert_eq!(blockchain.actual_supply(), 0.0, 
+        "Total supply should be 0 at genesis (1:1 USDC backed)");
+    assert!(blockchain.validate_supply(),
+        "Supply validation should pass");
 }
 
 // ============================================================================

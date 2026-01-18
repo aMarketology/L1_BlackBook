@@ -1,18 +1,16 @@
-//! Layer1 Protocol - PoH-aware blockchain state management
+//! Layer1 Protocol - Core Types
 //!
-//! Solana-style infrastructure:
-//! - Turbine: Block propagation via shreds
-//! - Cloudbreak: High-performance account database
-//! - Archivers: Distributed ledger storage
+//! Minimal blockchain types for 1:1 USDC-backed token system.
 
 pub mod blockchain;
-pub mod blockchain_state;
-pub mod persistence;
 pub mod helpers;
 
-// Core blockchain (used everywhere)
-
-// Persistence (used by tests and main)
-pub use persistence::EnhancedPersistence;
-
-// Solana-style services (used by routes_v2/services.rs)
+// Re-export core types
+pub use blockchain::{
+    Block, Transaction, TxType,
+    Account, AccountType,
+    LockRecord, LockPurpose,
+    SettlementProof,
+    GENESIS_TIMESTAMP, LAMPORTS_PER_BB,
+    compute_genesis_hash,
+};
