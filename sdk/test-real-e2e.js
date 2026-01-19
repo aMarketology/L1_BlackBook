@@ -12,15 +12,8 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import * as ed from '@noble/ed25519';
+import nacl from 'tweetnacl';
 import crypto from 'crypto';
-
-// Enable sync methods for ed25519 using native crypto
-ed.etc.sha512Sync = (...m) => {
-    const hash = crypto.createHash('sha512');
-    for (const msg of m) hash.update(msg);
-    return new Uint8Array(hash.digest());
-};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,22 +41,25 @@ const DEALER_L1 = 'L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D';
 
 class Wallet {
     constructor(seed) {
-        // Derive private key from seed
+        // Derive a 32-byte seed from the string seed
         const seedHash = crypto.createHash('sha256').update(seed).digest();
-        this.privateKey = seedHash;
-        this.publicKey = ed.getPublicKey(this.privateKey);
+        
+        // Generate Ed25519 keypair from seed
+        const keyPair = nacl.sign.keyPair.fromSeed(new Uint8Array(seedHash));
+        this.privateKey = keyPair.secretKey;  // 64 bytes (seed + public key)
+        this.publicKey = keyPair.publicKey;   // 32 bytes
         this.publicKeyHex = Buffer.from(this.publicKey).toString('hex');
         
-        // Derive L1 address
-        const addressHash = crypto.createHash('sha256').update(this.publicKey).digest();
+        // Derive L1 address from public key
+        const addressHash = crypto.createHash('sha256').update(Buffer.from(this.publicKey)).digest();
         this.address = `L1_${addressHash.slice(0, 20).toString('hex').toUpperCase()}`;
     }
 
     sign(message) {
-        const msgBytes = typeof message === 'string' 
+        const msgBytes = typeof message === 'string'
             ? new TextEncoder().encode(message)
-            : message;
-        return ed.sign(msgBytes, this.privateKey);
+            : new Uint8Array(message);
+        return nacl.sign.detached(msgBytes, this.privateKey);
     }
 
     signTimestamp(timestamp) {
