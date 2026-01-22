@@ -177,6 +177,42 @@ async fn balance_handler(
     }))
 }
 
+/// GET /transactions - Query transaction history
+#[derive(serde::Deserialize)]
+struct TransactionsQuery {
+    address: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_limit() -> usize { 100 }
+
+async fn transactions_handler(
+    State(state): State<AppState>,
+    Query(query): Query<TransactionsQuery>,
+) -> impl IntoResponse {
+    match state.blockchain.get_transactions(
+        query.address.as_deref(),
+        query.limit,
+        query.offset
+    ) {
+        Ok(transactions) => Json(serde_json::json!({
+            "success": true,
+            "transactions": transactions,
+            "count": transactions.len(),
+            "limit": query.limit,
+            "offset": query.offset
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "transactions": []
+        }))
+    }
+}
+
 /// GET /poh/status - PoH clock status
 async fn poh_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let poh = state.poh.read();
@@ -630,8 +666,30 @@ async fn transfer_handler(
                     let from_new = state.blockchain.get_balance(&req.payload_fields.from);
                     let to_new = state.blockchain.get_balance(&req.payload_fields.to);
                     
+                    // Log transaction to history
+                    let tx_id = format!("{}_{}", req.timestamp, req.nonce);
+                    let tx_record = storage::TransactionRecord {
+                        tx_id: tx_id.clone(),
+                        tx_type: "transfer".to_string(),
+                        from_address: req.payload_fields.from.clone(),
+                        to_address: req.payload_fields.to.clone(),
+                        amount: req.payload_fields.amount,
+                        timestamp: req.timestamp,
+                        status: "completed".to_string(),
+                        signature: Some(req.signature.clone()),
+                        metadata: Some(serde_json::json!({
+                            "payload_hash": req.payload_hash,
+                            "nonce": req.nonce,
+                        })),
+                    };
+                    
+                    if let Err(e) = state.blockchain.log_transaction(tx_record) {
+                        warn!("Failed to log transaction: {}", e);
+                    }
+                    
                     (StatusCode::OK, Json(serde_json::json!({
                         "success": true,
+                        "tx_id": tx_id,
                         "from": req.payload_fields.from,
                         "to": req.payload_fields.to,
                         "amount": req.payload_fields.amount,
@@ -672,6 +730,11 @@ struct OpenCreditRequest {
 }
 
 /// POST /credit/open - Reserve funds for L2 gaming session
+/// 
+/// This implements 1:1 token locking:
+/// 1. Debit the amount from user's L1 balance (actual lock)
+/// 2. Create a CreditSession tracking the locked funds
+/// 3. L2 can now credit the user with equivalent L2 tokens
 async fn credit_open_handler(
     State(state): State<AppState>,
     Json(req): Json<OpenCreditRequest>,
@@ -687,22 +750,62 @@ async fn credit_open_handler(
         })));
     }
     
+    // CRITICAL: Actually lock the tokens by debiting from available balance
+    // This ensures 1:1 backing - user cannot spend these tokens on L1 while playing on L2
+    if let Err(e) = state.blockchain.debit(&req.wallet, req.amount) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to lock tokens: {}", e)
+        })));
+    }
+    
     // Create credit session via AssetManager
     let session_id = req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     
     match state.assets.open_credit_session(&req.wallet, req.amount, &session_id) {
-        Ok(session) => (StatusCode::OK, Json(serde_json::json!({
-            "success": true,
-            "session_id": session.id,
-            "wallet": req.wallet,
-            "locked_amount": req.amount,
-            "available_credit": session.available_credit,
-            "expires_at": session.expires_at
-        }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "success": false,
-            "error": e
-        })))
+        Ok(session) => {
+            info!(
+                "🔒 Tokens locked for L2: {} BB from {} (session: {})",
+                req.amount, req.wallet, session.id
+            );
+            
+            // Log the lock transaction
+            let tx_record = storage::TransactionRecord {
+                tx_id: format!("lock_{}", session.id),
+                tx_type: "bridge_out".to_string(),
+                from_address: req.wallet.clone(),
+                to_address: "L2_ESCROW".to_string(),
+                amount: req.amount,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                status: "completed".to_string(),
+                signature: None,
+                metadata: Some(serde_json::json!({
+                    "session_id": session.id,
+                    "type": "credit_session_open"
+                })),
+            };
+            let _ = state.blockchain.log_transaction(tx_record);
+            
+            let new_balance = state.blockchain.get_balance(&req.wallet);
+            
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "session_id": session.id,
+                "wallet": req.wallet,
+                "locked_amount": req.amount,
+                "available_credit": session.available_credit,
+                "l1_balance_after_lock": new_balance,
+                "expires_at": session.expires_at
+            })))
+        },
+        Err(e) => {
+            // Rollback the debit if session creation fails
+            let _ = state.blockchain.credit(&req.wallet, req.amount);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "success": false,
+                "error": e
+            })))
+        }
     }
 }
 
@@ -713,34 +816,76 @@ struct SettleCreditRequest {
 }
 
 /// POST /credit/settle - Settle session and apply P&L to L1
+/// 
+/// This implements 1:1 settlement:
+/// 1. Get the locked amount from the session
+/// 2. Calculate final balance: locked_amount + net_pnl
+/// 3. Credit the final amount back to user's L1 balance
+/// 4. Close the session
 async fn credit_settle_handler(
     State(state): State<AppState>,
     Json(req): Json<SettleCreditRequest>,
 ) -> impl IntoResponse {
     match state.assets.settle_credit_session(&req.session_id, req.net_pnl) {
         Ok(result) => {
-            // Apply the P&L to the blockchain
+            // Credit back the full final amount (locked + P&L)
+            // The tokens were debited when session opened, now credit back what they deserve
             if let Some(wallet) = &result.wallet {
-                if req.net_pnl > 0.0 {
-                    // Player won - credit their account
-                    if let Err(e) = state.blockchain.credit(wallet, req.net_pnl) {
-                        error!("Failed to credit winner: {}", e);
+                let final_amount = result.locked_amount + req.net_pnl;
+                
+                if final_amount > 0.0 {
+                    // Credit back whatever they're owed (original lock + winnings, or original lock - losses)
+                    if let Err(e) = state.blockchain.credit(wallet, final_amount) {
+                        error!("Failed to credit settlement: {}", e);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                            "success": false,
+                            "error": format!("Failed to credit settlement: {}", e)
+                        })));
                     }
-                } else if req.net_pnl < 0.0 {
-                    // Player lost - debit their account (already locked, just release)
-                    if let Err(e) = state.blockchain.debit(wallet, req.net_pnl.abs()) {
-                        error!("Failed to debit loser: {}", e);
-                    }
+                    
+                    info!(
+                        "🔓 Settlement complete: {} BB returned to {} (locked: {}, pnl: {:+})",
+                        final_amount, wallet, result.locked_amount, req.net_pnl
+                    );
+                    
+                    // Log the settlement transaction
+                    let tx_record = storage::TransactionRecord {
+                        tx_id: format!("settle_{}", req.session_id),
+                        tx_type: "bridge_in".to_string(),
+                        from_address: "L2_ESCROW".to_string(),
+                        to_address: wallet.clone(),
+                        amount: final_amount,
+                        timestamp: chrono::Utc::now().timestamp() as u64,
+                        status: "completed".to_string(),
+                        signature: None,
+                        metadata: Some(serde_json::json!({
+                            "session_id": req.session_id,
+                            "locked_amount": result.locked_amount,
+                            "net_pnl": req.net_pnl,
+                            "type": "credit_session_settle"
+                        })),
+                    };
+                    let _ = state.blockchain.log_transaction(tx_record);
                 }
+                // If final_amount <= 0, user lost everything (or more with credit), nothing to return
+                
+                let new_balance = state.blockchain.get_balance(wallet);
+                
+                (StatusCode::OK, Json(serde_json::json!({
+                    "success": true,
+                    "session_id": req.session_id,
+                    "locked_amount": result.locked_amount,
+                    "net_pnl": req.net_pnl,
+                    "amount_returned": if final_amount > 0.0 { final_amount } else { 0.0 },
+                    "l1_balance_after_settle": new_balance,
+                    "settled_at": chrono::Utc::now().to_rfc3339()
+                })))
+            } else {
+                (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": "No wallet found for session"
+                })))
             }
-            
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "session_id": req.session_id,
-                "net_pnl": req.net_pnl,
-                "final_balance": result.final_balance,
-                "settled_at": chrono::Utc::now().to_rfc3339()
-            })))
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
@@ -1128,6 +1273,7 @@ fn build_public_routes() -> Router<AppState> {
         .route("/balance/:address/unified", get(unified_balance_handler))
         .route("/poh/status", get(poh_status_handler))
         .route("/performance/stats", get(performance_stats_handler))
+        .route("/transactions", get(transactions_handler))
         .route("/transfer", post(transfer_handler))
         .route("/transfer/simple", post(simple_transfer_handler))
 }

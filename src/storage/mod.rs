@@ -52,6 +52,23 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 /// Metadata: Key (String) → Value (bytes)
 const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 
+/// Transaction history: TxID (String) → TransactionData (Vec<u8>)
+const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transactions");
+
+/// Transaction record for history tracking
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TransactionRecord {
+    pub tx_id: String,
+    pub tx_type: String,  // "transfer", "mint", "burn", "bridge_out", "bridge_in"
+    pub from_address: String,
+    pub to_address: String,
+    pub amount: f64,
+    pub timestamp: u64,  // Unix timestamp
+    pub status: String,  // "completed", "failed", "pending"
+    pub signature: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
 // ============================================================================
 // CONCURRENT BLOCKCHAIN
 // ============================================================================
@@ -98,6 +115,7 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(ACCOUNTS)?;
             let _ = write_txn.open_table(BLOCKS)?;
             let _ = write_txn.open_table(METADATA)?;
+            let _ = write_txn.open_table(TRANSACTIONS)?;
         }
         write_txn.commit()?;
         
@@ -219,7 +237,7 @@ impl ConcurrentBlockchain {
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_add(micro_amount, Ordering::Relaxed);
         
-        info!(address = %address, amount = amount, new_balance = new_balance, "Credit successful");
+        info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens ADDED to wallet");
         Ok(())
     }
 
@@ -265,8 +283,55 @@ impl ConcurrentBlockchain {
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_sub(micro_amount, Ordering::Relaxed);
         
-        info!(address = %address, amount = amount, new_balance = new_balance, "Debit successful");
+        info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens SUBTRACTED from wallet");
         Ok(())
+    }
+
+    /// Log a transaction to history
+    pub fn log_transaction(&self, tx_record: TransactionRecord) -> Result<(), String> {
+        let tx_json = serde_json::to_vec(&tx_record)
+            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+        
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+            table.insert(tx_record.tx_id.as_str(), tx_json.as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+
+    /// Get all transactions (optionally filtered by address)
+    pub fn get_transactions(&self, address: Option<&str>, limit: usize, offset: usize) -> Result<Vec<TransactionRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+        
+        let mut transactions = Vec::new();
+        let mut iter = table.iter().map_err(|e| e.to_string())?;
+        
+        while let Some(result) = iter.next() {
+            let (_, value) = result.map_err(|e| e.to_string())?;
+            let tx_data = value.value();
+            
+            if let Ok(tx_record) = serde_json::from_slice::<TransactionRecord>(tx_data) {
+                // Filter by address if specified
+                if let Some(addr) = address {
+                    if tx_record.from_address != addr && tx_record.to_address != addr {
+                        continue;
+                    }
+                }
+                transactions.push(tx_record);
+            }
+        }
+        
+        // Sort by timestamp (newest first)
+        transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        
+        // Apply pagination
+        let end = std::cmp::min(offset + limit, transactions.len());
+        Ok(transactions.get(offset..end).unwrap_or(&[]).to_vec())
     }
 
     /// Transfer tokens between addresses (atomic)

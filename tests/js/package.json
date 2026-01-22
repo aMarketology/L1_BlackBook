@@ -1,0 +1,41 @@
+{
+  "name": "blackbook-l1-tests",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Production readiness tests for BlackBook L1 blockchain",
+  "scripts": {
+    "test": "node test-runner.js",
+    "test:quick": "node test-runner.js --quick",
+    "test:wallet": "node test-runner.js --category=wallet",
+    "test:transfer": "node test-runner.js --category=transfer",
+    "test:security": "node test-runner.js --category=security",
+    "test:bridge": "node test-runner.js --category=bridge",
+    "test:fuzz": "node test-runner.js --category=fuzz",
+    "test:performance": "node test-runner.js --category=performance",
+    "test:consensus": "node test-runner.js --category=consensus",
+    "test:01": "node 01-wallet-generate.test.js",
+    "test:02": "node 02-wallet-login.test.js",
+    "test:03": "node 03-send-tokens.test.js",
+    "test:04": "node 04-receive-tokens.test.js",
+    "test:05": "node 05-balance-accuracy.test.js",
+    "test:06": "node 06-transaction-history.test.js",
+    "test:07": "node 07-l2-session-lock.test.js",
+    "test:08": "node 08-l2-settlement.test.js",
+    "test:09": "node 09-signature-validation.test.js",
+    "test:10": "node 10-double-spend-prevention.test.js",
+    "test:11": "node 11-invalid-inputs.test.js",
+    "test:12": "node 12-reentrancy-prevention.test.js",
+    "test:13": "node 13-balance-invariants.test.js",
+    "test:14": "node 14-server-health.test.js",
+    "test:15": "node 15-persistence.test.js",
+    "test:16": "node 16-overflow-underflow.test.js",
+    "test:17": "node 17-fuzz-testing.test.js",
+    "test:18": "node 18-rate-limiting-dos.test.js",
+    "test:19": "node 19-consensus-validation.test.js",
+    "test:20": "node 20-wallet-key-security.test.js"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3",
+    "crypto-js": "^4.2.0"
+  }
+}

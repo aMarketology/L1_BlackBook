@@ -84,40 +84,55 @@ function deriveKeypair(seedHex) {
 }
 
 // ============================================================================
-// SIGNING (V1 Format - matches server expectations)
+// SIGNING (V2 Format - SDK Compatible)
 // ============================================================================
 
-function createSignedRequest(account, payload) {
+async function sha256(data) {
+  const encoder = new TextEncoder();
+  const dataBuffer = typeof data === 'string' ? encoder.encode(data) : data;
+  const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function createSignedRequest(account, to, amount) {
   const timestamp = Math.floor(Date.now() / 1000);
   const nonce = generateNonce();
   
   // Derive keypair from seed
   const { publicKey, secretKey } = deriveKeypair(account.seed);
   
-  // V1 format: payload as JSON string
-  const payloadJson = JSON.stringify(payload);
+  // V2 format: Canonical payload hash (ordered fields)
+  // Schema: ['from', 'to', 'amount', 'timestamp', 'nonce']
+  const canonical = `${account.address}|${to}|${amount}|${timestamp}|${nonce}`;
+  const payloadHash = await sha256(canonical);
   
-  // Message: {payload_json}\n{timestamp}\n{nonce}
-  const message = `${payloadJson}\n${timestamp}\n${nonce}`;
-  
-  // Prepend chain_id byte for domain separation
-  const chainIdByte = new Uint8Array([CHAIN_ID_L1]);
-  const messageBytes = new TextEncoder().encode(message);
-  const fullMessage = new Uint8Array(chainIdByte.length + messageBytes.length);
-  fullMessage.set(chainIdByte);
-  fullMessage.set(messageBytes, chainIdByte.length);
+  // Build signing message with domain separation
+  const requestPath = '/transfer';
+  const domainPrefix = `BLACKBOOK_L${CHAIN_ID_L1}${requestPath}`;
+  const message = `${domainPrefix}\n${payloadHash}\n${timestamp}\n${nonce}`;
   
   // Sign with Ed25519
-  const signature = nacl.sign.detached(fullMessage, secretKey);
+  const messageBytes = new TextEncoder().encode(message);
+  const signature = nacl.sign.detached(messageBytes, secretKey);
   
   return {
     public_key: publicKey,
-    wallet_address: account.address,
-    payload: payloadJson,
+    payload_hash: payloadHash,
+    payload_fields: {
+      from: account.address,
+      to: to,
+      amount: amount,
+      timestamp: timestamp,
+      nonce: nonce
+    },
+    operation_type: 'transfer',
+    schema_version: 2,
     timestamp: timestamp,
     nonce: nonce,
     chain_id: CHAIN_ID_L1,
-    schema_version: 1,
+    request_path: requestPath,
     signature: bytesToHex(signature)
   };
 }
@@ -133,8 +148,7 @@ async function getBalance(address) {
 }
 
 async function transfer(fromAccount, toAddress, amount) {
-  const payload = { to: toAddress, amount: amount };
-  const signedRequest = createSignedRequest(fromAccount, payload);
+  const signedRequest = await createSignedRequest(fromAccount, toAddress, amount);
   
   const res = await fetch(`${L1_URL}/transfer`, {
     method: 'POST',
