@@ -26,20 +26,39 @@ function bytesToHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function sha256(data) {
-  const buffer = await crypto.subtle.digest('SHA-256', data);
-  return new Uint8Array(buffer);
+function generateNonce() {
+  return crypto.randomUUID();
 }
 
 async function createSignedTransfer(from, to, amount, keyPair) {
-  const timestamp = Date.now();
-  const payload = { amount, chain_id: 1, from, timestamp, to };
-  const canonicalJson = JSON.stringify(payload, Object.keys(payload).sort());
-  const payloadBytes = new TextEncoder().encode(canonicalJson);
-  const payloadHash = await sha256(payloadBytes);
-  const signature = nacl.sign.detached(payloadHash, keyPair.secretKey);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = generateNonce();
+  const payload = JSON.stringify({ to, amount });
   
-  return { from, to, amount, timestamp, public_key: bytesToHex(keyPair.publicKey), signature: bytesToHex(signature) };
+  const chainIdByte = new Uint8Array([0x01]);
+  const payloadBytes = new TextEncoder().encode(payload);
+  const timestampBytes = new TextEncoder().encode(`\n${timestamp}\n`);
+  const nonceBytes = new TextEncoder().encode(nonce);
+  
+  const message = new Uint8Array(chainIdByte.length + payloadBytes.length + timestampBytes.length + nonceBytes.length);
+  let offset = 0;
+  message.set(chainIdByte, offset); offset += chainIdByte.length;
+  message.set(payloadBytes, offset); offset += payloadBytes.length;
+  message.set(timestampBytes, offset); offset += timestampBytes.length;
+  message.set(nonceBytes, offset);
+  
+  const signature = nacl.sign.detached(message, keyPair.secretKey);
+  
+  return {
+    public_key: bytesToHex(keyPair.publicKey),
+    wallet_address: from,
+    payload: payload,
+    timestamp: timestamp,
+    nonce: nonce,
+    chain_id: 1,
+    schema_version: 1,
+    signature: bytesToHex(signature)
+  };
 }
 
 export async function run() {
@@ -57,7 +76,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.error && response.error.includes('signature')) {
       throw new Error('Valid signature was rejected');
@@ -80,7 +99,7 @@ export async function run() {
     // Corrupt the signature
     request.signature = request.signature.replace(/[a-f]/g, '0');
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Invalid signature should be rejected');
@@ -107,7 +126,7 @@ export async function run() {
     // Use Bob's public key with Alice's signature
     request.public_key = bytesToHex(bobKeyPair.publicKey);
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Wrong public key should be rejected');
@@ -134,7 +153,7 @@ export async function run() {
     // Change amount after signing
     request.amount = 1000;
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Tampered amount should be rejected');
@@ -161,7 +180,7 @@ export async function run() {
     // Change recipient after signing
     request.to = TEST_ACCOUNTS.DEALER.address;
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Tampered recipient should be rejected');
@@ -204,7 +223,7 @@ export async function run() {
       signature: bytesToHex(signature),
     };
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Wrong signer should be rejected');
@@ -244,7 +263,7 @@ export async function run() {
       signature: bytesToHex(signature),
     };
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Note: Some systems allow old timestamps, some don't
     if (response.error && response.error.includes('timestamp')) {
@@ -269,7 +288,7 @@ export async function run() {
       signature: '',
     };
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Empty signature should be rejected');
@@ -288,7 +307,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

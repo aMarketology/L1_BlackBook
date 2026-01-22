@@ -334,6 +334,11 @@ impl ConcurrentBlockchain {
         Ok(transactions.get(offset..end).unwrap_or(&[]).to_vec())
     }
 
+    /// Get all recent transactions (for ledger display)
+    pub fn get_all_transactions(&self, limit: usize) -> Vec<TransactionRecord> {
+        self.get_transactions(None, limit, 0).unwrap_or_default()
+    }
+
     /// Transfer tokens between addresses (atomic)
     pub fn transfer(&self, from: &str, to: &str, amount: f64) -> Result<(), String> {
         if amount <= 0.0 {

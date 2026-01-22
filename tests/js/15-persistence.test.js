@@ -84,7 +84,7 @@ export async function run() {
         aliceKeyPair
       );
       
-      await httpPost('/transfer', request);
+      await httpPost('/transfer/simple', request);
       await new Promise(r => setTimeout(r, 1000)); // Wait for persistence
       
       const balanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
@@ -116,7 +116,7 @@ export async function run() {
         aliceKeyPair
       );
       
-      await httpPost('/transfer', request);
+      await httpPost('/transfer/simple', request);
       await new Promise(r => setTimeout(r, 1000)); // Wait
       
       const balanceAfter = await getBalance(TEST_ACCOUNTS.BOB.address);
@@ -199,7 +199,7 @@ export async function run() {
         aliceKeyPair
       );
       
-      await httpPost('/transfer', request);
+      await httpPost('/transfer/simple', request);
       await new Promise(r => setTimeout(r, 1000));
       
       // Check new account exists
@@ -237,7 +237,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

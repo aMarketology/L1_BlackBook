@@ -68,7 +68,7 @@ export async function run() {
     );
     
     const balanceBefore = await getBalance(TEST_ACCOUNTS.ALICE.address);
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     const balanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
     
     // Should be rejected
@@ -101,7 +101,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Infinity transfer should be rejected');
@@ -127,7 +127,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Negative infinity transfer should be rejected');
@@ -153,7 +153,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('NaN transfer should be rejected');
@@ -179,7 +179,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Should either reject or round to 0 (which should be rejected)
     console.log(`   Very small amount (0.000000001): ${response.error ? 'rejected' : 'processed'}`);
@@ -203,7 +203,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     const balanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
     
     // Should be rejected
@@ -241,7 +241,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('1e308 transfer should be rejected');
@@ -267,7 +267,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Should reject (amount too small)
     console.log(`   Tiny amount (1e-308): ${response.error ? 'rejected' : 'processed'}`);
@@ -292,7 +292,7 @@ export async function run() {
     );
     
     const balanceBefore = await getBalance(TEST_ACCOUNTS.ALICE.address);
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     const balanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
     
     if (!response.error) {
@@ -330,7 +330,7 @@ export async function run() {
         aliceKeyPair
       );
       
-      const response = await httpPost('/transfer', request);
+      const response = await httpPost('/transfer/simple', request);
       
       if (response.error) {
         throw new Error(`Normal transfer failed: ${response.error}`);
@@ -346,7 +346,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

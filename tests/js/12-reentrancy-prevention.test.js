@@ -35,9 +35,8 @@ function bytesToHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function sha256(data) {
-  const buffer = await crypto.subtle.digest('SHA-256', data);
-  return new Uint8Array(buffer);
+function generateNonce() {
+  return crypto.randomUUID();
 }
 
 async function getBalance(address) {
@@ -46,14 +45,34 @@ async function getBalance(address) {
 }
 
 async function createSignedTransfer(from, to, amount, keyPair, timestampOffset = 0) {
-  const timestamp = Date.now() + timestampOffset;
-  const payload = { amount, chain_id: 1, from, timestamp, to };
-  const canonicalJson = JSON.stringify(payload, Object.keys(payload).sort());
-  const payloadBytes = new TextEncoder().encode(canonicalJson);
-  const payloadHash = await sha256(payloadBytes);
-  const signature = nacl.sign.detached(payloadHash, keyPair.secretKey);
+  const timestamp = Math.floor(Date.now() / 1000) + Math.floor(timestampOffset / 1000);
+  const nonce = generateNonce();
+  const payload = JSON.stringify({ to, amount });
   
-  return { from, to, amount, timestamp, public_key: bytesToHex(keyPair.publicKey), signature: bytesToHex(signature) };
+  const chainIdByte = new Uint8Array([0x01]);
+  const payloadBytes = new TextEncoder().encode(payload);
+  const timestampBytes = new TextEncoder().encode(`\n${timestamp}\n`);
+  const nonceBytes = new TextEncoder().encode(nonce);
+  
+  const message = new Uint8Array(chainIdByte.length + payloadBytes.length + timestampBytes.length + nonceBytes.length);
+  let offset = 0;
+  message.set(chainIdByte, offset); offset += chainIdByte.length;
+  message.set(payloadBytes, offset); offset += payloadBytes.length;
+  message.set(timestampBytes, offset); offset += timestampBytes.length;
+  message.set(nonceBytes, offset);
+  
+  const signature = nacl.sign.detached(message, keyPair.secretKey);
+  
+  return {
+    public_key: bytesToHex(keyPair.publicKey),
+    wallet_address: from,
+    payload: payload,
+    timestamp: timestamp,
+    nonce: nonce,
+    chain_id: 1,
+    schema_version: 1,
+    signature: bytesToHex(signature)
+  };
 }
 
 export async function run() {
@@ -193,7 +212,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Balances should be UNCHANGED
     const aliceBalanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
@@ -317,7 +336,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

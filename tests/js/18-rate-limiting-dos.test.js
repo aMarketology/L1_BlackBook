@@ -429,7 +429,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

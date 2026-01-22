@@ -1,0 +1,20 @@
+{
+  "name": "blackbook-grpc-proto-lock-tests",
+  "version": "1.0.0",
+  "description": "gRPC and Protocol Buffer tests for BlackBook L1-L2 token locking",
+  "type": "module",
+  "scripts": {
+    "test": "node run-all-tests.js",
+    "test:basic": "node 01-basic-lock-unlock.test.js",
+    "test:concurrent": "node 02-concurrent-locks.test.js",
+    "test:settlement": "node 04-positive-pnl-settlement.test.js && node 05-negative-pnl-settlement.test.js",
+    "test:security": "node 07-double-lock-prevention.test.js",
+    "test:e2e": "node 11-end-to-end-game-session.test.js"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {},
+  "author": "BlackBook Protocol",
+  "license": "UNLICENSED"
+}

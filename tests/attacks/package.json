@@ -1,0 +1,16 @@
+{
+  "name": "blackbook-l1-attack-suite",
+  "version": "1.0.0",
+  "description": "Security attack simulations for BlackBook L1 blockchain",
+  "type": "module",
+  "scripts": {
+    "test": "node run-all-attacks.js",
+    "dao": "node dao-reentrancy-attack.js",
+    "replay": "node replay-attack.js"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  },
+  "author": "BlackBook Security Team",
+  "license": "UNLICENSED"
+}

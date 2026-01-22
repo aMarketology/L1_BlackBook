@@ -82,6 +82,10 @@ async function mnemonicToSeed(mnemonic) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export async function run() {
+  process.stdout.write('\n╔════════════════════════════════════════════════════════════════╗\n');
+  process.stdout.write('║  TEST 01: WALLET GENERATION                                    ║\n');
+  process.stdout.write('╚════════════════════════════════════════════════════════════════╝\n\n');
+  
   const results = new TestResults();
   
   // Test 1: Generate random keypair
@@ -210,7 +214,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

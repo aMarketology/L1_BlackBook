@@ -56,7 +56,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Invalid from address should be rejected');
@@ -80,7 +80,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Invalid to address should be rejected');
@@ -104,7 +104,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Negative amount should be rejected');
@@ -128,7 +128,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Zero amount should be rejected');
@@ -152,7 +152,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     if (response.success && !response.error) {
       throw new Error('Overflow amount should be rejected');
@@ -211,7 +211,7 @@ export async function run() {
     // Add XSS payload
     request.note = '<script>alert("xss")</script>';
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Server should either strip the field or handle it safely
     results.pass('XSS attempt handled');
@@ -228,7 +228,7 @@ export async function run() {
       aliceKeyPair
     );
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Self-transfer might be allowed or rejected - just shouldn't crash
     console.log(`   Self-transfer: ${response.error ? 'rejected' : 'allowed'}`);
@@ -283,7 +283,9 @@ export async function run() {
 }
 
 // Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+if (__filename === process.argv[1]) {
   run().then(r => {
     r.summary();
     process.exit(r.failed === 0 ? 0 : 1);

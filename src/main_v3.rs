@@ -131,12 +131,17 @@ pub struct AppState {
 // ============================================================================
 
 /// GET /health - Health check
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let total_supply = state.blockchain.total_supply();
+    let stats = state.blockchain.stats();
+    
     Json(serde_json::json!({
         "status": "ok",
         "version": "3.0.0",
         "engine": "axum",
-        "storage": "redb"
+        "storage": "redb",
+        "total_supply": total_supply,
+        "account_count": stats.total_accounts
     }))
 }
 
@@ -175,6 +180,105 @@ async fn balance_handler(
         "balance": balance,
         "unit": "BB"
     }))
+}
+
+/// GET /ledger - ASCII art visualization of all ledger entries
+async fn ledger_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let transactions = state.blockchain.get_all_transactions(200); // Last 200 transactions
+    let stats = state.blockchain.stats();
+    let total_supply = state.blockchain.total_supply();
+    
+    let mut output = String::new();
+    
+    // ANSI color codes - Jedi Green
+    let green = "\x1b[92m";  // Bright green
+    let reset = "\x1b[0m";   // Reset color
+    
+    // ASCII Art Header
+    output.push_str("\n");
+    output.push_str(&format!("{}╔═══════════════════════════════════════════════════════════════════════════════╗{}\n", green, reset));
+    output.push_str(&format!("{}║                         🔗 BLACKBOOK L1 LEDGER                                ║{}\n", green, reset));
+    output.push_str(&format!("{}║                         Blockchain Transaction Log                            ║{}\n", green, reset));
+    output.push_str(&format!("{}╚═══════════════════════════════════════════════════════════════════════════════╝{}\n", green, reset));
+    output.push_str("\n");
+    
+    // Stats Box
+    output.push_str(&format!("{}┌─────────────────────────────────────────────────────────────────────────────┐{}\n", green, reset));
+    output.push_str(&format!("{}│{} 📊 Total Supply:      {:>10.2} BB                                        {}│{}\n", green, reset, total_supply, green, reset));
+    output.push_str(&format!("{}│{} 👥 Total Accounts:    {:>10}                                             {}│{}\n", green, reset, stats.total_accounts, green, reset));
+    output.push_str(&format!("{}│{} 📦 Block Count:       {:>10}                                             {}│{}\n", green, reset, stats.block_count, green, reset));
+    output.push_str(&format!("{}│{} 🎰 Current Slot:      {:>10}                                             {}│{}\n", green, reset, stats.current_slot, green, reset));
+    output.push_str(&format!("{}│{} 📝 Recent Tx Count:   {:>10}                                             {}│{}\n", green, reset, transactions.len(), green, reset));
+    output.push_str(&format!("{}└─────────────────────────────────────────────────────────────────────────────┘{}\n", green, reset));
+    output.push_str("\n");
+    
+    // Transaction Table Header
+    output.push_str(&format!("{}┌──────────────────┬───────────┬────────────────────────────┬─────────────────┐{}\n", green, reset));
+    output.push_str(&format!("{}│{}   Transaction    {}│{}   Amount  {}│{}           From → To        {}│{}      Type       {}│{}\n", 
+        green, reset, green, reset, green, reset, green, reset, green, reset));
+    output.push_str(&format!("{}├──────────────────┼───────────┼────────────────────────────┼─────────────────┤{}\n", green, reset));
+    
+    // Display transactions
+    for tx in transactions.iter().take(50) { // Show last 50
+        let tx_id_short = if tx.tx_id.len() > 16 {
+            format!("{}...", &tx.tx_id[..13])
+        } else {
+            tx.tx_id.clone()
+        };
+        
+        let from_short = if tx.from_address.len() > 12 {
+            format!("{}...", &tx.from_address[..9])
+        } else {
+            tx.from_address.clone()
+        };
+        
+        let to_short = if tx.to_address.len() > 12 {
+            format!("{}...", &tx.to_address[..9])
+        } else {
+            tx.to_address.clone()
+        };
+        
+        let tx_type_short = format!("{:?}", tx.tx_type);
+        let tx_type_display = if tx_type_short.len() > 15 {
+            format!("{:.12}...", tx_type_short)
+        } else {
+            tx_type_short
+        };
+        
+        output.push_str(&format!(
+            "{}│{} {:16} {}│{} {:>9.2} {}│{} {} → {} {}│{} {:15} {}│{}\n",
+            green, reset,
+            tx_id_short,
+            green, reset,
+            tx.amount,
+            green, reset,
+            from_short,
+            to_short,
+            green, reset,
+            tx_type_display,
+            green, reset
+        ));
+    }
+    
+    output.push_str(&format!("{}└──────────────────┴───────────┴────────────────────────────┴─────────────────┘{}\n", green, reset));
+    output.push_str("\n");
+    
+    // Legend
+    output.push_str(&format!("{}Legend:{}\n", green, reset));
+    output.push_str("  • Transfer      - L1 token transfer between wallets\n");
+    output.push_str("  • BridgeOut     - Tokens locked for L2 session\n");
+    output.push_str("  • BridgeIn      - Tokens returned from L2 settlement\n");
+    output.push_str("  • Mint          - Admin token creation (testnet only)\n");
+    output.push_str("  • Burn          - Admin token destruction\n");
+    output.push_str("\n");
+    output.push_str(&format!("{}╔═══════════════════════════════════════════════════════════════════════════════╗{}\n", green, reset));
+    output.push_str(&format!("{}║  🛡️  All transactions cryptographically signed and immutably stored          ║{}\n", green, reset));
+    output.push_str(&format!("{}╚═══════════════════════════════════════════════════════════════════════════════╝{}\n", green, reset));
+    
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        output
+    )
 }
 
 /// GET /transactions - Query transaction history
@@ -1274,6 +1378,7 @@ fn build_public_routes() -> Router<AppState> {
         .route("/poh/status", get(poh_status_handler))
         .route("/performance/stats", get(performance_stats_handler))
         .route("/transactions", get(transactions_handler))
+        .route("/ledger", get(ledger_handler))
         .route("/transfer", post(transfer_handler))
         .route("/transfer/simple", post(simple_transfer_handler))
 }
@@ -1619,5 +1724,5 @@ async fn main() {
     // Final cleanup
     let social_data = social_system.lock().await.clone();
     save_social_system(&social_data);
-    info!("👋 Server shutdown complete");
+    info!("⚔️  You have chosen the path of the Jedi Knight");
 }
