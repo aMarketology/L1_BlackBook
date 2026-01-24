@@ -39,14 +39,35 @@ async function getBalance(address) {
 }
 
 async function createSignedTransfer(from, to, amount, keyPair) {
-  const timestamp = Date.now();
-  const payload = { amount, chain_id: 1, from, timestamp, to };
-  const canonicalJson = JSON.stringify(payload, Object.keys(payload).sort());
-  const payloadBytes = new TextEncoder().encode(canonicalJson);
-  const payloadHash = await sha256(payloadBytes);
-  const signature = nacl.sign.detached(payloadHash, keyPair.secretKey);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = crypto.randomUUID();
+  const payload = JSON.stringify({ to, amount });
   
-  return { from, to, amount, timestamp, public_key: bytesToHex(keyPair.publicKey), signature: bytesToHex(signature) };
+  // Sign: chain_id byte + payload + newline + timestamp + newline + nonce
+  const chainIdByte = new Uint8Array([0x01]);
+  const payloadBytes = new TextEncoder().encode(payload);
+  const timestampBytes = new TextEncoder().encode(`\n${timestamp}\n`);
+  const nonceBytes = new TextEncoder().encode(nonce);
+  
+  const message = new Uint8Array(chainIdByte.length + payloadBytes.length + timestampBytes.length + nonceBytes.length);
+  let offset = 0;
+  message.set(chainIdByte, offset); offset += chainIdByte.length;
+  message.set(payloadBytes, offset); offset += payloadBytes.length;
+  message.set(timestampBytes, offset); offset += timestampBytes.length;
+  message.set(nonceBytes, offset);
+  
+  const signature = nacl.sign.detached(message, keyPair.secretKey);
+  
+  return {
+    public_key: bytesToHex(keyPair.publicKey),
+    wallet_address: from,
+    payload: payload,
+    timestamp: timestamp,
+    nonce: nonce,
+    chain_id: 1,
+    schema_version: 1,
+    signature: bytesToHex(signature)
+  };
 }
 
 export async function run() {

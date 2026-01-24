@@ -184,101 +184,151 @@ async fn balance_handler(
 
 /// GET /ledger - ASCII art visualization of all ledger entries
 async fn ledger_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let transactions = state.blockchain.get_all_transactions(200); // Last 200 transactions
+    let transactions = state.blockchain.get_all_transactions(200);
     let stats = state.blockchain.stats();
     let total_supply = state.blockchain.total_supply();
     
     let mut output = String::new();
     
-    // ANSI color codes - Jedi Green
-    let green = "\x1b[92m";  // Bright green
-    let reset = "\x1b[0m";   // Reset color
-    
-    // ASCII Art Header
+    // Clean ASCII Header - No complex colors
     output.push_str("\n");
-    output.push_str(&format!("{}╔═══════════════════════════════════════════════════════════════════════════════╗{}\n", green, reset));
-    output.push_str(&format!("{}║                         🔗 BLACKBOOK L1 LEDGER                                ║{}\n", green, reset));
-    output.push_str(&format!("{}║                         Blockchain Transaction Log                            ║{}\n", green, reset));
-    output.push_str(&format!("{}╚═══════════════════════════════════════════════════════════════════════════════╝{}\n", green, reset));
+    output.push_str("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    output.push_str("║                        ⚔️  BLACKBOOK L1 LEDGER - IMMUTABLE TRANSACTION LOG  ⚔️                         ║\n");
+    output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
     output.push_str("\n");
     
     // Stats Box
-    output.push_str(&format!("{}┌─────────────────────────────────────────────────────────────────────────────┐{}\n", green, reset));
-    output.push_str(&format!("{}│{} 📊 Total Supply:      {:>10.2} BB                                        {}│{}\n", green, reset, total_supply, green, reset));
-    output.push_str(&format!("{}│{} 👥 Total Accounts:    {:>10}                                             {}│{}\n", green, reset, stats.total_accounts, green, reset));
-    output.push_str(&format!("{}│{} 📦 Block Count:       {:>10}                                             {}│{}\n", green, reset, stats.block_count, green, reset));
-    output.push_str(&format!("{}│{} 🎰 Current Slot:      {:>10}                                             {}│{}\n", green, reset, stats.current_slot, green, reset));
-    output.push_str(&format!("{}│{} 📝 Recent Tx Count:   {:>10}                                             {}│{}\n", green, reset, transactions.len(), green, reset));
-    output.push_str(&format!("{}└─────────────────────────────────────────────────────────────────────────────┘{}\n", green, reset));
+    output.push_str("┌─────────────────────────────────────────────────────────────────┐\n");
+    output.push_str("│  📊 CHAIN STATS                                                 │\n");
+    output.push_str("├─────────────────────────────────────────────────────────────────┤\n");
+    output.push_str(&format!("│  💰 Total Supply:      {:>15.2} BB                       │\n", total_supply));
+    output.push_str(&format!("│  👥 Active Wallets:    {:>15}                           │\n", stats.total_accounts));
+    output.push_str(&format!("│  📝 Transactions:      {:>15}                           │\n", transactions.len()));
+    output.push_str(&format!("│  🎰 Current Slot:      {:>15}                           │\n", stats.current_slot));
+    output.push_str("└─────────────────────────────────────────────────────────────────┘\n");
     output.push_str("\n");
     
-    // Transaction Table Header
-    output.push_str(&format!("{}┌──────────────────┬───────────┬────────────────────────────┬─────────────────┐{}\n", green, reset));
-    output.push_str(&format!("{}│{}   Transaction    {}│{}   Amount  {}│{}           From → To        {}│{}      Type       {}│{}\n", 
-        green, reset, green, reset, green, reset, green, reset, green, reset));
-    output.push_str(&format!("{}├──────────────────┼───────────┼────────────────────────────┼─────────────────┤{}\n", green, reset));
+    // Transaction Table - Wide and readable
+    output.push_str("┌─────┬──────────────┬────────────────────────────────────────────────────────────────────────────┬───────────────┐\n");
+    output.push_str("│  #  │    Amount    │                              Flow                                         │    Action     │\n");
+    output.push_str("├─────┼──────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────┤\n");
     
-    // Display transactions
-    for tx in transactions.iter().take(50) { // Show last 50
-        let tx_id_short = if tx.tx_id.len() > 16 {
-            format!("{}...", &tx.tx_id[..13])
-        } else {
-            tx.tx_id.clone()
-        };
+    for (index, tx) in transactions.iter().take(50).enumerate() {
+        // Format addresses - show last 12 chars for clarity
+        let from_display = format_address_readable(&tx.from_address);
+        let to_display = format_address_readable(&tx.to_address);
         
-        let from_short = if tx.from_address.len() > 12 {
-            format!("{}...", &tx.from_address[..9])
-        } else {
-            tx.from_address.clone()
-        };
+        // Determine transaction type - BRIDGE and LOCK are linked actions
+        let tx_type_lower = tx.tx_type.to_lowercase();
         
-        let to_short = if tx.to_address.len() > 12 {
-            format!("{}...", &tx.to_address[..9])
-        } else {
-            tx.to_address.clone()
+        match tx_type_lower.as_str() {
+            // BRIDGE OUT - User initiates L1 → L2 transfer (with LOCK attached)
+            "bridge_out" | "bridgeout" | "lock" | "l2_lock" => {
+                // Main BRIDGE OUT line
+                output.push_str(&format!(
+                    "│ {:>3} │ {:>10.2} BB │ 🌉 BRIDGE OUT: {}  ═══▶  L2 Gaming Session                     │               │\n",
+                    index + 1,
+                    tx.amount,
+                    from_display
+                ));
+                // Attached LOCK line (sub-action)
+                output.push_str(&format!(
+                    "│     │              │   └─🔒 LOCK: {:>10.2} BB secured in L2_ESCROW_POOL                            │               │\n",
+                    tx.amount
+                ));
+            },
+            // BRIDGE IN - User settles L2 session (with UNLOCK attached)
+            "bridge_in" | "bridgein" | "unlock" | "l2_unlock" => {
+                // Main BRIDGE IN line
+                output.push_str(&format!(
+                    "│ {:>3} │ {:>10.2} BB │ 🌉 BRIDGE IN: L2 Settlement  ═══▶  {}                          │               │\n",
+                    index + 1,
+                    tx.amount,
+                    to_display
+                ));
+                // Attached UNLOCK line (sub-action)
+                output.push_str(&format!(
+                    "│     │              │   └─🔓 UNLOCK: {:>10.2} BB released from L2_ESCROW_POOL                        │               │\n",
+                    tx.amount
+                ));
+            },
+            "mint" => {
+                output.push_str(&format!(
+                    "│ {:>3} │ {:>10.2} BB │ 🪙 MINT: USDC Treasury  ═══▶  {} [+NEW TOKENS]                 │               │\n",
+                    index + 1,
+                    tx.amount,
+                    to_display
+                ));
+            },
+            "burn" => {
+                output.push_str(&format!(
+                    "│ {:>3} │ {:>10.2} BB │ 🔥 BURN: {}  ═══▶  DESTROYED [-TOKENS]                         │               │\n",
+                    index + 1,
+                    tx.amount,
+                    from_display
+                ));
+            },
+            _ => {
+                // Standard L1 transfer
+                output.push_str(&format!(
+                    "│ {:>3} │ {:>10.2} BB │ 💸 TRANSFER: {}  ───▶  {}                    │               │\n",
+                    index + 1,
+                    tx.amount,
+                    from_display,
+                    to_display
+                ));
+            }
         };
-        
-        let tx_type_short = format!("{:?}", tx.tx_type);
-        let tx_type_display = if tx_type_short.len() > 15 {
-            format!("{:.12}...", tx_type_short)
-        } else {
-            tx_type_short
-        };
-        
-        output.push_str(&format!(
-            "{}│{} {:16} {}│{} {:>9.2} {}│{} {} → {} {}│{} {:15} {}│{}\n",
-            green, reset,
-            tx_id_short,
-            green, reset,
-            tx.amount,
-            green, reset,
-            from_short,
-            to_short,
-            green, reset,
-            tx_type_display,
-            green, reset
-        ));
     }
     
-    output.push_str(&format!("{}└──────────────────┴───────────┴────────────────────────────┴─────────────────┘{}\n", green, reset));
+    output.push_str("└─────┴──────────────┴────────────────────────────────────────────────────────────────────────────┴───────────────┘\n");
     output.push_str("\n");
     
-    // Legend
-    output.push_str(&format!("{}Legend:{}\n", green, reset));
-    output.push_str("  • Transfer      - L1 token transfer between wallets\n");
-    output.push_str("  • BridgeOut     - Tokens locked for L2 session\n");
-    output.push_str("  • BridgeIn      - Tokens returned from L2 settlement\n");
-    output.push_str("  • Mint          - Admin token creation (testnet only)\n");
-    output.push_str("  • Burn          - Admin token destruction\n");
+    // Legend - Updated to show relationship
+    output.push_str("┌───────────────────────────────────────────────────────────────────────────────┐\n");
+    output.push_str("│  📖 LEGEND                                                                    │\n");
+    output.push_str("├───────────────────────────────────────────────────────────────────────────────┤\n");
+    output.push_str("│  💸 TRANSFER    = L1 wallet-to-wallet token transfer                          │\n");
+    output.push_str("│                                                                               │\n");
+    output.push_str("│  🌉 BRIDGE OUT  = User sends tokens from L1 to L2 for gaming session          │\n");
+    output.push_str("│    └─🔒 LOCK    = Tokens locked in L2_ESCROW_POOL (linked to bridge out)      │\n");
+    output.push_str("│                                                                               │\n");
+    output.push_str("│  🌉 BRIDGE IN   = User settles L2 session, tokens return to L1                │\n");
+    output.push_str("│    └─🔓 UNLOCK  = Tokens released from L2_ESCROW_POOL (linked to bridge in)   │\n");
+    output.push_str("│                                                                               │\n");
+    output.push_str("│  🪙 MINT        = New tokens created (requires USDC backing)                  │\n");
+    output.push_str("│  🔥 BURN        = Tokens permanently destroyed                                │\n");
+    output.push_str("└───────────────────────────────────────────────────────────────────────────────┘\n");
     output.push_str("\n");
-    output.push_str(&format!("{}╔═══════════════════════════════════════════════════════════════════════════════╗{}\n", green, reset));
-    output.push_str(&format!("{}║  🛡️  All transactions cryptographically signed and immutably stored          ║{}\n", green, reset));
-    output.push_str(&format!("{}╚═══════════════════════════════════════════════════════════════════════════════╝{}\n", green, reset));
+    
+    // Footer
+    output.push_str("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+    output.push_str("║  🛡️  All transactions cryptographically signed with Ed25519 | Immutably stored on BlackBook L1       ║\n");
+    output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
     
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         output
     )
+}
+
+/// Helper to format addresses for display - show meaningful parts
+fn format_address_readable(addr: &str) -> String {
+    if addr.starts_with("L1_") {
+        // Show L1_ prefix + first 4 and last 8 chars
+        let hex_part = &addr[3..];
+        if hex_part.len() > 12 {
+            format!("L1_{}...{}", &hex_part[..4], &hex_part[hex_part.len()-8..])
+        } else {
+            addr.to_string()
+        }
+    } else if addr.starts_with("L2_") || addr.contains("ESCROW") || addr.contains("escrow") {
+        "L2_ESCROW_POOL".to_string()
+    } else if addr.len() > 20 {
+        format!("{}...{}", &addr[..8], &addr[addr.len()-8..])
+    } else {
+        addr.to_string()
+    }
 }
 
 /// GET /transactions - Query transaction history

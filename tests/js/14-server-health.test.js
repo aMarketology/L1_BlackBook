@@ -151,7 +151,7 @@ export async function run() {
   
   // Test 9: Transfer endpoint responds (doesn't need to succeed)
   try {
-    const response = await httpPost('/transfer', {});
+    const response = await httpPost('/transfer/simple', {});
     
     // Even with invalid data, endpoint should respond
     results.pass('Transfer endpoint functional');
@@ -169,7 +169,12 @@ async function httpPost(endpoint, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  return res.json();
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { success: false, error: text };
+  }
 }
 
 // Run if executed directly

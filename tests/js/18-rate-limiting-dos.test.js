@@ -139,7 +139,7 @@ export async function run() {
     
     // Send all at once
     const promises = transferRequests.map(req =>
-      httpPost('/transfer', req)
+      httpPost('/transfer/simple', req)
         .then(r => {
           if (r.success && !r.error) {
             successful++;
@@ -386,7 +386,7 @@ export async function run() {
               0.001,
               aliceKeyPair
             );
-            await httpPost('/transfer', req);
+            await httpPost('/transfer/simple', req);
             writes++;
           }
         } catch (err) {

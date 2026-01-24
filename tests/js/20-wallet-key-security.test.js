@@ -144,7 +144,7 @@ export async function run() {
     };
     
     const bobBalanceBefore = await httpGet(`/balance/${TEST_ACCOUNTS.BOB.address}`);
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     const bobBalanceAfter = await httpGet(`/balance/${TEST_ACCOUNTS.BOB.address}`);
     
     // Should be rejected - can't sign for Bob with Alice's keys
@@ -289,7 +289,7 @@ export async function run() {
       signature: bytesToHex(signature),
     };
     
-    const response = await httpPost('/transfer', request);
+    const response = await httpPost('/transfer/simple', request);
     
     // Should succeed if algorithm matches
     if (response.error?.includes('signature') || response.error?.includes('invalid')) {
@@ -329,7 +329,7 @@ export async function run() {
         ...edgeCase,
       };
       
-      const response = await httpPost('/transfer', request);
+      const response = await httpPost('/transfer/simple', request);
       
       if (response.success && !response.error) {
         console.log(`   Warning: Edge case accepted: ${JSON.stringify(edgeCase).substring(0, 50)}`);

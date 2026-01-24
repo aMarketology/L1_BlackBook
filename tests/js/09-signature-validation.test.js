@@ -150,8 +150,11 @@ export async function run() {
       aliceKeyPair
     );
     
-    // Change amount after signing
-    request.amount = 1000;
+    // Change amount in payload after signing (THIS is the actual tampering)
+    // Parse the signed payload, modify it, and re-stringify
+    const originalPayload = JSON.parse(request.payload);
+    originalPayload.amount = 1000;
+    request.payload = JSON.stringify(originalPayload);
     
     const response = await httpPost('/transfer/simple', request);
     
@@ -177,8 +180,10 @@ export async function run() {
       aliceKeyPair
     );
     
-    // Change recipient after signing
-    request.to = TEST_ACCOUNTS.DEALER.address;
+    // Change recipient in payload after signing (THIS is the actual tampering)
+    const originalPayload = JSON.parse(request.payload);
+    originalPayload.to = TEST_ACCOUNTS.DEALER.address;
+    request.payload = JSON.stringify(originalPayload);
     
     const response = await httpPost('/transfer/simple', request);
     

@@ -130,7 +130,18 @@ export async function httpPost(endpoint, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  
+  const text = await res.text();
+  
+  // Try to parse as JSON, otherwise wrap in error object
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // Server returned non-JSON (likely a text error)
+    data = { success: false, error: text };
+  }
+  
   if (!res.ok && !data.error) {
     throw new Error(`POST ${endpoint} failed: ${res.status}`);
   }

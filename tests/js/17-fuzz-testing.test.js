@@ -110,7 +110,7 @@ export async function run() {
           [randomString(5)]: randomString(10),
         };
         
-        const response = await httpPost('/transfer', fuzzPayload);
+        const response = await httpPost('/transfer/simple', fuzzPayload);
         
         if (response.error) {
           rejected++;
@@ -281,7 +281,7 @@ export async function run() {
     
     for (const payload of unicodePayloads) {
       try {
-        await httpPost('/transfer', { ...payload, public_key: randomHex(64), signature: randomHex(128), timestamp: Date.now() });
+        await httpPost('/transfer/simple', { ...payload, public_key: randomHex(64), signature: randomHex(128), timestamp: Date.now() });
       } catch (err) {
         if (err.message.includes('ECONNREFUSED')) {
           crashed++;
@@ -311,7 +311,7 @@ export async function run() {
     
     for (const payload of binaryTests) {
       try {
-        await httpPost('/transfer', { ...payload, public_key: randomHex(64), signature: randomHex(128), timestamp: Date.now() });
+        await httpPost('/transfer/simple', { ...payload, public_key: randomHex(64), signature: randomHex(128), timestamp: Date.now() });
       } catch (err) {
         if (err.message.includes('ECONNREFUSED')) {
           crashed++;
@@ -342,7 +342,7 @@ export async function run() {
       if (i % 3 === 0) {
         promises.push(httpGet(`/balance/${randomAddress()}`).catch(() => null));
       } else if (i % 3 === 1) {
-        promises.push(httpPost('/transfer', {
+        promises.push(httpPost('/transfer/simple', {
           from: randomAddress(),
           to: randomAddress(),
           amount: randomAmount(),

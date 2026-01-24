@@ -137,8 +137,8 @@ export async function run() {
       );
       
       // Send both
-      const response1 = await httpPost('/transfer', request1);
-      const response2 = await httpPost('/transfer', request2);
+      const response1 = await httpPost('/transfer/simple', request1);
+      const response2 = await httpPost('/transfer/simple', request2);
       
       // At most one should succeed
       const success1 = !response1.error && response1.success !== false;
@@ -161,7 +161,7 @@ export async function run() {
           balance,
           bobKeyPair
         );
-        await httpPost('/transfer', returnRequest);
+        await httpPost('/transfer/simple', returnRequest);
       }
       
       results.pass('Cannot double-spend entire balance');

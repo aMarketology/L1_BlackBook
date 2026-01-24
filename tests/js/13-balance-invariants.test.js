@@ -337,8 +337,8 @@ export async function run() {
         bobKeyPair,
         i * 2 + 1
       );
-      promises.push(httpPost('/transfer', req1));
-      promises.push(httpPost('/transfer', req2));
+      promises.push(httpPost('/transfer/simple', req1));
+      promises.push(httpPost('/transfer/simple', req2));
     }
     
     await Promise.all(promises);

@@ -123,7 +123,7 @@ export async function run() {
       }
       
       // Fire all at once (simulated reentrancy attack)
-      const responses = await Promise.all(requests.map(r => httpPost('/transfer', r)));
+      const responses = await Promise.all(requests.map(r => httpPost('/transfer/simple', r)));
       
       const successCount = responses.filter(r => !r.error && r.success !== false).length;
       const balanceAfter = await getBalance(TEST_ACCOUNTS.ALICE.address);
@@ -170,7 +170,7 @@ export async function run() {
       
       // Send simultaneously
       const [resp1, resp2] = await Promise.all([
-        httpPost('/transfer', requests[0]),
+        httpPost('/transfer/simple', requests[0]),
         httpPost('/transfer', requests[1]),
       ]);
       

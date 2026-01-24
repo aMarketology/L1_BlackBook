@@ -169,7 +169,7 @@ export async function run() {
   
   // Test 6: Missing required fields
   try {
-    const response = await httpPost('/transfer', {
+    const response = await httpPost('/transfer/simple', {
       from: TEST_ACCOUNTS.ALICE.address,
       // Missing: to, amount, timestamp, signature, public_key
     });
@@ -268,7 +268,7 @@ export async function run() {
   
   // Test 12: Null bytes in input
   try {
-    const response = await httpPost('/transfer', {
+    const response = await httpPost('/transfer/simple', {
       from: TEST_ACCOUNTS.ALICE.address + '\x00',
       to: TEST_ACCOUNTS.BOB.address,
       amount: 1,
