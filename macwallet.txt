@@ -1,0 +1,205 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                      MAC'S BLACKBOOK WALLET - COMPLETE INFO                   ║
+║                      Vault-Based Secure Wallet Storage                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 WALLET IDENTIFICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+L1 Address:       L1_94B3C863E068096596CE80F04C2233B72AE11790
+L2 Address:       L2_94B3C863E068096596CE80F04C2233B72AE11790
+Public Key:       ec6941c71740e192bbf5933d5f9cc18ea161329ce864da900d8de73d45c28752
+
+Username:         mac_blackbook
+Email:            mac@blackbook.io
+Created:          2026-01-16T01:39:47.311Z
+Chain:            BlackBook L1
+Curve:            Ed25519
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔐 ENCRYPTED VAULT DATA (Safe to Store in Database)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Salt:             579a5c28a02f8c3ecc2801545a216cec
+Encrypted Blob:   U2FsdGVkX19443Y8LJ1PaUV6/aG4Ctod88tWo7AVDftZlcgWurkSGAhVEAScVQ91+Ew9iP0d588HfIUYlXQPGEmIMDhjj3M6cDPbDtnTZFh848l0Z71CjV0CpB41Avad
+Algorithm:        AES-256
+KDF:              PBKDF2
+KDF Iterations:   100000
+
+⚠️ TEST PASSWORD:  MacSecurePassword2026!
+   (In production, user provides their own secure password)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔑 SECURITY MODEL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Private key is NEVER stored anywhere
+✅ Private key is NEVER transmitted over network
+✅ Only encrypted seed stored in vault
+✅ Password never leaves client
+✅ Salt is unique per wallet (prevents rainbow table attacks)
+✅ PBKDF2 with 100k iterations (makes brute force expensive)
+✅ Key derived in-memory on-demand when user logs in
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 HOW IT WORKS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WALLET CREATION:
+1. Generate cryptographically secure random seed (32 bytes)
+2. Generate unique salt for PBKDF2
+3. Derive encryption key from password + salt (100k iterations)
+4. Encrypt seed with AES-256
+5. Derive public key and L1 address from seed
+6. Store ONLY: vault data (encrypted blob + salt), public key, address
+7. DISCARD: seed and private key (never stored)
+
+USER LOGIN:
+1. User provides password
+2. Derive encryption key from password + stored salt (PBKDF2)
+3. Decrypt vault to recover seed
+4. Derive Ed25519 keypair from seed (in-memory only)
+5. Use keypair.secretKey to sign transactions
+6. After use, keypair is cleared from memory
+
+TRANSACTION SIGNING:
+1. Build transaction message
+2. Sign with secretKey: nacl.sign.detached(message, secretKey)
+3. Send to L1: { message, signature, public_key }
+4. L1 verifies signature using public key
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 VAULT DECRYPTION CODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Unlock Mac's wallet from vault
+function unlockWallet(vault, password) {
+    // 1. Derive encryption key using PBKDF2
+    const encryptionKey = CryptoJS.PBKDF2(password, vault.salt, {
+        keySize: 256 / 32,
+        iterations: 100000,
+        hasher: CryptoJS.algo.SHA256
+    });
+    
+    // 2. Decrypt the vault to get seed
+    const decrypted = CryptoJS.AES.decrypt(
+        vault.encrypted_blob, 
+        encryptionKey.toString()
+    );
+    const seedHex = decrypted.toString(CryptoJS.enc.Utf8);
+    
+    // 3. Derive Ed25519 keypair from seed
+    const seedBytes = Buffer.from(seedHex, 'hex');
+    const keypair = nacl.sign.keyPair.fromSeed(seedBytes);
+    
+    return keypair;  // { publicKey, secretKey }
+}
+
+// Sign a transaction
+const keypair = unlockWallet(MAC.vault, MAC.password);
+const message = Buffer.from(JSON.stringify(transaction));
+const signature = nacl.sign.detached(message, keypair.secretKey);
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🧪 TEST USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mac is used in various tests to demonstrate secure wallet operations:
+
+• bob-mac-live-transfer.js    - Bob sends to Mac, Mac unlocks & sends back
+• bob-mac-transfer-test.js    - Transfer test with vault authentication
+• wallet-unlock-simple.js     - Simple example of unlocking Mac's wallet
+• mac-secure-wallet.js        - Generator script that created this wallet
+• Mac-test-wallet.md          - Full documentation
+
+Test Scenarios:
+✓ Vault-based login (encrypted storage)
+✓ Send tokens from vault-secured wallet
+✓ Receive tokens to vault address
+✓ Balance queries
+✓ Wallet unlock/lock cycles
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 PURPOSE & ROLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mac represents a PRODUCTION-STYLE SECURE WALLET pattern, unlike Alice and Bob
+who have their private keys exposed in TEST_ACCOUNTS.txt.
+
+Mac demonstrates:
+• How real users' wallets should be secured
+• Password-protected seed storage
+• Key derivation on-demand
+• No private key exposure in database or logs
+• Client-side cryptography
+
+Comparison:
+┌──────────────┬────────────────────┬─────────────────────────┐
+│ Account      │ Storage Method     │ Security Level          │
+├──────────────┼────────────────────┼─────────────────────────┤
+│ Alice        │ Plaintext keys     │ Test/Dev only           │
+│ Bob          │ Plaintext keys     │ Test/Dev only           │
+│ Dealer       │ .env file          │ Server-side protected   │
+│ Mac          │ Encrypted vault    │ Production-ready        │
+└──────────────┴────────────────────┴─────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 FULL WALLET RECORD (for Supabase/Database)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{
+    "username": "mac_blackbook",
+    "email": "mac@blackbook.io",
+    "l1_address": "L1_94B3C863E068096596CE80F04C2233B72AE11790",
+    "l2_address": "L2_94B3C863E068096596CE80F04C2233B72AE11790",
+    "public_key": "ec6941c71740e192bbf5933d5f9cc18ea161329ce864da900d8de73d45c28752",
+    "vault_salt": "579a5c28a02f8c3ecc2801545a216cec",
+    "vault_encrypted_blob": "U2FsdGVkX19443Y8LJ1PaUV6/aG4Ctod88tWo7AVDftZlcgWurkSGAhVEAScVQ91+Ew9iP0d588HfIUYlXQPGEmIMDhjj3M6cDPbDtnTZFh848l0Z71CjV0CpB41Avad",
+    "vault_algorithm": "AES-256",
+    "vault_kdf": "PBKDF2",
+    "vault_kdf_iterations": 100000,
+    "created_at": "2026-01-16T01:39:47.311Z",
+    "curve": "Ed25519",
+    "wallet_type": "vault_encrypted"
+}
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ IMPORTANT NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. This is a TEST ACCOUNT - password is exposed for testing purposes
+2. In production, users create their own passwords
+3. The password is NEVER stored or transmitted to the server
+4. All decryption happens CLIENT-SIDE in the browser/app
+5. Server only stores: address, public key, vault blob, and salt
+6. Private key CANNOT be recovered without the user's password
+7. Lost password = lost wallet (no recovery possible without backup)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 RELATED FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+sdk/Mac-test-wallet.md           - Full documentation
+sdk/mac-secure-wallet.js         - Wallet generator script
+sdk/wallet-unlock-simple.js      - Simple unlock example
+sdk/bob-mac-live-transfer.js     - Transfer test with Mac
+sdk/bob-mac-transfer-test.js     - Transfer test script
+sdk/wallet-recovery-sdk.js       - Recovery mechanisms
+tests/js/02-wallet-login.test.js - Login tests including vault-based
+tests/js/03-send-tokens.test.js  - Send token tests with Mac
+tests/js/04-receive-tokens.test.js - Receive token tests with Mac
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            END OF MAC WALLET INFO                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
