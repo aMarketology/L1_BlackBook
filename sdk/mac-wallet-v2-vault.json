@@ -1,0 +1,13 @@
+{
+  "username": "mac_blackbook",
+  "email": "mac@blackbook.io",
+  "l1_address": "L1_94B3C863E068096596CE80F04C2233B72AE11790",
+  "l2_address": "L2_94B3C863E068096596CE80F04C2233B72AE11790",
+  "public_key": "ec6941c71740e192bbf5933d5f9cc18ea161329ce864da900d8de73d45c28752",
+  "auth_salt": "c797f810b635e1ea6c19bd0a1f1ef2d40ea565a03fd20eec9aa0350e88fa81a7",
+  "vault_salt": "41176c59b52a392d6abaf26857ae97ab97c0733852d81fbd586f08ce12a9492b",
+  "vault_ciphertext": "4q/jTciq0L6MaVz5tnLJQ7Rxu/owxXwPu2Fk6LCVHWlyP6O1HHbdEfj5B0bwl+N9XJ9WdCgox3EvBcCjNvSGPJMgHckGha+rO3PFMnTgxD0=",
+  "vault_nonce": "7d23f1f893dfdad678080b7d",
+  "vault_version": 2,
+  "created_at": "2026-01-24T05:12:36.477Z"
+}
