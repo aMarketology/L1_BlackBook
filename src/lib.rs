@@ -1,13 +1,14 @@
 //! BlackBook Layer1 Blockchain
 //!
-//! High-performance blockchain with 1:1 USDC backing.
+//! Treasury & Blockchain Layer for Sweepstakes
 //!
-//! ## Architecture (V3)
+//! ## Architecture
 //!
-//! - **Storage**: ReDB (ACID) + DashMap (lock-free cache)
-//! - **Server**: Axum (fast, no recursion limits)
-//! - **Auth**: Ed25519 signatures (no JWT)
-//! - **Token**: 1:1 USDC backed (no treasury)
+//! 1. Bridge Contract (Base) - Holds USDC, multi-sig controlled
+//! 2. Wrapped USDC (L1) - 1:1 mint when bridge detects deposit
+//! 3. BlackBook Token ($BB) - Only Cashier mints, only Redemption burns
+//! 4. Cashier Contract - wUSDC → FanGold (L2) + $BB (L1)
+//! 5. Redemption Contract - Burns $BB, releases value
 
 // Core modules
 pub mod social_mining;
@@ -35,20 +36,24 @@ pub mod runtime;
 // Storage
 pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
 
-// Blockchain types - The 4 Critical Functions
+// Protocol - Treasury Architecture
 pub use protocol::blockchain::{
+    // Token Ledgers
+    WusdcLedger, BlackBookLedger,
+    // Contracts
+    BridgeAuthority, CashierContract, RedemptionContract, PendingRelease,
+    // Bundles
+    Bundle,
+    // Events (for L2 indexer)
+    L1Event,
+    // Transactions
+    Transaction, TxData,
     // State
-    L1State, EscrowVault,
-    // Transactions (MINT, LOCK, SETTLE, BURN)
-    Transaction, TxType, TxData,
-    LockParticipant, Payout,
+    L1State,
     // Errors
     ChainError,
-    // Blocks
-    Block,
-    // Constants
-    GENESIS_TIMESTAMP, LAMPORTS_PER_BB, DEFAULT_ESCROW_EXPIRY_SECS,
-    compute_genesis_hash,
+    // Compliance
+    ProofOfReserves,
 };
 
 // Social mining

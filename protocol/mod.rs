@@ -1,23 +1,31 @@
-//! Layer1 Protocol - The Sweepstakes Ledger
+//! Layer1 Protocol - Treasury & Blockchain Layer
 //!
-//! Only 4 operations: MINT, LOCK, SETTLE, BURN
-//! Zero-sum invariant enforced on all operations.
+//! Architecture:
+//!   1. Bridge Contract (Base) - Holds USDC, multi-sig controlled
+//!   2. Wrapped USDC (L1) - 1:1 mint when bridge detects deposit
+//!   3. BlackBook Token ($BB) - Only Cashier mints, only Redemption burns
+//!   4. Cashier Contract - wUSDC → FanGold (L2) + $BB (L1)
+//!   5. Redemption Contract - Burns $BB, releases value
 
 pub mod blockchain;
 pub mod helpers;
 
 // Re-export core types
 pub use blockchain::{
-    // Constants
-    GENESIS_TIMESTAMP, LAMPORTS_PER_BB, DEFAULT_ESCROW_EXPIRY_SECS,
-    compute_genesis_hash,
-    // State
-    L1State, EscrowVault,
+    // Token Ledgers
+    WusdcLedger, BlackBookLedger,
+    // Contracts
+    BridgeAuthority, CashierContract, RedemptionContract, PendingRelease,
+    // Bundles
+    Bundle,
+    // Events (for L2 indexer)
+    L1Event,
     // Transactions
-    Transaction, TxType, TxData,
-    LockParticipant, Payout,
+    Transaction, TxData,
+    // State
+    L1State,
     // Errors
     ChainError,
-    // Blocks
-    Block,
+    // Compliance
+    ProofOfReserves,
 };

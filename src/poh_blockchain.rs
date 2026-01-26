@@ -35,7 +35,7 @@ use crate::runtime::{
     SharedPoHService, PoHEntry, LeaderSchedule,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
-use crate::protocol::{Transaction, TxType, TxData};
+use crate::protocol::{Transaction, TxData};
 
 // ============================================================================
 // CONSTANTS
@@ -362,7 +362,7 @@ impl BlockProducer {
     /// Submit a transaction for inclusion in the next block
     pub fn submit_transaction(&self, tx: Transaction) -> Result<String, String> {
         // Queue transaction and mix into PoH for ordering
-        let tx_id = tx.id.clone();
+        let tx_id = tx.hash.clone();
         
         {
             let mut poh = self.poh.write();
@@ -442,7 +442,7 @@ impl BlockProducer {
                     });
                 }
                 Err(e) => {
-                    warn!("Transaction {} failed: {}", tx.id, e);
+                    warn!("Transaction {} failed: {}", tx.hash, e);
                 }
             }
         }
@@ -523,36 +523,42 @@ impl BlockProducer {
         Ok(block)
     }
 
-    /// Execute a single transaction using the 4 critical functions
+    /// Execute a single transaction using the new treasury architecture
+    /// Note: Amounts are in u64 (6 decimals), converted to f64 for storage
     fn execute_transaction(&self, tx: &Transaction) -> Result<(), String> {
         match &tx.data {
-            TxData::Mint { user, amount, .. } => {
-                // MINT: Credit the user
-                self.blockchain.credit(user, *amount)
+            TxData::BridgeMint { recipient, amount, base_tx_hash } => {
+                // Bridge mints wUSDC for user (deposit detected on Base)
+                info!("Bridge mint: {} wUSDC to {} (base_tx: {})", 
+                    amount, recipient, &base_tx_hash[..8.min(base_tx_hash.len())]);
+                self.blockchain.credit(recipient, *amount as f64)
             }
-            TxData::Lock { participants, .. } => {
-                // LOCK: Debit all participants (escrow handled separately)
-                for p in participants {
-                    self.blockchain.debit(&p.address, p.amount)?;
-                }
+            
+            TxData::TransferWusdc { to, amount } => {
+                // Transfer wUSDC between accounts
+                self.blockchain.debit(&tx.from, *amount as f64)?;
+                self.blockchain.credit(to, *amount as f64)
+            }
+            
+            TxData::BuyBundle { bundle_id } => {
+                // User buys bundle - wUSDC to Cashier, $BB minted
+                // Note: The actual bundle logic is in L1State
+                // Here we just log for the PoH chain
+                info!("Bundle purchase: {} bought {}", tx.from, bundle_id);
                 Ok(())
             }
-            TxData::Settle { winner, payouts, .. } => {
-                // SETTLE: Credit winner or distribute payouts
-                if let Some(payouts) = payouts {
-                    for payout in payouts {
-                        self.blockchain.credit(&payout.address, payout.amount)?;
-                    }
-                } else {
-                    // Winner takes all - amount comes from escrow
-                    // For now, we don't have escrow tracking in blockchain
-                    // This is a simplified version
-                }
+            
+            TxData::Redeem { amount } => {
+                // User redeems $BB for wUSDC
+                info!("Redemption: {} redeemed {} $BB", tx.from, amount);
                 Ok(())
             }
-            TxData::Burn { user, amount, .. } => {
-                // BURN: Debit the user
-                self.blockchain.debit(user, *amount)
+            
+            TxData::BridgeRelease { user, amount, base_tx_hash } => {
+                // Bridge released USDC on Base, burn wUSDC on L1
+                info!("Bridge release: {} wUSDC from {} (base_tx: {})",
+                    amount, user, &base_tx_hash[..8.min(base_tx_hash.len())]);
+                self.blockchain.debit(user, *amount as f64)
             }
         }
     }
