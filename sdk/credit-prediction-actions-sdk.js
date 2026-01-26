@@ -1,22 +1,60 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * CREDIT PREDICTION ACTIONS SDK
+ * CREDIT PREDICTION ACTIONS SDK - v3 PRODUCTION
  * ═══════════════════════════════════════════════════════════════════════════
  * 
- * Frontend SDK for BlackBook L2 - Credit Line Trading & Prediction Markets
+ * Frontend SDK for BlackBook L2 - Real L1 Integration & Prediction Markets
+ * 
+ * ⚠️  PRODUCTION MODE - L1 gRPC Required:
+ *    - L1 server must be running at localhost:50051
+ *    - All deposits verify REAL L1 balances via gRPC
+ *    - No simulated deposits - production L1 verification only
+ * 
+ * SETTLEMENT ROADMAP (January 2026):
+ * ══════════════════════════════════════════════════════════════════════════
+ * 
+ * PHASE 1: DEALER DEPOSITS (✅ IMPLEMENTED - v3)
+ *   Endpoint: POST /deposit
+ *   Requirements: Dealer signature + L1 balance verification via gRPC
+ *   
+ * PHASE 2: CPMM TRADING (✅ IMPLEMENTED)
+ *   Endpoints: POST /buy, POST /sell
+ *   Features: Real-time pricing, Ed25519 signatures
+ *   
+ * PHASE 3: ORACLE RESOLUTION (✅ IMPLEMENTED)  
+ *   Endpoint: POST /resolve
+ *   Requirements: Dealer signature + oracle authentication
+ *   Auto-features: Payout calculation, balance distribution
+ *   
+ * PHASE 4: WITHDRAWALS (✅ IMPLEMENTED)
+ *   Flow: POST /withdraw → POST /withdraw/complete
+ *   Requirements: Dual dealer signatures for security
+ * 
+ * PHASE 5: CREDIT LINES (⚠️ NOT IMPLEMENTED)
+ *   Status: Planned for future release
+ *   Credit line endpoints (/credit/*) are deprecated in v3
+ * 
+ * ⚠️  CRITICAL: Dealer operations require Ed25519 signatures with replay protection
  * 
  * Usage:
  *   const sdk = new CreditPredictionSDK({
  *     l2Url: 'http://localhost:1234',
  *     supabaseUrl: 'https://xxx.supabase.co',
  *     supabaseKey: 'your-anon-key',
- *     address: 'user-wallet-address',
- *     signer: async (msg) => wallet.sign(msg)  // from your L1 wallet
+ *     address: 'L2_YOUR_ADDRESS',
+ *     publicKey: 'your-ed25519-public-key-hex',
+ *     signer: async (msg) => wallet.sign(msg)
  *   });
  * 
+ *   // User flow
  *   await sdk.openCredit(1000);
  *   await sdk.bet('market-id', 0, 100);
  *   await sdk.settleCredit();
+ * 
+ *   // Dealer flow (requires dealer private key)
+ *   const dealerSdk = new CreditPredictionSDK({ ...config, isDealerMode: true });
+ *   await dealerSdk.confirmDeposit({ ... });
+ *   await dealerSdk.resolveMarket('market-id', 0);
  * 
  * ═══════════════════════════════════════════════════════════════════════════
  */
@@ -32,9 +70,12 @@ export class CreditPredictionSDK {
     this.l2Url = (config.l2Url || 'http://localhost:1234').replace(/\/$/, '');
     this.l1Url = (config.l1Url || 'http://localhost:8080').replace(/\/$/, '');
     this.address = config.address;
-    this.publicKey = config.publicKey;  // Ed25519 public key for L1 signing
+    this.publicKey = config.publicKey;  // Ed25519 public key for signing
     this.signer = config.signer;
     this.listeners = [];
+    
+    // Dealer mode - enables clearinghouse confirmations and resolution
+    this.isDealerMode = config.isDealerMode || false;
     
     // Supabase for markets
     if (config.supabaseUrl && config.supabaseKey) {
@@ -43,16 +84,58 @@ export class CreditPredictionSDK {
     
     // Active credit session tracking
     this.activeSession = null;
+    
+    // Nonce counter for replay protection
+    this._nonceCounter = Date.now();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // SIGNING
+  // SIGNING & REPLAY PROTECTION
   // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Generate a unique nonce for replay protection
+   */
+  generateNonce() {
+    return `${Date.now()}_${++this._nonceCounter}_${Math.random().toString(36).slice(2, 10)}`;
+  }
 
   async signTransaction(tx) {
     const message = JSON.stringify(tx);
     const signature = await this.signer(message);
     return { tx, signature, signer: this.address };
+  }
+
+  /**
+   * Sign a message with dealer authentication format (for protected endpoints)
+   * Required for: /clearinghouse/deposit, /clearinghouse/withdraw/complete, /resolve
+   * @param {object} payload - The payload to sign
+   * @returns {object} Signed payload with dealer auth fields
+   */
+  async signDealerMessage(payload) {
+    if (!this.publicKey) {
+      throw new Error('publicKey required for dealer operations');
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = this.generateNonce();
+    
+    const message = JSON.stringify({
+      action: payload.action || 'dealer_operation',
+      timestamp,
+      nonce,
+      payload
+    });
+    
+    const signature = await this.signer(message);
+    
+    return {
+      ...payload,
+      dealer_public_key: this.publicKey,
+      dealer_signature: signature,
+      timestamp,
+      nonce
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -190,7 +273,7 @@ export class CreditPredictionSDK {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // BALANCE
+  // BALANCE & USER STATUS
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -199,17 +282,40 @@ export class CreditPredictionSDK {
   async getBalance() {
     const res = await this.l2Get(`/balance/${this.address}`);
     return {
-      available: res.available || res.balance || 0,
-      locked: res.locked || 0,
+      available: res.l2_available || 0,
+      locked: res.l2_locked || 0,
       hasActiveCredit: res.has_active_credit || false
     };
+  }
+
+  /**
+   * Get unified L1/L2 balance view
+   */
+  async getUnifiedBalance() {
+    const res = await this.l2Get(`/unified/balance/${this.address}`);
+    return {
+      l1Available: res.l1_available || 0,
+      l1Locked: res.l1_locked || 0,
+      l2Available: res.l2_available || 0,
+      l2Locked: res.l2_locked || 0,
+      totalAvailable: res.total_available || 0,
+      hasActiveCredit: res.has_active_credit || false
+    };
+  }
+
+  /**
+   * Get comprehensive user status (balance + positions + bets + credit)
+   */
+  async getUserStatus() {
+    const res = await this.l2Get(`/user/status/${this.address}`);
+    return res;
   }
 
   /**
    * Get all positions for connected wallet
    */
   async getPositions() {
-    const res = await this.l2Get(`/positions/${this.address}`);
+    const res = await this.l2Get(`/unified/positions/${this.address}`);
     return res.positions || [];
   }
 
@@ -229,13 +335,152 @@ export class CreditPredictionSDK {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // CLEARINGHOUSE (Dealer-Controlled Deposits & Withdrawals)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Confirm a deposit (DEALER ONLY - requires dealer signature)
+   * Called after L1 lock is verified
+   * @param {object} params - { userAddress, amount, l1TxHash, lockId }
+   */
+  async confirmDeposit(params) {
+    if (!this.isDealerMode) {
+      throw new Error('confirmDeposit requires dealer mode (isDealerMode: true)');
+    }
+
+    const payload = {
+      action: 'deposit_confirm',
+      user_address: params.userAddress,
+      amount: params.amount,
+      l1_tx_hash: params.l1TxHash,
+      lock_id: params.lockId
+    };
+
+    const signedPayload = await this.signDealerMessage(payload);
+    const res = await this.l2Post('/deposit', signedPayload);
+
+    if (res.success) {
+      this.emit({ type: 'deposit_confirmed', userAddress: params.userAddress, amount: params.amount });
+    }
+
+    return {
+      success: res.success !== false,
+      newBalance: res.new_balance,
+      message: res.message || 'Deposit confirmed'
+    };
+  }
+
+  /**
+   * Request a withdrawal (user-initiated)
+   * @param {number} amount - Amount to withdraw
+   */
+  async requestWithdrawal(amount) {
+    const tx = {
+      action: 'withdraw_request',
+      wallet: this.address,
+      amount,
+      timestamp: Date.now()
+    };
+
+    const signed = await this.signTransaction(tx);
+    const res = await this.l2Post('/withdraw', {
+      ...signed,
+      address: this.address,
+      amount
+    });
+
+    if (res.success) {
+      this.emit({ type: 'withdrawal_requested', amount, requestId: res.request_id });
+    }
+
+    return {
+      success: res.success !== false,
+      requestId: res.request_id,
+      status: res.status || 'pending',
+      message: res.message || 'Withdrawal requested'
+    };
+  }
+
+  /**
+   * Complete a withdrawal (DEALER ONLY - requires dealer signature)
+   * @param {object} params - { requestId, userAddress, amount, l1TxHash }
+   */
+  async completeWithdrawal(params) {
+    if (!this.isDealerMode) {
+      throw new Error('completeWithdrawal requires dealer mode (isDealerMode: true)');
+    }
+
+    const payload = {
+      action: 'withdraw_complete',
+      request_id: params.requestId,
+      user_address: params.userAddress,
+      amount: params.amount,
+      l1_tx_hash: params.l1TxHash
+    };
+
+    const signedPayload = await this.signDealerMessage(payload);
+    const res = await this.l2Post('/withdraw/complete', signedPayload);
+
+    if (res.success) {
+      this.emit({ type: 'withdrawal_completed', userAddress: params.userAddress, amount: params.amount });
+    }
+
+    return {
+      success: res.success !== false,
+      message: res.message || 'Withdrawal completed'
+    };
+  }
+
+  /**
+   * Get pending withdrawals (for dealer dashboard)
+   */
+  async getPendingWithdrawals() {
+    const res = await this.l2Get('/withdrawals/pending');
+    return res.pending || [];
+  }
+
+  /**
+   * Get clearinghouse statistics
+   */
+  async getClearinghouseStats() {
+    const res = await this.l2Get('/clearinghouse/stats');
+    return {
+      totalDeposits: res.total_deposits || 0,
+      totalWithdrawals: res.total_withdrawals || 0,
+      pendingWithdrawals: res.pending_withdrawals || 0,
+      netBalance: res.net_balance || 0,
+      userCount: res.user_count || 0
+    };
+  }
+
+  /**
+   * Get user's deposit history
+   */
+  async getMyDeposits() {
+    const res = await this.l2Get(`/clearinghouse/deposits/${this.address}`);
+    return res.deposits || [];
+  }
+
+  /**
+   * Get user's withdrawal history
+   */
+  async getMyWithdrawals() {
+    const res = await this.l2Get(`/clearinghouse/withdrawals/${this.address}`);
+    return res.withdrawals || [];
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // CREDIT LINE
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * Check if user has an active credit session
+   * @deprecated Credit line endpoints not implemented in v3 production
    */
   async getCreditSession() {
+    console.warn('⚠️ DEPRECATED: Credit line endpoints (/credit/*) not implemented in v3');
+    throw new Error('Credit line feature not available in v3 production. Use deposits instead.');
+    /*
     try {
       const res = await this.l2Get(`/credit/session/${this.address}`);
       this.activeSession = res.session || null;
@@ -244,13 +489,18 @@ export class CreditPredictionSDK {
       this.activeSession = null;
       return null;
     }
+    */
   }
 
   /**
    * Open a credit line session
    * @param {number} amount - Amount of credit to request
+   * @deprecated Credit line endpoints not implemented in v3 production
    */
   async openCredit(amount) {
+    console.warn('⚠️ DEPRECATED: Credit line endpoints (/credit/*) not implemented in v3');
+    throw new Error('Credit line feature not available in v3 production. Use confirmDeposit() for dealer deposits.');
+    /*
     const tx = {
       action: 'credit_open',
       wallet: this.address,
@@ -279,12 +529,17 @@ export class CreditPredictionSDK {
       virtualBalance: res.virtual_balance || amount,
       message: res.message || 'Credit opened'
     };
+    */
   }
 
   /**
    * Settle and close the credit session
+   * @deprecated Credit line endpoints not implemented in v3 production
    */
   async settleCredit() {
+    console.warn('⚠️ DEPRECATED: Credit line endpoints (/credit/*) not implemented in v3');
+    throw new Error('Credit line feature not available in v3 production.');
+    /*
     const tx = {
       action: 'credit_settle',
       wallet: this.address,
@@ -307,6 +562,7 @@ export class CreditPredictionSDK {
       pnl,
       message: res.message || 'Credit settled'
     };
+    */
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -609,16 +865,23 @@ export class CreditPredictionSDK {
   }
 
   /**
-   * Approve a draft market (DEALER ONLY - adds liquidity)
+   * Approve a draft market (DEALER ONLY - requires dealer signature)
    * @param {string} marketId - Market ID to approve
    * @param {number} initialLiquidity - Amount of $BB to add as liquidity
    */
   async approveMarket(marketId, initialLiquidity) {
-    const res = await this.l2Post('/market/approve', {
+    if (!this.isDealerMode) {
+      throw new Error('approveMarket requires dealer mode (isDealerMode: true)');
+    }
+
+    const payload = {
+      action: 'market_approve',
       market_id: marketId,
-      initial_liquidity: initialLiquidity,
-      caller: this.address,  // Must be dealer/oracle address
-    });
+      initial_liquidity: initialLiquidity
+    };
+
+    const signedPayload = await this.signDealerMessage(payload);
+    const res = await this.l2Post('/market/approve', signedPayload);
 
     if (res.success) {
       this.emit({ type: 'market_approved', marketId, liquidity: initialLiquidity });
@@ -634,16 +897,23 @@ export class CreditPredictionSDK {
   }
 
   /**
-   * Reject a draft market (DEALER ONLY)
+   * Reject a draft market (DEALER ONLY - requires dealer signature)
    * @param {string} marketId - Market ID to reject
    * @param {string} reason - Reason for rejection
    */
   async rejectMarket(marketId, reason) {
-    const res = await this.l2Post('/market/reject', {
+    if (!this.isDealerMode) {
+      throw new Error('rejectMarket requires dealer mode (isDealerMode: true)');
+    }
+
+    const payload = {
+      action: 'market_reject',
       market_id: marketId,
-      reason: reason,
-      caller: this.address,  // Must be dealer/oracle address
-    });
+      reason: reason
+    };
+
+    const signedPayload = await this.signDealerMessage(payload);
+    const res = await this.l2Post('/market/reject', signedPayload);
 
     if (res.success) {
       this.emit({ type: 'market_rejected', marketId, reason });
@@ -659,16 +929,24 @@ export class CreditPredictionSDK {
   }
 
   /**
-   * Resolve a market (ORACLE ONLY)
+   * Resolve a market (DEALER/ORACLE ONLY - requires dealer signature)
+   * Automatically calculates and distributes payouts to winners
    * @param {string} marketId - Market ID to resolve
    * @param {number} winningOutcome - Index of winning outcome (0, 1, etc.)
    */
   async resolveMarket(marketId, winningOutcome) {
-    const res = await this.l2Post('/resolve', {
+    if (!this.isDealerMode) {
+      throw new Error('resolveMarket requires dealer mode (isDealerMode: true)');
+    }
+
+    const payload = {
+      action: 'resolve',
       market_id: marketId,
-      winning_outcome: winningOutcome,
-      caller: this.address,  // Must be oracle address
-    });
+      winning_outcome: winningOutcome
+    };
+
+    const signedPayload = await this.signDealerMessage(payload);
+    const res = await this.l2Post('/resolve', signedPayload);
 
     if (res.success) {
       this.emit({ type: 'market_resolved', marketId, winningOutcome, payouts: res.payouts });
@@ -853,7 +1131,7 @@ export class CreditPredictionSDK {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // HEALTH
+  // HEALTH & STATE
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -862,10 +1140,44 @@ export class CreditPredictionSDK {
   async health() {
     try {
       const res = await this.l2Get('/health');
-      return { healthy: true, blockHeight: res.block_height };
+      return { 
+        healthy: true, 
+        blockHeight: res.block_height,
+        stateRoot: res.state_root,
+        marketCount: res.market_count,
+        userCount: res.user_count
+      };
     } catch {
       return { healthy: false };
     }
+  }
+
+  /**
+   * Get current state root (for L1 verification)
+   */
+  async getStateRoot() {
+    const res = await this.l2Get('/state_root');
+    return {
+      stateRoot: res.state_root,
+      blockHeight: res.block_height || res.tx_count,
+      timestamp: res.timestamp
+    };
+  }
+
+  /**
+   * Get reserve proof for a user's balance
+   * @param {string} address - User address to prove
+   */
+  async getReserveProof(address) {
+    const res = await this.l2Post('/clearinghouse/reserves', {
+      address: address || this.address
+    });
+    return {
+      balance: res.balance,
+      proof: res.proof,
+      stateRoot: res.state_root,
+      verified: res.verified
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -915,8 +1227,34 @@ export class CreditPredictionSDK {
 // FACTORY & DEFAULT EXPORT
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Create a user SDK instance
+ */
 export function createCreditPredictionSDK(config) {
   return new CreditPredictionSDK(config);
 }
+
+/**
+ * Create a dealer SDK instance (for clearinghouse operations)
+ * Requires dealer private key for signing
+ * 
+ * @param {object} config - SDK configuration
+ * @param {string} config.l2Url - L2 server URL
+ * @param {string} config.publicKey - Dealer Ed25519 public key (hex)
+ * @param {function} config.signer - Signing function
+ */
+export function createDealerSDK(config) {
+  return new CreditPredictionSDK({
+    ...config,
+    isDealerMode: true,
+    address: config.address || `L2_DEALER` // Dealer doesn't need user address
+  });
+}
+
+/**
+ * Dealer address constant (from .env)
+ */
+export const DEALER_ADDRESS = 'L2_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D';
+export const ORACLE_ADDRESS = DEALER_ADDRESS; // Same entity
 
 export default CreditPredictionSDK;

@@ -61,22 +61,25 @@ mod protocol;
 #[path = "../runtime/mod.rs"]
 mod runtime;
 
+mod poh_blockchain;
+
 // ============================================================================
 // IMPORTS
 // ============================================================================
 
 use social_mining::SocialMiningSystem;
-use storage::{ConcurrentBlockchain, AssetManager};
+use storage::{ConcurrentBlockchain, AssetManager, TransactionRecord};
+use integration::unified_auth::SignedRequest;
 use runtime::{
     PoHConfig, SharedPoHService, create_poh_service, run_poh_clock,
-    TransactionPipeline, LeaderSchedule, GulfStreamService,
-    ParallelScheduler, AccountLockManager, PipelinePacket,
-    verify_poh_chain, CONFIRMATIONS_REQUIRED, ConfirmationStatus,
+    TransactionPipeline, LeaderSchedule, GulfStreamService, PoHEntry,
+    ParallelScheduler,
+    CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
-use protocol::{
-    Block, Transaction as ProtocolTransaction, TxType,
-    Account, AccountType, LockRecord, LockPurpose,
-    SettlementProof, LAMPORTS_PER_BB,
+use protocol::Transaction as ProtocolTransaction;
+use poh_blockchain::{
+    BlockProducer, FinalizedBlock, MerkleTree, FinalityTracker,
+    verify_block, verify_chain,
 };
 
 // ============================================================================
@@ -124,6 +127,12 @@ pub struct AppState {
     
     /// Gulf Stream - transaction forwarding to upcoming leaders
     pub gulf_stream: Arc<GulfStreamService>,
+    
+    /// PoH-integrated block producer
+    pub block_producer: Arc<BlockProducer>,
+    
+    /// Transaction finality tracker
+    pub finality_tracker: Arc<FinalityTracker>,
 }
 
 // ============================================================================
@@ -883,12 +892,13 @@ struct OpenCreditRequest {
     session_id: Option<String>,
 }
 
-/// POST /credit/open - Reserve funds for L2 gaming session
+/// POST /credit/open - Reserve BB tokens for prediction market session
 /// 
-/// This implements 1:1 token locking:
+/// This implements token locking for prediction markets:
 /// 1. Debit the amount from user's L1 balance (actual lock)
-/// 2. Create a CreditSession tracking the locked funds
-/// 3. L2 can now credit the user with equivalent L2 tokens
+/// 2. Create a MarketSession tracking the locked BB tokens
+/// 3. User can now trade on prediction markets with locked balance
+/// Note: All operations use L1 BB tokens directly - no separate L2 token
 async fn credit_open_handler(
     State(state): State<AppState>,
     Json(req): Json<OpenCreditRequest>,
@@ -905,7 +915,7 @@ async fn credit_open_handler(
     }
     
     // CRITICAL: Actually lock the tokens by debiting from available balance
-    // This ensures 1:1 backing - user cannot spend these tokens on L1 while playing on L2
+    // This ensures tokens can't be double-spent while trading on prediction markets
     if let Err(e) = state.blockchain.debit(&req.wallet, req.amount) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "success": false,
@@ -913,29 +923,29 @@ async fn credit_open_handler(
         })));
     }
     
-    // Create credit session via AssetManager
+    // Create market session via AssetManager
     let session_id = req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     
-    match state.assets.open_credit_session(&req.wallet, req.amount, &session_id) {
+    match state.assets.open_market_session(&req.wallet, req.amount, &session_id) {
         Ok(session) => {
             info!(
-                "🔒 Tokens locked for L2: {} BB from {} (session: {})",
+                "🔒 BB tokens locked for prediction market: {} BB from {} (session: {})",
                 req.amount, req.wallet, session.id
             );
             
             // Log the lock transaction
             let tx_record = storage::TransactionRecord {
                 tx_id: format!("lock_{}", session.id),
-                tx_type: "bridge_out".to_string(),
+                tx_type: "market_lock".to_string(),
                 from_address: req.wallet.clone(),
-                to_address: "L2_ESCROW".to_string(),
+                to_address: "MARKET_ESCROW".to_string(),
                 amount: req.amount,
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 status: "completed".to_string(),
                 signature: None,
                 metadata: Some(serde_json::json!({
                     "session_id": session.id,
-                    "type": "credit_session_open"
+                    "type": "market_session_open"
                 })),
             };
             let _ = state.blockchain.log_transaction(tx_record);
@@ -947,7 +957,7 @@ async fn credit_open_handler(
                 "session_id": session.id,
                 "wallet": req.wallet,
                 "locked_amount": req.amount,
-                "available_credit": session.available_credit,
+                "available_balance": session.available_balance,
                 "l1_balance_after_lock": new_balance,
                 "expires_at": session.expires_at
             })))
@@ -969,18 +979,18 @@ struct SettleCreditRequest {
     net_pnl: f64, // Positive = player won, Negative = player lost
 }
 
-/// POST /credit/settle - Settle session and apply P&L to L1
+/// POST /credit/settle - Settle prediction market session and apply P&L
 /// 
-/// This implements 1:1 settlement:
+/// This implements settlement of BB tokens:
 /// 1. Get the locked amount from the session
 /// 2. Calculate final balance: locked_amount + net_pnl
-/// 3. Credit the final amount back to user's L1 balance
+/// 3. Credit the final BB amount back to user's L1 balance
 /// 4. Close the session
 async fn credit_settle_handler(
     State(state): State<AppState>,
     Json(req): Json<SettleCreditRequest>,
 ) -> impl IntoResponse {
-    match state.assets.settle_credit_session(&req.session_id, req.net_pnl) {
+    match state.assets.settle_market_session(&req.session_id, req.net_pnl) {
         Ok(result) => {
             // Credit back the full final amount (locked + P&L)
             // The tokens were debited when session opened, now credit back what they deserve
@@ -1005,8 +1015,8 @@ async fn credit_settle_handler(
                     // Log the settlement transaction
                     let tx_record = storage::TransactionRecord {
                         tx_id: format!("settle_{}", req.session_id),
-                        tx_type: "bridge_in".to_string(),
-                        from_address: "L2_ESCROW".to_string(),
+                        tx_type: "market_settle".to_string(),
+                        from_address: "MARKET_ESCROW".to_string(),
                         to_address: wallet.clone(),
                         amount: final_amount,
                         timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1016,7 +1026,7 @@ async fn credit_settle_handler(
                             "session_id": req.session_id,
                             "locked_amount": result.locked_amount,
                             "net_pnl": req.net_pnl,
-                            "type": "credit_session_settle"
+                            "type": "market_session_settle"
                         })),
                     };
                     let _ = state.blockchain.log_transaction(tx_record);
@@ -1063,8 +1073,8 @@ async fn credit_status_handler(
         "session": session.map(|s| serde_json::json!({
             "id": s.id,
             "locked_amount": s.locked_amount,
-            "available_credit": s.available_credit,
-            "used_credit": s.used_credit,
+            "available_balance": s.available_balance,
+            "used_amount": s.used_amount,
             "expires_at": s.expires_at
         }))
     }))
@@ -1074,33 +1084,62 @@ async fn credit_status_handler(
 // ADMIN HANDLERS (Feature-gated in production)
 // ============================================================================
 
-#[derive(serde::Deserialize)]
-struct BridgeInitiateRequest {
-    wallet: String,
-    amount: f64,
-    target_layer: Option<String>,
-}
-
-/// POST /bridge/initiate - Lock tokens for L1→L2 bridge transfer
+/// POST /bridge/initiate - Lock tokens for L1→L2 bridge transfer (with signature validation)
 async fn bridge_initiate_handler(
     State(state): State<AppState>,
-    Json(req): Json<BridgeInitiateRequest>,
+    Json(signed_req): Json<SignedRequest>,
 ) -> impl IntoResponse {
-    let target = req.target_layer.unwrap_or_else(|| "L2".to_string());
+    // 🔐 VALIDATE SIGNATURE FIRST
+    let wallet = match signed_req.verify() {
+        Ok(w) => w,
+        Err(e) => {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Signature validation failed: {}", e)
+            })));
+        }
+    };
+
+    // Parse payload to get amount and target_layer
+    let payload_str = signed_req.payload.unwrap_or_else(|| "{}".to_string());
+    let payload: serde_json::Value = match serde_json::from_str(&payload_str) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Invalid payload JSON: {}", e)
+            })));
+        }
+    };
+
+    let amount = match payload.get("amount").and_then(|v| v.as_f64()) {
+        Some(a) if a > 0.0 => a,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid or missing amount in payload"
+            })));
+        }
+    };
+
+    let target = payload.get("target_layer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("L2")
+        .to_string();
     
     // Check L1 balance
-    let balance = state.blockchain.get_balance(&req.wallet);
-    if balance < req.amount {
+    let balance = state.blockchain.get_balance(&wallet);
+    if balance < amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
             "error": "Insufficient balance",
             "available": balance,
-            "requested": req.amount
+            "requested": amount
         })));
     }
     
     // Lock tokens (debit from spendable balance)
-    if let Err(e) = state.blockchain.debit(&req.wallet, req.amount) {
+    if let Err(e) = state.blockchain.debit(&wallet, amount) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "success": false,
             "error": format!("Failed to lock tokens: {}", e)
@@ -1108,15 +1147,39 @@ async fn bridge_initiate_handler(
     }
     
     // Create bridge lock record
-    match state.assets.initiate_bridge(&req.wallet, req.amount, &target) {
+    match state.assets.initiate_bridge(&wallet, amount, &target) {
         Ok(lock) => {
             info!("🌉 Bridge initiated: {} - {} BB from {} to {}", 
-                lock.lock_id, req.amount, req.wallet, target);
+                lock.lock_id, amount, wallet, target);
+            
+            // 🔥 LOG BRIDGE TRANSACTION TO LEDGER
+            let tx_record = TransactionRecord {
+                tx_id: lock.lock_id.clone(),
+                tx_type: "bridge_out".to_string(),
+                from_address: wallet.clone(),
+                to_address: format!("{}_ESCROW", target),
+                amount: amount,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                status: "locked".to_string(),
+                signature: Some(signed_req.signature.clone()),
+                metadata: Some(serde_json::json!({
+                    "lock_id": lock.lock_id,
+                    "target_layer": target,
+                    "expires_at": lock.expires_at,
+                    "public_key": signed_req.public_key,
+                    "nonce": signed_req.nonce
+                }))
+            };
+            
+            if let Err(e) = state.blockchain.log_transaction(tx_record) {
+                warn!("Failed to log bridge transaction: {}", e);
+            }
+            
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "lock_id": lock.lock_id,
-                "wallet": req.wallet,
-                "amount": req.amount,
+                "wallet": wallet,
+                "amount": amount,
                 "target_layer": target,
                 "status": "pending",
                 "expires_at": lock.expires_at,
@@ -1125,7 +1188,7 @@ async fn bridge_initiate_handler(
         }
         Err(e) => {
             // Refund if bridge creation failed
-            let _ = state.blockchain.credit(&req.wallet, req.amount);
+            let _ = state.blockchain.credit(&wallet, amount);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "success": false,
                 "error": e
@@ -1416,6 +1479,340 @@ async fn admin_burn_handler(
 }
 
 // ============================================================================
+// POH BLOCKCHAIN HANDLERS - Production-Ready Block Operations
+// ============================================================================
+
+/// GET /poh/block/latest - Get the latest produced block
+async fn poh_latest_block_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.block_producer.get_latest_block() {
+        Some(block) => Json(serde_json::json!({
+            "success": true,
+            "block": {
+                "slot": block.slot,
+                "timestamp": block.timestamp,
+                "hash": block.hash,
+                "previous_hash": block.previous_hash,
+                "state_root": block.state_root,
+                "poh_hash": block.poh_hash,
+                "poh_sequence": block.poh_sequence,
+                "tx_count": block.tx_count,
+                "leader": block.leader,
+                "epoch": block.epoch,
+                "confirmations": block.confirmations,
+                "finality_status": format!("{:?}", block.confirmation_status())
+            }
+        })),
+        None => Json(serde_json::json!({
+            "success": false,
+            "error": "No blocks produced yet"
+        }))
+    }
+}
+
+/// GET /poh/block/:slot - Get block by slot number
+async fn poh_block_by_slot_handler(
+    State(state): State<AppState>,
+    Path(slot): Path<u64>,
+) -> impl IntoResponse {
+    match state.block_producer.get_block(slot) {
+        Some(block) => Json(serde_json::json!({
+            "success": true,
+            "block": {
+                "slot": block.slot,
+                "timestamp": block.timestamp,
+                "hash": block.hash,
+                "previous_hash": block.previous_hash,
+                "state_root": block.state_root,
+                "poh_hash": block.poh_hash,
+                "poh_sequence": block.poh_sequence,
+                "tx_count": block.tx_count,
+                "leader": block.leader,
+                "epoch": block.epoch,
+                "confirmations": block.confirmations,
+                "transactions": block.transactions.iter().map(|tx| {
+                    serde_json::json!({
+                        "id": tx.tx.id,
+                        "from": tx.tx.from,
+                        "to": tx.tx.to,
+                        "amount": tx.tx.amount,
+                        "poh_hash": tx.poh_hash,
+                        "poh_sequence": tx.poh_sequence,
+                        "position": tx.position
+                    })
+                }).collect::<Vec<_>>()
+            }
+        })),
+        None => Json(serde_json::json!({
+            "success": false,
+            "error": format!("Block at slot {} not found", slot)
+        }))
+    }
+}
+
+/// GET /poh/block/verify/:slot - Verify block integrity
+async fn poh_verify_block_handler(
+    State(state): State<AppState>,
+    Path(slot): Path<u64>,
+) -> impl IntoResponse {
+    let block = match state.block_producer.get_block(slot) {
+        Some(b) => b,
+        None => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Block at slot {} not found", slot)
+        }))
+    };
+    
+    // Get previous block for hash verification
+    let previous_hash = if slot > 0 {
+        state.block_producer.get_block(slot - 1)
+            .map(|b| b.hash)
+            .unwrap_or_else(|| "0".repeat(64))
+    } else {
+        "0".repeat(64)
+    };
+    
+    let is_valid = verify_block(&block, &previous_hash);
+    
+    Json(serde_json::json!({
+        "success": true,
+        "slot": slot,
+        "is_valid": is_valid,
+        "checks": {
+            "hash_chain": block.previous_hash == previous_hash,
+            "hash_computed": FinalizedBlock::compute_hash(
+                block.slot,
+                &block.previous_hash,
+                &block.state_root,
+                &block.poh_hash,
+                block.timestamp,
+            ) == block.hash,
+            "tx_count_match": block.transactions.len() == block.tx_count as usize
+        }
+    }))
+}
+
+/// GET /poh/chain/verify - Verify entire chain integrity
+async fn poh_verify_chain_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let block_count = state.block_producer.block_count();
+    
+    // Collect all blocks for verification
+    let mut blocks = Vec::new();
+    for slot in 0..block_count as u64 {
+        if let Some(block) = state.block_producer.get_block(slot) {
+            blocks.push(block);
+        }
+    }
+    
+    let is_valid = verify_chain(&blocks);
+    
+    Json(serde_json::json!({
+        "success": true,
+        "chain_valid": is_valid,
+        "block_count": block_count,
+        "latest_slot": blocks.last().map(|b| b.slot).unwrap_or(0),
+        "latest_hash": blocks.last().map(|b| b.hash.clone()).unwrap_or_default()
+    }))
+}
+
+/// GET /poh/chain/stats - Get chain statistics
+async fn poh_chain_stats_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let block_count = state.block_producer.block_count();
+    let pending_txs = state.block_producer.pending_tx_count();
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    
+    let poh_stats = {
+        let poh = state.poh.read();
+        serde_json::json!({
+            "num_hashes": poh.num_hashes,
+            "current_hash": poh.current_hash.chars().take(16).collect::<String>(),
+            "current_slot": poh.current_slot,
+            "current_epoch": poh.current_epoch,
+            "entries_in_slot": poh.current_entries.len()
+        })
+    };
+    
+    Json(serde_json::json!({
+        "success": true,
+        "blocks": {
+            "produced": block_count,
+            "pending_txs": pending_txs
+        },
+        "consensus": {
+            "current_slot": current_slot,
+            "confirmations_required": CONFIRMATIONS_REQUIRED
+        },
+        "poh": poh_stats
+    }))
+}
+
+/// GET /poh/tx/:tx_id/status - Get transaction finality status
+async fn poh_tx_status_handler(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> impl IntoResponse {
+    let status = state.finality_tracker.get_status(&tx_id);
+    let is_finalized = state.finality_tracker.is_finalized(&tx_id);
+    
+    Json(serde_json::json!({
+        "success": true,
+        "tx_id": tx_id,
+        "status": format!("{:?}", status),
+        "is_finalized": is_finalized,
+        "confirmations_required": CONFIRMATIONS_REQUIRED
+    }))
+}
+
+/// GET /poh/proof/:address - Generate merkle state proof for address
+async fn poh_state_proof_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    let balance = state.blockchain.get_balance(&address);
+    
+    match state.block_producer.generate_account_proof(&address) {
+        Some(proof) => Json(serde_json::json!({
+            "success": true,
+            "address": address,
+            "balance": balance,
+            "proof": {
+                "leaf_index": proof.leaf_index,
+                "root": proof.root,
+                "path_length": proof.proof.len(),
+                "proof_nodes": proof.proof.iter().map(|n| {
+                    serde_json::json!({
+                        "hash": n.hash,
+                        "is_left": n.is_left
+                    })
+                }).collect::<Vec<_>>()
+            },
+            "verification": "proof.verify(address, balance) should return true"
+        })),
+        None => {
+            // Generate a standalone merkle proof from current state
+            let mut accounts = std::collections::BTreeMap::new();
+            accounts.insert(address.clone(), balance);
+            let tree = MerkleTree::from_accounts(&accounts);
+            
+            Json(serde_json::json!({
+                "success": true,
+                "address": address,
+                "balance": balance,
+                "state_root": tree.root_hex(),
+                "note": "Single-account proof generated"
+            }))
+        }
+    }
+}
+
+/// POST /poh/produce - Produce a new block (admin/validator endpoint)
+async fn poh_produce_block_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Check if we are the leader
+    if !state.block_producer.is_current_leader() {
+        let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+        let leader = {
+            let schedule = state.leader_schedule.read();
+            schedule.get_leader(current_slot)
+        };
+        
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Not the current leader",
+            "current_slot": current_slot,
+            "expected_leader": leader
+        }));
+    }
+    
+    match state.block_producer.produce_block() {
+        Ok(block) => {
+            // Update finality tracker for all transactions in block
+            for tx in &block.transactions {
+                state.finality_tracker.record_inclusion(&tx.tx.id, block.slot);
+            }
+            state.finality_tracker.update_confirmations(block.slot);
+            
+            Json(serde_json::json!({
+                "success": true,
+                "block": {
+                    "slot": block.slot,
+                    "hash": block.hash,
+                    "state_root": block.state_root,
+                    "poh_hash": block.poh_hash,
+                    "tx_count": block.tx_count,
+                    "timestamp": block.timestamp
+                }
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))
+    }
+}
+
+/// GET /poh/leader/current - Get current leader info
+async fn poh_current_leader_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let schedule = state.leader_schedule.read();
+    
+    let leader = schedule.get_leader(current_slot);
+    let next_leader = schedule.get_leader(current_slot + 1);
+    
+    let is_our_slot = state.block_producer.is_current_leader();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "current_slot": current_slot,
+        "current_leader": leader,
+        "next_leader": next_leader,
+        "is_our_slot": is_our_slot,
+        "epoch": schedule.epoch
+    }))
+}
+
+/// GET /poh/leader/schedule - Get leader schedule
+async fn poh_leader_schedule_handler(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let count = params.get("count")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+    
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let schedule = state.leader_schedule.read();
+    
+    let upcoming: Vec<_> = (0..count)
+        .map(|i| {
+            let slot = current_slot + i;
+            serde_json::json!({
+                "slot": slot,
+                "leader": schedule.get_leader(slot)
+            })
+        })
+        .collect();
+    
+    // Get validator addresses
+    let validators: Vec<_> = schedule.validator_stakes.keys().cloned().collect();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "current_slot": current_slot,
+        "upcoming_leaders": upcoming,
+        "validators": validators
+    }))
+}
+
+// ============================================================================
 // ROUTER BUILDERS
 // ============================================================================
 
@@ -1468,6 +1865,31 @@ fn build_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/mint", post(admin_mint_handler))
         .route("/burn", post(admin_burn_handler))
+}
+
+fn build_poh_blockchain_routes() -> Router<AppState> {
+    Router::new()
+        // Block queries
+        .route("/block/latest", get(poh_latest_block_handler))
+        .route("/block/:slot", get(poh_block_by_slot_handler))
+        .route("/block/verify/:slot", get(poh_verify_block_handler))
+        
+        // Chain verification
+        .route("/chain/verify", get(poh_verify_chain_handler))
+        .route("/chain/stats", get(poh_chain_stats_handler))
+        
+        // Transaction finality
+        .route("/tx/:tx_id/status", get(poh_tx_status_handler))
+        
+        // State proofs
+        .route("/proof/:address", get(poh_state_proof_handler))
+        
+        // Block production (admin/validator)
+        .route("/produce", post(poh_produce_block_handler))
+        
+        // Leader schedule
+        .route("/leader/current", get(poh_current_leader_handler))
+        .route("/leader/schedule", get(poh_leader_schedule_handler))
 }
 
 // ============================================================================
@@ -1644,6 +2066,21 @@ async fn main() {
     let social_system = Arc::new(TokioMutex::new(load_social_system()));
 
     // ========================================================================
+    // 5D. INITIALIZE POH-INTEGRATED BLOCK PRODUCER
+    // ========================================================================
+    let block_producer = Arc::new(BlockProducer::new(
+        blockchain.clone(),
+        poh_service.clone(),
+        leader_schedule.clone(),
+        current_slot.clone(),
+        "genesis_validator".to_string(),
+    ));
+    info!("🏭 BlockProducer initialized (PoH-integrated block production)");
+
+    let finality_tracker = Arc::new(FinalityTracker::new(current_slot.clone()));
+    info!("✅ FinalityTracker initialized (confirmation tracking)");
+
+    // ========================================================================
     // 6. BUILD APPLICATION STATE
     // ========================================================================
     let state = AppState {
@@ -1656,6 +2093,8 @@ async fn main() {
         pipeline,
         parallel_scheduler,
         gulf_stream,
+        block_producer,
+        finality_tracker,
     };
 
     // ========================================================================
@@ -1675,6 +2114,7 @@ async fn main() {
         .nest("/bridge", build_bridge_routes())
         .nest("/admin", build_admin_routes())
         .nest("/sealevel", build_sealevel_routes())
+        .nest("/poh", build_poh_blockchain_routes())
         // Middleware
         .layer(TraceLayer::new_for_http())
         .layer(cors)

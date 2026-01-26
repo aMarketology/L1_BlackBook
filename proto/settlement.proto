@@ -2,7 +2,7 @@
 // BlackBook L1 ↔ L2 Settlement Protocol
 // ============================================================================
 //
-// Simple, focused protocol for Layer 1 (Bank) and Layer 2 (Casino) communication
+// Complete protocol for Layer 1 (Bank) and Layer 2 (Casino) communication
 //
 // KEY CONCEPT: Unified Virtual Balance
 // - L2 balance automatically mirrors L1 available balance
@@ -57,6 +57,145 @@ service L1Settlement {
   // === Signature Verification ===
   // Verify an Ed25519 signature (L2 validates user signatures against L1)
   rpc VerifySignature(VerifySignatureRequest) returns (VerifySignatureResponse);
+  
+  // === Health ===
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ============================================================================
+// L2 TRADING SERVICE - Layer 2 Prediction Market Operations
+// ============================================================================
+
+service L2Trading {
+  // === Market Operations ===
+  // List all markets with optional filters
+  rpc ListMarkets(ListMarketsRequest) returns (ListMarketsResponse);
+  
+  // Get detailed information about a specific market
+  rpc GetMarket(GetMarketRequest) returns (GetMarketResponse);
+  
+  // Create a new prediction market
+  rpc CreateMarket(CreateMarketRequest) returns (CreateMarketResponse);
+  
+  // Get current CPMM prices for a market
+  rpc GetMarketPrices(GetMarketPricesRequest) returns (GetMarketPricesResponse);
+  
+  // === Trading Operations ===
+  // Get a quote for a potential bet (preview without executing)
+  rpc GetQuote(GetQuoteRequest) returns (GetQuoteResponse);
+  
+  // Place a bet on a market outcome
+  rpc PlaceBet(PlaceBetRequest) returns (PlaceBetResponse);
+  
+  // Sell shares back to the pool
+  rpc SellShares(SellSharesRequest) returns (SellSharesResponse);
+  
+  // Redeem winning shares after market resolution
+  rpc RedeemShares(RedeemSharesRequest) returns (RedeemSharesResponse);
+  
+  // === Position & Balance ===
+  // Get user's L2 balance
+  rpc GetL2Balance(L2BalanceRequest) returns (L2BalanceResponse);
+  
+  // Get user's position in a specific market
+  rpc GetPosition(GetPositionRequest) returns (GetPositionResponse);
+  
+  // Get all user positions across markets
+  rpc GetAllPositions(GetAllPositionsRequest) returns (GetAllPositionsResponse);
+  
+  // Get user's transaction history
+  rpc GetTransactionHistory(TransactionHistoryRequest) returns (TransactionHistoryResponse);
+  
+  // Get user's betting history
+  rpc GetBetHistory(BetHistoryRequest) returns (BetHistoryResponse);
+  
+  // === Liquidity Provision ===
+  // Add liquidity to a market (become LP)
+  rpc AddLiquidity(AddLiquidityRequest) returns (AddLiquidityResponse);
+  
+  // Remove liquidity from a market
+  rpc RemoveLiquidity(RemoveLiquidityRequest) returns (RemoveLiquidityResponse);
+  
+  // Get LP information for a market
+  rpc GetLPInfo(GetLPInfoRequest) returns (GetLPInfoResponse);
+  
+  // Distribute collected fees to LPs
+  rpc DistributeLPFees(DistributeLPFeesRequest) returns (DistributeLPFeesResponse);
+  
+  // === Oracle & Resolution ===
+  // Resolve a market (oracle only)
+  rpc ResolveMarket(ResolveMarketRequest) returns (ResolveMarketResponse);
+  
+  // Propose a resolution (starts dispute window)
+  rpc ProposeResolution(ProposeResolutionRequest) returns (ProposeResolutionResponse);
+  
+  // Dispute a pending resolution
+  rpc DisputeResolution(DisputeResolutionRequest) returns (DisputeResolutionResponse);
+  
+  // Sign a resolution as oracle (multi-sig)
+  rpc SignResolution(SignResolutionRequest) returns (SignResolutionResponse);
+  
+  // Vote on a dispute (panel only)
+  rpc VoteOnDispute(VoteOnDisputeRequest) returns (VoteOnDisputeResponse);
+  
+  // === Draft Markets (User-Proposed) ===
+  // Create a draft market proposal
+  rpc CreateDraftMarket(CreateDraftMarketRequest) returns (CreateDraftMarketResponse);
+  
+  // Fund a draft market (auto-activates when threshold met)
+  rpc FundDraftMarket(FundDraftMarketRequest) returns (FundDraftMarketResponse);
+  
+  // Get user's draft markets
+  rpc GetMyDrafts(GetMyDraftsRequest) returns (GetMyDraftsResponse);
+  
+  // List drafts needing funding
+  rpc ListDraftsNeedingFunding(ListDraftsNeedingFundingRequest) returns (ListDraftsNeedingFundingResponse);
+  
+  // Edit a draft market
+  rpc EditDraftMarket(EditDraftMarketRequest) returns (EditDraftMarketResponse);
+  
+  // Delete a draft market
+  rpc DeleteDraftMarket(DeleteDraftMarketRequest) returns (DeleteDraftMarketResponse);
+  
+  // === Insurance ===
+  // File an insurance claim for voided market
+  rpc FileInsuranceClaim(FileInsuranceClaimRequest) returns (FileInsuranceClaimResponse);
+  
+  // Get insurance fund information
+  rpc GetInsuranceFundInfo(GetInsuranceFundInfoRequest) returns (GetInsuranceFundInfoResponse);
+  
+  // Top up insurance fund (dealer only)
+  rpc TopUpInsuranceFund(TopUpInsuranceFundRequest) returns (TopUpInsuranceFundResponse);
+  
+  // === Oracle Registry ===
+  // Get oracle statistics
+  rpc GetOracleStats(GetOracleStatsRequest) returns (GetOracleStatsResponse);
+  
+  // List all oracles
+  rpc ListOracles(ListOraclesRequest) returns (ListOraclesResponse);
+  
+  // Add oracle to whitelist (admin only)
+  rpc AddOracle(AddOracleRequest) returns (AddOracleResponse);
+  
+  // Remove oracle from whitelist (admin only)
+  rpc RemoveOracle(RemoveOracleRequest) returns (RemoveOracleResponse);
+  
+  // === Clearinghouse (Bridge Operations) ===
+  // Deposit funds to L2 (dealer signed)
+  rpc DepositToL2(DepositToL2Request) returns (DepositToL2Response);
+  
+  // Request withdrawal from L2 to L1
+  rpc RequestWithdrawal(RequestWithdrawalRequest) returns (RequestWithdrawalResponse);
+  
+  // Complete withdrawal (dealer signed)
+  rpc CompleteWithdrawal(CompleteWithdrawalRequest) returns (CompleteWithdrawalResponse);
+  
+  // === Authentication ===
+  // Authenticate and get session token
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  
+  // Verify session token
+  rpc VerifySession(VerifySessionRequest) returns (VerifySessionResponse);
   
   // === Health ===
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -344,4 +483,831 @@ message HealthResponse {
   uint64 uptime_seconds = 4;
   uint32 active_locks = 5;
   uint32 active_sessions = 6;
+}
+
+// ============================================================================
+// L2 TRADING MESSAGES
+// ============================================================================
+
+// === Market Messages ===
+
+message ListMarketsRequest {
+  string status = 1;            // "active", "closed", "resolved", "all"
+  string category = 2;          // "sports", "crypto", "politics", etc.
+  string parent_event_id = 3;   // Filter by parent event
+  uint32 limit = 4;
+  uint32 offset = 5;
+}
+
+message ListMarketsResponse {
+  bool success = 1;
+  string error = 2;
+  repeated Market markets = 3;
+}
+
+message GetMarketRequest {
+  string market_id = 1;
+}
+
+message GetMarketResponse {
+  bool success = 1;
+  string error = 2;
+  Market market = 3;
+}
+
+message CreateMarketRequest {
+  string title = 1;
+  string description = 2;
+  repeated string outcomes = 3;
+  string category = 4;
+  repeated string tags = 5;
+  uint64 initial_liquidity = 6;
+  repeated double initial_odds = 7;     // Optional: custom initial odds
+  uint64 betting_closes_at = 8;         // Unix timestamp
+  string parent_event_id = 9;           // For prop bets
+  string source_url = 10;
+  string image_url = 11;
+  
+  // Authentication
+  string creator_address = 20;
+  string public_key = 21;
+  bytes signature = 22;
+  uint64 timestamp = 23;
+  string nonce = 24;
+}
+
+message CreateMarketResponse {
+  bool success = 1;
+  string error = 2;
+  string market_id = 3;
+  Market market = 4;
+}
+
+message GetMarketPricesRequest {
+  string market_id = 1;
+}
+
+message GetMarketPricesResponse {
+  bool success = 1;
+  string error = 2;
+  repeated double prices = 3;           // Current CPMM prices per outcome
+  repeated double reserves = 4;         // Current reserves per outcome
+  double total_liquidity = 5;
+}
+
+message Market {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  repeated string outcomes = 4;
+  string status = 5;                    // "active", "trading_halted", "resolved"
+  string category = 6;
+  repeated string tags = 7;
+  
+  // CPMM State
+  repeated double reserves = 10;
+  double k = 11;                        // Constant product
+  repeated double current_prices = 12;
+  
+  // Trading Stats
+  double total_volume = 20;
+  uint32 bet_count = 21;
+  uint32 unique_bettors = 22;
+  
+  // Resolution
+  bool resolved = 30;
+  uint32 winning_outcome = 31;
+  string resolution_reason = 32;
+  uint64 resolved_at = 33;
+  
+  // Timing
+  uint64 created_at = 40;
+  uint64 betting_closes_at = 41;
+  
+  // Relationships
+  string parent_event_id = 50;
+  string creator = 51;
+  
+  // LP Info
+  double lp_fees_collected = 60;
+  map<string, double> lp_shares = 61;   // LP address -> share percentage
+}
+
+// === Trading Messages ===
+
+message GetQuoteRequest {
+  string market_id = 1;
+  uint32 outcome = 2;
+  uint64 amount = 3;
+}
+
+message GetQuoteResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 cost = 3;                      // Total cost
+  double shares = 4;                    // Estimated shares
+  double average_price = 5;
+  double price_impact = 6;              // Percentage
+  double new_probability = 7;
+  repeated double new_prices = 8;       // All outcome prices after trade
+}
+
+message PlaceBetRequest {
+  string market_id = 1;
+  string user_address = 2;
+  uint32 outcome = 3;
+  uint64 amount = 4;
+  uint64 max_cost = 5;                  // Slippage protection
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+  string nonce = 13;
+}
+
+message PlaceBetResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string bet_id = 3;
+  double shares_purchased = 4;
+  double average_price = 5;
+  uint64 cost_paid = 6;
+  uint64 new_balance = 7;
+  repeated double new_market_prices = 8;
+}
+
+message SellSharesRequest {
+  string market_id = 1;
+  string user_address = 2;
+  uint32 outcome = 3;
+  double shares = 4;
+  uint64 min_receive = 5;               // Slippage protection
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+  string nonce = 13;
+}
+
+message SellSharesResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 amount_received = 3;
+  double shares_sold = 4;
+  double average_price = 5;
+  uint64 new_balance = 6;
+  repeated double new_market_prices = 7;
+}
+
+message RedeemSharesRequest {
+  string bet_id = 1;
+  string user_address = 2;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message RedeemSharesResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 payout = 3;
+  uint64 new_balance = 4;
+  string market_id = 5;
+}
+
+// === Position & Balance Messages ===
+
+message L2BalanceRequest {
+  string address = 1;
+}
+
+message L2BalanceResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 available = 3;
+  uint64 locked = 4;
+  uint64 total = 5;
+  
+  // Virtual balance sync with L1
+  uint64 l1_available = 10;
+  uint64 l1_locked = 11;
+}
+
+message GetPositionRequest {
+  string market_id = 1;
+  string user_address = 2;
+}
+
+message GetPositionResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string market_id = 3;
+  map<uint32, double> shares = 4;      // outcome -> shares owned
+  uint64 total_invested = 5;
+  double current_value = 6;
+  double unrealized_pnl = 7;
+}
+
+message GetAllPositionsRequest {
+  string user_address = 1;
+}
+
+message GetAllPositionsResponse {
+  bool success = 1;
+  string error = 2;
+  
+  repeated Position positions = 3;
+  uint64 total_invested = 4;
+  double total_current_value = 5;
+  double total_unrealized_pnl = 6;
+}
+
+message Position {
+  string market_id = 1;
+  string market_title = 2;
+  bool resolved = 3;
+  map<uint32, double> shares = 4;
+  uint64 invested = 5;
+  double current_value = 6;
+  double pnl = 7;
+}
+
+message TransactionHistoryRequest {
+  string user_address = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+message TransactionHistoryResponse {
+  bool success = 1;
+  string error = 2;
+  repeated Transaction transactions = 3;
+}
+
+message Transaction {
+  string id = 1;
+  string tx_type = 2;                   // DEPOSIT, WITHDRAW, BET, REDEEM, etc.
+  string from_address = 3;
+  string to_address = 4;
+  uint64 amount = 5;
+  string description = 6;
+  uint64 timestamp = 7;
+  string market_id = 8;
+}
+
+message BetHistoryRequest {
+  string user_address = 1;
+  string market_id = 2;                 // Optional filter
+  uint32 limit = 3;
+  uint32 offset = 4;
+}
+
+message BetHistoryResponse {
+  bool success = 1;
+  string error = 2;
+  repeated Bet bets = 3;
+}
+
+message Bet {
+  string id = 1;
+  string market_id = 2;
+  string market_title = 3;
+  string user = 4;
+  uint32 outcome = 5;
+  string outcome_name = 6;
+  uint64 amount = 7;
+  double shares = 8;
+  double average_price = 9;
+  bool resolved = 10;
+  bool won = 11;
+  uint64 payout = 12;
+  uint64 created_at = 13;
+}
+
+// === Liquidity Provision Messages ===
+
+message AddLiquidityRequest {
+  string market_id = 1;
+  string lp_address = 2;
+  uint64 amount = 3;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message AddLiquidityResponse {
+  bool success = 1;
+  string error = 2;
+  
+  double share_percentage = 3;
+  uint64 total_pool_size = 4;
+  uint64 new_balance = 5;
+}
+
+message RemoveLiquidityRequest {
+  string market_id = 1;
+  string lp_address = 2;
+  double share_fraction = 3;           // 0.0 - 1.0
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message RemoveLiquidityResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 amount_withdrawn = 3;
+  uint64 fees_collected = 4;
+  double remaining_share = 5;
+  uint64 new_balance = 6;
+}
+
+message GetLPInfoRequest {
+  string market_id = 1;
+}
+
+message GetLPInfoResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 total_liquidity = 3;
+  uint64 fees_collected = 4;
+  map<string, LPShare> lp_shares = 5;
+}
+
+message LPShare {
+  string address = 1;
+  double share_percentage = 2;
+  uint64 amount_provided = 3;
+  uint64 fees_earned = 4;
+}
+
+message DistributeLPFeesRequest {
+  string market_id = 1;
+  string caller_address = 2;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message DistributeLPFeesResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 total_fees_distributed = 3;
+  map<string, uint64> distributions = 4;  // LP address -> amount
+}
+
+// === Oracle & Resolution Messages ===
+
+message ResolveMarketRequest {
+  string market_id = 1;
+  uint32 winning_outcome = 2;
+  string resolution_reason = 3;
+  string resolver_address = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+  string nonce = 13;
+}
+
+message ResolveMarketResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string market_id = 3;
+  uint32 winning_outcome = 4;
+  uint64 resolved_at = 5;
+  uint32 winners_count = 6;
+  uint64 total_payout = 7;
+}
+
+message ProposeResolutionRequest {
+  string market_id = 1;
+  uint32 outcome = 2;
+  string evidence = 3;
+  string proposer_address = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message ProposeResolutionResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string proposal_id = 3;
+  uint64 dispute_window_ends_at = 4;
+}
+
+message DisputeResolutionRequest {
+  string market_id = 1;
+  string proposal_id = 2;
+  string reason = 3;
+  uint32 proposed_outcome = 4;          // Disputer's proposed outcome
+  string disputer_address = 5;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message DisputeResolutionResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string dispute_id = 3;
+  uint64 stake_amount = 4;              // Amount staked for dispute
+  string status = 5;
+}
+
+message SignResolutionRequest {
+  string market_id = 1;
+  uint32 winning_outcome = 2;
+  string evidence = 3;
+  string oracle_address = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message SignResolutionResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint32 signatures_count = 3;
+  uint32 required_signatures = 4;
+  bool auto_resolved = 5;
+}
+
+message VoteOnDisputeRequest {
+  string dispute_id = 1;
+  string decision = 2;                  // "accept_dispute", "reject_dispute", "void_market"
+  string reasoning = 3;
+  string oracle_address = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message VoteOnDisputeResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint32 votes_count = 3;
+  uint32 required_votes = 4;
+  bool dispute_resolved = 5;
+  string final_decision = 6;
+}
+
+// === Draft Market Messages ===
+
+message CreateDraftMarketRequest {
+  string title = 1;
+  string description = 2;
+  repeated string outcomes = 3;
+  string parent_event_id = 4;
+  uint64 initial_liquidity = 5;
+  string creator_address = 6;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message CreateDraftMarketResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string draft_id = 3;
+  uint64 funding_needed = 4;
+  string status = 5;
+}
+
+message FundDraftMarketRequest {
+  string draft_id = 1;
+  uint64 amount = 2;
+  bool take_opposing_position = 3;
+  string funder_address = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message FundDraftMarketResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 total_funded = 3;
+  uint64 funding_needed = 4;
+  bool activated = 5;
+  string market_id = 6;                 // If activated
+}
+
+message GetMyDraftsRequest {
+  string user_address = 1;
+}
+
+message GetMyDraftsResponse {
+  bool success = 1;
+  string error = 2;
+  repeated DraftMarket drafts = 3;
+}
+
+message ListDraftsNeedingFundingRequest {
+  string event_id = 1;                  // Optional filter
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+message ListDraftsNeedingFundingResponse {
+  bool success = 1;
+  string error = 2;
+  repeated DraftMarket drafts = 3;
+}
+
+message DraftMarket {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  repeated string outcomes = 4;
+  string creator = 5;
+  uint64 funding_needed = 6;
+  uint64 funding_received = 7;
+  string status = 8;
+  uint64 created_at = 9;
+}
+
+message EditDraftMarketRequest {
+  string draft_id = 1;
+  string title = 2;
+  string description = 3;
+  repeated string outcomes = 4;
+  string user_address = 5;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message EditDraftMarketResponse {
+  bool success = 1;
+  string error = 2;
+  DraftMarket draft = 3;
+}
+
+message DeleteDraftMarketRequest {
+  string draft_id = 1;
+  string user_address = 2;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message DeleteDraftMarketResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// === Insurance Messages ===
+
+message FileInsuranceClaimRequest {
+  string market_id = 1;
+  string claimant_address = 2;
+  uint64 amount = 3;
+  string reason = 4;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message FileInsuranceClaimResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string claim_id = 3;
+  string status = 4;
+  uint64 amount = 5;
+}
+
+message GetInsuranceFundInfoRequest {}
+
+message GetInsuranceFundInfoResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 total_fund_balance = 3;
+  uint64 total_claims_paid = 4;
+  uint32 active_claims = 5;
+  uint32 total_claims = 6;
+}
+
+message TopUpInsuranceFundRequest {
+  uint64 amount = 1;
+  string depositor_address = 2;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message TopUpInsuranceFundResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 new_balance = 3;
+}
+
+// === Oracle Registry Messages ===
+
+message GetOracleStatsRequest {
+  string oracle_address = 1;
+}
+
+message GetOracleStatsResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string address = 3;
+  uint32 markets_resolved = 4;
+  uint32 disputes_faced = 5;
+  uint32 disputes_lost = 6;
+  double reputation_score = 7;
+  bool is_active = 8;
+  bool is_admin = 9;
+}
+
+message ListOraclesRequest {
+  bool active_only = 1;
+}
+
+message ListOraclesResponse {
+  bool success = 1;
+  string error = 2;
+  repeated OracleInfo oracles = 3;
+}
+
+message OracleInfo {
+  string address = 1;
+  string name = 2;
+  uint32 markets_resolved = 3;
+  double reputation_score = 4;
+  bool is_active = 5;
+  bool is_admin = 6;
+}
+
+message AddOracleRequest {
+  string oracle_address = 1;
+  bool is_admin = 2;
+  string caller_address = 3;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message AddOracleResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message RemoveOracleRequest {
+  string oracle_address = 1;
+  string caller_address = 2;
+  
+  // Authentication
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message RemoveOracleResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// === Clearinghouse (Bridge) Messages ===
+
+message DepositToL2Request {
+  string l1_tx_hash = 1;
+  string from_l1_address = 2;
+  string to_l2_address = 3;
+  uint64 amount = 4;
+  string dealer_address = 5;
+  
+  // Authentication (dealer signed)
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message DepositToL2Response {
+  bool success = 1;
+  string error = 2;
+  
+  string deposit_id = 3;
+  uint64 new_l2_balance = 4;
+}
+
+message RequestWithdrawalRequest {
+  string from_l2_address = 1;
+  string to_l1_address = 2;
+  uint64 amount = 3;
+  
+  // Authentication (user signed)
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message RequestWithdrawalResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string withdrawal_id = 3;
+  string status = 4;
+  uint64 estimated_completion = 5;
+}
+
+message CompleteWithdrawalRequest {
+  string withdrawal_id = 1;
+  string l1_tx_hash = 2;
+  string dealer_address = 3;
+  
+  // Authentication (dealer signed)
+  string public_key = 10;
+  bytes signature = 11;
+  uint64 timestamp = 12;
+}
+
+message CompleteWithdrawalResponse {
+  bool success = 1;
+  string error = 2;
+  
+  uint64 amount = 3;
+  string l1_tx_hash = 4;
+  uint64 completed_at = 5;
+}
+
+// === Authentication Messages ===
+
+message AuthenticateRequest {
+  string address = 1;
+  string public_key = 2;
+  bytes signature = 3;
+  uint64 timestamp = 4;
+}
+
+message AuthenticateResponse {
+  bool success = 1;
+  string error = 2;
+  
+  string session_token = 3;
+  uint64 expires_at = 4;
+}
+
+message VerifySessionRequest {
+  string session_token = 1;
+}
+
+message VerifySessionResponse {
+  bool valid = 1;
+  string address = 2;
+  uint64 expires_at = 3;
 }

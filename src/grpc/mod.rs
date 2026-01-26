@@ -124,10 +124,11 @@ impl L1SettlementService {
 
     /// Validate L2 signature with Ed25519 verification and replay protection
     fn validate_l2_signature(&self, public_key: &str, signature: &[u8], timestamp: u64) -> Result<(), Status> {
-        // Skip validation if signature is empty (for backwards compatibility during testing)
+        // 🔒 PRODUCTION MODE: All signatures required, no bypasses allowed
         if signature.is_empty() || public_key.is_empty() {
-            warn!("Empty signature/pubkey - skipping validation (test mode)");
-            return Ok(());
+            return Err(Status::unauthenticated(
+                "Missing signature or public key - all transactions must be signed"
+            ));
         }
 
         // 1. Check timestamp is within acceptable window (prevent replay attacks)

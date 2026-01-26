@@ -55,6 +55,10 @@ const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 /// Transaction history: TxID (String) → TransactionData (Vec<u8>)
 const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transactions");
 
+/// Processed bridge transactions: ExternalTxHash (String) → MintTxID (String)
+/// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
+const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
+
 /// Transaction record for history tracking
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransactionRecord {
@@ -82,6 +86,10 @@ pub struct TransactionRecord {
 /// - `Clone` is cheap (Arc handles)
 /// - `get_balance()` is lock-free
 /// - `credit()`/`debit()` use ReDB's MVCC (safe, serialized writes)
+///
+/// # Bridge Replay Protection
+/// - Tracks all processed external TX hashes (Ethereum/Solana)
+/// - Prevents double-minting from the same USDC lock event
 #[derive(Clone)]
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
@@ -89,6 +97,9 @@ pub struct ConcurrentBlockchain {
     
     /// In-memory balance cache (DashMap = lock-free reads)
     cache: Arc<DashMap<String, f64>>,
+    
+    /// Processed bridge TX cache (for fast replay checks)
+    processed_bridge_txs: Arc<DashMap<String, String>>,
     
     /// Block height counter
     block_height: Arc<AtomicU64>,
@@ -116,11 +127,13 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(BLOCKS)?;
             let _ = write_txn.open_table(METADATA)?;
             let _ = write_txn.open_table(TRANSACTIONS)?;
+            let _ = write_txn.open_table(PROCESSED_BRIDGE_TXS)?;
         }
         write_txn.commit()?;
         
         // Load existing data into cache
         let cache = Arc::new(DashMap::new());
+        let processed_bridge_txs = Arc::new(DashMap::new());
         let mut total = 0.0f64;
         
         {
@@ -136,14 +149,25 @@ impl ConcurrentBlockchain {
                 cache.insert(address, balance);
                 total += balance;
             }
+            
+            // Load processed bridge TXs into cache
+            if let Ok(bridge_table) = read_txn.open_table(PROCESSED_BRIDGE_TXS) {
+                let mut iter = bridge_table.iter()?;
+                while let Some(result) = iter.next() {
+                    let (key, value) = result?;
+                    processed_bridge_txs.insert(key.value().to_string(), value.value().to_string());
+                }
+            }
         }
         
         let account_count = cache.len();
-        info!(accounts = account_count, total_supply = total, "Database loaded");
+        let bridge_tx_count = processed_bridge_txs.len();
+        info!(accounts = account_count, total_supply = total, processed_bridge_txs = bridge_tx_count, "Database loaded");
         
         Ok(Self {
             db: Arc::new(db),
             cache,
+            processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
             total_supply: Arc::new(AtomicU64::new((total * 1_000_000.0) as u64)), // Store as micro-units
         })
@@ -430,38 +454,42 @@ pub struct BlockchainStats {
 }
 
 // ============================================================================
-// ASSET MANAGER (Unified L2 State)
+// ASSET MANAGER (Prediction Market State)
 // ============================================================================
 
-/// Manages credit sessions for L2 integration.
+/// Manages market sessions for prediction market integration.
 ///
-/// Credit sessions allow players to "lock" funds on L1 while playing on L2.
-/// When the session ends, P&L is settled back to L1.
+/// Market sessions allow players to "lock" BB tokens while trading on prediction markets.
+/// When the session ends, P&L is settled and tokens are released.
+/// All operations use L1 BB tokens directly - no separate L2 token.
 #[derive(Clone)]
 pub struct AssetManager {
-    /// Active credit sessions: wallet address → session
-    sessions: Arc<DashMap<String, CreditSession>>,
+    /// Active market sessions: wallet address → session
+    sessions: Arc<DashMap<String, MarketSession>>,
     
     /// Session lookup by ID: session_id → wallet address
     session_index: Arc<DashMap<String, String>>,
     
-    /// Pending bridge transfers: lock_id → BridgeLock
-    bridge_locks: Arc<DashMap<String, BridgeLock>>,
+    /// Pending lock transfers: lock_id → TokenLock
+    bridge_locks: Arc<DashMap<String, TokenLock>>,
     
-    /// Bridge locks by wallet: wallet → Vec<lock_id>
+    /// Locks by wallet: wallet → Vec<lock_id>
     wallet_locks: Arc<DashMap<String, Vec<String>>>,
 }
 
-/// A credit session representing locked funds for L2 gaming
+/// A market session representing locked BB tokens for prediction market trading
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct CreditSession {
+pub struct MarketSession {
     pub id: String,
     pub wallet: String,
     pub locked_amount: f64,
-    pub available_credit: f64,
-    pub used_credit: f64,
+    pub available_balance: f64,
+    pub used_amount: f64,
     pub expires_at: String,
 }
+
+// Type alias for backwards compatibility
+pub type CreditSession = MarketSession;
 
 /// Result of settling a credit session
 #[derive(Clone, Debug, serde::Serialize)]
@@ -473,28 +501,44 @@ pub struct SettlementResult {
     pub final_balance: f64,
 }
 
-/// A bridge lock representing tokens locked for L1→L2 transfer
+/// A token lock representing BB tokens reserved for market operations
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct BridgeLock {
+pub struct TokenLock {
     pub lock_id: String,
     pub wallet: String,
     pub amount: f64,
-    pub target_layer: String,
-    pub status: BridgeStatus,
+    pub purpose: String,
+    pub status: LockStatus,
     pub created_at: String,
     pub expires_at: String,
+    pub settlement_tx: Option<String>,
+    // Legacy fields for backwards compatibility
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_layer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub l2_tx_hash: Option<String>,
 }
 
-/// Bridge lock status
+// Type alias for backwards compatibility
+pub type BridgeLock = TokenLock;
+
+/// Token lock status
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]
-pub enum BridgeStatus {
-    Pending,      // Locked on L1, awaiting L2 confirmation
-    Confirmed,    // L2 confirmed receipt
-    Completed,    // Bridge complete, tokens released
-    Expired,      // Lock expired without completion
-    Cancelled,    // User cancelled before L2 confirmation
+pub enum LockStatus {
+    // New names (preferred)
+    Active,       // Tokens locked for market activity
+    Settled,      // Market resolved, awaiting release
+    Released,     // Tokens released back to wallet
+    Expired,      // Lock expired without settlement
+    Cancelled,    // User cancelled before settlement
+    // Legacy names (for backwards compatibility)
+    Pending,      // Same as Active
+    Confirmed,    // Same as Settled
+    Completed,    // Same as Released
 }
+
+// Type alias for backwards compatibility
+pub type BridgeStatus = LockStatus;
 
 impl AssetManager {
     /// Create a new AssetManager
@@ -508,13 +552,13 @@ impl AssetManager {
         }
     }
 
-    /// Open a new credit session (lock funds for L2 gaming)
-    pub fn open_credit_session(
+    /// Open a new market session (lock BB tokens for prediction market trading)
+    pub fn open_market_session(
         &self,
         wallet: &str,
         amount: f64,
         session_id: &str,
-    ) -> Result<CreditSession, String> {
+    ) -> Result<MarketSession, String> {
         // Check if wallet already has an active session
         if self.sessions.contains_key(wallet) {
             return Err("Wallet already has an active session".to_string());
@@ -525,12 +569,12 @@ impl AssetManager {
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
 
-        let session = CreditSession {
+        let session = MarketSession {
             id: session_id.to_string(),
             wallet: wallet.to_string(),
             locked_amount: amount,
-            available_credit: amount,
-            used_credit: 0.0,
+            available_balance: amount,
+            used_amount: 0.0,
             expires_at,
         };
 
@@ -542,14 +586,25 @@ impl AssetManager {
             session_id = %session_id,
             wallet = %wallet,
             amount = amount,
-            "Credit session opened"
+            "Market session opened"
         );
 
         Ok(session)
     }
 
-    /// Settle a credit session (apply P&L and release funds)
-    pub fn settle_credit_session(
+    /// Backwards compatibility alias
+    #[inline]
+    pub fn open_credit_session(
+        &self,
+        wallet: &str,
+        amount: f64,
+        session_id: &str,
+    ) -> Result<MarketSession, String> {
+        self.open_market_session(wallet, amount, session_id)
+    }
+
+    /// Settle a market session (apply P&L and release BB tokens)
+    pub fn settle_market_session(
         &self,
         session_id: &str,
         net_pnl: f64,
@@ -575,7 +630,7 @@ impl AssetManager {
             wallet = %wallet,
             net_pnl = net_pnl,
             final_balance = final_balance,
-            "Credit session settled"
+            "Market session settled"
         );
 
         Ok(SettlementResult {
@@ -587,8 +642,18 @@ impl AssetManager {
         })
     }
 
+    /// Backwards compatibility alias
+    #[inline]
+    pub fn settle_credit_session(
+        &self,
+        session_id: &str,
+        net_pnl: f64,
+    ) -> Result<SettlementResult, String> {
+        self.settle_market_session(session_id, net_pnl)
+    }
+
     /// Get active session for a wallet
-    pub fn get_active_session(&self, wallet: &str) -> Option<CreditSession> {
+    pub fn get_active_session(&self, wallet: &str) -> Option<MarketSession> {
         self.sessions.get(wallet).map(|v| v.clone())
     }
 
@@ -604,17 +669,17 @@ impl AssetManager {
     }
 
     // ========================================================================
-    // BRIDGE OPERATIONS
+    // TOKEN LOCK OPERATIONS (formerly Bridge Operations)
     // ========================================================================
 
-    /// Initiate a bridge transfer (lock tokens on L1 for L2)
+    /// Initiate a token lock (lock BB tokens for market operations)
     pub fn initiate_bridge(
         &self,
         wallet: &str,
         amount: f64,
         target_layer: &str,
-    ) -> Result<BridgeLock, String> {
-        let lock_id = format!("bridge_{}", uuid::Uuid::new_v4());
+    ) -> Result<TokenLock, String> {
+        let lock_id = format!("lock_{}", uuid::Uuid::new_v4());
         
         let now = chrono::Utc::now();
         let expires_at = now
@@ -622,14 +687,17 @@ impl AssetManager {
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
 
-        let lock = BridgeLock {
+        let lock = TokenLock {
             lock_id: lock_id.clone(),
             wallet: wallet.to_string(),
             amount,
-            target_layer: target_layer.to_string(),
-            status: BridgeStatus::Pending,
+            purpose: format!("market_session_{}", target_layer),
+            status: LockStatus::Pending,
             created_at: now.to_rfc3339(),
             expires_at,
+            settlement_tx: None,
+            // Legacy fields
+            target_layer: Some(target_layer.to_string()),
             l2_tx_hash: None,
         };
 
@@ -646,94 +714,95 @@ impl AssetManager {
             lock_id = %lock_id,
             wallet = %wallet,
             amount = amount,
-            target = %target_layer,
-            "Bridge initiated"
+            purpose = %lock.purpose,
+            "Token lock initiated"
         );
 
         Ok(lock)
     }
 
-    /// Get bridge lock by ID
-    pub fn get_bridge_lock(&self, lock_id: &str) -> Option<BridgeLock> {
+    /// Get token lock by ID
+    pub fn get_bridge_lock(&self, lock_id: &str) -> Option<TokenLock> {
         self.bridge_locks.get(lock_id).map(|v| v.clone())
     }
 
-    /// Get all pending bridges for a wallet
-    pub fn get_pending_bridges(&self, wallet: &str) -> Vec<BridgeLock> {
+    /// Get all pending locks for a wallet
+    pub fn get_pending_bridges(&self, wallet: &str) -> Vec<TokenLock> {
         self.wallet_locks
             .get(wallet)
             .map(|lock_ids| {
                 lock_ids
                     .iter()
                     .filter_map(|id| self.bridge_locks.get(id).map(|v| v.clone()))
-                    .filter(|lock| lock.status == BridgeStatus::Pending)
+                    .filter(|lock| lock.status == LockStatus::Pending)
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Confirm bridge on L2 side
-    pub fn confirm_bridge(&self, lock_id: &str, l2_tx_hash: &str) -> Result<BridgeLock, String> {
+    /// Confirm lock (mark as settled/confirmed)
+    pub fn confirm_bridge(&self, lock_id: &str, settlement_tx: &str) -> Result<TokenLock, String> {
         let mut lock = self.bridge_locks
             .get_mut(lock_id)
-            .ok_or_else(|| format!("Bridge lock not found: {}", lock_id))?;
+            .ok_or_else(|| format!("Token lock not found: {}", lock_id))?;
 
-        if lock.status != BridgeStatus::Pending {
-            return Err(format!("Bridge is not pending, status: {:?}", lock.status));
+        if lock.status != LockStatus::Pending {
+            return Err(format!("Lock is not pending, status: {:?}", lock.status));
         }
 
-        lock.status = BridgeStatus::Confirmed;
-        lock.l2_tx_hash = Some(l2_tx_hash.to_string());
+        lock.status = LockStatus::Confirmed;
+        lock.settlement_tx = Some(settlement_tx.to_string());
+        lock.l2_tx_hash = Some(settlement_tx.to_string()); // Legacy field
 
-        info!(lock_id = %lock_id, l2_tx_hash = %l2_tx_hash, "Bridge confirmed");
+        info!(lock_id = %lock_id, settlement_tx = %settlement_tx, "Lock confirmed");
 
         Ok(lock.clone())
     }
 
-    /// Complete bridge (release/burn tokens)
-    pub fn complete_bridge(&self, lock_id: &str) -> Result<BridgeLock, String> {
+    /// Complete lock (release tokens)
+    pub fn complete_bridge(&self, lock_id: &str) -> Result<TokenLock, String> {
         let mut lock = self.bridge_locks
             .get_mut(lock_id)
-            .ok_or_else(|| format!("Bridge lock not found: {}", lock_id))?;
+            .ok_or_else(|| format!("Token lock not found: {}", lock_id))?;
 
-        if lock.status != BridgeStatus::Confirmed {
-            return Err(format!("Bridge must be confirmed first, status: {:?}", lock.status));
+        if lock.status != LockStatus::Confirmed {
+            return Err(format!("Lock must be confirmed first, status: {:?}", lock.status));
         }
 
-        lock.status = BridgeStatus::Completed;
+        lock.status = LockStatus::Completed;
 
-        info!(lock_id = %lock_id, "Bridge completed");
+        info!(lock_id = %lock_id, "Lock completed");
 
         Ok(lock.clone())
     }
 
-    /// Release a soft-lock directly (for L2 position closures)
+    /// Release a lock directly (for market position closures)
     /// 
     /// Unlike complete_bridge, this doesn't require confirmation.
-    /// Used when L2 positions close and funds should return to L1.
-    pub fn release_soft_lock(&self, lock_id: &str) -> Result<BridgeLock, String> {
+    /// Used when market positions close and funds should return to wallet.
+    pub fn release_soft_lock(&self, lock_id: &str) -> Result<TokenLock, String> {
         let mut lock = self.bridge_locks
             .get_mut(lock_id)
             .ok_or_else(|| format!("Lock not found: {}", lock_id))?;
 
-        // Allow release from Pending (soft-lock) or Confirmed states
-        if lock.status != BridgeStatus::Pending && lock.status != BridgeStatus::Confirmed {
+        // Allow release from Pending or Confirmed states
+        if lock.status != LockStatus::Pending && lock.status != LockStatus::Confirmed {
             return Err(format!("Lock cannot be released, status: {:?}", lock.status));
         }
 
-        lock.status = BridgeStatus::Completed;
+        lock.status = LockStatus::Completed;
 
         // Remove from wallet's pending list
         if let Some(mut wallet_locks) = self.wallet_locks.get_mut(&lock.wallet) {
             wallet_locks.retain(|id| id != lock_id);
         }
 
-        info!(lock_id = %lock_id, wallet = %lock.wallet, "Soft-lock released");
+        info!(lock_id = %lock_id, wallet = %lock.wallet, "Lock released");
 
         Ok(lock.clone())
     }
 
-    /// Get total soft-locked amount for a wallet
+    /// Get total locked amount for a wallet
     pub fn get_soft_locked_amount(&self, wallet: &str) -> f64 {
         self.get_pending_bridges(wallet)
             .iter()
@@ -741,11 +810,11 @@ impl AssetManager {
             .sum()
     }
 
-    /// Get bridge statistics
+    /// Get lock statistics
     pub fn bridge_stats(&self) -> serde_json::Value {
         let pending: Vec<_> = self.bridge_locks
             .iter()
-            .filter(|l| l.status == BridgeStatus::Pending)
+            .filter(|l| l.status == LockStatus::Pending)
             .collect();
         
         let total_pending_amount: f64 = pending.iter().map(|l| l.amount).sum();

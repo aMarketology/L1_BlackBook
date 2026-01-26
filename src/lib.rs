@@ -12,6 +12,7 @@
 // Core modules
 pub mod social_mining;
 pub mod storage;
+pub mod poh_blockchain;
 
 // Stub modules (simplified for MVP)
 pub mod integration;
@@ -34,13 +35,19 @@ pub mod runtime;
 // Storage
 pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
 
-// Blockchain types
+// Blockchain types - The 4 Critical Functions
 pub use protocol::blockchain::{
-    Block, Transaction, TxType,
-    Account, AccountType,
-    LockRecord, LockPurpose,
-    SettlementProof,
-    GENESIS_TIMESTAMP, LAMPORTS_PER_BB,
+    // State
+    L1State, EscrowVault,
+    // Transactions (MINT, LOCK, SETTLE, BURN)
+    Transaction, TxType, TxData,
+    LockParticipant, Payout,
+    // Errors
+    ChainError,
+    // Blocks
+    Block,
+    // Constants
+    GENESIS_TIMESTAMP, LAMPORTS_PER_BB, DEFAULT_ESCROW_EXPIRY_SECS,
     compute_genesis_hash,
 };
 
@@ -52,6 +59,15 @@ pub use runtime::{
     PoHConfig, PoHService, SharedPoHService, 
     create_poh_service, run_poh_clock,
     TransactionPipeline, LeaderSchedule,
+    CONFIRMATIONS_REQUIRED, ConfirmationStatus,
+};
+
+// PoH-Integrated Blockchain
+pub use poh_blockchain::{
+    BlockProducer, FinalizedBlock, OrderedTransaction,
+    MerkleTree, MerkleProof, FinalityTracker,
+    verify_block, verify_chain,
+    MAX_TXS_PER_BLOCK, BLOCK_INTERVAL_MS,
 };
 
 // Authentication

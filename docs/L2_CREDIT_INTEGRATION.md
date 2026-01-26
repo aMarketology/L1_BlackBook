@@ -1,38 +1,38 @@
-# L2 Credit Line Integration Guide
+# Prediction Market Integration Guide
 
 ## Overview
 
-Layer 1 (L1) is the **sole source of truth** for all real token balances. Layer 2 (L2) operates on **credit lines** - virtual balances backed by L1 reserves. No tokens are ever "moved" between layers; instead:
+Layer 1 (L1) is the **sole source of truth** for all $BB token balances. Prediction markets operate on **locked balances** - tokens reserved from L1 for market trading. No separate token exists; instead:
 
-1. L2 requests credit against a user's L1 balance
+1. Market requests lock against user's L1 $BB balance
 2. L1 reserves the requested amount
-3. User plays on L2 with virtual balance
-4. L2 settles the session by reporting P&L to L1
-5. L1 transfers tokens between user and dealer based on P&L
+3. User trades on prediction markets with locked $BB
+4. Market settles the session by reporting P&L to L1
+5. L1 releases tokens with P&L applied
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      CREDIT LINE FLOW                           │
+│                      TOKEN LOCK FLOW                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│   USER L1 BALANCE: 10,000 $BC                                   │
+│   USER L1 BALANCE: 10,000 $BB                                   │
 │         │                                                       │
 │         ▼                                                       │
 │   ┌─────────────────┐    POST /credit/open     ┌──────────────┐│
-│   │   L1 Reserve    │ ◄──────────────────────── │     L2      ││
-│   │   5,000 $BC     │    (amount: 5000)         │  Sequencer  ││
+│   │   L1 Lock       │ ◄──────────────────────── │  Prediction ││
+│   │   5,000 $BB     │    (amount: 5000)         │   Markets   ││
 │   └────────┬────────┘                           └──────┬───────┘│
 │            │                                           │        │
-│            │  User plays, wins 2,500                   │        │
+│            │  User trades, wins 2,500                  │        │
 │            │                                           │        │
 │            ▼                                           ▼        │
 │   ┌─────────────────┐    POST /credit/settle   ┌──────────────┐│
-│   │  Apply P&L      │ ◄──────────────────────── │  L2 reports ││
-│   │  +2,500 to user │    (pnl: 2500)            │  final P&L  ││
+│   │  Apply P&L      │ ◄──────────────────────── │   Oracle    ││
+│   │  +2,500 to user │    (pnl: 2500)            │  reports    ││
 │   └────────┬────────┘                           └─────────────┘│
 │            │                                                    │
 │            ▼                                                    │
-│   USER L1 BALANCE: 12,500 $BC  (10,000 + 2,500 winnings)       │
+│   USER L1 BALANCE: 12,500 $BB  (10,000 + 2,500 winnings)       │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
