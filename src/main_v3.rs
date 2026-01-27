@@ -491,8 +491,12 @@ async fn sealevel_pending_handler(
 
 /// POST /auth/keypair - Generate new Ed25519 keypair
 async fn keypair_handler() -> impl IntoResponse {
-    use integration::unified_auth::generate_keypair;
+    use integration::unified_auth::{generate_keypair, derive_l1_address};
     let (pubkey, secret) = generate_keypair();
+    
+    // Generate proper L1 address from public key
+    let address = derive_l1_address(&pubkey)
+        .unwrap_or_else(|_| format!("L1_ERROR_{}", &pubkey[..16]));
     
     // Log keypair generation anonymously
     info!("🔑 New keypair generated (wallet address not logged for privacy)");
@@ -501,7 +505,7 @@ async fn keypair_handler() -> impl IntoResponse {
         "success": true,
         "public_key": pubkey,
         "secret_key": secret,
-        "address": format!("L1_{}", &pubkey[..40].to_uppercase())
+        "address": address
     }))
 }
 

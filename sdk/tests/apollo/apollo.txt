@@ -1,0 +1,99 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║                      🚀 APOLLO WALLET INFORMATION                    ║
+║              Enhanced Secure Wallet - Dual-Key Architecture          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+WALLET IDENTITY
+═══════════════════════════════════════════════════════════════════════
+Name:              Apollo
+Address:           L1_47597088CDD24661AAA867D44CBBF6519635338C
+Created:           2026-01-27T06:28:10.371Z
+
+CRYPTOGRAPHIC ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════
+Key Derivation:    PBKDF2-SHA256-300k iterations
+Encryption:        AES-256-GCM
+SSS Recovery:      2-of-3-secp256k1
+
+PUBLIC KEYS
+═══════════════════════════════════════════════════════════════════════
+Root Public Key (long-term identity):
+  6e38fc3ba891b2c2f6f50dec3423479a4b600d77492e0a8c614fa0a80d8ac2ad
+
+Operational Public Key (daily transactions):
+  4c6fc26efbb41288294f696237de0a1eadb9fde5864ce8b7056128a20fab41fd
+
+ENCRYPTION DATA
+═══════════════════════════════════════════════════════════════════════
+Salt (for password-based key derivation):
+  bc33931677e629c2b859459c9ba3c53a8b1c793148ffd22e01cf3050e2d08f8e
+
+Encrypted Operational Key:
+  Ciphertext: b3fca652f88f7ad08e5729dc0119ab9a59ab39273000844f89231d15cb5e0eab
+  IV:         72aab142828da34722e954cc
+  Auth Tag:   33444b1515790da79d6df085bdf47ca2
+
+SHAMIR SECRET SHARING (SSS) - PAPER BACKUP
+═══════════════════════════════════════════════════════════════════════
+⚠️  IMPORTANT: Keep these shares in separate secure locations
+⚠️  Any 2 of 3 shares can recover the root key
+
+Share 1/3:
+  x: 1
+  y: a395810d8c1e2c5288099bbd98385d15ae3863fce9b99342b0078b8bc3dca22f
+  QR: APOLLO-SHARE-1-a395810d8c1e2c5288099bbd98385d15ae3863fce9b99342b0078b8bc3dca22f
+
+Share 2/3:
+  x: 2
+  y: 3cf9fae43ed389d1d24b95ee51ee42ef2649451c8f264e6fc4052bbe00119fb5
+  QR: APOLLO-SHARE-2-3cf9fae43ed389d1d24b95ee51ee42ef2649451c8f264e6fc4052bbe00119fb5
+
+Share 3/3:
+  x: 3
+  y: d65e74baf188e7511c8d901f0ba428c89e5a263c3493099cd802cbef3c46996a
+  QR: APOLLO-SHARE-3-d65e74baf188e7511c8d901f0ba428c89e5a263c3493099cd802cbef3c46996a
+
+USER PASSWORD (for testing only)
+═══════════════════════════════════════════════════════════════════════
+Password: apollo_secure_password_2026
+
+⚠️  In production, this password would never be stored!
+
+WALLET CAPABILITIES
+═══════════════════════════════════════════════════════════════════════
+✓ Root Key: Long-term identity, rarely used (secured by SSS)
+✓ Operational Key: Daily transactions (encrypted with user password)
+✓ Password-Protected: Operational key encrypted with user password
+✓ SSS Recovery: Can recover root key with any 2 of 3 shares
+✓ Zero-Knowledge: Server never sees unencrypted keys or passwords
+✓ Ed25519 Signatures: All transactions cryptographically signed
+
+SECURITY NOTES
+═══════════════════════════════════════════════════════════════════════
+⚠️  PRIVATE KEYS ARE NOT STORED IN THIS FILE FOR SECURITY
+⚠️  Root key can be recovered from SSS shares
+⚠️  Operational key can be decrypted with user password + salt
+⚠️  Print SSS shares and store in separate physical locations
+⚠️  Never share your user password or SSS shares
+
+TRANSACTION HISTORY
+═══════════════════════════════════════════════════════════════════════
+✓ Minted 1000 BB tokens
+✓ Transferred 100 BB to L1_BOB_TEST_ACCOUNT
+✓ Current Balance: 900 BB
+
+TEST RESULTS
+═══════════════════════════════════════════════════════════════════════
+✓ Wallet Creation: PASSED
+✓ SSS Recovery (Shares 1+2): PASSED
+✓ SSS Recovery (Shares 2+3): PASSED
+✓ Login/Decryption: PASSED
+✓ Token Minting: PASSED
+✓ Balance Verification: PASSED
+✓ Signed Transfer: PASSED
+✓ Wrong Password Rejection: PASSED
+✓ Final Balance Check: PASSED
+
+═══════════════════════════════════════════════════════════════════════
+Total: 9/9 tests passed ✓
+═══════════════════════════════════════════════════════════════════════
