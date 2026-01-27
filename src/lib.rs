@@ -48,6 +48,9 @@ pub use protocol::blockchain::{
     L1Event,
     // Transactions
     Transaction, TxData,
+    // Security
+    AccountSecurity,
+    // State
     // State
     L1State,
     // Errors

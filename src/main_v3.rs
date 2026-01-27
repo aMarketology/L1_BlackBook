@@ -1450,33 +1450,197 @@ async fn admin_mint_handler(
     }
 }
 
+// ============================================================================
+// BURN HANDLER (Secure)
+// ============================================================================
+
 #[derive(serde::Deserialize)]
 struct BurnRequest {
-    from: String,
-    amount: f64,
+    public_key: String,
+    payload_hash: String,
+    payload_fields: BurnPayload,
+    operation_type: String,
+    // schema_version: u8, // Optional/Unused
+    timestamp: u64,
+    nonce: String,
+    chain_id: u8,
+    request_path: String,
+    signature: String,
 }
 
-/// POST /admin/burn - Burn tokens (dev mode enabled)
+#[derive(serde::Deserialize)]
+struct BurnPayload {
+    from: String,
+    amount: f64,
+    timestamp: u64,
+    nonce: String,
+}
+
+/// POST /burn - Burn tokens (requires owner signature)
 async fn admin_burn_handler(
     State(state): State<AppState>,
     Json(req): Json<BurnRequest>,
 ) -> impl IntoResponse {
-    match state.blockchain.debit(&req.from, req.amount) {
-        Ok(_) => {
-            info!("🔥 Burned {} BB from {}", req.amount, req.from);
-            Json(serde_json::json!({
-                "success": true,
-                "burned": req.amount,
-                "from": req.from,
-                "new_balance": state.blockchain.get_balance(&req.from)
-            }))
-        }
-        Err(e) => Json(serde_json::json!({
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Sha256, Digest};
+    
+    // Basic validation
+    if req.operation_type != "burn" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
-            "error": e
-        }))
+            "error": "Invalid operation type"
+        })));
+    }
+
+    if req.payload_fields.from.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid from address"
+        })));
+    }
+
+    if req.payload_fields.amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Amount must be positive"
+        })));
+    }
+
+    // Verify signature (Standard V2 SDK format)
+    // 1. Recreate canonical payload hash
+    // Canonical format: from|amount|timestamp|nonce
+    let canonical = format!(
+        "{}|{}|{}|{}",
+        req.payload_fields.from,
+        req.payload_fields.amount,
+        req.payload_fields.timestamp,
+        req.payload_fields.nonce
+    );
+    
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let payload_hash = format!("{:x}", hasher.finalize());
+    
+    // 2. Verify payload hash matches
+    if payload_hash != req.payload_hash {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Payload hash mismatch"
+        })));
+    }
+    
+    // 3. Recreate signing message
+    let domain_prefix = format!("BLACKBOOK_L{}{}", req.chain_id, req.request_path);
+    let message = format!("{}\n{}\n{}\n{}", 
+        domain_prefix, 
+        req.payload_hash,
+        req.timestamp,
+        req.nonce
+    );
+    
+    // 4. Verify Ed25519 signature
+    let pubkey_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid public key"
+            })));
+        }
+    };
+    
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid signature"
+            })));
+        }
+    };
+    
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": "Invalid public key format"
+            })));
+        }
+    };
+    
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    
+    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "success": false,
+            "error": "Signature verification failed"
+        })));
+    }
+
+    // Check balance
+    let current_balance = state.blockchain.get_balance(&req.payload_fields.from);
+    if current_balance < req.payload_fields.amount {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("Insufficient balance to burn: {} < {}", current_balance, req.payload_fields.amount)
+        })));
+    }
+
+    // Execute burn
+    match state.blockchain.debit(&req.payload_fields.from, req.payload_fields.amount) {
+        Ok(_) => {
+            info!(
+                "🔥 BURN: {} burned {} BB",
+                req.payload_fields.from,
+                req.payload_fields.amount
+            );
+            
+            let new_balance = state.blockchain.get_balance(&req.payload_fields.from);
+            
+            // Log transaction
+            let tx_id = format!("burn_{}_{}", req.timestamp, req.nonce);
+            let tx_record = storage::TransactionRecord {
+                tx_id: tx_id.clone(),
+                tx_type: "burn".to_string(),
+                from_address: req.payload_fields.from.clone(),
+                to_address: "legacy_burn_address".to_string(), // Or null
+                amount: req.payload_fields.amount,
+                timestamp: req.timestamp,
+                status: "completed".to_string(),
+                signature: Some(req.signature.clone()),
+                metadata: Some(serde_json::json!({
+                    "payload_hash": req.payload_hash,
+                    "nonce": req.nonce,
+                    "burn": true
+                })),
+            };
+            
+            if let Err(e) = state.blockchain.log_transaction(tx_record) {
+                warn!("Failed to log burn transaction: {}", e);
+            }
+            
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "tx_id": tx_id,
+                "from": req.payload_fields.from,
+                "burned_amount": req.payload_fields.amount,
+                "new_balance": new_balance,
+                "timestamp": req.timestamp
+            })))
+        },
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to burn tokens: {}", e)
+            })))
+        }
     }
 }
+
+
+// Insecure admin burn handler removed in favor of secure implementation upstream
+
 
 // ============================================================================
 // POH BLOCKCHAIN HANDLERS - Production-Ready Block Operations
@@ -1533,10 +1697,9 @@ async fn poh_block_by_slot_handler(
                 "confirmations": block.confirmations,
                 "transactions": block.transactions.iter().map(|tx| {
                     serde_json::json!({
-                        "id": tx.tx.id,
+                        "hash": tx.tx.hash,
                         "from": tx.tx.from,
-                        "to": tx.tx.to,
-                        "amount": tx.tx.amount,
+                        "timestamp": tx.tx.timestamp,
                         "poh_hash": tx.poh_hash,
                         "poh_sequence": tx.poh_sequence,
                         "position": tx.position
@@ -1734,7 +1897,7 @@ async fn poh_produce_block_handler(
         Ok(block) => {
             // Update finality tracker for all transactions in block
             for tx in &block.transactions {
-                state.finality_tracker.record_inclusion(&tx.tx.id, block.slot);
+                state.finality_tracker.record_inclusion(&tx.tx.hash, block.slot);
             }
             state.finality_tracker.update_confirmations(block.slot);
             

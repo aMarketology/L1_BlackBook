@@ -527,6 +527,27 @@ impl BlockProducer {
     /// Note: Amounts are in u64 (6 decimals), converted to f64 for storage
     fn execute_transaction(&self, tx: &Transaction) -> Result<(), String> {
         match &tx.data {
+            TxData::CreateAccount { root_pubkey, initial_op_pubkey, kdf_params_hash } => {
+                // New account creation with dual-key architecture
+                info!("Create account: {} (root: {}..., op: {}..., kdf: {}...)",
+                    tx.from,
+                    &root_pubkey[..16.min(root_pubkey.len())],
+                    &initial_op_pubkey[..16.min(initial_op_pubkey.len())],
+                    &kdf_params_hash[..16.min(kdf_params_hash.len())]);
+                // Account is created in L1State, no balance operation here
+                Ok(())
+            }
+
+            TxData::RotateOpKey { new_op_pubkey, kdf_params_hash } => {
+                // Operational key rotation (must be signed by root key)
+                info!("Rotate op key: {} -> {}... (kdf: {}...)",
+                    tx.from,
+                    &new_op_pubkey[..16.min(new_op_pubkey.len())],
+                    &kdf_params_hash[..16.min(kdf_params_hash.len())]);
+                // Key rotation handled in L1State, no balance operation here
+                Ok(())
+            }
+
             TxData::BridgeMint { recipient, amount, base_tx_hash } => {
                 // Bridge mints wUSDC for user (deposit detected on Base)
                 info!("Bridge mint: {} wUSDC to {} (base_tx: {})", 
@@ -552,6 +573,12 @@ impl BlockProducer {
                 // User redeems $BB for wUSDC
                 info!("Redemption: {} redeemed {} $BB", tx.from, amount);
                 Ok(())
+            }
+
+            TxData::Burn { amount } => {
+                // User burns $BB (permanently removing from supply)
+                info!("Burn: {} burned {} $BB", tx.from, amount);
+                self.blockchain.debit(&tx.from, *amount as f64)
             }
             
             TxData::BridgeRelease { user, amount, base_tx_hash } => {

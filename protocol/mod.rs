@@ -23,7 +23,7 @@ pub use blockchain::{
     // Transactions
     Transaction, TxData,
     // State
-    L1State,
+    L1State, AccountSecurity,
     // Errors
     ChainError,
     // Compliance

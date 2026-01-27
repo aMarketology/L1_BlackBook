@@ -1415,13 +1415,370 @@ class BlackBookWallet {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// SECURE WALLET - DUAL KEY ARCHITECTURE (NO MNEMONICS)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Shamir's Secret Sharing (GF(2^256)) - 2-of-3 split
+ * WARNING: For production, review with cryptographer or use vetted library
+ */
+const SSS_PRIME = 2n ** 256n - 189n;
+
+function randomBigInt(max) {
+  const bytes = randomBytes(32);
+  const num = BigInt('0x' + bytesToHex(bytes));
+  return num % max;
+}
+
+function modInverse(a, m) {
+  let [old_r, r] = [a, m];
+  let [old_s, s] = [1n, 0n];
+  while (r !== 0n) {
+    const q = old_r / r;
+    [old_r, r] = [r, old_r - q * r];
+    [old_s, s] = [s, old_s - q * s];
+  }
+  if (old_s < 0n) old_s += m;
+  return old_s;
+}
+
+function splitSecret(secretBytes, n, k) {
+  const secret = BigInt('0x' + bytesToHex(secretBytes));
+  const coeffs = [secret];
+  for (let i = 1; i < k; i++) coeffs.push(randomBigInt(SSS_PRIME));
+  
+  const shares = [];
+  for (let i = 1; i <= n; i++) {
+    const x = BigInt(i);
+    let y = 0n;
+    for (let j = 0; j < k; j++) {
+      y = (y + coeffs[j] * (x ** BigInt(j))) % SSS_PRIME;
+    }
+    shares.push({ x: i, y: y.toString(16) });
+  }
+  return shares;
+}
+
+function reconstructSecret(shares) {
+  let secret = 0n;
+  for (let i = 0; i < shares.length; i++) {
+    const xi = BigInt(shares[i].x);
+    const yi = BigInt('0x' + shares[i].y);
+    let num = 1n;
+    let den = 1n;
+    
+    for (let j = 0; j < shares.length; j++) {
+      if (i === j) continue;
+      const xj = BigInt(shares[j].x);
+      num = (num * (0n - xj)) % SSS_PRIME;
+      den = (den * (xi - xj)) % SSS_PRIME;
+    }
+    
+    const langrange = (yi * num * modInverse(den, SSS_PRIME)) % SSS_PRIME;
+    secret = (secret + langrange) % SSS_PRIME;
+  }
+  
+  if (secret < 0n) secret += SSS_PRIME;
+  
+  let hex = secret.toString(16);
+  if (hex.length % 2 !== 0) hex = '0' + hex;
+  return hexToBytes(hex);
+}
+
+/**
+ * SecureWallet - Dual Key Architecture
+ * 
+ * Root Key: High-entropy, SSS-split (2-of-3), offline recovery only
+ * Operational Key: Password-derived (Argon2id), online daily use
+ * 
+ * NO MNEMONICS - Professional key management for sweepstakes platform
+ */
+class SecureWallet {
+  /**
+   * Create new secure account from password
+   * 
+   * @param {string} password - User's password
+   * @param {string} apiUrl - L1 blockchain URL (optional, for on-chain registration)
+   * @returns {Promise<object>} - { address, shares, op_wallet, create_tx, storage }
+   */
+  static async createAccount(password, apiUrl = null) {
+    if (!password || password.length < 8) {
+      throw new Error('Password must be at least 8 characters');
+    }
+
+    // 1. Generate Root Key (Random 32 bytes - never derived from password)
+    const rootKey = randomBytes(32);
+    const rootPub = nacl.sign.keyPair.fromSeed(rootKey).publicKey;
+    const rootPubHex = bytesToHex(rootPub);
+    
+    // 2. Split Root Key (3 shares, threshold 2)
+    // User will distribute: Share 1 (printed), Share 2 (hardware/USB), Share 3 (trusted person)
+    const shares = splitSecret(rootKey, 3, 2);
+    
+    // 3. Derive Operational Key from password
+    const salt = randomBytes(16);
+    const opKeySeed = await SecureWallet.deriveOpKey(password, salt);
+    const opKeyPair = nacl.sign.keyPair.fromSeed(opKeySeed);
+    const opPub = opKeyPair.publicKey;
+    const opPubHex = bytesToHex(opPub);
+    
+    // 4. Address = L1_ + SHA256(rootPub)[0..20].toUpperCase()
+    const addressBytes = hexToBytes(await sha256(rootPub));
+    const address = 'L1_' + bytesToHex(addressBytes.slice(0, 20)).toUpperCase();
+    
+    // 5. KDF Params for storage
+    const kdfParams = {
+      salt: bytesToHex(salt),
+      params: {
+        type: 'argon2id',
+        mem: 2**16,
+        time: 3,
+        parallelism: 4,
+        len: 32
+      }
+    };
+    const kdfHash = await sha256(JSON.stringify(kdfParams));
+
+    // 6. Sign CreateAccount transaction with Root Key
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = generateNonce();
+    const txData = `CreateAccount:${rootPubHex}:${opPubHex}:${timestamp}:${nonce}`;
+    const txDataBytes = new TextEncoder().encode(txData);
+    const signature = nacl.sign.detached(txDataBytes, nacl.sign.keyPair.fromSeed(rootKey).secretKey);
+
+    const result = {
+      address,
+      shares: shares.map(s => ({ index: s.x, value: s.y })),
+      op_wallet: {
+        publicKey: opPubHex,
+        salt: bytesToHex(salt),
+        // Never expose the actual key!
+        keyPreview: bytesToHex(opKeySeed.slice(0, 4)) + '...'
+      },
+      create_tx: {
+        type: 'CreateAccount',
+        from: address,
+        data: {
+          root_pubkey: rootPubHex,
+          initial_op_pubkey: opPubHex,
+          kdf_params_hash: kdfHash
+        },
+        timestamp,
+        nonce,
+        signature: bytesToHex(signature),
+        signer_pubkey: rootPubHex
+      },
+      storage: {
+        address,
+        salt: bytesToHex(salt),
+        // In production, store encrypted locally
+      }
+    };
+
+    // Optional: Submit to blockchain if apiUrl provided
+    if (apiUrl) {
+      try {
+        const response = await fetch(`${apiUrl}/account/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(result.create_tx)
+        });
+        
+        const data = await response.json();
+        result.blockchain_response = data;
+      } catch (err) {
+        result.blockchain_error = err.message;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Login: Derive Op Key from password
+   * 
+   * @param {string} password - User's password
+   * @param {string} saltHex - Salt from storage (64 hex chars)
+   * @returns {Promise<object>} - { privateKey, publicKey, address }
+   */
+  static async login(password, saltHex, address = null) {
+    const salt = hexToBytes(saltHex);
+    const opKeySeed = await SecureWallet.deriveOpKey(password, salt);
+    const keyPair = nacl.sign.keyPair.fromSeed(opKeySeed);
+    
+    return {
+      privateKey: opKeySeed,
+      publicKey: bytesToHex(keyPair.publicKey),
+      address: address || null  // Address from local storage
+    };
+  }
+
+  /**
+   * Recover: Reconstruct Root Key from shares → Rotate to new password
+   * 
+   * @param {Array} sharesInput - [{x:1, y:'...'}, {x:2, y:'...'}] (2-of-3)
+   * @param {string} newPassword - New password for new Op Key
+   * @param {string} oldAddress - Known address for verification
+   * @param {string} apiUrl - L1 blockchain URL (optional, for on-chain rotation)
+   * @returns {Promise<object>} - { new_storage, rotation_tx }
+   */
+  static async recoverAccount(sharesInput, newPassword, oldAddress, apiUrl = null) {
+    if (sharesInput.length < 2) {
+      throw new Error('Need at least 2 shares for recovery');
+    }
+
+    // 1. Reconstruct Root Key
+    const rootKeyBytes = reconstructSecret(sharesInput);
+    const rootKey = new Uint8Array(rootKeyBytes);
+    const rootKeyPair = nacl.sign.keyPair.fromSeed(rootKey.slice(0, 32));
+    const rootPub = rootKeyPair.publicKey;
+    
+    // 2. Verify address matches
+    const addressBytes = hexToBytes(await sha256(rootPub));
+    const derivedAddr = 'L1_' + bytesToHex(addressBytes.slice(0, 20)).toUpperCase();
+    
+    if (oldAddress && derivedAddr !== oldAddress) {
+      throw new Error(`Recovered key does not match account address! Expected ${oldAddress}, got ${derivedAddr}`);
+    }
+
+    // 3. Generate new Op Key
+    const newSalt = randomBytes(16);
+    const newOpSeed = await SecureWallet.deriveOpKey(newPassword, newSalt);
+    const newOpPub = nacl.sign.keyPair.fromSeed(newOpSeed).publicKey;
+    const newOpPubHex = bytesToHex(newOpPub);
+
+    // 4. Create RotateOpKey transaction (signed by ROOT Key)
+    const kdfParams = { salt: bytesToHex(newSalt) };
+    const kdfHash = await sha256(JSON.stringify(kdfParams));
+    
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = generateNonce();
+    const txData = `RotateOpKey:${newOpPubHex}:${kdfHash}:${timestamp}:${nonce}`;
+    const txDataBytes = new TextEncoder().encode(txData);
+    const signature = nacl.sign.detached(txDataBytes, rootKeyPair.secretKey);
+
+    const result = {
+      new_storage: {
+        address: derivedAddr,
+        salt: bytesToHex(newSalt)
+      },
+      rotation_tx: {
+        type: 'RotateOpKey',
+        from: derivedAddr,
+        data: {
+          new_op_pubkey: newOpPubHex,
+          kdf_params_hash: kdfHash
+        },
+        timestamp,
+        nonce,
+        signature: bytesToHex(signature),
+        signer_pubkey: bytesToHex(rootPub)
+      }
+    };
+
+    // Optional: Submit to blockchain
+    if (apiUrl) {
+      try {
+        const response = await fetch(`${apiUrl}/account/rotate_key`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(result.rotation_tx)
+        });
+        
+        const data = await response.json();
+        result.blockchain_response = data;
+      } catch (err) {
+        result.blockchain_error = err.message;
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Sign transaction with Op Key (daily use)
+   * 
+   * @param {Uint8Array} opPrivateKey - Operational private key
+   * @param {object} txPayload - Transaction payload
+   * @returns {Promise<object>} - Signed transaction
+   */
+  static async signTransaction(opPrivateKey, txPayload) {
+    const keyPair = nacl.sign.keyPair.fromSeed(opPrivateKey);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = generateNonce();
+    
+    const txData = JSON.stringify({ ...txPayload, timestamp, nonce });
+    const txDataBytes = new TextEncoder().encode(txData);
+    const signature = nacl.sign.detached(txDataBytes, keyPair.secretKey);
+    
+    return {
+      ...txPayload,
+      timestamp,
+      nonce,
+      signature: bytesToHex(signature),
+      signer_pubkey: bytesToHex(keyPair.publicKey)
+    };
+  }
+
+  /**
+   * Internal: Derive Op Key using Argon2id
+   * 
+   * @param {string} password - User password
+   * @param {Uint8Array} salt - 16-byte salt
+   * @returns {Promise<Uint8Array>} - 32-byte key seed
+   */
+  static async deriveOpKey(password, salt) {
+    // Check if argon2 is available (loaded via argon2-browser or npm argon2)
+    if (typeof argon2 !== 'undefined' && argon2.hash) {
+      // argon2-browser format
+      const result = await argon2.hash({
+        pass: password,
+        salt: salt,
+        type: argon2.ArgonType.Argon2id,
+        mem: 2 ** 16, // 64 MB
+        time: 3,
+        parallelism: 4,
+        hashLen: 32
+      });
+      return result.hash;
+    } else {
+      // Fallback to PBKDF2 if argon2 not available (less secure!)
+      console.warn('Argon2 not available, falling back to PBKDF2. Install argon2-browser for production.');
+      
+      const encoder = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        'raw',
+        encoder.encode(password),
+        { name: 'PBKDF2' },
+        false,
+        ['deriveBits']
+      );
+      
+      const derivedBits = await crypto.subtle.deriveBits(
+        {
+          name: 'PBKDF2',
+          salt: salt,
+          iterations: 100000,
+          hash: 'SHA-256'
+        },
+        keyMaterial,
+        256
+      );
+      
+      return new Uint8Array(derivedBits);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    // Main wallet class
+    // Main wallet classes
     BlackBookWallet,
+    SecureWallet,
     
     // Core crypto functions
     forkPassword,
@@ -1429,6 +1786,10 @@ if (typeof module !== 'undefined' && module.exports) {
     decryptVault,
     signRequest,
     createCanonicalPayloadHash,
+    
+    // Shamir Secret Sharing
+    splitSecret,
+    reconstructSecret,
     
     // Constants
     CHAIN_ID_L1,
