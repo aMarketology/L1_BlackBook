@@ -493,6 +493,10 @@ async fn sealevel_pending_handler(
 async fn keypair_handler() -> impl IntoResponse {
     use integration::unified_auth::generate_keypair;
     let (pubkey, secret) = generate_keypair();
+    
+    // Log keypair generation anonymously
+    info!("🔑 New keypair generated (wallet address not logged for privacy)");
+    
     Json(serde_json::json!({
         "success": true,
         "public_key": pubkey,

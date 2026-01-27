@@ -1,74 +1,64 @@
-# BlackBook L1 ↔ L2 Integration Test Suite Runner
-# PowerShell script to run all tests sequentially
+# PowerShell Test Runner for BlackBook L1
 
 Write-Host ""
-Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║        BLACKBOOK L1 ↔ L2 INTEGRATION TEST SUITE          ║" -ForegroundColor Cyan
-Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "╔═══════════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║   BLACKBOOK L1 - WALLET & SECURITY TEST SUITE                         ║" -ForegroundColor Cyan
+Write-Host "╚═══════════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 
+# Check if server is running
+try {
+    $health = Invoke-RestMethod -Uri "http://localhost:8080/health" -Method Get -TimeoutSec 5
+    Write-Host "✓ Server is running" -ForegroundColor Green
+} catch {
+    Write-Host "✗ Server not reachable at http://localhost:8080" -ForegroundColor Red
+    Write-Host "  Start the server with: cargo run" -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host ""
+
+# Define tests
 $tests = @(
-    "test-01-l1-health.js",
-    "test-02-l1-balances.js",
-    "test-03-l2-health.js",
-    "test-04-l2-balances.js",
-    "test-05-l1-transfer.js",
-    "test-06-bridge-initiate.js",
-    "test-07-l2-markets.js",
-    "test-08-credit-line.js"
+    @{ file = "test-01-server-health.js"; name = "Server Health" },
+    @{ file = "test-02-wallet-creation.js"; name = "Wallet Creation" },
+    @{ file = "test-03-wallet-funding.js"; name = "Wallet Funding" },
+    @{ file = "test-04-secure-transfer.js"; name = "Secure Transfer" },
+    @{ file = "test-05-secure-burn.js"; name = "Secure Burn" },
+    @{ file = "test-06-sss-recovery.js"; name = "SSS Recovery" },
+    @{ file = "test-07-wallet-security.js"; name = "Wallet Security" },
+    @{ file = "test-08-full-lifecycle.js"; name = "Full Lifecycle" }
 )
 
-$results = @()
+$passed = 0
+$failed = 0
 
 foreach ($test in $tests) {
-    Write-Host ""
-    Write-Host "🚀 Running: $test" -ForegroundColor Yellow
-    Write-Host ""
+    Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Magenta
+    Write-Host "  RUNNING: $($test.name)" -ForegroundColor Magenta
+    Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Magenta
     
-    $output = & node $test
-    $exitCode = $LASTEXITCODE
+    $result = node $test.file
     
-    Write-Output $output
-    
-    $results += [PSCustomObject]@{
-        Test = $test
-        Passed = ($exitCode -eq 0)
-    }
-    
-    Write-Host ""
-    Write-Host "─" * 60 -ForegroundColor Gray
-}
-
-# Final Summary
-Write-Host ""
-Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║                    FINAL SUMMARY                          ║" -ForegroundColor Cyan
-Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
-Write-Host ""
-
-$passedCount = ($results | Where-Object { $_.Passed }).Count
-$failedCount = ($results | Where-Object { -not $_.Passed }).Count
-
-foreach ($result in $results) {
-    if ($result.Passed) {
-        Write-Host "   ✅ $($result.Test)" -ForegroundColor Green
+    if ($LASTEXITCODE -eq 0) {
+        $passed++
     } else {
-        Write-Host "   ❌ $($result.Test)" -ForegroundColor Red
+        $failed++
+        Write-Host ""
+        Write-Host "Test failed. Stopping." -ForegroundColor Red
+        break
     }
 }
 
 Write-Host ""
-Write-Host "   Total: $($results.Count) test files"
-Write-Host "   ✅ Passed: $passedCount" -ForegroundColor Green
-Write-Host "   ❌ Failed: $failedCount" -ForegroundColor Red
-Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor White
+Write-Host "  SUMMARY: Passed: $passed  |  Failed: $failed" -ForegroundColor White
+Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor White
 
-if ($failedCount -eq 0) {
-    Write-Host "🎉 ALL TESTS PASSED!" -ForegroundColor Green
+if ($failed -eq 0) {
     Write-Host ""
-    exit 0
+    Write-Host "✨ ALL TESTS PASSED! ✨" -ForegroundColor Green
+    Write-Host ""
 } else {
-    Write-Host "⚠️  $failedCount test file(s) had failures." -ForegroundColor Yellow
-    Write-Host ""
     exit 1
 }

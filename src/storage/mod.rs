@@ -234,7 +234,7 @@ impl ConcurrentBlockchain {
 
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         
-        let new_balance = {
+        let (new_balance, is_new_wallet) = {
             let mut table = write_txn.open_table(ACCOUNTS).map_err(|e| e.to_string())?;
             
             // Get current balance inside the write transaction (atomic)
@@ -243,12 +243,13 @@ impl ConcurrentBlockchain {
                 .map(|v| v.value())
                 .unwrap_or(0.0);
             
+            let is_new = current == 0.0 && !self.cache.contains_key(address);
             let new_balance = current + amount;
             
             // Write new balance
             table.insert(address, new_balance).map_err(|e| e.to_string())?;
             
-            new_balance
+            (new_balance, is_new)
         };
         
         // Commit the transaction
@@ -260,6 +261,12 @@ impl ConcurrentBlockchain {
         // Update total supply
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_add(micro_amount, Ordering::Relaxed);
+        
+        // Log new wallet creation (anonymously - no address shown)
+        if is_new_wallet {
+            let total_wallets = self.cache.len();
+            info!("🆕 NEW WALLET CREATED! Total wallets on chain: {}", total_wallets);
+        }
         
         info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens ADDED to wallet");
         Ok(())

@@ -1,173 +1,155 @@
-# BlackBook L1 ↔ L2 Integration Tests
+# BlackBook L1 - Wallet & Security Test Suite
 
-Comprehensive test suite validating L1 and L2 server functionality with isolated, focused test scenarios.
+## Overview
 
-## Test Overview
-
-Each test file focuses on a specific feature area for clear diagnostics:
-
-1. **test-01-l1-health.js** - L1 server health, stats, and PoH status
-2. **test-02-l1-balances.js** - L1 balance queries for known/unknown accounts
-3. **test-03-l2-health.js** - L2 server health, market count, L1 connection
-4. **test-04-l2-balances.js** - L2 balance queries across test accounts
-5. **test-05-l1-transfer.js** - L1 transfer validation (requires Ed25519 signatures)
-6. **test-06-bridge-initiate.js** - L1→L2 bridge lock initiation and status tracking
-7. **test-07-l2-markets.js** - L2 market listing, details, prices, CPMM pool state
-8. **test-08-credit-line.js** - Credit session endpoints and validation
+This test suite validates the complete wallet creation, security, and SSS (Shamir's Secret Sharing) recovery system for BlackBook L1.
 
 ## Prerequisites
 
-- **L1 Server**: Running on `http://localhost:8080`
-- **L2 Server**: Running on `http://localhost:1234`
-- **Node.js**: v18+ with ES modules support
+1. **L1 Server Running**: Start the server before running tests:
+   ```bash
+   cargo run
+   ```
+
+2. **Dependencies**: Install npm packages:
+   ```bash
+   npm install tweetnacl node-fetch
+   ```
 
 ## Running Tests
 
-### Individual Tests (Recommended)
+### Run All Tests
+```bash
+# Node.js
+node run-all-tests.js
 
-Run one test at a time for detailed output:
-
-```powershell
-cd sdk/tests
-
-node test-01-l1-health.js
-node test-02-l1-balances.js
-node test-03-l2-health.js
-node test-04-l2-balances.js
-node test-05-l1-transfer.js
-node test-06-bridge-initiate.js
-node test-07-l2-markets.js
-node test-08-credit-line.js
+# PowerShell
+./run-all.ps1
 ```
 
-### All Tests (PowerShell)
-
-```powershell
-cd sdk/tests
-.\run-all.ps1
+### Quick Mode (Skip Lifecycle Test)
+```bash
+node run-all-tests.js quick
 ```
 
-### Quick Check
-
-```powershell
-# Check if servers are running
-Invoke-WebRequest -Uri "http://localhost:8080/health"  # L1
-Invoke-WebRequest -Uri "http://localhost:1234/health"  # L2
+### Run Specific Test
+```bash
+node run-all-tests.js test-04
+# or
+node test-04-secure-transfer.js
 ```
 
-## Test Accounts
+## Test Suite
 
-The tests use these predefined accounts:
+| # | Test | Description |
+|---|------|-------------|
+| 01 | Server Health | Validates L1 server health, stats, PoH status |
+| 02 | Wallet Creation | Ed25519 keypair generation, SSS share creation |
+| 03 | Wallet Funding | Admin mint, balance verification |
+| 04 | Secure Transfer | V2 signed transfers, signature validation |
+| 05 | Secure Burn | Signed burns, unauthorized burn prevention |
+| 06 | SSS Recovery | 2-of-3 share recovery, all combinations |
+| 07 | Wallet Security | PBKDF2, AES-256-GCM, auto-lock, key zeroing |
+| 08 | Full Lifecycle | End-to-end user journey with password recovery |
 
-- **Alice**: `L1_52882D768C0F3E7932AAD1813CF8B19058D507A8` / `L2_52882D768C0F3E7932AAD1813CF8B19058D507A8`
-- **Bob**: `L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433` / `L2_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433`
-- **Dealer**: `L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D` / `L2_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D`
+## Security Features Tested
 
-## Expected Results
+### Cryptographic Primitives
+- **Ed25519**: Digital signatures for transactions
+- **PBKDF2**: Password-based key derivation (100k iterations, SHA-512)
+- **AES-256-GCM**: Authenticated encryption for seed storage
+- **SSS (2-of-3)**: Shamir's Secret Sharing for recovery
 
-All tests should pass when both L1 and L2 servers are running correctly:
+### V2 Signing Protocol
+- Domain separation: `BLACKBOOK_L{chain_id}{path}`
+- Payload hash verification
+- Timestamp and nonce for replay prevention
+- Ed25519 signature validation
+
+### Session Security
+- Auto-lock timeout (10 min desktop, 60s mobile)
+- Key zeroing on lock (memory cleared)
+- Activity-based timeout refresh
+
+## Test Output Example
 
 ```
-📊 TEST 01 SUMMARY
-   ✅ Passed: 3
-   ❌ Failed: 0
+╔═══════════════════════════════════════════════════════════════════════╗
+║   BLACKBOOK L1 - WALLET & SECURITY TEST SUITE                         ║
+╚═══════════════════════════════════════════════════════════════════════╝
 
-📊 TEST 02 SUMMARY
-   ✅ Passed: 4
-   ❌ Failed: 0
+✓ Server is running
 
-... (and so on for all 8 tests)
+═══════════════════════════════════════════════════════════════
+  RUNNING: Wallet Creation & SSS Shares
+═══════════════════════════════════════════════════════════════
+
+  ✓ Wallet created
+  ✓ SSS Shares generated (2-of-3)
+  ✓ Seed recovered from shares 1 & 2
+  ✓ Seed recovered from shares 2 & 3
+  ✓ Single share cannot recover seed (security verified)
+
+═══════════════════════════════════════════════════════════════
+  TEST SUMMARY
+═══════════════════════════════════════════════════════════════
+  Passed: 8  |  Failed: 0  |  Time: 12.5s
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║   ✨  ALL TESTS PASSED!  ✨                                           ║
+╚═══════════════════════════════════════════════════════════════════════╝
 ```
 
-## Test Details
+## SSS Recovery Guide
 
-### Test 01: L1 Health (3 subtests)
-- Health endpoint returns `{status: "ok", engine: "axum", storage: "redb"}`
-- Stats endpoint returns block height and account count
-- PoH status shows current slot and tick count
+The wallet uses 2-of-3 Shamir's Secret Sharing:
 
-### Test 02: L1 Balances (4 subtests)
-- Alice, Bob, Dealer balance queries
-- Unknown address returns 0 balance
+| Share | Storage | Usage |
+|-------|---------|-------|
+| 1 | Encrypted with password (Supabase) | Primary access |
+| 2 | Recovery codes (user writes down) | Backup |
+| 3 | Email backup (encrypted) | Emergency |
 
-### Test 03: L2 Health (4 subtests)
-- Health endpoint returns market count and L2 supply
-- L1 connection status (configured: true)
-- Markets endpoint lists active markets
-- Balances endpoint returns account list
+### Recovery Scenarios:
+- **Forgot password?** → Use Recovery Codes + Email
+- **Lost recovery codes?** → Use Password + Email
+- **Lost email access?** → Use Password + Recovery Codes
+- **Lost 2+ methods?** → ❌ Cannot recover (by design)
 
-### Test 04: L2 Balances (4 subtests)
-- Alice, Bob, Dealer L2 balance queries
-- Balance format: `{available, locked, total}`
+## Files
 
-### Test 05: L1 Transfer (5 subtests)
-- Initial balance retrieval
-- Transfer endpoint validation (requires Ed25519 signature)
-- Balance integrity after invalid transfer
-- Debug endpoint security check
-- Schema validation for malformed requests
-
-### Test 06: Bridge Initiate (6 subtests)
-- Bridge stats (total locks, pending amount)
-- Pending bridges for Alice
-- Initiate bridge lock (creates lock_id)
-- Lock status tracking
-- Pending count increment
-- L2 balance check post-bridge
-
-### Test 07: L2 Markets (5 subtests)
-- List all active markets
-- Get market details (`/market/{id}`)
-- CPMM prices endpoint (`/cpmm/prices/{id}`)
-- Market status breakdown (active/frozen/resolved)
-- CPMM pool state (reserves, k constant, liquidity)
-
-### Test 08: Credit Line (5 subtests)
-- Credit balance endpoint validation
-- Credit status for wallet
-- Credit open endpoint schema validation
-- Credit settle endpoint validation
-- List credit sessions endpoint
+```
+sdk/tests/
+├── run-all-tests.js       # Main test runner
+├── run-all.ps1            # PowerShell runner
+├── test-01-server-health.js
+├── test-02-wallet-creation.js
+├── test-03-wallet-funding.js
+├── test-04-secure-transfer.js
+├── test-05-secure-burn.js
+├── test-06-sss-recovery.js
+├── test-07-wallet-security.js
+├── test-08-full-lifecycle.js
+└── README.md              # This file
+```
 
 ## Troubleshooting
 
+### Server Not Running
+```
+✗ Server not reachable at http://localhost:8080
+  Start the server with: cargo run
+```
+**Solution**: Run `cargo run` in the project root.
+
+### Missing Dependencies
+```
+Error: Cannot find module 'tweetnacl'
+```
+**Solution**: `npm install tweetnacl node-fetch`
+
 ### Test Failures
-
-**L1 connection refused**
+Run the specific failing test for detailed output:
+```bash
+node test-04-secure-transfer.js
 ```
-Check if L1 server is running: cargo run
-```
-
-**L2 connection refused**
-```
-Check if L2 server is running on port 1234
-```
-
-**Signature verification failures**
-```
-Expected for Test 05 and Test 08 - L1 requires real Ed25519 signatures
-These tests validate that endpoints correctly reject unsigned requests
-```
-
-### Common Issues
-
-1. **Servers not running**: Start both L1 and L2 before running tests
-2. **Port conflicts**: Ensure 8080 (L1) and 1234 (L2) are available
-3. **Test account balances**: Some tests assume Alice/Bob/Dealer exist with non-zero balances
-
-## Integration with SDK
-
-These tests validate the endpoints used by:
-- `unified-dealer-sdk.js`
-- `credit-prediction-actions-sdk.js`
-- `blackbook-wallet-sdk.js`
-
-If a test fails, the corresponding SDK method may also fail.
-
-## Next Steps
-
-After all tests pass:
-1. Test signed transfers using the SDK with real keypairs
-2. Test full bridge flow (L1 lock → L2 credit)
-3. Test market creation and betting with credit sessions
-4. Implement rate limiting and nonce enforcement
