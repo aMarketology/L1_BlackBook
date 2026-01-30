@@ -68,10 +68,10 @@ uuid = { version = "1.0", features = ["serde", "v4"] }
 hex = "0.4"
 lru = "0.12"  # LRU cache for nonce deduplication
 chrono = { version = "0.4.41", features = ["serde"] }
+md5 = "0.7"  # Fast hashing for tx_hash computation
 reqwest = { version = "0.11", features = ["json"] }
 dotenv = "0.15"
 jsonwebtoken = "9.0"
-md5 = "0.7"
 base64 = "0.21"
 fastrand = "2.0"
 lazy_static = "1.4"

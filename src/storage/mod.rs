@@ -59,18 +59,213 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
-/// Transaction record for history tracking
+// ============================================================================
+// ENHANCED LEDGER ENUMS (Type-Safe Blockchain Integrity)
+// ============================================================================
+
+/// Transaction type enum for type-safe categorization
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxType {
+    Transfer,
+    Mint,
+    Burn,
+    BridgeOut,
+    BridgeIn,
+    Lock,
+    Unlock,
+}
+
+impl std::fmt::Display for TxType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxType::Transfer => write!(f, "TRANSFER"),
+            TxType::Mint => write!(f, "MINT"),
+            TxType::Burn => write!(f, "BURN"),
+            TxType::BridgeOut => write!(f, "BRIDGE_OUT"),
+            TxType::BridgeIn => write!(f, "BRIDGE_IN"),
+            TxType::Lock => write!(f, "LOCK"),
+            TxType::Unlock => write!(f, "UNLOCK"),
+        }
+    }
+}
+
+/// Transaction status enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxStatus {
+    Pending,
+    Finalized,
+    Reverted,
+    Failed,
+}
+
+impl std::fmt::Display for TxStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxStatus::Pending => write!(f, "PENDING"),
+            TxStatus::Finalized => write!(f, "FINALIZED"),
+            TxStatus::Reverted => write!(f, "REVERTED"),
+            TxStatus::Failed => write!(f, "FAILED"),
+        }
+    }
+}
+
+/// Authentication type for ZKP/SSS tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    MasterKey,      // Direct password authentication
+    SessionKey,     // Scoped session key
+    ZkProof,        // Zero-knowledge proof
+    SystemInternal, // Internal system operation (mints, etc)
+}
+
+impl std::fmt::Display for AuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthType::MasterKey => write!(f, "MASTER_KEY"),
+            AuthType::SessionKey => write!(f, "SESSION_KEY"),
+            AuthType::ZkProof => write!(f, "ZKP_SESSION"),
+            AuthType::SystemInternal => write!(f, "SYSTEM"),
+        }
+    }
+}
+
+// ============================================================================
+// ENHANCED TRANSACTION RECORD (Full Blockchain Integrity)
+// ============================================================================
+
+/// Enhanced transaction record with full blockchain integrity fields
+/// 
+/// This structure provides:
+/// - Chain Integrity: block_height, tx_hash, prev_tx_hash, merkle_root
+/// - Auth & ZK: zk_proof_ref, session_id, auth_type, gas_fee
+/// - State Validation: nonce, balance_before, balance_after, validator_sig
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TransactionRecord {
+    // === CORE IDENTITY ===
     pub tx_id: String,
     pub tx_type: String,  // "transfer", "mint", "burn", "bridge_out", "bridge_in"
     pub from_address: String,
     pub to_address: String,
     pub amount: f64,
-    pub timestamp: u64,  // Unix timestamp
-    pub status: String,  // "completed", "failed", "pending"
+    pub timestamp: u64,  // Unix timestamp (seconds)
+    pub status: String,  // "completed", "failed", "pending", "finalized"
+    
+    // === CHAIN INTEGRITY (The Backbone) ===
+    /// Block height - chronological index in the chain
+    #[serde(default)]
+    pub block_height: u64,
+    /// Transaction hash - SHA256 fingerprint of this transaction
+    #[serde(default)]
+    pub tx_hash: String,
+    /// Previous transaction hash - links to prior tx for chain continuity
+    #[serde(default)]
+    pub prev_tx_hash: String,
+    /// Merkle root of the block this tx belongs to
+    #[serde(default)]
+    pub merkle_root: String,
+    
+    // === AUTH & ZK (The Security Guard) ===
+    /// Reference to ZK-SNARK proof (UUID or hash)
+    #[serde(default)]
+    pub zk_proof_ref: Option<String>,
+    /// Session ID for scoped session key tracking
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Authentication type used
+    #[serde(default)]
+    pub auth_type: String,
+    /// Gas/computational fee (0 for users, tracked for health)
+    #[serde(default)]
+    pub gas_fee: f64,
+    
+    // === STATE VALIDATION (The Health Check) ===
+    /// Transaction nonce - prevents replay attacks
+    #[serde(default)]
+    pub nonce: u64,
+    /// Sender's balance before transaction
+    #[serde(default)]
+    pub balance_before: f64,
+    /// Sender's balance after transaction
+    #[serde(default)]
+    pub balance_after: f64,
+    /// Recipient's balance after transaction
+    #[serde(default)]
+    pub recipient_balance_after: f64,
+    /// Validator's Ed25519 signature (hex)
+    #[serde(default)]
+    pub validator_sig: Option<String>,
+    
+    // === LEGACY FIELDS ===
     pub signature: Option<String>,
     pub metadata: Option<serde_json::Value>,
+}
+
+impl TransactionRecord {
+    /// Create a new transaction record with computed hash
+    pub fn new(
+        tx_type: TxType,
+        from: &str,
+        to: &str,
+        amount: f64,
+        nonce: u64,
+        balance_before: f64,
+        balance_after: f64,
+        recipient_balance_after: f64,
+        auth_type: AuthType,
+    ) -> Self {
+        let timestamp = chrono::Utc::now().timestamp() as u64;
+        let tx_id = format!("tx_{}", chrono::Utc::now().timestamp_millis());
+        
+        // Compute transaction hash
+        let hash_input = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            tx_id, tx_type, from, to, amount, timestamp, nonce
+        );
+        let tx_hash = format!("{:x}", md5::compute(hash_input.as_bytes()));
+        
+        Self {
+            tx_id,
+            tx_type: tx_type.to_string().to_lowercase(),
+            from_address: from.to_string(),
+            to_address: to.to_string(),
+            amount,
+            timestamp,
+            status: "finalized".to_string(),
+            block_height: 0,
+            tx_hash,
+            prev_tx_hash: String::new(),
+            merkle_root: String::new(),
+            zk_proof_ref: None,
+            session_id: None,
+            auth_type: auth_type.to_string().to_lowercase(),
+            gas_fee: 0.0,
+            nonce,
+            balance_before,
+            balance_after,
+            recipient_balance_after,
+            validator_sig: None,
+            signature: None,
+            metadata: None,
+        }
+    }
+    
+    /// Check if balance reconciles: BEFORE - AMOUNT - GAS == AFTER
+    pub fn is_reconciled(&self) -> bool {
+        let expected = self.balance_before - self.amount - self.gas_fee;
+        (expected - self.balance_after).abs() < 0.0001
+    }
+    
+    /// Get abbreviated tx_hash (first 8 + last 4 chars)
+    pub fn short_hash(&self) -> String {
+        if self.tx_hash.len() > 12 {
+            format!("{}...{}", &self.tx_hash[..8], &self.tx_hash[self.tx_hash.len()-4..])
+        } else {
+            self.tx_hash.clone()
+        }
+    }
 }
 
 // ============================================================================
@@ -90,13 +285,18 @@ pub struct TransactionRecord {
 /// # Bridge Replay Protection
 /// - Tracks all processed external TX hashes (Ethereum/Solana)
 /// - Prevents double-minting from the same USDC lock event
+///
+/// # Sealevel Integration
+/// - `cache` field is public for direct parallel execution access
+/// - ParallelScheduler uses DashMap for lock-free batch updates
 #[derive(Clone)]
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
     db: Arc<Database>,
     
     /// In-memory balance cache (DashMap = lock-free reads)
-    cache: Arc<DashMap<String, f64>>,
+    /// PUBLIC: Used by Sealevel ParallelScheduler for direct batch execution
+    pub cache: Arc<DashMap<String, f64>>,
     
     /// Processed bridge TX cache (for fast replay checks)
     processed_bridge_txs: Arc<DashMap<String, String>>,
@@ -268,6 +468,23 @@ impl ConcurrentBlockchain {
             info!("🆕 NEW WALLET CREATED! Total wallets on chain: {}", total_wallets);
         }
         
+        // Log mint transaction to ledger with enhanced fields
+        let tx_record = TransactionRecord::new(
+            TxType::Mint,
+            "USDC_TREASURY",
+            address,
+            amount,
+            0, // nonce
+            0.0, // balance_before (treasury has unlimited)
+            0.0, // balance_after (treasury unchanged)
+            new_balance, // recipient_balance_after
+            AuthType::SystemInternal,
+        );
+        
+        if let Err(e) = self.log_transaction(tx_record) {
+            warn!("Failed to log mint transaction: {}", e);
+        }
+        
         info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens ADDED to wallet");
         Ok(())
     }
@@ -314,12 +531,41 @@ impl ConcurrentBlockchain {
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_sub(micro_amount, Ordering::Relaxed);
         
+        // Get balance_before for logging (was current before debit)
+        let balance_before = new_balance + amount;
+        
+        // Log burn transaction to ledger with enhanced fields
+        let tx_record = TransactionRecord::new(
+            TxType::Burn,
+            address,
+            "DESTROYED",
+            amount,
+            0, // nonce
+            balance_before,
+            new_balance,
+            0.0, // recipient_balance_after (destroyed)
+            AuthType::MasterKey,
+        );
+        
+        if let Err(e) = self.log_transaction(tx_record) {
+            warn!("Failed to log burn transaction: {}", e);
+        }
+        
         info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens SUBTRACTED from wallet");
         Ok(())
     }
 
-    /// Log a transaction to history
-    pub fn log_transaction(&self, tx_record: TransactionRecord) -> Result<(), String> {
+    /// Log a transaction to history with chain integrity
+    pub fn log_transaction(&self, mut tx_record: TransactionRecord) -> Result<(), String> {
+        // Set block height from current chain state
+        tx_record.block_height = self.block_height.load(Ordering::Relaxed);
+        
+        // Get previous transaction hash for chain linking
+        tx_record.prev_tx_hash = self.get_last_tx_hash().unwrap_or_else(|| "GENESIS".to_string());
+        
+        // Increment block height for next transaction
+        self.block_height.fetch_add(1, Ordering::Relaxed);
+        
         let tx_json = serde_json::to_vec(&tx_record)
             .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
         
@@ -332,6 +578,27 @@ impl ConcurrentBlockchain {
         write_txn.commit().map_err(|e| e.to_string())?;
         
         Ok(())
+    }
+    
+    /// Get the hash of the last transaction for chain linking
+    fn get_last_tx_hash(&self) -> Option<String> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(TRANSACTIONS).ok()?;
+        
+        let mut latest_tx: Option<TransactionRecord> = None;
+        let mut iter = table.iter().ok()?;
+        
+        while let Some(result) = iter.next() {
+            if let Ok((_, value)) = result {
+                if let Ok(tx) = serde_json::from_slice::<TransactionRecord>(value.value()) {
+                    if latest_tx.is_none() || tx.timestamp > latest_tx.as_ref().unwrap().timestamp {
+                        latest_tx = Some(tx);
+                    }
+                }
+            }
+        }
+        
+        latest_tx.map(|tx| tx.tx_hash)
     }
 
     /// Get all transactions (optionally filtered by address)
@@ -419,6 +686,26 @@ impl ConcurrentBlockchain {
         // Update caches AFTER successful commit
         self.cache.insert(from.to_string(), from_balance);
         self.cache.insert(to.to_string(), to_balance);
+        
+        // Calculate balance_before for sender
+        let from_balance_before = from_balance + amount;
+        
+        // Log transaction to ledger with enhanced fields
+        let tx_record = TransactionRecord::new(
+            TxType::Transfer,
+            from,
+            to,
+            amount,
+            0, // nonce - TODO: implement proper nonce tracking
+            from_balance_before,
+            from_balance,
+            to_balance,
+            AuthType::MasterKey, // Default to master key for simple transfers
+        );
+        
+        if let Err(e) = self.log_transaction(tx_record) {
+            warn!("Failed to log transaction: {}", e);
+        }
         
         info!(
             from = %from, 

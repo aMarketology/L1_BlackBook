@@ -28,23 +28,27 @@ use serde::Serialize;
 use super::{PoHConfig, PoHEntry};
 
 // ============================================================================
-// PIPELINE CONSTANTS (Solana-style Transaction Pipeline)
+// PIPELINE CONSTANTS (Solana-style Transaction Pipeline) - TUNED
 // ============================================================================
 
 /// Pipeline stage buffer capacity
-const PIPELINE_BUFFER_SIZE: usize = 10_000;
+/// TUNED: 100k buffer allows for traffic spikes without backpressure
+const PIPELINE_BUFFER_SIZE: usize = 100_000;
+
 /// Number of parallel sigverify workers
-const SIGVERIFY_WORKERS: usize = 4;
+/// TUNED: 8 workers (was 4) for better signature verification parallelism
+const SIGVERIFY_WORKERS: usize = 8;
+
 /// Commit batch size for efficiency
-const COMMIT_BATCH_SIZE: usize = 64;
+/// TUNED: 128 (was 64) matches Sealevel batch size for consistency
+const COMMIT_BATCH_SIZE: usize = 128;
 
 // ============================================================================
 // FINALITY CONSTANTS
 // ============================================================================
 
 /// Number of confirmations required for transaction finality
-/// - 2 confirmations = ~2 slots = ~2 seconds for fast finality
-/// - Lower than Ethereum (12 blocks) but secure for our use case
+/// TUNED: 2 confirmations = ~1.2 seconds at 600ms slots (stable + fast finality)
 pub const CONFIRMATIONS_REQUIRED: u64 = 2;
 
 /// Confirmation status for transactions

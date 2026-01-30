@@ -1,8 +1,9 @@
-//! Routes V2 - Stub Module
+//! Routes V2 - ZKP Auth Module
 //!
-//! NOTE: Legacy Warp routes have been removed.
-//! All production routes are now in main_v3.rs using Axum.
-//!
-//! This module is kept for backwards compatibility with lib.rs exports.
+//! NOTE: Legacy Warp routes have been moved to Axum in main_v3.rs.
+//! This module provides ZKP authentication types and functions.
 
-// Empty module - all routes moved to main_v3.rs Axum handlers
+pub mod auth;
+
+// Re-export ZKP types for use in main_v3.rs
+pub use auth::*;

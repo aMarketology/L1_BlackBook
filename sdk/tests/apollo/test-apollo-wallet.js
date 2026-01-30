@@ -307,6 +307,49 @@ class ApolloWallet {
             nonce: nonce
         };
     }
+
+    /**
+     * Sign a burn transaction with operational key (V2 SDK format)
+     */
+    static signBurnTransaction(session, from, amount) {
+        const timestamp = Math.floor(Date.now() / 1000);
+        const nonce = Date.now().toString(); // Nonce as string
+        
+        // 1. Create canonical payload for hashing (from|amount|timestamp|nonce)
+        const canonical = `${from}|${amount}|${timestamp}|${nonce}`;
+        const payloadHash = crypto.createHash('sha256').update(canonical).digest('hex');
+        
+        // 2. Create signing message with domain separation
+        const chainId = 1; // L1
+        const requestPath = '/burn';
+        const domainPrefix = `BLACKBOOK_L${chainId}${requestPath}`;
+        const message = `${domainPrefix}\n${payloadHash}\n${timestamp}\n${nonce}`;
+        
+        // 3. Sign with Ed25519
+        const signature = nacl.sign.detached(
+            Buffer.from(message, 'utf-8'),
+            session.opKeyPair.secretKey
+        );
+        
+        // 4. Return V2 SDK format
+        return {
+            operation_type: 'burn',
+            payload_fields: {
+                from: from,
+                amount: amount,
+                timestamp: timestamp,
+                nonce: nonce
+            },
+            payload_hash: payloadHash,
+            public_key: Buffer.from(session.opKeyPair.publicKey).toString('hex'),
+            signature: Buffer.from(signature).toString('hex'),
+            chain_id: chainId,
+            request_path: requestPath,
+            schema_version: 2,
+            timestamp: timestamp,
+            nonce: nonce
+        };
+    }
 }
 
 // ==================== MAIN TEST ====================
@@ -527,8 +570,74 @@ async function runApolloTests() {
         failed++;
     }
     
-    // ==================== TEST 8: Wrong Password Test ====================
-    section('Test 8: Security - Wrong Password Rejection');
+    // ==================== TEST 8: Burn Tokens ====================
+    section('Test 8: Burn 200 BB Tokens');
+    try {
+        const burnAmount = 200;
+        const signedBurn = ApolloWallet.signBurnTransaction(
+            apolloSession,
+            apolloWallet.address,
+            burnAmount
+        );
+        
+        info('Burn transaction signed with Ed25519');
+        
+        const burnRes = await fetch(`${L1_URL}/admin/burn`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(signedBurn)
+        });
+        
+        let burnData;
+        const contentType = burnRes.headers.get('content-type');
+        
+        if (contentType && contentType.includes('application/json')) {
+            burnData = await burnRes.json();
+        } else {
+             const text = await burnRes.text();
+             fail(`Server returned non-JSON response: ${text.slice(0, 100)}`);
+             failed++;
+             throw new Error('Non-JSON response');
+        }
+
+        if (burnData.success) {
+            pass(`Burn successful: ${burnAmount} BB destroyed`);
+            info(`New Apollo balance: ${burnData.new_balance} BB`);
+            passed++;
+        } else {
+            fail(`Burn failed: ${burnData.error}`);
+            failed++;
+        }
+    } catch (e) {
+        if (!e.message.includes('Non-JSON')) {
+             fail(`Burn test failed: ${e.message}`);
+             failed++;
+        }
+    }
+
+    // ==================== TEST 9: Verify Balance After Burn ====================
+    section('Test 9: Verify Balance After Burn');
+    try {
+        const balRes = await fetch(`${L1_URL}/balance/${apolloWallet.address}`);
+        const balData = await balRes.json();
+        
+        const expectedBalance = 700; // 900 - 200
+        
+        if (balData.balance === expectedBalance) {
+            pass(`Post-burn balance confirmed: ${balData.balance} BB`);
+            passed++;
+        } else {
+            fail(`Balance mismatch: expected ${expectedBalance}, got ${balData.balance}`);
+            failed++;
+        }
+        
+    } catch (e) {
+        fail(`Balance check failed: ${e.message}`);
+        failed++;
+    }
+
+    // ==================== TEST 10: Wrong Password Test ====================
+    section('Test 10: Security - Wrong Password Rejection');
     try {
         try {
             ApolloWallet.login(apolloWallet, 'wrong_password_123');

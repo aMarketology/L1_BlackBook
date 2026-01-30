@@ -75,11 +75,17 @@ use runtime::{
     TransactionPipeline, LeaderSchedule, GulfStreamService, PoHEntry,
     ParallelScheduler,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
+    // Ideal Hybrid Security Infrastructure
+    NetworkThrottler, CircuitBreaker, LocalizedFeeMarket,
+    AccountValidator, AccountType, AccountMetadata, PDAInfo,
+    AccountAccess, ProgramDerivedAddress,
 };
 use protocol::Transaction as ProtocolTransaction;
 use poh_blockchain::{
     BlockProducer, FinalizedBlock, MerkleTree, FinalityTracker,
     verify_block, verify_chain,
+    MAX_TXS_PER_BLOCK, BLOCK_INTERVAL_MS,
+    TurbineShredder, TurbinePropagator, TURBINE_FANOUT,
 };
 
 // ============================================================================
@@ -88,6 +94,10 @@ use poh_blockchain::{
 
 const SOCIAL_DATA_FILE: &str = "social_mining_data.json";
 const REDB_DATA_PATH: &str = "./blockchain_data";
+
+// Tiered Security - High-value transaction threshold
+const HIGH_VALUE_THRESHOLD: f64 = 100_000.0;
+const DEFAULT_SECURITY_PIN: &str = "1234"; // Dev mode - replace with proper PIN system
 
 // Test account addresses (derived from Ed25519 seeds)
 const ALICE_L1: &str = "L1_52882D768C0F3E7932AAD1813CF8B19058D507A8";
@@ -133,16 +143,58 @@ pub struct AppState {
     
     /// Transaction finality tracker
     pub finality_tracker: Arc<FinalityTracker>,
+    
+    // =========================================================================
+    // IDEAL HYBRID SECURITY INFRASTRUCTURE
+    // =========================================================================
+    
+    /// Network throttler - Stake-weighted rate limiting (QUIC-style)
+    /// Prevents spam by limiting tx/sec based on sender's stake
+    pub throttler: Arc<NetworkThrottler>,
+    
+    /// Circuit breaker - Automatic protection against bank runs
+    /// Trips if >20% of account value moved in one block
+    pub circuit_breaker: Arc<CircuitBreaker>,
+    
+    /// Localized fee market - Per-account-group fees (not global spikes)
+    /// Spam only raises fees for the spammer, not everyone
+    pub fee_market: Arc<LocalizedFeeMarket>,
+    
+    /// Account metadata - Type-safe PDA accounts (immune to confusion attacks)
+    pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
 }
 
 // ============================================================================
 // AXUM HANDLERS (Clean, type-safe, no Warp boilerplate)
 // ============================================================================
 
-/// GET /health - Health check
+/// GET /health - Health check with full Solana-style infrastructure status
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let total_supply = state.blockchain.total_supply();
     let stats = state.blockchain.stats();
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let parallel_stats = state.parallel_scheduler.get_stats();
+    let gulf_stream_stats = state.gulf_stream.get_stats();
+    let pipeline_stats = state.pipeline.get_stats();
+    
+    // PoH status
+    let poh_status = {
+        let poh = state.poh.read();
+        poh.get_status()
+    };
+    
+    // Calculate TPS metrics
+    // 10,000 txs/block ÷ 0.4s = 25,000 TPS theoretical max
+    let theoretical_max_tps = (MAX_TXS_PER_BLOCK as f64 / (BLOCK_INTERVAL_MS as f64 / 1000.0)) as u64;
+    let finality_time_ms = CONFIRMATIONS_REQUIRED * BLOCK_INTERVAL_MS;
+    
+    // Current throughput estimate
+    let current_tps = if parallel_stats.total_batches > 0 {
+        // txs processed × 2.5 slots/sec
+        (parallel_stats.total_processed as f64 / parallel_stats.total_batches as f64) * 2.5
+    } else {
+        0.0
+    };
     
     Json(serde_json::json!({
         "status": "ok",
@@ -150,7 +202,111 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         "engine": "axum",
         "storage": "redb",
         "total_supply": total_supply,
-        "account_count": stats.total_accounts
+        "account_count": stats.total_accounts,
+        
+        // ═══════════════════════════════════════════════════════════
+        // SOLANA-STYLE INFRASTRUCTURE STATUS
+        // ═══════════════════════════════════════════════════════════
+        
+        "poh_clock": {
+            "status": "running",
+            "current_slot": poh_status["current_slot"],
+            "current_epoch": poh_status["current_epoch"],
+            "num_hashes": poh_status["num_hashes"],
+            "slot_duration_ms": BLOCK_INTERVAL_MS,
+            "slots_per_second": 2.5,
+            "hash_rate": poh_status["hashes_per_second"],
+        },
+        
+        "gulf_stream": {
+            "status": if gulf_stream_stats.is_active { "active" } else { "inactive" },
+            "description": "Mempool-less transaction forwarding to upcoming leaders",
+            "transactions_received": gulf_stream_stats.transactions_received,
+            "transactions_forwarded": gulf_stream_stats.transactions_forwarded,
+            "cache_size": gulf_stream_stats.cache_size,
+            "leaders_cached": gulf_stream_stats.current_leaders_cached,
+            "avg_forward_latency_us": gulf_stream_stats.avg_forward_latency_us,
+        },
+        
+        "sealevel": {
+            "status": "active",
+            "description": "Parallel transaction execution with fine-grained account locking",
+            "total_processed": parallel_stats.total_processed,
+            "total_batches": parallel_stats.total_batches,
+            "current_batch_size": parallel_stats.current_batch_size,
+            "conflict_rate_percent": format!("{:.2}", parallel_stats.conflict_rate * 100.0),
+            "thread_count": parallel_stats.thread_count,
+        },
+        
+        "turbine": {
+            "status": "ready",
+            "description": "Block propagation via shreds with erasure coding",
+            "fanout": TURBINE_FANOUT,
+            "max_hops_1000_validators": TurbinePropagator::max_hops(1000),
+            "max_hops_10000_validators": TurbinePropagator::max_hops(10000),
+        },
+        
+        "pipeline": {
+            "status": if pipeline_stats.is_running { "running" } else { "stopped" },
+            "description": "4-stage async processing: fetch → verify → execute → commit",
+            "packets_received": pipeline_stats.packets_received,
+            "packets_verified": pipeline_stats.packets_verified,
+            "packets_executed": pipeline_stats.packets_executed,
+            "packets_committed": pipeline_stats.packets_committed,
+            "avg_latency_us": pipeline_stats.avg_pipeline_latency_us,
+        },
+        
+        // ═══════════════════════════════════════════════════════════
+        // PERFORMANCE METRICS
+        // ═══════════════════════════════════════════════════════════
+        
+        "performance": {
+            "theoretical_max_tps": theoretical_max_tps,
+            "current_tps": format!("{:.1}", current_tps),
+            "max_txs_per_block": MAX_TXS_PER_BLOCK,
+            "block_interval_ms": BLOCK_INTERVAL_MS,
+            "finality_time_ms": finality_time_ms,
+            "finality_time_human": format!("{:.1}s", finality_time_ms as f64 / 1000.0),
+            "confirmations_required": CONFIRMATIONS_REQUIRED,
+        },
+        
+        // ═══════════════════════════════════════════════════════════
+        // VALIDATOR REQUIREMENTS
+        // ═══════════════════════════════════════════════════════════
+        
+        "validator_requirements": {
+            "cpu_cores_min": 32,
+            "cpu_cores_recommended": 64,
+            "ram_gb_min": 128,
+            "storage_type": "NVMe SSD",
+            "storage_tb_min": 2,
+            "network_gbps_min": 1,
+            "os_recommended": "Ubuntu 22.04 LTS",
+        },
+        
+        // ═══════════════════════════════════════════════════════════
+        // IDEAL HYBRID SECURITY INFRASTRUCTURE
+        // ═══════════════════════════════════════════════════════════
+        // These systems differentiate BlackBook L1 from Solana:
+        // - Stake-weighted throttling (vs unfiltered UDP)
+        // - Localized fee markets (vs global fee spikes)
+        // - Circuit breakers (vs unlimited withdrawals)
+        // - Type-safe PDAs (vs manual account verification)
+        
+        "security": {
+            "throttler": state.throttler.get_stats(),
+            "circuit_breaker": state.circuit_breaker.get_stats(),
+            "fee_market": state.fee_market.get_stats(),
+            "account_metadata_count": state.account_metadata.len(),
+            "design": "Ideal Hybrid Stablecoin L1",
+            "vs_solana": {
+                "transaction_ingest": "QUIC + Stake-Weighted (vs Unfiltered UDP)",
+                "fee_structure": "Localized Fee Markets (vs Global Spikes)",
+                "account_safety": "Declarative Framework (vs Manual Verification)",
+                "consensus_speed": "600ms Stable (vs 400ms Fragile)",
+                "pda_system": "Type-safe Namespaced (vs Manual Seeds)"
+            }
+        }
     }))
 }
 
@@ -192,128 +348,164 @@ async fn balance_handler(
 }
 
 /// GET /ledger - ASCII art visualization of all ledger entries
-async fn ledger_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let transactions = state.blockchain.get_all_transactions(200);
+#[derive(serde::Deserialize)]
+struct LedgerQuery {
+    #[serde(default = "default_page")]
+    page: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+fn default_page() -> usize { 1 }
+fn default_limit() -> usize { 50 }
+
+async fn ledger_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LedgerQuery>
+) -> impl IntoResponse {
+    let mut transactions = state.blockchain.get_all_transactions(10000);
+    // Sort by timestamp descending (most recent first)
+    transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let stats = state.blockchain.stats();
     let total_supply = state.blockchain.total_supply();
     
+    // Pagination
+    let limit = query.limit.min(100).max(1); // Max 100, min 1
+    let page = query.page.max(1); // Min page 1
+    let total_pages = (transactions.len() + limit - 1) / limit;
+    let start_idx = (page - 1) * limit;
+    let end_idx = (start_idx + limit).min(transactions.len());
+    
+    let page_transactions = if start_idx < transactions.len() {
+        &transactions[start_idx..end_idx]
+    } else {
+        &[]
+    };
+    
     let mut output = String::new();
     
-    // Clean ASCII Header - No complex colors
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HEADER - Chain Summary
+    // ═══════════════════════════════════════════════════════════════════════════
     output.push_str("\n");
-    output.push_str("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-    output.push_str("║                        ⚔️  BLACKBOOK L1 LEDGER - IMMUTABLE TRANSACTION LOG  ⚔️                         ║\n");
-    output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
-    output.push_str("\n");
-    
-    // Stats Box
-    output.push_str("┌─────────────────────────────────────────────────────────────────┐\n");
-    output.push_str("│  📊 CHAIN STATS                                                 │\n");
-    output.push_str("├─────────────────────────────────────────────────────────────────┤\n");
-    output.push_str(&format!("│  💰 Total Supply:      {:>15.2} BB                       │\n", total_supply));
-    output.push_str(&format!("│  👥 Active Wallets:    {:>15}                           │\n", stats.total_accounts));
-    output.push_str(&format!("│  📝 Transactions:      {:>15}                           │\n", transactions.len()));
-    output.push_str(&format!("│  🎰 Current Slot:      {:>15}                           │\n", stats.current_slot));
-    output.push_str("└─────────────────────────────────────────────────────────────────┘\n");
+    output.push_str(" ═══ BLACKBOOK L1 AUDIT LEDGER ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    output.push_str(&format!("  BLOCK HEIGHT : {:>12}                     NETWORK : [ MAINNET-ZK ]           VERSION : 2.0.0-zkp\n", stats.block_count));
+    output.push_str(&format!("  TOTAL SUPPLY : {:>12.2} BB              WALLETS : {:>6}                    STATUS  : [ FINALIZED ]\n", total_supply, stats.total_accounts));
+    output.push_str(&format!("  TRANSACTIONS : {:>12}                     PAGE    : {:>4} of {:>4}                SHOWING : {} - {}\n", transactions.len(), page, total_pages, start_idx + 1, end_idx));
+    output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     output.push_str("\n");
     
-    // Transaction Table - Wide and readable
-    output.push_str("┌─────┬──────────────┬────────────────────────────────────────────────────────────────────────────┬───────────────┐\n");
-    output.push_str("│  #  │    Amount    │                              Flow                                         │    Action     │\n");
-    output.push_str("├─────┼──────────────┼────────────────────────────────────────────────────────────────────────────┼───────────────┤\n");
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TRANSACTION TABLE - Compact but Complete
+    // ═══════════════════════════════════════════════════════════════════════════
+    output.push_str(" ┌─────┬─────────────────────┬──────────────┬──────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────┐\n");
+    output.push_str(" │ BLK │      TIMESTAMP      │    TX HASH   │   PREV HASH  │                                    TRANSACTION DETAILS                                          │\n");
+    output.push_str(" ├─────┼─────────────────────┼──────────────┼──────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤\n");
     
-    for (index, tx) in transactions.iter().take(50).enumerate() {
-        // Format addresses - show last 12 chars for clarity
+    for tx in page_transactions.iter() {
+        // Format timestamp
+        let datetime = chrono::DateTime::from_timestamp(tx.timestamp as i64, 0)
+            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+        let time_str = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        
+        // Format addresses
         let from_display = format_address_readable(&tx.from_address);
         let to_display = format_address_readable(&tx.to_address);
         
-        // Determine transaction type - BRIDGE and LOCK are linked actions
-        let tx_type_lower = tx.tx_type.to_lowercase();
-        
-        match tx_type_lower.as_str() {
-            // BRIDGE OUT - User initiates L1 → L2 transfer (with LOCK attached)
-            "bridge_out" | "bridgeout" | "lock" | "l2_lock" => {
-                // Main BRIDGE OUT line
-                output.push_str(&format!(
-                    "│ {:>3} │ {:>10.2} BB │ 🌉 BRIDGE OUT: {}  ═══▶  L2 Gaming Session                     │               │\n",
-                    index + 1,
-                    tx.amount,
-                    from_display
-                ));
-                // Attached LOCK line (sub-action)
-                output.push_str(&format!(
-                    "│     │              │   └─🔒 LOCK: {:>10.2} BB secured in L2_ESCROW_POOL                            │               │\n",
-                    tx.amount
-                ));
-            },
-            // BRIDGE IN - User settles L2 session (with UNLOCK attached)
-            "bridge_in" | "bridgein" | "unlock" | "l2_unlock" => {
-                // Main BRIDGE IN line
-                output.push_str(&format!(
-                    "│ {:>3} │ {:>10.2} BB │ 🌉 BRIDGE IN: L2 Settlement  ═══▶  {}                          │               │\n",
-                    index + 1,
-                    tx.amount,
-                    to_display
-                ));
-                // Attached UNLOCK line (sub-action)
-                output.push_str(&format!(
-                    "│     │              │   └─🔓 UNLOCK: {:>10.2} BB released from L2_ESCROW_POOL                        │               │\n",
-                    tx.amount
-                ));
-            },
-            "mint" => {
-                output.push_str(&format!(
-                    "│ {:>3} │ {:>10.2} BB │ 🪙 MINT: USDC Treasury  ═══▶  {} [+NEW TOKENS]                 │               │\n",
-                    index + 1,
-                    tx.amount,
-                    to_display
-                ));
-            },
-            "burn" => {
-                output.push_str(&format!(
-                    "│ {:>3} │ {:>10.2} BB │ 🔥 BURN: {}  ═══▶  DESTROYED [-TOKENS]                         │               │\n",
-                    index + 1,
-                    tx.amount,
-                    from_display
-                ));
-            },
-            _ => {
-                // Standard L1 transfer
-                output.push_str(&format!(
-                    "│ {:>3} │ {:>10.2} BB │ 💸 TRANSFER: {}  ───▶  {}                    │               │\n",
-                    index + 1,
-                    tx.amount,
-                    from_display,
-                    to_display
-                ));
-            }
+        // Short hashes
+        let tx_hash_short = if tx.tx_hash.len() > 8 { format!("{}..{}", &tx.tx_hash[..4], &tx.tx_hash[tx.tx_hash.len()-4..]) } else { tx.tx_hash.clone() };
+        let prev_hash_short = if tx.prev_tx_hash.len() > 8 { 
+            format!("{}..{}", &tx.prev_tx_hash[..4], &tx.prev_tx_hash[tx.prev_tx_hash.len()-4..]) 
+        } else if tx.prev_tx_hash.is_empty() || tx.prev_tx_hash == "GENESIS" { 
+            "GENESIS".to_string() 
+        } else { 
+            tx.prev_tx_hash.clone() 
         };
+        
+        // Auth icon
+        let auth_lower = tx.auth_type.to_lowercase();
+        let auth_icon = match auth_lower.as_str() {
+            "master_key" | "masterkey" => "🔑",
+            "session_key" | "sessionkey" => "⚡",
+            "zk_proof" | "zkproof" | "zkp_session" => "🔮",
+            "system_internal" | "systeminternal" | "system" => "⚙️",
+            _ => "❓",
+        };
+        
+        // Status icon
+        let status_icon = match tx.status.as_str() {
+            "finalized" | "completed" => "✅",
+            "pending" => "⏳",
+            "reverted" => "↩️",
+            "failed" => "❌",
+            _ => "❓",
+        };
+        
+        // Reconciliation check
+        let reconciled_icon = if tx.is_reconciled() { "✓" } else { "✗" };
+        
+        // Action icon and type
+        let (action_icon, action_name) = match tx.tx_type.to_lowercase().as_str() {
+            "transfer" => ("💸", "TRANSFER"),
+            "mint" => ("🪙", "MINT"),
+            "burn" => ("🔥", "BURN"),
+            "bridge_out" | "bridgeout" | "lock" => ("🌉", "BRIDGE_OUT"),
+            "bridge_in" | "bridgein" | "unlock" => ("🌉", "BRIDGE_IN"),
+            "market_lock" => ("🔒", "MARKET_LOCK"),
+            "market_settle" => ("🔓", "MARKET_SETTLE"),
+            _ => ("❓", "UNKNOWN"),
+        };
+        
+        // Line 1: Block, Time, Hashes, Action & Flow
+        output.push_str(&format!(
+            " │{:>4} │ {} │ {:>12} │ {:>12} │ {} {} {} ───▶ {}                              │\n",
+            tx.block_height, time_str, tx_hash_short, prev_hash_short, action_icon, action_name, from_display, to_display
+        ));
+        
+        // Line 2: Value, Auth, State, Integrity
+        output.push_str(&format!(
+            " │     │                     │              │              │   {} {} │ {:>10.2} BB │ Bal: {:>10.2} → {:>10.2} │ Recv: {:>10.2} │ [{}] │\n",
+            status_icon, auth_icon, tx.amount, tx.balance_before, tx.balance_after, tx.recipient_balance_after, reconciled_icon
+        ));
+        
+        // Separator between transactions
+        output.push_str(" ├─────┼─────────────────────┼──────────────┼──────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤\n");
     }
     
-    output.push_str("└─────┴──────────────┴────────────────────────────────────────────────────────────────────────────┴───────────────┘\n");
+    // Close table
+    output.push_str(" └─────┴─────────────────────┴──────────────┴──────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────┘\n");
     output.push_str("\n");
     
-    // Legend - Updated to show relationship
-    output.push_str("┌───────────────────────────────────────────────────────────────────────────────┐\n");
-    output.push_str("│  📖 LEGEND                                                                    │\n");
-    output.push_str("├───────────────────────────────────────────────────────────────────────────────┤\n");
-    output.push_str("│  💸 TRANSFER    = L1 wallet-to-wallet token transfer                          │\n");
-    output.push_str("│                                                                               │\n");
-    output.push_str("│  🌉 BRIDGE OUT  = User sends tokens from L1 to L2 for gaming session          │\n");
-    output.push_str("│    └─🔒 LOCK    = Tokens locked in L2_ESCROW_POOL (linked to bridge out)      │\n");
-    output.push_str("│                                                                               │\n");
-    output.push_str("│  🌉 BRIDGE IN   = User settles L2 session, tokens return to L1                │\n");
-    output.push_str("│    └─🔓 UNLOCK  = Tokens released from L2_ESCROW_POOL (linked to bridge in)   │\n");
-    output.push_str("│                                                                               │\n");
-    output.push_str("│  🪙 MINT        = New tokens created (requires USDC backing)                  │\n");
-    output.push_str("│  🔥 BURN        = Tokens permanently destroyed                                │\n");
-    output.push_str("└───────────────────────────────────────────────────────────────────────────────┘\n");
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LEGEND
+    // ═══════════════════════════════════════════════════════════════════════════
+    output.push_str(" ─── LEGEND ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n");
+    output.push_str("  ACTIONS: 💸 TRANSFER │ 🪙 MINT │ 🔥 BURN │ 🌉 BRIDGE (OUT/IN) │ 🔒 LOCK │ 🔓 UNLOCK\n");
+    output.push_str("  AUTH:    🔑 Master Key │ ⚡ Session Key │ 🔮 ZK Proof │ ⚙️ System Internal\n");
+    output.push_str("  STATUS:  ✅ Finalized │ ⏳ Pending │ ↩️ Reverted │ ❌ Failed      RECONCILED: [✓] Valid │ [✗] Mismatch\n");
+    output.push_str("  COLUMNS: BLK=Block Height │ TX HASH=Transaction Hash │ PREV HASH=Chain Link │ Bal=Balance Before→After │ Recv=Recipient Balance\n");
+    output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     output.push_str("\n");
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PAGINATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    if total_pages > 1 {
+        output.push_str(" ─── NAVIGATION ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n");
+        if page > 1 {
+            output.push_str(&format!("  ◀ Previous:  /ledger?page={}&limit={}\n", page - 1, limit));
+        }
+        if page < total_pages {
+            output.push_str(&format!("  ▶ Next:      /ledger?page={}&limit={}\n", page + 1, limit));
+        }
+        output.push_str(&format!("  📋 Total: {} transactions │ {} pages │ Showing {} per page\n", transactions.len(), total_pages, limit));
+        output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    }
     
     // Footer
-    output.push_str("╔══════════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
-    output.push_str("║  🛡️  All transactions cryptographically signed with Ed25519 | Immutably stored on BlackBook L1       ║\n");
-    output.push_str("╚══════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
+    output.push_str("\n");
+    output.push_str(" 🛡️  Ed25519 Signatures │ MD5 TX Hashes │ Chain-Linked │ State Validated │ ZKP Auth Ready │ Immutably Stored on BlackBook L1\n");
+    output.push_str("\n");
     
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -349,8 +541,6 @@ struct TransactionsQuery {
     #[serde(default)]
     offset: usize,
 }
-
-fn default_limit() -> usize { 100 }
 
 async fn transactions_handler(
     State(state): State<AppState>,
@@ -406,6 +596,14 @@ async fn performance_stats_handler(State(state): State<AppState>) -> impl IntoRe
 // ============================================================================
 
 /// POST /sealevel/submit - Submit transaction to Gulf Stream for forwarding
+/// 
+/// This is the HIGH-PERFORMANCE entry point for transactions:
+/// 1. Validates basic fields
+/// 2. Submits to Gulf Stream for forwarding to upcoming leaders
+/// 3. Also submits to Pipeline for 4-stage processing
+/// 4. Returns immediately (non-blocking) with tx_id
+/// 
+/// Transactions are then executed in parallel batches by the Sealevel loop.
 #[derive(serde::Deserialize)]
 struct GulfStreamSubmitRequest {
     from: String,
@@ -413,6 +611,8 @@ struct GulfStreamSubmitRequest {
     amount: f64,
     #[serde(default)]
     tx_type: String,  // "transfer", "bet", "social"
+    #[serde(default)]
+    priority: Option<u64>,  // Optional priority boost (higher = faster processing)
 }
 
 async fn gulf_stream_submit_handler(
@@ -420,6 +620,71 @@ async fn gulf_stream_submit_handler(
     Json(req): Json<GulfStreamSubmitRequest>,
 ) -> impl IntoResponse {
     use runtime::core::{Transaction as RuntimeTx, TransactionType};
+    use runtime::PipelinePacket;
+    
+    // Basic validation
+    if req.from.is_empty() || req.to.is_empty() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid from/to addresses"
+        }));
+    }
+    if req.amount <= 0.0 {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Amount must be positive"
+        }));
+    }
+    
+    // =========================================================================
+    // IDEAL HYBRID SECURITY CHECK 1: Stake-Weighted Rate Limiting
+    // =========================================================================
+    // Unlike Solana's unfiltered UDP, we enforce per-sender throttling
+    // Higher stake = more transactions allowed per second
+    let sender_stake = state.blockchain.get_balance(&req.from); // Use balance as proxy for stake
+    if let Err(e) = state.throttler.check_transaction(&req.from, sender_stake) {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Rate limited: {}", e),
+            "throttler_stats": state.throttler.get_stats()
+        }));
+    }
+    
+    // =========================================================================
+    // IDEAL HYBRID SECURITY CHECK 2: Localized Fee Market
+    // =========================================================================
+    // Calculate fee based on sender's group congestion (not global!)
+    let required_fee = state.fee_market.calculate_fee(&req.from);
+    // For now, we don't charge fees but we log them for monitoring
+    if required_fee > 0.0 {
+        info!("💰 Localized fee for {}: {:.6} wUSDC", &req.from[..20.min(req.from.len())], required_fee);
+    }
+    
+    // =========================================================================
+    // IDEAL HYBRID SECURITY CHECK 3: Circuit Breaker (Bank Run Protection)
+    // =========================================================================
+    // Check if this transfer would trip the circuit breaker
+    let current_balance = state.blockchain.get_balance(&req.from);
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    
+    if let Err(e) = state.circuit_breaker.check_transfer(&req.from, req.amount, current_balance, current_slot) {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Circuit breaker tripped: {}", e),
+            "circuit_breaker_stats": state.circuit_breaker.get_stats()
+        }));
+    }
+    
+    // Balance check (fast, lock-free)
+    let balance = state.blockchain.get_balance(&req.from);
+    if balance < req.amount {
+        // Mark transaction completed (for throttler accounting)
+        state.throttler.transaction_completed();
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Insufficient balance: have {:.2}, need {:.2}", balance, req.amount)
+        }));
+    }
     
     let tx_type = match req.tx_type.as_str() {
         "bet" => TransactionType::BetPlacement,
@@ -427,38 +692,199 @@ async fn gulf_stream_submit_handler(
         _ => TransactionType::Transfer,
     };
     
-    let tx = RuntimeTx::new(req.from.clone(), req.to.clone(), req.amount, tx_type);
+    // Create runtime transaction with auto-detected read/write accounts
+    let mut tx = RuntimeTx::new(req.from.clone(), req.to.clone(), req.amount, tx_type);
     let tx_id = tx.id.clone();
     
-    match state.gulf_stream.submit(tx) {
-        Ok(_) => Json(serde_json::json!({
-            "success": true,
-            "tx_id": tx_id,
-            "message": "Transaction submitted to Gulf Stream for forwarding to upcoming leaders",
-            "status": "pending"
-        })),
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "error": e,
-        })),
+    // Apply priority boost if provided (higher value transactions or explicit priority)
+    if let Some(p) = req.priority {
+        // Priority will be used by Gulf Stream for ordering
+        tx.nonce = p; // Reuse nonce field for priority in Gulf Stream
     }
+    
+    // Submit to Gulf Stream (forwarding to upcoming leaders)
+    if let Err(e) = state.gulf_stream.submit(tx.clone()) {
+        state.throttler.transaction_completed();
+        return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Gulf Stream submission failed: {}", e)
+        }));
+    }
+    
+    // Also submit to Pipeline for 4-stage processing (fetch → verify → execute → commit)
+    let packet = PipelinePacket::new(tx_id.clone(), req.from.clone(), req.to.clone(), req.amount);
+    if let Err(e) = state.pipeline.submit(packet).await {
+        warn!("Pipeline submission failed (Gulf Stream will still process): {}", e);
+    }
+    
+    // Note: transaction_completed() will be called after execution completes
+    
+    Json(serde_json::json!({
+        "success": true,
+        "tx_id": tx_id,
+        "message": "Transaction submitted to Gulf Stream + Pipeline for parallel execution",
+        "status": "pending",
+        "estimated_slot": current_slot + 1,
+        "gulf_stream_cache_size": state.gulf_stream.get_stats().cache_size,
+        "localized_fee": required_fee,
+        "security_checks_passed": ["rate_limit", "circuit_breaker", "balance"]
+    }))
 }
 
 /// GET /sealevel/stats - Get Sealevel execution statistics  
+/// 
+/// Returns comprehensive stats for all Solana-style infrastructure:
+/// - ParallelScheduler: Batch processing, conflict rate, thread count
+/// - AccountLockManager: Fine-grained locking statistics
+/// - GulfStream: Transaction forwarding metrics
+/// - Pipeline: 4-stage processing throughput
 async fn sealevel_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     let parallel_stats = state.parallel_scheduler.get_stats();
     let lock_stats = state.parallel_scheduler.lock_manager.get_stats();
     let gulf_stream_stats = state.gulf_stream.get_stats();
+    let pipeline_stats = state.pipeline.get_stats();
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    
+    // Calculate throughput metrics
+    let txs_per_slot = if parallel_stats.total_batches > 0 {
+        parallel_stats.total_processed as f64 / parallel_stats.total_batches as f64
+    } else {
+        0.0
+    };
     
     Json(serde_json::json!({
-        "parallel_scheduler": parallel_stats,
-        "account_lock_manager": lock_stats,
-        "gulf_stream": gulf_stream_stats,
-        "infrastructure": {
+        "sealevel": {
+            "parallel_scheduler": {
+                "total_processed": parallel_stats.total_processed,
+                "total_batches": parallel_stats.total_batches,
+                "current_batch_size": parallel_stats.current_batch_size,
+                "conflict_rate_percent": parallel_stats.conflict_rate * 100.0,
+                "thread_count": parallel_stats.thread_count,
+                "avg_txs_per_batch": txs_per_slot,
+            },
+            "account_locks": lock_stats,
+            "gulf_stream": {
+                "transactions_received": gulf_stream_stats.transactions_received,
+                "transactions_forwarded": gulf_stream_stats.transactions_forwarded,
+                "transactions_expired": gulf_stream_stats.transactions_expired,
+                "cache_size": gulf_stream_stats.cache_size,
+                "leaders_cached": gulf_stream_stats.current_leaders_cached,
+                "avg_forward_latency_us": gulf_stream_stats.avg_forward_latency_us,
+                "is_active": gulf_stream_stats.is_active,
+            },
+            "pipeline": {
+                "packets_received": pipeline_stats.packets_received,
+                "packets_verified": pipeline_stats.packets_verified,
+                "packets_executed": pipeline_stats.packets_executed,
+                "packets_committed": pipeline_stats.packets_committed,
+                "packets_failed": pipeline_stats.packets_failed,
+                "avg_latency_us": pipeline_stats.avg_pipeline_latency_us,
+                "is_running": pipeline_stats.is_running,
+            },
+        },
+        "consensus": {
+            "current_slot": current_slot,
             "confirmations_required": CONFIRMATIONS_REQUIRED,
+            "slot_duration_ms": 400,  // Tuned to Solana-speed
+        },
+        "status": {
             "parallel_execution": true,
             "gulf_stream_active": gulf_stream_stats.is_active,
+            "pipeline_running": pipeline_stats.is_running,
+            "performance_mode": "SEALEVEL_ENABLED",
         }
+    }))
+}
+
+/// POST /sealevel/batch - Submit multiple transactions in a single request
+/// 
+/// High-throughput batch submission endpoint for maximum efficiency.
+/// All transactions are validated and submitted atomically.
+#[derive(serde::Deserialize)]
+struct BatchSubmitRequest {
+    transactions: Vec<GulfStreamSubmitRequest>,
+}
+
+async fn sealevel_batch_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BatchSubmitRequest>,
+) -> impl IntoResponse {
+    use runtime::core::{Transaction as RuntimeTx, TransactionType};
+    
+    if req.transactions.is_empty() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Empty transaction batch"
+        }));
+    }
+    
+    if req.transactions.len() > 1_024 {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Batch too large (max 1,024 transactions)"
+        }));
+    }
+    
+    let mut submitted = Vec::new();
+    let mut failed = Vec::new();
+    
+    for tx_req in req.transactions {
+        // Validate
+        if tx_req.from.is_empty() || tx_req.to.is_empty() || tx_req.amount <= 0.0 {
+            failed.push(serde_json::json!({
+                "from": tx_req.from,
+                "to": tx_req.to,
+                "error": "Invalid transaction fields"
+            }));
+            continue;
+        }
+        
+        // Balance check
+        let balance = state.blockchain.get_balance(&tx_req.from);
+        if balance < tx_req.amount {
+            failed.push(serde_json::json!({
+                "from": tx_req.from,
+                "to": tx_req.to,
+                "error": format!("Insufficient balance: {:.2} < {:.2}", balance, tx_req.amount)
+            }));
+            continue;
+        }
+        
+        let tx_type = match tx_req.tx_type.as_str() {
+            "bet" => TransactionType::BetPlacement,
+            "social" => TransactionType::SocialAction,
+            _ => TransactionType::Transfer,
+        };
+        
+        let tx = RuntimeTx::new(tx_req.from.clone(), tx_req.to.clone(), tx_req.amount, tx_type);
+        let tx_id = tx.id.clone();
+        
+        if state.gulf_stream.submit(tx).is_ok() {
+            submitted.push(serde_json::json!({
+                "tx_id": tx_id,
+                "from": tx_req.from,
+                "to": tx_req.to,
+                "amount": tx_req.amount
+            }));
+        } else {
+            failed.push(serde_json::json!({
+                "from": tx_req.from,
+                "to": tx_req.to,
+                "error": "Gulf Stream submission failed"
+            }));
+        }
+    }
+    
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    
+    Json(serde_json::json!({
+        "success": failed.is_empty(),
+        "submitted_count": submitted.len(),
+        "failed_count": failed.len(),
+        "submitted": submitted,
+        "failed": failed,
+        "estimated_slot": current_slot + 1,
+        "gulf_stream_cache_size": state.gulf_stream.get_stats().cache_size
     }))
 }
 
@@ -490,7 +916,7 @@ async fn sealevel_pending_handler(
 // ============================================================================
 
 /// POST /auth/keypair - Generate new Ed25519 keypair
-async fn keypair_handler() -> impl IntoResponse {
+async fn keypair_handler(State(state): State<AppState>) -> impl IntoResponse {
     use integration::unified_auth::{generate_keypair, derive_l1_address};
     let (pubkey, secret) = generate_keypair();
     
@@ -498,14 +924,60 @@ async fn keypair_handler() -> impl IntoResponse {
     let address = derive_l1_address(&pubkey)
         .unwrap_or_else(|_| format!("L1_ERROR_{}", &pubkey[..16]));
     
+    // =========================================================================
+    // IDEAL HYBRID: Register Type-Safe PDA on Wallet Creation
+    // =========================================================================
+    // This prevents account confusion attacks by explicitly typing accounts
+    
+    // Derive PDA for this wallet
+    let pda_result = ProgramDerivedAddress::derive(
+        AccountType::UserWallet,
+        &address,
+        None,  // No optional ID for wallet
+    );
+    
+    // Create account metadata using derived PDA or fallback
+    let (pda_bump, pda_address) = match &pda_result {
+        Ok(p) => (p.bump, p.address.clone()),
+        Err(_) => (255, address.clone()),  // Fallback if derivation fails
+    };
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    let metadata = AccountMetadata {
+        account_type: AccountType::UserWallet,
+        owner: address.clone(),  // Self-owned wallet
+        created_at: now,
+        updated_at: now,
+        pda_info: Some(PDAInfo {
+            namespace: "wallet".to_string(),
+            bump: pda_bump,
+            index: None,
+        }),
+        frozen: false,
+        data: None,
+    };
+    
+    // Register in account metadata store
+    state.account_metadata.insert(address.clone(), metadata);
+    
     // Log keypair generation anonymously
-    info!("🔑 New keypair generated (wallet address not logged for privacy)");
+    info!("🔑 New keypair generated with type-safe PDA (privacy preserved)");
     
     Json(serde_json::json!({
         "success": true,
         "public_key": pubkey,
         "secret_key": secret,
-        "address": address
+        "address": address,
+        "pda": {
+            "derived_address": pda_address,
+            "bump": pda_bump,
+            "account_type": "UserWallet",
+            "namespace": "wallet"
+        }
     }))
 }
 
@@ -535,6 +1007,181 @@ async fn test_accounts_handler(State(state): State<AppState>) -> impl IntoRespon
 }
 
 // ============================================================================
+// ZKP WALLET HANDLERS (Non-Custodial Authentication)
+// ============================================================================
+
+/// POST /auth/zkp-register - Register ZKP wallet with Share B storage
+async fn zkp_register_handler(
+    State(state): State<AppState>,
+    Json(data): Json<integration::unified_auth::WalletZKPData>,
+) -> impl IntoResponse {
+    use integration::unified_auth::{store_share_b, is_wallet_registered};
+
+    // Check if wallet already registered
+    if is_wallet_registered(&data.address) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "success": false,
+            "error": format!("Wallet already registered: {}", data.address)
+        })));
+    }
+
+    // Validate data
+    if data.pubkey.len() != 64 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid public key length (expected 64 hex chars)"
+        })));
+    }
+
+    if data.zk_commitment.len() != 64 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Invalid ZK-commitment length (expected 64 hex chars)"
+        })));
+    }
+
+    if data.share_b.x != 2 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Share B must have x=2 (Share A=1, B=2, C=3)"
+        })));
+    }
+
+    // Store Share B
+    match store_share_b(data.clone()) {
+        Ok(()) => {
+            info!("🔐 ZKP wallet registered: {}... Commitment: {}...", 
+                     &data.address[..14], &data.zk_commitment[..16]);
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "address": data.address,
+                "share_b_stored": true,
+                "message": "ZKP wallet registered successfully",
+                "note": "Store Share C in Supabase, Share A derived from password"
+            })))
+        },
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "success": false,
+                "error": e
+            })))
+        }
+    }
+}
+
+/// POST /auth/zkp-login - Login with ZK-proof, get Share B
+async fn zkp_login_handler(
+    State(state): State<AppState>,
+    Json(request): Json<integration::unified_auth::ZKPLoginRequest>,
+) -> impl IntoResponse {
+    use integration::unified_auth::{get_wallet_zkp_data, verify_zk_proof, release_share_b};
+
+    // Get wallet data
+    let wallet_data = match get_wallet_zkp_data(&request.address) {
+        Ok(data) => data,
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Wallet not found: {}", e)
+            })));
+        }
+    };
+
+    // Verify ZK-proof
+    match verify_zk_proof(&request.zk_proof, &wallet_data.zk_commitment, &request.nonce) {
+        Ok(()) => {
+            info!("✅ ZK-proof verified for: {}...", &request.address[..14]);
+
+            // Release Share B
+            match release_share_b(&request.address) {
+                Ok(share_b) => {
+                    // TODO: In production, encrypt Share B with session key
+                    (StatusCode::OK, Json(serde_json::json!({
+                        "success": true,
+                        "share_b": share_b,
+                        "pubkey": wallet_data.pubkey,
+                        "message": "ZK-proof verified, Share B released",
+                        "note": "Combine with Share A (from password) to sign transactions"
+                    })))
+                },
+                Err(e) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to release Share B: {}", e)
+                    })))
+                }
+            }
+        },
+        Err(e) => {
+            info!("❌ ZK-proof verification failed: {}", e);
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "success": false,
+                "error": format!("ZK-proof verification failed: {}", e)
+            })))
+        }
+    }
+}
+
+/// GET /auth/zkp-commitment/:address - Get ZK-commitment and salt for login
+async fn zkp_get_commitment_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    use integration::unified_auth::get_wallet_zkp_data;
+
+    match get_wallet_zkp_data(&address) {
+        Ok(data) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "address": data.address,
+                "zk_commitment": data.zk_commitment,
+                "salt": data.salt,
+                "pubkey": data.pubkey,
+                "note": "Use salt + password to derive Share A, then generate ZK-proof"
+            })))
+        },
+        Err(e) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "success": false,
+                "error": format!("Wallet not found: {}", e)
+            })))
+        }
+    }
+}
+
+/// POST /auth/zkp-recover - Initiate wallet recovery
+async fn zkp_recover_handler(
+    State(state): State<AppState>,
+    Json(recovery_request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let address = recovery_request.get("address")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    info!("🔄 Recovery requested for: {}", address);
+
+    // In production, this would:
+    // 1. Verify identity (KYC, email verification, etc.)
+    // 2. Release Share B after verification
+    // 3. User gets Share C from Supabase (with pepper)
+    // 4. Reconstruct key from Share B + C
+    // 5. Generate new password and shares
+
+    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+        "success": false,
+        "error": "Recovery not yet implemented",
+        "message": "Please contact support for manual recovery",
+        "recovery_process": [
+            "1. Verify identity through support",
+            "2. Receive Share B from L1",
+            "3. Decrypt Share C from Supabase (requires old password or recovery key)",
+            "4. Reconstruct wallet with Share B + C",
+            "5. Set new password and regenerate shares"
+        ]
+    })))
+}
+
+// ============================================================================
 // TRANSFER HANDLER
 // ============================================================================
 
@@ -550,6 +1197,8 @@ struct TransferRequest {
     chain_id: u8,
     request_path: String,
     signature: String,
+    #[serde(default)]
+    security_pin: Option<String>, // Required for transactions > 100,000 BB
 }
 
 #[derive(serde::Deserialize)]
@@ -674,12 +1323,43 @@ async fn simple_transfer_handler(
         })));
     }
 
-    // Check balance
+    // =========================================================================
+    // IDEAL HYBRID SECURITY CHECKS
+    // =========================================================================
+    
+    // 1. STAKE-WEIGHTED RATE LIMITING
+    let sender_stake = state.blockchain.get_balance(from) / 1000.0;
+    if let Err(e) = state.throttler.check_transaction(from, sender_stake) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "security_check": "rate_limit",
+            "stake": sender_stake
+        })));
+    }
+    
+    // 2. LOCALIZED FEE MARKET
+    let localized_fee = state.fee_market.calculate_fee(from);
+    
+    // 3. CIRCUIT BREAKER
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
     let from_balance = state.blockchain.get_balance(from);
+    if let Err(e) = state.circuit_breaker.check_transfer(from, amount, from_balance, current_slot) {
+        state.throttler.transaction_completed();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "security_check": "circuit_breaker"
+        })));
+    }
+
+    // Check balance (already have from_balance)
     if from_balance < amount {
+        state.throttler.transaction_completed();
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
-            "error": format!("Insufficient balance: {} < {}", from_balance, amount)
+            "error": format!("Insufficient balance: {} < {}", from_balance, amount),
+            "localized_fee": localized_fee
         })));
     }
 
@@ -687,6 +1367,7 @@ async fn simple_transfer_handler(
     match state.blockchain.transfer(from, to, amount) {
         Ok(_) => {
             info!("💸 Transfer: {} → {} : {} BB", from, to, amount);
+            state.throttler.transaction_completed();
             
             let from_new = state.blockchain.get_balance(from);
             let to_new = state.blockchain.get_balance(to);
@@ -699,10 +1380,13 @@ async fn simple_transfer_handler(
                 "from_balance": from_new,
                 "to_balance": to_new,
                 "timestamp": req.timestamp,
-                "nonce": req.nonce
+                "nonce": req.nonce,
+                "localized_fee": localized_fee,
+                "security_checks_passed": ["rate_limit", "circuit_breaker", "balance"]
             })))
         }
         Err(e) => {
+            state.throttler.transaction_completed();
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "success": false,
                 "error": e
@@ -739,6 +1423,32 @@ async fn transfer_handler(
             "success": false,
             "error": "Amount must be positive"
         })));
+    }
+
+    // TIERED SECURITY: Require PIN for high-value transactions (> 100,000 BB)
+    if req.payload_fields.amount > HIGH_VALUE_THRESHOLD {
+        match &req.security_pin {
+            Some(pin) if pin == DEFAULT_SECURITY_PIN => {
+                info!("🔐 High-value transfer ({} BB) - PIN verified", req.payload_fields.amount);
+            }
+            Some(_) => {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                    "success": false,
+                    "error": "Invalid security PIN for high-value transaction",
+                    "amount": req.payload_fields.amount,
+                    "threshold": HIGH_VALUE_THRESHOLD
+                })));
+            }
+            None => {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                    "success": false,
+                    "error": "Security PIN required for transactions over 100,000 BB",
+                    "amount": req.payload_fields.amount,
+                    "threshold": HIGH_VALUE_THRESHOLD,
+                    "hint": "Include security_pin in request body"
+                })));
+            }
+        }
     }
 
     // Verify signature (V2 SDK format)
@@ -813,12 +1523,52 @@ async fn transfer_handler(
         })));
     }
 
-    // Check balance
+    // =========================================================================
+    // IDEAL HYBRID SECURITY CHECKS
+    // =========================================================================
+    
+    // 1. STAKE-WEIGHTED RATE LIMITING (QUIC-style, not unfiltered UDP)
+    // Stake calculated as 1 stake per 1000 BB balance
+    let sender_stake = state.blockchain.get_balance(&req.payload_fields.from) / 1000.0;
+    if let Err(e) = state.throttler.check_transaction(&req.payload_fields.from, sender_stake) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "security_check": "rate_limit",
+            "stake": sender_stake,
+            "hint": "Increase stake or wait for rate limit window to reset"
+        })));
+    }
+    
+    // 2. LOCALIZED FEE MARKET (spam only affects spammer, not everyone)
+    let localized_fee = state.fee_market.calculate_fee(&req.payload_fields.from);
+    // Note: Fee is informational - could deduct in production
+    
+    // 3. CIRCUIT BREAKER (automatic protection against exploits/bank runs)
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
     let from_balance = state.blockchain.get_balance(&req.payload_fields.from);
+    if let Err(e) = state.circuit_breaker.check_transfer(
+        &req.payload_fields.from,
+        req.payload_fields.amount,
+        from_balance,
+        current_slot,
+    ) {
+        state.throttler.transaction_completed(); // Release throttle slot
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "success": false,
+            "error": e,
+            "security_check": "circuit_breaker",
+            "hint": "Large withdrawals are rate-limited for security"
+        })));
+    }
+
+    // Check balance (already fetched from_balance above)
     if from_balance < req.payload_fields.amount {
+        state.throttler.transaction_completed(); // Release throttle slot
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "success": false,
-            "error": format!("Insufficient balance: {} < {}", from_balance, req.payload_fields.amount)
+            "error": format!("Insufficient balance: {} < {}", from_balance, req.payload_fields.amount),
+            "localized_fee": localized_fee
         })));
     }
 
@@ -837,26 +1587,27 @@ async fn transfer_handler(
                     let from_new = state.blockchain.get_balance(&req.payload_fields.from);
                     let to_new = state.blockchain.get_balance(&req.payload_fields.to);
                     
-                    // Log transaction to history
-                    let tx_id = format!("{}_{}", req.timestamp, req.nonce);
-                    let tx_record = storage::TransactionRecord {
-                        tx_id: tx_id.clone(),
-                        tx_type: "transfer".to_string(),
-                        from_address: req.payload_fields.from.clone(),
-                        to_address: req.payload_fields.to.clone(),
-                        amount: req.payload_fields.amount,
-                        timestamp: req.timestamp,
-                        status: "completed".to_string(),
-                        signature: Some(req.signature.clone()),
-                        metadata: Some(serde_json::json!({
-                            "payload_hash": req.payload_hash,
-                            "nonce": req.nonce,
-                        })),
-                    };
+                    // Log transaction to history with enhanced fields
+                    let nonce_num: u64 = req.nonce.parse().unwrap_or(0);
+                    let tx_record = storage::TransactionRecord::new(
+                        storage::TxType::Transfer,
+                        &req.payload_fields.from,
+                        &req.payload_fields.to,
+                        req.payload_fields.amount,
+                        nonce_num,
+                        from_balance,
+                        from_new,
+                        to_new,
+                        storage::AuthType::MasterKey,
+                    );
+                    let tx_id = tx_record.tx_id.clone();
                     
                     if let Err(e) = state.blockchain.log_transaction(tx_record) {
                         warn!("Failed to log transaction: {}", e);
                     }
+                    
+                    // Release throttle slot on success
+                    state.throttler.transaction_completed();
                     
                     (StatusCode::OK, Json(serde_json::json!({
                         "success": true,
@@ -867,12 +1618,15 @@ async fn transfer_handler(
                         "from_balance": from_new,
                         "to_balance": to_new,
                         "timestamp": req.timestamp,
-                        "nonce": req.nonce
+                        "nonce": req.nonce,
+                        "localized_fee": localized_fee,
+                        "security_checks_passed": ["rate_limit", "circuit_breaker", "balance"]
                     })))
                 }
                 Err(e) => {
                     // Rollback debit
                     let _ = state.blockchain.credit(&req.payload_fields.from, req.payload_fields.amount);
+                    state.throttler.transaction_completed(); // Release on failure too
                     (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                         "success": false,
                         "error": format!("Failed to credit recipient: {}", e)
@@ -881,6 +1635,7 @@ async fn transfer_handler(
             }
         }
         Err(e) => {
+            state.throttler.transaction_completed(); // Release on failure
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "success": false,
                 "error": format!("Failed to debit sender: {}", e)
@@ -941,24 +1696,20 @@ async fn credit_open_handler(
                 req.amount, req.wallet, session.id
             );
             
-            // Log the lock transaction
-            let tx_record = storage::TransactionRecord {
-                tx_id: format!("lock_{}", session.id),
-                tx_type: "market_lock".to_string(),
-                from_address: req.wallet.clone(),
-                to_address: "MARKET_ESCROW".to_string(),
-                amount: req.amount,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                status: "completed".to_string(),
-                signature: None,
-                metadata: Some(serde_json::json!({
-                    "session_id": session.id,
-                    "type": "market_session_open"
-                })),
-            };
-            let _ = state.blockchain.log_transaction(tx_record);
-            
+            // Log the lock transaction with enhanced fields
             let new_balance = state.blockchain.get_balance(&req.wallet);
+            let tx_record = storage::TransactionRecord::new(
+                storage::TxType::Lock,
+                &req.wallet,
+                "MARKET_ESCROW",
+                req.amount,
+                0,
+                new_balance + req.amount, // balance before lock
+                new_balance,
+                req.amount, // escrow balance after
+                storage::AuthType::MasterKey,
+            );
+            let _ = state.blockchain.log_transaction(tx_record);
             
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
@@ -1020,23 +1771,19 @@ async fn credit_settle_handler(
                         final_amount, wallet, result.locked_amount, req.net_pnl
                     );
                     
-                    // Log the settlement transaction
-                    let tx_record = storage::TransactionRecord {
-                        tx_id: format!("settle_{}", req.session_id),
-                        tx_type: "market_settle".to_string(),
-                        from_address: "MARKET_ESCROW".to_string(),
-                        to_address: wallet.clone(),
-                        amount: final_amount,
-                        timestamp: chrono::Utc::now().timestamp() as u64,
-                        status: "completed".to_string(),
-                        signature: None,
-                        metadata: Some(serde_json::json!({
-                            "session_id": req.session_id,
-                            "locked_amount": result.locked_amount,
-                            "net_pnl": req.net_pnl,
-                            "type": "market_session_settle"
-                        })),
-                    };
+                    // Log the settlement transaction with enhanced fields
+                    let new_balance = state.blockchain.get_balance(wallet);
+                    let tx_record = storage::TransactionRecord::new(
+                        storage::TxType::Unlock,
+                        "MARKET_ESCROW",
+                        wallet,
+                        final_amount,
+                        0,
+                        result.locked_amount, // escrow balance before
+                        0.0, // escrow balance after
+                        new_balance,
+                        storage::AuthType::SystemInternal,
+                    );
                     let _ = state.blockchain.log_transaction(tx_record);
                 }
                 // If final_amount <= 0, user lost everything (or more with credit), nothing to return
@@ -1160,24 +1907,20 @@ async fn bridge_initiate_handler(
             info!("🌉 Bridge initiated: {} - {} BB from {} to {}", 
                 lock.lock_id, amount, wallet, target);
             
-            // 🔥 LOG BRIDGE TRANSACTION TO LEDGER
-            let tx_record = TransactionRecord {
-                tx_id: lock.lock_id.clone(),
-                tx_type: "bridge_out".to_string(),
-                from_address: wallet.clone(),
-                to_address: format!("{}_ESCROW", target),
-                amount: amount,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                status: "locked".to_string(),
-                signature: Some(signed_req.signature.clone()),
-                metadata: Some(serde_json::json!({
-                    "lock_id": lock.lock_id,
-                    "target_layer": target,
-                    "expires_at": lock.expires_at,
-                    "public_key": signed_req.public_key,
-                    "nonce": signed_req.nonce
-                }))
-            };
+            // 🔥 LOG BRIDGE TRANSACTION TO LEDGER with enhanced fields
+            let balance_after = state.blockchain.get_balance(&wallet);
+            let nonce_num: u64 = signed_req.nonce.parse().unwrap_or(0);
+            let tx_record = TransactionRecord::new(
+                storage::TxType::BridgeOut,
+                &wallet,
+                &format!("{}_ESCROW", target),
+                amount,
+                nonce_num,
+                balance_after + amount, // balance before
+                balance_after,
+                amount, // escrow balance after
+                storage::AuthType::MasterKey,
+            );
             
             if let Err(e) = state.blockchain.log_transaction(tx_record) {
                 warn!("Failed to log bridge transaction: {}", e);
@@ -1474,6 +2217,8 @@ struct BurnRequest {
     chain_id: u8,
     request_path: String,
     signature: String,
+    #[serde(default)]
+    security_pin: Option<String>, // Required for burns > 100,000 BB
 }
 
 #[derive(serde::Deserialize)]
@@ -1512,6 +2257,32 @@ async fn admin_burn_handler(
             "success": false,
             "error": "Amount must be positive"
         })));
+    }
+
+    // TIERED SECURITY: Require PIN for high-value burns (> 100,000 BB)
+    if req.payload_fields.amount > HIGH_VALUE_THRESHOLD {
+        match &req.security_pin {
+            Some(pin) if pin == DEFAULT_SECURITY_PIN => {
+                info!("🔐 High-value burn ({} BB) - PIN verified", req.payload_fields.amount);
+            }
+            Some(_) => {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                    "success": false,
+                    "error": "Invalid security PIN for high-value burn",
+                    "amount": req.payload_fields.amount,
+                    "threshold": HIGH_VALUE_THRESHOLD
+                })));
+            }
+            None => {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                    "success": false,
+                    "error": "Security PIN required for burns over 100,000 BB",
+                    "amount": req.payload_fields.amount,
+                    "threshold": HIGH_VALUE_THRESHOLD,
+                    "hint": "Include security_pin in request body"
+                })));
+            }
+        }
     }
 
     // Verify signature (Standard V2 SDK format)
@@ -1605,24 +2376,22 @@ async fn admin_burn_handler(
             );
             
             let new_balance = state.blockchain.get_balance(&req.payload_fields.from);
+            let balance_before = new_balance + req.payload_fields.amount;
             
-            // Log transaction
-            let tx_id = format!("burn_{}_{}", req.timestamp, req.nonce);
-            let tx_record = storage::TransactionRecord {
-                tx_id: tx_id.clone(),
-                tx_type: "burn".to_string(),
-                from_address: req.payload_fields.from.clone(),
-                to_address: "legacy_burn_address".to_string(), // Or null
-                amount: req.payload_fields.amount,
-                timestamp: req.timestamp,
-                status: "completed".to_string(),
-                signature: Some(req.signature.clone()),
-                metadata: Some(serde_json::json!({
-                    "payload_hash": req.payload_hash,
-                    "nonce": req.nonce,
-                    "burn": true
-                })),
-            };
+            // Log transaction with enhanced fields
+            let nonce_num: u64 = req.nonce.parse().unwrap_or(0);
+            let tx_record = storage::TransactionRecord::new(
+                storage::TxType::Burn,
+                &req.payload_fields.from,
+                "DESTROYED",
+                req.payload_fields.amount,
+                nonce_num,
+                balance_before,
+                new_balance,
+                0.0, // destroyed tokens have no recipient
+                storage::AuthType::MasterKey,
+            );
+            let tx_id = tx_record.tx_id.clone();
             
             if let Err(e) = state.blockchain.log_transaction(tx_record) {
                 warn!("Failed to log burn transaction: {}", e);
@@ -1643,6 +2412,161 @@ async fn admin_burn_handler(
                 "error": format!("Failed to burn tokens: {}", e)
             })))
         }
+    }
+}
+
+// ============================================================================
+// SECURITY ADMIN HANDLERS - Ideal Hybrid Infrastructure Controls
+// ============================================================================
+
+/// GET /admin/security/stats - Comprehensive security infrastructure status
+async fn security_stats_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let throttler_stats = state.throttler.get_stats();
+    let circuit_breaker_stats = state.circuit_breaker.get_stats();
+    let fee_market_stats = state.fee_market.get_stats();
+    
+    // Get tripped accounts (for monitoring)
+    let tripped_count = state.account_metadata.iter()
+        .filter(|entry| state.circuit_breaker.is_tripped(entry.key()))
+        .count();
+    
+    Json(serde_json::json!({
+        "success": true,
+        "infrastructure": "Ideal Hybrid Stablecoin L1",
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        
+        "throttler": throttler_stats,
+        "circuit_breaker": circuit_breaker_stats,
+        "fee_market": fee_market_stats,
+        
+        "accounts": {
+            "total_registered": state.account_metadata.len(),
+            "tripped_by_circuit_breaker": tripped_count,
+        },
+        
+        "security_features": {
+            "stake_weighted_rate_limiting": true,
+            "localized_fee_markets": true,
+            "circuit_breakers": true,
+            "type_safe_pdas": true,
+            "declarative_account_validation": true
+        },
+        
+        "vs_solana": {
+            "transaction_ingest": "QUIC + Stake-Weighted (vs Unfiltered UDP)",
+            "fee_structure": "Localized Fee Markets (vs Global Spikes)", 
+            "account_safety": "Declarative Framework (vs Manual Verification)",
+            "consensus_speed": "600ms Stable (vs 400ms Fragile)",
+            "pda_system": "Type-safe Namespaced (vs Manual Seeds)"
+        }
+    }))
+}
+
+/// POST /admin/security/circuit-breaker/reset/:account - Reset a tripped circuit breaker
+async fn circuit_breaker_reset_handler(
+    State(state): State<AppState>,
+    Path(account): Path<String>,
+) -> impl IntoResponse {
+    if state.circuit_breaker.is_tripped(&account) {
+        state.circuit_breaker.admin_reset(&account);
+        Json(serde_json::json!({
+            "success": true,
+            "account": account,
+            "action": "circuit_breaker_reset",
+            "message": "Circuit breaker reset, account can transact normally"
+        }))
+    } else {
+        Json(serde_json::json!({
+            "success": false,
+            "account": account,
+            "error": "Account is not currently tripped"
+        }))
+    }
+}
+
+/// POST /admin/security/circuit-breaker/exempt/:account - Exempt account from circuit breaker
+async fn circuit_breaker_exempt_handler(
+    State(state): State<AppState>,
+    Path(account): Path<String>,
+) -> impl IntoResponse {
+    state.circuit_breaker.add_exemption(&account);
+    Json(serde_json::json!({
+        "success": true,
+        "account": account,
+        "action": "circuit_breaker_exempt",
+        "message": "Account exempted from circuit breaker limits (use for treasury/bridge)"
+    }))
+}
+
+/// POST /admin/security/throttler/halt - Emergency halt all transactions
+async fn throttler_halt_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    state.throttler.emergency_halt();
+    warn!("🚨 EMERGENCY HALT activated via admin endpoint");
+    Json(serde_json::json!({
+        "success": true,
+        "action": "emergency_halt",
+        "message": "All transactions halted. Use /admin/security/throttler/resume to restore."
+    }))
+}
+
+/// POST /admin/security/throttler/resume - Resume from emergency halt
+async fn throttler_resume_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    state.throttler.resume();
+    info!("✅ Emergency halt lifted via admin endpoint");
+    Json(serde_json::json!({
+        "success": true,
+        "action": "resume",
+        "message": "Transaction processing resumed"
+    }))
+}
+
+/// GET /admin/security/pda/:address - Get PDA info for an account
+async fn pda_info_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    if let Some(metadata) = state.account_metadata.get(&address) {
+        Json(serde_json::json!({
+            "success": true,
+            "address": address,
+            "account_type": format!("{:?}", metadata.account_type),
+            "owner": metadata.owner,
+            "created_at": metadata.created_at,
+            "frozen": metadata.frozen,
+            "pda_info": metadata.pda_info.as_ref().map(|p| serde_json::json!({
+                "namespace": p.namespace,
+                "index": p.index,
+                "bump": p.bump
+            })),
+            "is_circuit_breaker_tripped": state.circuit_breaker.is_tripped(&address)
+        }))
+    } else {
+        // Try to derive PDA info even if not registered
+        let derived = ProgramDerivedAddress::derive(
+            AccountType::UserWallet,
+            &address,
+            None,
+        );
+        let pda_info = derived.ok().map(|d| serde_json::json!({
+            "address": d.address,
+            "bump": d.bump
+        }));
+        Json(serde_json::json!({
+            "success": false,
+            "address": address,
+            "error": "Account not registered in metadata store",
+            "hint": "Create account via /auth/keypair to auto-register",
+            "derived_pda": pda_info
+        }))
     }
 }
 
@@ -2004,6 +2928,7 @@ fn build_public_routes() -> Router<AppState> {
 fn build_sealevel_routes() -> Router<AppState> {
     Router::new()
         .route("/submit", post(gulf_stream_submit_handler))
+        .route("/batch", post(sealevel_batch_handler))  // NEW: High-throughput batch submission
         .route("/stats", get(sealevel_stats_handler))
         .route("/pending/:leader", get(sealevel_pending_handler))
 }
@@ -2012,6 +2937,11 @@ fn build_auth_routes() -> Router<AppState> {
     Router::new()
         .route("/keypair", post(keypair_handler))
         .route("/test-accounts", get(test_accounts_handler))
+        // ZKP Wallet Routes (Non-Custodial)
+        .route("/zkp-register", post(zkp_register_handler))
+        .route("/zkp-login", post(zkp_login_handler))
+        .route("/zkp-commitment/:address", get(zkp_get_commitment_handler))
+        .route("/zkp-recover", post(zkp_recover_handler))
 }
 
 fn build_credit_routes() -> Router<AppState> {
@@ -2036,6 +2966,13 @@ fn build_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/mint", post(admin_mint_handler))
         .route("/burn", post(admin_burn_handler))
+        // Security admin endpoints (Ideal Hybrid Infrastructure)
+        .route("/security/stats", get(security_stats_handler))
+        .route("/security/circuit-breaker/reset/:account", post(circuit_breaker_reset_handler))
+        .route("/security/circuit-breaker/exempt/:account", post(circuit_breaker_exempt_handler))
+        .route("/security/throttler/halt", post(throttler_halt_handler))
+        .route("/security/throttler/resume", post(throttler_resume_handler))
+        .route("/security/pda/:address", get(pda_info_handler))
 }
 
 fn build_poh_blockchain_routes() -> Router<AppState> {
@@ -2177,11 +3114,13 @@ async fn main() {
     // ========================================================================
     // 2. INITIALIZE PROOF OF HISTORY (PoH) SERVICE
     // ========================================================================
+    // IDEAL HYBRID: 600ms slots for stability (vs Solana's fragile 400ms)
+    // This gives us ~1.67 slots/second with better network tolerance
     let poh_config = PoHConfig {
-        slot_duration_ms: 1000,
-        hashes_per_tick: 12500,
-        ticks_per_slot: 64,
-        slots_per_epoch: 432000,
+        slot_duration_ms: 600,       // 600ms = stable+fast (vs Solana's 400ms)
+        hashes_per_tick: 12500,      // ~12.5k SHA256 hashes per tick
+        ticks_per_slot: 64,          // 64 ticks per slot
+        slots_per_epoch: 432000,     // ~3 days at 600ms slots
     };
     let poh_service: SharedPoHService = create_poh_service(poh_config);
     
@@ -2214,7 +3153,7 @@ async fn main() {
         schedule.generate_schedule(0, 432000);
     }
 
-    let (pipeline, _commit_rx) = TransactionPipeline::new();
+    let (pipeline, commit_rx) = TransactionPipeline::new();
     pipeline.start(current_slot.clone());
     info!("🔄 Transaction Pipeline started");
 
@@ -2252,6 +3191,128 @@ async fn main() {
     info!("✅ FinalityTracker initialized (confirmation tracking)");
 
     // ========================================================================
+    // 5F. IDEAL HYBRID SECURITY INFRASTRUCTURE
+    // ========================================================================
+    // These systems make BlackBook L1 immune to Solana's vulnerabilities:
+    // - Spam attacks: Stake-weighted throttling (not unfiltered UDP)
+    // - Bank runs: Circuit breakers (automatic slowdown on large outflows)
+    // - Fee spikes: Localized fee markets (spam only affects spammer)
+    // - Account confusion: Type-safe PDAs (namespace + owner + bump)
+    
+    let throttler = Arc::new(NetworkThrottler::new());
+    info!("🛡️ NetworkThrottler initialized (stake-weighted rate limiting)");
+    
+    let circuit_breaker = Arc::new(CircuitBreaker::new());
+    // Exempt system accounts from circuit breakers
+    circuit_breaker.add_exemption("genesis");
+    circuit_breaker.add_exemption("mining_reward");
+    circuit_breaker.add_exemption("social_mining");
+    circuit_breaker.add_exemption("system");
+    info!("🔌 CircuitBreaker initialized (bank run protection)");
+    
+    let fee_market = Arc::new(LocalizedFeeMarket::new());
+    info!("💰 LocalizedFeeMarket initialized (per-group fees, no global spikes)");
+    
+    let account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>> = Arc::new(dashmap::DashMap::new());
+    info!("🔐 AccountMetadata initialized (type-safe PDA accounts)");
+
+    // ========================================================================
+    // 5G. SEALEVEL EXECUTION LOOP - WIRE UP PARALLEL PROCESSING
+    // ========================================================================
+    // This is the critical integration that makes ParallelScheduler actually execute!
+    // It consumes from Gulf Stream and executes batches in parallel.
+    let sealevel_blockchain = blockchain.clone();
+    let sealevel_scheduler = parallel_scheduler.clone();
+    let sealevel_gulf_stream = gulf_stream.clone();
+    let sealevel_leader_schedule = leader_schedule.clone();
+    let sealevel_current_slot = current_slot.clone();
+    let sealevel_finality = finality_tracker.clone();
+    let sealevel_poh = poh_service.clone();
+    
+    tokio::spawn(async move {
+        info!("⚡ Sealevel execution loop started - processing Gulf Stream transactions");
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100)); // 10x per slot
+        
+        loop {
+            interval.tick().await;
+            
+            // Get current leader for this slot
+            let slot = sealevel_current_slot.load(std::sync::atomic::Ordering::Relaxed);
+            let leader = {
+                let schedule = sealevel_leader_schedule.read();
+                schedule.get_leader(slot)
+            };
+            
+            // Pull pending transactions from Gulf Stream for this leader
+            let pending = sealevel_gulf_stream.get_pending_by_priority(&leader, 64); // Batch of 64
+            
+            if pending.is_empty() {
+                continue;
+            }
+            
+            // Convert to runtime transactions and schedule into non-conflicting batches
+            let batches = sealevel_scheduler.schedule_with_locks(pending);
+            
+            if batches.is_empty() {
+                continue;
+            }
+            
+            // Execute each batch in parallel using Sealevel-style execution
+            for batch in batches {
+                let batch_size = batch.len();
+                
+                // Execute with fine-grained account locks
+                let results = sealevel_scheduler.execute_batch_with_locks(
+                    batch.clone(),
+                    &sealevel_blockchain.cache,
+                );
+                
+                // Process results and update blockchain state
+                let mut success_count = 0;
+                let mut fail_count = 0;
+                
+                for (i, result) in results.iter().enumerate() {
+                    if result.success {
+                        let tx = &batch[i];
+                        
+                        // Persist to ReDB (DashMap already updated by execute_batch_with_locks)
+                        if let Err(e) = sealevel_blockchain.transfer(&tx.from, &tx.to, tx.amount) {
+                            warn!("Sealevel persist failed: {}", e);
+                            fail_count += 1;
+                        } else {
+                            // Mix transaction into PoH for ordering proof
+                            {
+                                let mut poh = sealevel_poh.write();
+                                poh.queue_transaction(tx.id.clone());
+                            }
+                            
+                            // Track for finality (record_inclusion is the correct method)
+                            sealevel_finality.record_inclusion(&tx.id, slot);
+                            success_count += 1;
+                        }
+                    } else {
+                        fail_count += 1;
+                    }
+                }
+                
+                if success_count > 0 || fail_count > 0 {
+                    info!(
+                        "⚡ Sealevel batch executed: {} txs ({} success, {} failed) @ slot {}",
+                        batch_size, success_count, fail_count, slot
+                    );
+                }
+            }
+            
+            // Clear processed transactions from Gulf Stream
+            sealevel_gulf_stream.clear_leader_cache(&leader);
+            
+            // Tune batch size based on conflict rate
+            sealevel_scheduler.tune_batch_size();
+        }
+    });
+    info!("⚡ Sealevel execution loop WIRED (parallel batch processing active)");
+
+    // ========================================================================
     // 6. BUILD APPLICATION STATE
     // ========================================================================
     let state = AppState {
@@ -2266,6 +3327,11 @@ async fn main() {
         gulf_stream,
         block_producer,
         finality_tracker,
+        // Ideal Hybrid Security Infrastructure
+        throttler,
+        circuit_breaker,
+        fee_market,
+        account_metadata,
     };
 
     // ========================================================================

@@ -1,0 +1,176 @@
+{
+  "passed": 4,
+  "failed": 30,
+  "tests": [
+    {
+      "name": "Load alice wallet",
+      "passed": true,
+      "details": "Address: L1_40B59B2AE14FC3404E40477B557F6F5ED1FAC9DA"
+    },
+    {
+      "name": "Load bob wallet",
+      "passed": true,
+      "details": "Address: L1_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372"
+    },
+    {
+      "name": "Load mac wallet",
+      "passed": true,
+      "details": "Address: L1_0CEB3CEC6F37F2C72CDE35231EB7A0B86AC169D5"
+    },
+    {
+      "name": "Load apollo wallet",
+      "passed": true,
+      "details": "Address: L1_CDCFA0999FB34AD2AD226D1552B37CF9C677D342"
+    },
+    {
+      "name": "alice login",
+      "passed": false,
+      "details": "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "bob login",
+      "passed": false,
+      "details": "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "mac login",
+      "passed": false,
+      "details": "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "apollo login",
+      "passed": false,
+      "details": "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "alice L1 registered",
+      "passed": false,
+      "details": "Connection error: request to http://localhost:3030/auth/zkp-commitment/L1_40B59B2AE14FC3404E40477B557F6F5ED1FAC9DA failed, reason: "
+    },
+    {
+      "name": "bob L1 registered",
+      "passed": false,
+      "details": "Connection error: request to http://localhost:3030/auth/zkp-commitment/L1_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372 failed, reason: "
+    },
+    {
+      "name": "mac L1 registered",
+      "passed": false,
+      "details": "Connection error: request to http://localhost:3030/auth/zkp-commitment/L1_0CEB3CEC6F37F2C72CDE35231EB7A0B86AC169D5 failed, reason: "
+    },
+    {
+      "name": "apollo L1 registered",
+      "passed": false,
+      "details": "Connection error: request to http://localhost:3030/auth/zkp-commitment/L1_CDCFA0999FB34AD2AD226D1552B37CF9C677D342 failed, reason: "
+    },
+    {
+      "name": "alice register",
+      "passed": false,
+      "details": "Wallet not logged in"
+    },
+    {
+      "name": "bob register",
+      "passed": false,
+      "details": "Wallet not logged in"
+    },
+    {
+      "name": "mac register",
+      "passed": false,
+      "details": "Wallet not logged in"
+    },
+    {
+      "name": "apollo register",
+      "passed": false,
+      "details": "Wallet not logged in"
+    },
+    {
+      "name": "alice ZKP login",
+      "passed": false,
+      "details": "Wallet not ready"
+    },
+    {
+      "name": "bob ZKP login",
+      "passed": false,
+      "details": "Wallet not ready"
+    },
+    {
+      "name": "mac ZKP login",
+      "passed": false,
+      "details": "Wallet not ready"
+    },
+    {
+      "name": "apollo ZKP login",
+      "passed": false,
+      "details": "Wallet not ready"
+    },
+    {
+      "name": "alice reconstruct key",
+      "passed": false,
+      "details": "Prerequisites not met"
+    },
+    {
+      "name": "bob reconstruct key",
+      "passed": false,
+      "details": "Prerequisites not met"
+    },
+    {
+      "name": "mac reconstruct key",
+      "passed": false,
+      "details": "Prerequisites not met"
+    },
+    {
+      "name": "apollo reconstruct key",
+      "passed": false,
+      "details": "Prerequisites not met"
+    },
+    {
+      "name": "alice sign transaction",
+      "passed": false,
+      "details": "Key not reconstructed"
+    },
+    {
+      "name": "bob sign transaction",
+      "passed": false,
+      "details": "Key not reconstructed"
+    },
+    {
+      "name": "mac sign transaction",
+      "passed": false,
+      "details": "Key not reconstructed"
+    },
+    {
+      "name": "apollo sign transaction",
+      "passed": false,
+      "details": "Key not reconstructed"
+    },
+    {
+      "name": "alice password change",
+      "passed": false,
+      "details": "Wallet not available"
+    },
+    {
+      "name": "bob SSS recovery",
+      "passed": false,
+      "details": "Wallet not available"
+    },
+    {
+      "name": "alice reject wrong password",
+      "passed": false,
+      "details": "Unexpected error: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "bob reject wrong password",
+      "passed": false,
+      "details": "Unexpected error: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "mac reject wrong password",
+      "passed": false,
+      "details": "Unexpected error: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    },
+    {
+      "name": "apollo reject wrong password",
+      "passed": false,
+      "details": "Unexpected error: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined"
+    }
+  ]
+}

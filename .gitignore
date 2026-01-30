@@ -4,6 +4,11 @@
 *.pdb
 Cargo.lock
 
+# Node.js
+node_modules/
+package-lock.json
+yarn.lock
+
 # Environment Variables
 .env
 .env.local

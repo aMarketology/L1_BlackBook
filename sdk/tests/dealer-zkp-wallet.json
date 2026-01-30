@@ -1,0 +1,17 @@
+{
+  "version": "2.0-zkp",
+  "address": "L1_BC22A8143B93E904663110B3D1C1812CB8F5281F",
+  "pubkey": "b7351c92d5d0ca89f3dd730323f238e2e4d722d1188ef65ddb0cfa05f10fbcf9",
+  "salt": "1698ce95496a1af32c27953a3f3b7996f4fb2d4362729fd633250afddc847310",
+  "zkCommitment": "895c7561d84409fbf878b9380a6f20790c502614fa5b9afb582a9ff917654f59",
+  "created": "2026-01-29T07:15:22.596Z",
+  "keyDerivation": "Argon2id-64MB",
+  "encryption": "AES-256-GCM-PEPPERED",
+  "sss": "2-of-3-GF(2^256)",
+  "shareCEncrypted": {
+    "encrypted": "43461e088484e8b8352811bc2940ebc0fb10f93c49dd3573bd7d24ee1e706515",
+    "iv": "3f72f7f7da58ec316a5f4f7b",
+    "authTag": "1119db342100008cd7ae8cac36b38e89"
+  },
+  "_note": "Share A derived from password. Share B on L1. Share C here (encrypted)."
+}
