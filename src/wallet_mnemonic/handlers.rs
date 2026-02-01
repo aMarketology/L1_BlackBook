@@ -168,6 +168,8 @@ impl MnemonicHandlers {
             .route("/mnemonic/export/:address", post(Self::export_mnemonic))
             // Signing
             .route("/mnemonic/sign", post(Self::sign_transaction))
+            // Transfer (sign + execute)
+            .route("/mnemonic/transfer", post(Self::transfer))
             // Share management
             .route("/mnemonic/share-b/:address", get(Self::get_share_b))
             .route("/mnemonic/share-b", post(Self::store_share_b))
@@ -260,6 +262,47 @@ pub struct ExportResponse {
     pub mnemonic: String,
     /// Security warning
     pub warning: String,
+}
+
+/// Transfer request - uses SSS to sign and execute transfer
+#[derive(Debug, Deserialize)]
+pub struct TransferRequest {
+    /// Sender wallet address
+    pub from: String,
+    /// Recipient wallet address
+    pub to: String,
+    /// Amount to transfer
+    pub amount: f64,
+    /// Sender's password
+    pub password: String,
+    /// Share A bound (hex)
+    pub share_a_bound: String,
+    /// Recovery path: "ab" (default), "ac", or "bc"
+    #[serde(default = "default_recovery_path")]
+    pub recovery_path: String,
+    /// Share C encrypted (required for "ac" path)
+    #[serde(default)]
+    pub share_c_encrypted: Option<String>,
+    /// Admin key (required for "bc" path)
+    #[serde(default)]
+    pub admin_key: Option<String>,
+}
+
+fn default_recovery_path() -> String {
+    "ab".to_string()
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransferResponse {
+    pub success: bool,
+    pub tx_id: String,
+    pub from: String,
+    pub to: String,
+    pub amount: f64,
+    pub new_balance_from: f64,
+    pub new_balance_to: f64,
+    pub signature: String,
+    pub recovery_path_used: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +438,7 @@ impl MnemonicHandlers {
         let metadata = WalletMetadata {
             address: wallet.address.clone(),
             public_key: hex::encode(wallet.public_key.to_bytes()),
+            username: None, // Can be set via /mnemonic/wallet/{address}/username endpoint
             security_mode: WalletSecurityMode::Deterministic(MnemonicConfig {
                 share_a_salt: hex::encode(&shares.password_salt),
                 share_b_location: format!("l1:{}", wallet.address),
@@ -524,6 +568,220 @@ impl MnemonicHandlers {
         }))
     }
     
+    /// Transfer tokens using SSS-based signing
+    /// 
+    /// Supports all 3 recovery paths:
+    /// - A+B (default): Password + L1 blockchain
+    /// - A+C: Password + HashiCorp Vault (emergency)
+    /// - B+C: L1 blockchain + Vault (privileged, admin only)
+    async fn transfer(
+        State(state): State<MnemonicHandlers>,
+        Json(req): Json<TransferRequest>,
+    ) -> Result<Json<TransferResponse>, (StatusCode, Json<ErrorResponse>)> {
+        info!("💸 Transfer: {} BB from {} to {}", req.amount, req.from, req.to);
+        
+        // Validate amount
+        if req.amount <= 0.0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "Amount must be positive".to_string() })
+            ));
+        }
+        
+        // Get blockchain reference
+        let blockchain = state.blockchain.as_ref().ok_or_else(|| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: "Blockchain not available".to_string() })
+        ))?;
+        
+        // Check sender balance
+        let sender_balance = blockchain.get_balance(&req.from);
+        if sender_balance < req.amount {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { 
+                    error: format!("Insufficient balance: {} BB available, {} BB requested", 
+                        sender_balance, req.amount) 
+                })
+            ));
+        }
+        
+        // Reconstruct keypair based on recovery path
+        let mnemonic = match req.recovery_path.as_str() {
+            "ab" | "AB" => {
+                // A+B: Password + L1 Blockchain (standard path)
+                let share_a = SecureShare::from_hex(&req.share_a_bound)
+                    .map_err(|e| (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error: format!("Invalid Share A: {}", e) })
+                    ))?;
+                
+                let share_b = state.get_share_b_internal(&req.from)
+                    .map_err(|e| (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: e })
+                    ))?;
+                
+                let salt = state.password_salts.get(&req.from)
+                    .map(|s| s.clone())
+                    .ok_or_else(|| (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: "Password salt not found".to_string() })
+                    ))?;
+                
+                use crate::wallet_mnemonic::sss::reconstruct_from_ab;
+                let entropy = reconstruct_from_ab(&share_a, &share_b, &req.password, &salt)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: format!("A+B reconstruction failed: {}", e) })
+                    ))?;
+                
+                use crate::wallet_mnemonic::mnemonic::entropy_to_mnemonic;
+                entropy_to_mnemonic(&entropy)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: e.to_string() })
+                    ))?
+            },
+            "ac" | "AC" => {
+                // A+C: Password + HashiCorp Vault (emergency path)
+                let share_a = SecureShare::from_hex(&req.share_a_bound)
+                    .map_err(|e| (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error: format!("Invalid Share A: {}", e) })
+                    ))?;
+                
+                let share_c_encrypted = req.share_c_encrypted.as_ref().ok_or_else(|| (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "share_c_encrypted required for A+C path".to_string() })
+                ))?;
+                
+                let share_c_bytes = hex::decode(share_c_encrypted)
+                    .map_err(|e| (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse { error: format!("Invalid Share C hex: {}", e) })
+                    ))?;
+                
+                let salt = state.password_salts.get(&req.from)
+                    .map(|s| s.clone())
+                    .ok_or_else(|| (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: "Password salt not found".to_string() })
+                    ))?;
+                
+                use crate::wallet_mnemonic::sss::reconstruct_from_ac;
+                let entropy = reconstruct_from_ac(&share_a, &share_c_bytes, &req.password, &salt, &state.vault_pepper)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: format!("A+C reconstruction failed: {}", e) })
+                    ))?;
+                
+                use crate::wallet_mnemonic::mnemonic::entropy_to_mnemonic;
+                entropy_to_mnemonic(&entropy)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: e.to_string() })
+                    ))?
+            },
+            "bc" | "BC" => {
+                // B+C: L1 Blockchain + Vault (privileged admin path)
+                let admin_key = req.admin_key.as_ref().ok_or_else(|| (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: "admin_key required for B+C path".to_string() })
+                ))?;
+                
+                // Verify admin key
+                if admin_key != "blackbook_admin_recovery_key_2026" {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(ErrorResponse { error: "Invalid admin key".to_string() })
+                    ));
+                }
+                
+                let share_b = state.get_share_b_internal(&req.from)
+                    .map_err(|e| (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: e })
+                    ))?;
+                
+                let share_c_encrypted = state.share_c_storage.get(&req.from)
+                    .map(|s| s.clone())
+                    .ok_or_else(|| (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse { error: "Share C not found".to_string() })
+                    ))?;
+                
+                use crate::wallet_mnemonic::sss::reconstruct_from_bc;
+                let entropy = reconstruct_from_bc(&share_b, &share_c_encrypted, &state.vault_pepper)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: format!("B+C reconstruction failed: {}", e) })
+                    ))?;
+                
+                use crate::wallet_mnemonic::mnemonic::entropy_to_mnemonic;
+                entropy_to_mnemonic(&entropy)
+                    .map_err(|e| (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse { error: e.to_string() })
+                    ))?
+            },
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse { error: format!("Invalid recovery_path: {}. Use 'ab', 'ac', or 'bc'", req.recovery_path) })
+                ));
+            }
+        };
+        
+        // Recover wallet from mnemonic to get signing key
+        use crate::wallet_mnemonic::mnemonic::recover_wallet;
+        let wallet = recover_wallet(&mnemonic, "")
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: format!("Wallet recovery failed: {}", e) })
+            ))?;
+        
+        // Create transfer message
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tx_message = format!("TRANSFER|{}|{}|{}|{}", req.from, req.to, req.amount, timestamp);
+        let tx_id = format!("tx_{:x}", md5::compute(&tx_message));
+        
+        // Sign the transfer using the secure private key
+        use ed25519_dalek::Signer;
+        let signing_key = wallet.private_key.to_signing_key();
+        let signature = signing_key.sign(tx_message.as_bytes());
+        
+        // Execute the transfer on blockchain using atomic transfer() method
+        // This properly logs as TRANSFER type (not separate BURN + MINT)
+        blockchain.transfer(&req.from, &req.to, req.amount)
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: format!("Transfer failed: {}", e) })
+            ))?;
+        
+        // Get new balances
+        let new_balance_from = blockchain.get_balance(&req.from);
+        let new_balance_to = blockchain.get_balance(&req.to);
+        
+        info!("✅ Transfer complete: {} BB from {} to {} (TX: {})", 
+            req.amount, req.from, req.to, tx_id);
+        
+        Ok(Json(TransferResponse {
+            success: true,
+            tx_id,
+            from: req.from,
+            to: req.to,
+            amount: req.amount,
+            new_balance_from,
+            new_balance_to,
+            signature: hex::encode(signature.to_bytes()),
+            recovery_path_used: req.recovery_path,
+        }))
+    }
+    
     /// Recover wallet from 24-word mnemonic
     async fn recover_from_mnemonic(
         State(state): State<MnemonicHandlers>,
@@ -576,6 +834,7 @@ impl MnemonicHandlers {
         let metadata = WalletMetadata {
             address: wallet.address.clone(),
             public_key: hex::encode(wallet.public_key.to_bytes()),
+            username: None, // Can be set via /mnemonic/wallet/{address}/username endpoint
             security_mode: WalletSecurityMode::Deterministic(MnemonicConfig {
                 share_a_salt: hex::encode(&shares.password_salt),
                 share_b_location: format!("l1:{}", wallet.address),

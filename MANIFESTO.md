@@ -33,7 +33,48 @@ Supabase Role: Stores the Login Hash and the Encrypted Vault.Security: Supabase 
     L2->>L2: Unlock Stake + Mint Winnings
     L2->>L1: AGGRESSIVE FLUSH (Immediate Return)
     L1->>L1: Credit 200 BB (Available)
-Address Scheme:Base: ABC123DEF... (Derived from Master Seed)L1 Address: L1_ABC123... (Used for Transfers/Holding)L2 Address: L2_ABC123... (Used for Order Matching)💎 The Social Mining EconomyWe replace Proof-of-Work (Energy) with Proof-of-Engagement (Social).The "Engagement Ledger"Every "Like," "Comment," and "Post" is a signed transaction validated by the network.ActionReward (BB)Validator FunctionDaily Check-in1.00Proves LivenessHigh-Quality Post0.50Validated by Curator Nodes (AI)Referral5.00Validated by Graph AnalysisValidationVariableNodes earn % of betting feesAnti-Sybil Mechanism:We use Reputation Decay. Accounts that stop engaging see their "Mining Power" (Multiplier) decay over time, preventing early adopters from sitting passively on stack.🛠️ Technology StackComponentTechnologyPerformance RoleLanguageRustZero-cost abstractions, memory safety without GCRuntimeSealevel™Parallel transaction processingConsensusPoH + Tower BFTSub-second finality (~400ms)SerializationBorshHigh-performance, deterministic binary layoutTransportQUIC + TurbineUDP-based packet propagationDatabaseRocksDB (Ledger)High-throughput Key-Value storageClient DBSupabase (Postgres)Encrypted Vault & Salt storageFrontendBun + ReactFast client-side hashing & derivation📡 API Spec (Borsh Optimized)All high-performance endpoints expect Borsh-serialized binary data, not JSON.Transaction RPCPOST /rpc/send_transactionPayload (Base64 encoded Borsh):Ruststruct SignedTransaction {
+Address Scheme:Base: ABC123DEF... (Derived from Master Seed)L1 Address: L1_ABC123... (Used for Transfers/Holding)L2 Address: L2_ABC123... (Used for Order Matching)� The BB Token Economics
+
+## Fixed Value Peg (Immutable)
+
+**1 BB = $0.10 USD (Ten Cents) — Forever and Always**
+
+This is not a floating token. BB is a **stable utility token** with a permanent fixed exchange rate:
+
+| BB Amount | USD Value |
+|-----------|-----------|
+| 1 BB      | $0.10     |
+| 10 BB     | $1.00     |
+| 100 BB    | $10.00    |
+| 1,000 BB  | $100.00   |
+| 10,000 BB | $1,000.00 |
+
+**Why Fixed Value?**
+- **Predictable Economics**: Users always know exactly what their BB is worth
+- **No Speculation**: BB is for utility, not trading
+- **Regulatory Clarity**: Fixed-value tokens have cleaner compliance paths
+- **User Trust**: No rug pulls, no volatility, no surprises
+
+**Backing**: All BB in circulation is backed 1:1 by USD reserves held in regulated custodial accounts.
+
+---
+
+💎 The Social Mining Economy
+
+We replace Proof-of-Work (Energy) with Proof-of-Engagement (Social).
+
+The "Engagement Ledger"
+
+Every "Like," "Comment," and "Post" is a signed transaction validated by the network.
+
+| Action | Reward (BB) | USD Value | Validator Function |
+|--------|-------------|-----------|-------------------|
+| Daily Check-in | 1.00 BB | $0.10 | Proves Liveness |
+| High-Quality Post | 0.50 BB | $0.05 | Validated by Curator Nodes (AI) |
+| Referral | 5.00 BB | $0.50 | Validated by Graph Analysis |
+| Validation | Variable | Variable | Nodes earn % of betting fees |
+
+Anti-Sybil Mechanism:We use Reputation Decay. Accounts that stop engaging see their "Mining Power" (Multiplier) decay over time, preventing early adopters from sitting passively on stack.🛠️ Technology StackComponentTechnologyPerformance RoleLanguageRustZero-cost abstractions, memory safety without GCRuntimeSealevel™Parallel transaction processingConsensusPoH + Tower BFTSub-second finality (~400ms)SerializationBorshHigh-performance, deterministic binary layoutTransportQUIC + TurbineUDP-based packet propagationDatabaseRocksDB (Ledger)High-throughput Key-Value storageClient DBSupabase (Postgres)Encrypted Vault & Salt storageFrontendBun + ReactFast client-side hashing & derivation📡 API Spec (Borsh Optimized)All high-performance endpoints expect Borsh-serialized binary data, not JSON.Transaction RPCPOST /rpc/send_transactionPayload (Base64 encoded Borsh):Ruststruct SignedTransaction {
     sender: [u8; 32],
     signature: [u8; 64],
     message: Message, // Instructions, Nonce, RecentBlockhash

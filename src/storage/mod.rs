@@ -207,6 +207,14 @@ pub struct TransactionRecord {
     #[serde(default)]
     pub validator_sig: Option<String>,
     
+    // === USERNAME FIELDS (For Human-Readable Ledger) ===
+    /// Sender's username/alias
+    #[serde(default)]
+    pub from_username: Option<String>,
+    /// Recipient's username/alias
+    #[serde(default)]
+    pub to_username: Option<String>,
+    
     // === LEGACY FIELDS ===
     pub signature: Option<String>,
     pub metadata: Option<serde_json::Value>,
@@ -256,6 +264,8 @@ impl TransactionRecord {
             balance_after,
             recipient_balance_after,
             validator_sig: None,
+            from_username: None,
+            to_username: None,
             signature: None,
             metadata: None,
         }
@@ -824,6 +834,24 @@ impl ConcurrentBlockchain {
             Some(access) => Ok(Some(access.value().to_vec())),
             None => Ok(None),
         }
+    }
+
+    /// Get username from wallet metadata (if set)
+    /// 
+    /// Returns the username/alias associated with a wallet address,
+    /// useful for human-readable ledger display
+    pub fn get_username(&self, wallet_address: &str) -> Option<String> {
+        if let Ok(Some(metadata_bytes)) = self.get_wallet_metadata(wallet_address) {
+            // Try to deserialize as WalletMetadata
+            if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_bytes) {
+                if let Some(username) = metadata.get("username").and_then(|u| u.as_str()) {
+                    if !username.is_empty() {
+                        return Some(username.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Get all wallet addresses that have shares stored on-chain

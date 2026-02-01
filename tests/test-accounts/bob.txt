@@ -1,0 +1,119 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    👤 BOB - Regular User / Bettor                            ║
+║                         ZKP Wallet v2.0 + SSS 2-of-3                         ║
+║                                                                               ║
+║  ⚠️  PRIVATE KEYS EXPOSED - For development/testing ONLY                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              WALLET ADDRESSES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+L1 Address:       L1_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372
+L2 Address:       L2_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372
+BB Address:       bb_83474eaa6feb5f10a673bc3f4adc51f611eb4372
+
+Public Key:       a7d1ac4a4f276b6ac55856c422f2ad2ecae9d11021e4261fa855603739d00ad9
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              AUTHENTICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Password:         BobPassword123!
+2FA Code (test):  123456
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                         SHAMIR SECRET SHARING (2-of-3)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Share Distribution:
+  Share A: Client-side (password-bound via Argon2id)
+  Share B: L1 Blockchain (stored in ReDB WALLET_SHARES table)
+  Share C: HashiCorp Vault (AES-256-GCM encrypted with pepper)
+
+Recovery Paths:
+  ✅ A + B = Normal operation (password + blockchain)
+  ✅ A + C = Emergency recovery (password + vault, L1 unavailable)
+  ✅ B + C = Privileged recovery (admin key required)
+
+Cryptographic Details:
+  Salt:           8cd55bf3453c6faa1d9c1217e894a8d5355217631ac8792915379b71a0c6073c
+  ZK Commitment:  85ae8ee0261281521d09e0eb088254a48b21873bb70218c1958a6746281d7233
+  Key Derivation: Argon2id (64MB memory, 3 iterations, parallelism 4)
+  Encryption:     AES-256-GCM with peppered nonce
+  Vault Pepper:   blackbook_pepper_32_bytes_long!!
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              CAPABILITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Role: Regular User / Bettor
+
+Permissions:
+  ✅ Create and manage ZKP wallet
+  ✅ Sign transactions with Ed25519
+  ✅ Place bets on prediction markets
+  ✅ Transfer funds between wallets
+  ✅ Cross-chain bridge operations (L1 ↔ L2)
+  ❌ Create markets
+  ❌ Resolve markets
+  ❌ Admin functions
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              LEGACY KEYS (Deprecated)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  These keys are from the old wallet system. Use ZKP wallet for new operations.
+
+Old L1 Address:   L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433
+Old Public Key:   582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a
+Old Private Key:  e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              API ENDPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create Wallet:
+  POST /mnemonic/create
+  Body: { "password": "BobPassword123!" }
+
+Sign Transaction:
+  POST /mnemonic/sign
+  Body: { "wallet_address": "bb_...", "password": "BobPassword123!", "message": "..." }
+
+Export Mnemonic:
+  POST /mnemonic/export/{address}
+  Body: { "password": "BobPassword123!", "two_factor_code": "123456", "share_a_bound": "..." }
+
+Recovery (A+B):
+  POST /mnemonic/recover/ab
+  Body: { "wallet_address": "...", "password": "...", "share_a_bound": "..." }
+
+Recovery (A+C):
+  POST /mnemonic/recover/ac
+  Body: { "wallet_address": "...", "password": "...", "share_a_bound": "...", "share_c_encrypted": "..." }
+
+Recovery (B+C - Admin):
+  POST /mnemonic/recover/bc
+  Body: { "wallet_address": "...", "admin_key": "blackbook_admin_recovery_key_2026", "share_c_encrypted": "..." }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Created: February 2026
+Last Updated: February 1, 2026
+Wallet Version: ZKP Wallet v2.0 with Shamir 2-of-3 SSS
+
+Test Scenarios:
+  1. Normal wallet creation and signing
+  2. Transaction signing with Ed25519
+  3. Transfer funds to/from Alice
+  4. Prediction market betting
+  5. All three recovery paths (A+B, A+C, B+C)

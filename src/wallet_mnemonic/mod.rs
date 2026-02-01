@@ -148,4 +148,7 @@ pub struct WalletMetadata {
     pub created_at: u64,
     /// Last activity timestamp
     pub last_active: u64,
+    /// Username/alias for the wallet (for ledger display)
+    #[serde(default)]
+    pub username: Option<String>,
 }

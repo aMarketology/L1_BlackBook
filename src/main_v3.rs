@@ -419,14 +419,20 @@ async fn ledger_handler(
     output.push_str(" ├─────┼─────────────────────┼──────────────┼──────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤\n");
     
     for tx in page_transactions.iter() {
-        // Format timestamp
-        let datetime = chrono::DateTime::from_timestamp(tx.timestamp as i64, 0)
+        // Format timestamp as MM/DD/YY HH:MM:SS in Central Standard Time (UTC-6)
+        let datetime_utc = chrono::DateTime::from_timestamp(tx.timestamp as i64, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-        let time_str = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        // Convert UTC to CST (Central Standard Time = UTC-6 hours)
+        let cst_offset = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
+        let datetime_cst = datetime_utc.with_timezone(&cst_offset);
+        let time_str = datetime_cst.format("%m/%d/%y %H:%M:%S").to_string();
         
-        // Format addresses
-        let from_display = format_address_readable(&tx.from_address);
-        let to_display = format_address_readable(&tx.to_address);
+        // Format addresses with usernames
+        let from_username = state.blockchain.get_username(&tx.from_address);
+        let to_username = state.blockchain.get_username(&tx.to_address);
+        
+        let from_display = format_address_with_username(&tx.from_address, from_username.as_deref());
+        let to_display = format_address_with_username(&tx.to_address, to_username.as_deref());
         
         // Short hashes
         let tx_hash_short = if tx.tx_hash.len() > 8 { format!("{}..{}", &tx.tx_hash[..4], &tx.tx_hash[tx.tx_hash.len()-4..]) } else { tx.tx_hash.clone() };
@@ -545,6 +551,36 @@ fn format_address_readable(addr: &str) -> String {
         format!("{}...{}", &addr[..8], &addr[addr.len()-8..])
     } else {
         addr.to_string()
+    }
+}
+
+/// Helper to format addresses WITH USERNAME for ledger display
+/// Format: "username (bb_1234...abcd)" or just "bb_1234...abcd" if no username
+fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
+    let addr_short = if addr.starts_with("bb_") {
+        if addr.len() > 16 {
+            format!("bb_{}...{}", &addr[3..8], &addr[addr.len()-6..])
+        } else {
+            addr.to_string()
+        }
+    } else if addr == "USDC_TREASURY" || addr == "DESTROYED" {
+        addr.to_string()
+    } else if addr.starts_with("L1_") {
+        let hex_part = &addr[3..];
+        if hex_part.len() > 12 {
+            format!("L1_{}...{}", &hex_part[..4], &hex_part[hex_part.len()-6..])
+        } else {
+            addr.to_string()
+        }
+    } else if addr.len() > 16 {
+        format!("{}...{}", &addr[..6], &addr[addr.len()-6..])
+    } else {
+        addr.to_string()
+    };
+    
+    match username {
+        Some(name) => format!("{} ({})", name.to_uppercase(), addr_short),
+        None => addr_short,
     }
 }
 
@@ -3120,8 +3156,10 @@ async fn main() {
     let wallet_router = WalletHandlers::router()
         .with_state((*wallet_handlers).clone());
     
+    // Create MnemonicHandlers with blockchain for transfer support
+    let mnemonic_handlers = MnemonicHandlers::with_blockchain(Arc::new(state.blockchain.clone()));
     let mnemonic_router = MnemonicHandlers::router()
-        .with_state(MnemonicHandlers::new());
+        .with_state(mnemonic_handlers);
     
     // Build the main router with AppState
     let app = Router::new()
