@@ -40,6 +40,30 @@ curve25519-dalek = { version = "4.1", features = ["group"] }
 getrandom = "0.2"
 once_cell = "1.19"
 
+# ═══════════════════════════════════════════════════════════════
+# S+ TIER: FROST TSS (Threshold Signature Scheme)
+# ═══════════════════════════════════════════════════════════════
+# FROST - Flexible Round-Optimized Schnorr Threshold Signatures
+# Key NEVER exists in full - born distributed, signs distributed
+frost-ed25519 = "2.0.0"
+frost-core = "2.0.0"
+
+# OPAQUE - Password Authenticated Key Exchange (PAKE)
+# Server can't see password OR hash - mathematically blind verification
+opaque-ke = "3.0.0"
+
+# VSS (Verifiable Secret Sharing) for DKG
+vsss-rs = "4.0"
+
+# Encryption for shard storage at rest
+chacha20poly1305 = "0.10"
+
+# BLAKE3 for fast hashing (wallet addresses, verification)
+blake3 = "1.5"
+
+# Rand compatibility for FROST (uses rand_core 0.6)
+rand_core = "0.6"
+
 # BIP-39 / SLIP-0010 for hardware wallet compatible key derivation
 bip39 = "2.0"
 slip10_ed25519 = "0.1"
@@ -51,6 +75,9 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1.7", features = ["derive"] }
 bcrypt = "0.15"  # For auth_key hashing in Fork Architecture
+
+# HashiCorp Vault integration (for secure pepper retrieval)
+vaultrs = "0.7"
 
 # Parallel processing - Sealevel-style execution
 rayon = "1.10"

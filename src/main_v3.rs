@@ -88,6 +88,11 @@ use poh_blockchain::{
     TurbineShredder, TurbinePropagator, TURBINE_FANOUT,
 };
 
+// S+ Tier Wallet System (FROST + OPAQUE)
+use unified_wallet::{
+    WalletHandlers, FrostDKG, ThresholdSigner, OpaqueAuth, ShardStorage,
+};
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -162,6 +167,13 @@ pub struct AppState {
     
     /// Account metadata - Type-safe PDA accounts (immune to confusion attacks)
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
+    
+    // =========================================================================
+    // S+ TIER WALLET SYSTEM (FROST + OPAQUE)
+    // =========================================================================
+    
+    /// Unified wallet handlers (MPC threshold signing, OPAQUE auth)
+    pub wallet_handlers: Arc<WalletHandlers>,
 }
 
 // ============================================================================
@@ -912,274 +924,18 @@ async fn sealevel_pending_handler(
 }
 
 // ============================================================================
-// AUTH HANDLERS
+// AUTH HANDLERS (Legacy - Migrated to unified_wallet module for S+ Tier)
 // ============================================================================
-
-/// POST /auth/keypair - Generate new Ed25519 keypair
-async fn keypair_handler(State(state): State<AppState>) -> impl IntoResponse {
-    use integration::unified_auth::{generate_keypair, derive_l1_address};
-    let (pubkey, secret) = generate_keypair();
-    
-    // Generate proper L1 address from public key
-    let address = derive_l1_address(&pubkey)
-        .unwrap_or_else(|_| format!("L1_ERROR_{}", &pubkey[..16]));
-    
-    // =========================================================================
-    // IDEAL HYBRID: Register Type-Safe PDA on Wallet Creation
-    // =========================================================================
-    // This prevents account confusion attacks by explicitly typing accounts
-    
-    // Derive PDA for this wallet
-    let pda_result = ProgramDerivedAddress::derive(
-        AccountType::UserWallet,
-        &address,
-        None,  // No optional ID for wallet
-    );
-    
-    // Create account metadata using derived PDA or fallback
-    let (pda_bump, pda_address) = match &pda_result {
-        Ok(p) => (p.bump, p.address.clone()),
-        Err(_) => (255, address.clone()),  // Fallback if derivation fails
-    };
-    
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    
-    let metadata = AccountMetadata {
-        account_type: AccountType::UserWallet,
-        owner: address.clone(),  // Self-owned wallet
-        created_at: now,
-        updated_at: now,
-        pda_info: Some(PDAInfo {
-            namespace: "wallet".to_string(),
-            bump: pda_bump,
-            index: None,
-        }),
-        frozen: false,
-        data: None,
-    };
-    
-    // Register in account metadata store
-    state.account_metadata.insert(address.clone(), metadata);
-    
-    // Log keypair generation anonymously
-    info!("🔑 New keypair generated with type-safe PDA (privacy preserved)");
-    
-    Json(serde_json::json!({
-        "success": true,
-        "public_key": pubkey,
-        "secret_key": secret,
-        "address": address,
-        "pda": {
-            "derived_address": pda_address,
-            "bump": pda_bump,
-            "account_type": "UserWallet",
-            "namespace": "wallet"
-        }
-    }))
-}
-
-/// GET /auth/test-accounts - Get test account info
-async fn test_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let alice_bal = state.blockchain.get_balance(ALICE_L1);
-    let bob_bal = state.blockchain.get_balance(BOB_L1);
-    let dealer_bal = state.blockchain.get_balance(DEALER_L1);
-    
-    Json(serde_json::json!({
-        "alice": {
-            "address": ALICE_L1,
-            "balance": alice_bal,
-            "seed": "alice_test_seed_do_not_use_in_production"
-        },
-        "bob": {
-            "address": BOB_L1,
-            "balance": bob_bal,
-            "seed": "bob_test_seed_do_not_use_in_production"
-        },
-        "dealer": {
-            "address": DEALER_L1,
-            "balance": dealer_bal,
-            "note": "Dealer private key in DEALER_PRIVATE_KEY env var"
-        }
-    }))
-}
-
-// ============================================================================
-// ZKP WALLET HANDLERS (Non-Custodial Authentication)
-// ============================================================================
-
-/// POST /auth/zkp-register - Register ZKP wallet with Share B storage
-async fn zkp_register_handler(
-    State(state): State<AppState>,
-    Json(data): Json<integration::unified_auth::WalletZKPData>,
-) -> impl IntoResponse {
-    use integration::unified_auth::{store_share_b, is_wallet_registered};
-
-    // Check if wallet already registered
-    if is_wallet_registered(&data.address) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "success": false,
-            "error": format!("Wallet already registered: {}", data.address)
-        })));
-    }
-
-    // Validate data
-    if data.pubkey.len() != 64 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "success": false,
-            "error": "Invalid public key length (expected 64 hex chars)"
-        })));
-    }
-
-    if data.zk_commitment.len() != 64 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "success": false,
-            "error": "Invalid ZK-commitment length (expected 64 hex chars)"
-        })));
-    }
-
-    if data.share_b.x != 2 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "success": false,
-            "error": "Share B must have x=2 (Share A=1, B=2, C=3)"
-        })));
-    }
-
-    // Store Share B
-    match store_share_b(data.clone()) {
-        Ok(()) => {
-            info!("🔐 ZKP wallet registered: {}... Commitment: {}...", 
-                     &data.address[..14], &data.zk_commitment[..16]);
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "address": data.address,
-                "share_b_stored": true,
-                "message": "ZKP wallet registered successfully",
-                "note": "Store Share C in Supabase, Share A derived from password"
-            })))
-        },
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "success": false,
-                "error": e
-            })))
-        }
-    }
-}
-
-/// POST /auth/zkp-login - Login with ZK-proof, get Share B
-async fn zkp_login_handler(
-    State(state): State<AppState>,
-    Json(request): Json<integration::unified_auth::ZKPLoginRequest>,
-) -> impl IntoResponse {
-    use integration::unified_auth::{get_wallet_zkp_data, verify_zk_proof, release_share_b};
-
-    // Get wallet data
-    let wallet_data = match get_wallet_zkp_data(&request.address) {
-        Ok(data) => data,
-        Err(e) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "success": false,
-                "error": format!("Wallet not found: {}", e)
-            })));
-        }
-    };
-
-    // Verify ZK-proof
-    match verify_zk_proof(&request.zk_proof, &wallet_data.zk_commitment, &request.nonce) {
-        Ok(()) => {
-            info!("✅ ZK-proof verified for: {}...", &request.address[..14]);
-
-            // Release Share B
-            match release_share_b(&request.address) {
-                Ok(share_b) => {
-                    // TODO: In production, encrypt Share B with session key
-                    (StatusCode::OK, Json(serde_json::json!({
-                        "success": true,
-                        "share_b": share_b,
-                        "pubkey": wallet_data.pubkey,
-                        "message": "ZK-proof verified, Share B released",
-                        "note": "Combine with Share A (from password) to sign transactions"
-                    })))
-                },
-                Err(e) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("Failed to release Share B: {}", e)
-                    })))
-                }
-            }
-        },
-        Err(e) => {
-            info!("❌ ZK-proof verification failed: {}", e);
-            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                "success": false,
-                "error": format!("ZK-proof verification failed: {}", e)
-            })))
-        }
-    }
-}
-
-/// GET /auth/zkp-commitment/:address - Get ZK-commitment and salt for login
-async fn zkp_get_commitment_handler(
-    State(state): State<AppState>,
-    Path(address): Path<String>,
-) -> impl IntoResponse {
-    use integration::unified_auth::get_wallet_zkp_data;
-
-    match get_wallet_zkp_data(&address) {
-        Ok(data) => {
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "address": data.address,
-                "zk_commitment": data.zk_commitment,
-                "salt": data.salt,
-                "pubkey": data.pubkey,
-                "note": "Use salt + password to derive Share A, then generate ZK-proof"
-            })))
-        },
-        Err(e) => {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "success": false,
-                "error": format!("Wallet not found: {}", e)
-            })))
-        }
-    }
-}
-
-/// POST /auth/zkp-recover - Initiate wallet recovery
-async fn zkp_recover_handler(
-    State(state): State<AppState>,
-    Json(recovery_request): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let address = recovery_request.get("address")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    info!("🔄 Recovery requested for: {}", address);
-
-    // In production, this would:
-    // 1. Verify identity (KYC, email verification, etc.)
-    // 2. Release Share B after verification
-    // 3. User gets Share C from Supabase (with pepper)
-    // 4. Reconstruct key from Share B + C
-    // 5. Generate new password and shares
-
-    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
-        "success": false,
-        "error": "Recovery not yet implemented",
-        "message": "Please contact support for manual recovery",
-        "recovery_process": [
-            "1. Verify identity through support",
-            "2. Receive Share B from L1",
-            "3. Decrypt Share C from Supabase (requires old password or recovery key)",
-            "4. Reconstruct wallet with Share B + C",
-            "5. Set new password and regenerate shares"
-        ]
-    })))
-}
+// 
+// The old C+ grade wallet handlers have been removed in favor of the S+ Tier
+// implementation in src/unified_wallet/. The new system uses:
+// - FROST TSS (Threshold Signature Scheme) - key NEVER exists in full
+// - OPAQUE (Password Authenticated Key Exchange) - server never sees password
+// - DKG (Distributed Key Generation) - key born distributed
+//
+// See: src/unified_wallet/handlers.rs for the new API endpoints
+// See: blackbook-wallet.md for documentation
+//
 
 // ============================================================================
 // TRANSFER HANDLER
@@ -2934,14 +2690,10 @@ fn build_sealevel_routes() -> Router<AppState> {
 }
 
 fn build_auth_routes() -> Router<AppState> {
+    // Legacy ZKP routes removed - migrated to S+ Tier unified_wallet module
+    // New endpoints: /wallet/register/*, /wallet/login/*, /wallet/sign/*
+    // See: src/unified_wallet/handlers.rs
     Router::new()
-        .route("/keypair", post(keypair_handler))
-        .route("/test-accounts", get(test_accounts_handler))
-        // ZKP Wallet Routes (Non-Custodial)
-        .route("/zkp-register", post(zkp_register_handler))
-        .route("/zkp-login", post(zkp_login_handler))
-        .route("/zkp-commitment/:address", get(zkp_get_commitment_handler))
-        .route("/zkp-recover", post(zkp_recover_handler))
 }
 
 fn build_credit_routes() -> Router<AppState> {
@@ -3313,7 +3065,23 @@ async fn main() {
     info!("⚡ Sealevel execution loop WIRED (parallel batch processing active)");
 
     // ========================================================================
-    // 6. BUILD APPLICATION STATE
+    // 6. BUILD S+ TIER WALLET SYSTEM (FROST + OPAQUE)
+    // ========================================================================
+    let frost_dkg = Arc::new(FrostDKG::new());
+    let threshold_signer = Arc::new(ThresholdSigner::new());
+    let opaque_auth = Arc::new(OpaqueAuth::new());
+    let shard_storage = Arc::new(ShardStorage::new());
+    
+    let wallet_handlers = Arc::new(WalletHandlers::new(
+        frost_dkg,
+        threshold_signer,
+        opaque_auth,
+        shard_storage,
+    ));
+    info!("🔐 S+ Tier Wallet System initialized (FROST TSS + OPAQUE PAKE)");
+
+    // ========================================================================
+    // 7. BUILD APPLICATION STATE
     // ========================================================================
     let state = AppState {
         blockchain,
@@ -3332,6 +3100,8 @@ async fn main() {
         circuit_breaker,
         fee_market,
         account_metadata,
+        // S+ Tier Wallet System
+        wallet_handlers: wallet_handlers.clone(),
     };
 
     // ========================================================================
@@ -3342,10 +3112,17 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Build wallet router with separate state (use wallet_handlers before it's moved)
+    let wallet_router = WalletHandlers::router()
+        .with_state((*wallet_handlers).clone());
+    
+    // Build the main router with AppState
     let app = Router::new()
         // Public routes at root
         .merge(build_public_routes())
-        // Grouped routes
+        // S+ Tier Wallet System (separate state, merged before with_state)
+        .merge(wallet_router)
+        // Legacy routes (auth routes migrated to /wallet/*)
         .nest("/auth", build_auth_routes())
         .nest("/credit", build_credit_routes())
         .nest("/bridge", build_bridge_routes())
@@ -3410,12 +3187,25 @@ async fn main() {
     });
 
     // ========================================================================
-    // 10. START HTTP SERVER
+    // 11. START HTTP SERVER
     // ========================================================================
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
     info!("🚀 Server listening on http://{}", addr);
     info!("");
-    info!("📡 ENDPOINTS:");
+    info!("🔐 S+ TIER WALLET ENDPOINTS (FROST + OPAQUE MPC):");
+    info!("   POST /wallet/register/start  - Start DKG + OPAQUE registration");
+    info!("   POST /wallet/register/round1 - Exchange DKG round 1");
+    info!("   POST /wallet/register/round2 - Exchange DKG round 2");
+    info!("   POST /wallet/register/finish - Finalize wallet creation");
+    info!("   POST /wallet/login/start     - Start OPAQUE authentication");
+    info!("   POST /wallet/login/finish    - Complete login, get session");
+    info!("   POST /wallet/sign/start      - Begin threshold signing");
+    info!("   POST /wallet/sign/commitment - Exchange commitments");
+    info!("   POST /wallet/sign/finish     - Aggregate signatures");
+    info!("   GET  /wallet/info/:address   - Wallet public info");
+    info!("   GET  /wallet/health          - Wallet system health");
+    info!("");
+    info!("📡 CORE ENDPOINTS:");
     info!("   GET  /health              - Health check");
     info!("   GET  /stats               - Blockchain + Sealevel stats");
     info!("   GET  /balance/:address    - Public balance lookup");
@@ -3423,8 +3213,6 @@ async fn main() {
     info!("   GET  /performance/stats   - All service statistics");
     info!("   POST /transfer            - Transfer (V2 SDK format)");
     info!("   POST /transfer/simple     - Transfer (simple frontend format)");
-    info!("   POST /auth/keypair        - Generate keypair");
-    info!("   GET  /auth/test-accounts  - Test account info");
     info!("   POST /credit/open         - Open credit session");
     info!("   POST /credit/settle       - Settle session");
     info!("   GET  /credit/status/:wallet - Session status");
