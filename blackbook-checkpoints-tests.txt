@@ -1,0 +1,30 @@
+To ensure your S+ Tier Wallet (MPC/FROST + OPAQUE) is operating at its first 10% (The Foundation Phase), you need to verify that the mathematical "handshakes" are working. At this stage, you aren't worried about the UI; you are proving that Shard A and Shard B can talk to each other without leaking the secret.Here are your milestones and the specific tests to run.🚩 Milestone 1: The OPAQUE HandshakeGoal: Prove the server can recognize the user without seeing a password or a hash.Verification Checklist:[ ] Client can generate an OPAQUE RegistrationRequest.[ ] Server can store the RegistrationRecord without knowing the password.[ ] Client can complete a login flow and derive the identical export_key as the server.The "S+ Tier" Test (Terminal):Run a test script that attempts a "Server-Side Shadow Attack."Test: Manually inspect your database/ReDB for the user's password.Pass Criteria: If the only thing in the DB is a random-looking 32-byte string (the OPAQUE record) that cannot be used in a standard bcrypt or sha256 cracker, you have passed.🚩 Milestone 2: FROST Key Generation (DKG)Goal: Create a wallet where the private key is born in pieces.Verification Checklist:[ ] Client generates a "Group Public Key" (The L1 Address).[ ] Client creates Share 1 (local) and Share 2 (server).[ ] The server stores Share 2 inside the OPAQUE-protected envelope.The "S+ Tier" Test (Unit Test):Rust#[test]
+fn test_key_non_existence() {
+    // 1. Generate FROST shards
+    // 2. Assert that Share 1 != Private Key
+    // 3. Assert that Share 2 != Private Key
+    // 4. Assert that (Share 1 + Share 2) via addition DOES NOT equal Private Key 
+    //    (TSS uses Lagrange interpolation, not simple addition!)
+}
+🚩 Milestone 3: Threshold Signing (The 10% Core)Goal: Produce a valid L1 transaction signature using two partial signatures.Verification Checklist:[ ] Client signs a "Hello World" message with Share 1.[ ] Server signs the same message with Share 2.[ ] The Client aggregates both.[ ] The L1 Validator accepts the signature.The "S+ Tier" Test (Integration):Run this manual curl flow to ensure the logic is sound:Bash# 1. Get the signing challenge
+CHALLENGE=$(curl -X POST http://localhost:8080/auth/login-start -d '{"username": "alice"}')
+
+# 2. Submit partial signature (The "Ceremony")
+RESULT=$(curl -X POST http://localhost:8080/auth/secure-sign -d "{
+    \"partial_sig\": \"$CLIENT_SIG\",
+    \"message\": \"transfer 10 L1_TO_BOB\"
+}")
+
+# 3. Verify finality
+echo $RESULT | jq '.final_signature'
+# Use your CLI tool to verify:
+blackbook-cli verify-sig --sig $FINAL_SIG --msg "transfer 10 L1_TO_BOB"
+📊 Performance Checkpoints (The "10%" Metrics)To confirm you are truly at 10% operational capacity, measure these three metrics. If they fall within these ranges, your Rust implementation is optimized:MetricTargetWhy it mattersOPAQUE Latency< 150msNeeds to feel like a "normal" login to the user.Signing Latency< 300msFROST is math-heavy; anything over 1s is too slow for L1.RAM Overhead< 50MBThe signing ceremony should not leak memory or spike CPU.🛠️ Your "10% Complete" Debug CommandIf you want to see if the system is "alive," add a hidden debug endpoint that returns the Group Public Key but errors out if you ask for a Private Key:Rust// src/main.rs
+pub async fn system_health(State(state): State<AppState>) -> Json<Value> {
+    json!({
+        "status": "Operational",
+        "mpc_ready": true,
+        "protocol": "FROST-Ed25519",
+        "security_level": "S-Tier-Threshold"
+    })
+}

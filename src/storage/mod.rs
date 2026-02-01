@@ -59,6 +59,15 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
+/// Wallet Share B storage: WalletAddress (String) → EncryptedShare (Vec<u8>)
+/// Share B is stored on-chain for institutional-grade custody recovery
+/// The share is encrypted with the user's password-derived key
+const WALLET_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_shares");
+
+/// Wallet metadata: WalletAddress (String) → WalletMetadata (Vec<u8>)
+/// Stores wallet info (created_at, last_accessed, share locations, etc.)
+const WALLET_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_metadata");
+
 // ============================================================================
 // ENHANCED LEDGER ENUMS (Type-Safe Blockchain Integrity)
 // ============================================================================
@@ -328,6 +337,8 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(METADATA)?;
             let _ = write_txn.open_table(TRANSACTIONS)?;
             let _ = write_txn.open_table(PROCESSED_BRIDGE_TXS)?;
+            let _ = write_txn.open_table(WALLET_SHARES)?;
+            let _ = write_txn.open_table(WALLET_METADATA)?;
         }
         write_txn.commit()?;
         
@@ -730,6 +741,106 @@ impl ConcurrentBlockchain {
             total_supply: self.total_supply(),
             cache_hit_rate: 0.99, // DashMap is extremely fast
         }
+    }
+
+    // ========================================================================
+    // WALLET SHARE STORAGE (For Hybrid Custody)
+    // ========================================================================
+
+    /// Store an encrypted wallet share (Share B) on-chain
+    /// 
+    /// Share B is stored in the L1 blockchain for institutional-grade custody.
+    /// The share is encrypted with the user's password-derived key before storage.
+    pub fn store_wallet_share(&self, wallet_address: &str, encrypted_share: &[u8]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
+            table.insert(wallet_address, encrypted_share).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        
+        info!(wallet = %wallet_address, size = encrypted_share.len(), "Stored wallet share on-chain");
+        Ok(())
+    }
+
+    /// Retrieve an encrypted wallet share (Share B) from on-chain storage
+    /// 
+    /// Returns None if no share exists for this wallet address.
+    pub fn get_wallet_share(&self, wallet_address: &str) -> Result<Option<Vec<u8>>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
+        
+        match table.get(wallet_address).map_err(|e| e.to_string())? {
+            Some(access) => Ok(Some(access.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Check if a wallet share exists on-chain
+    pub fn has_wallet_share(&self, wallet_address: &str) -> bool {
+        match self.get_wallet_share(wallet_address) {
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Delete a wallet share from on-chain storage (for wallet deletion)
+    /// 
+    /// CAUTION: This is destructive. Only call when user explicitly deletes wallet.
+    pub fn delete_wallet_share(&self, wallet_address: &str) -> Result<bool, String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let removed = {
+            let mut table = write_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
+            let result = table.remove(wallet_address).map_err(|e| e.to_string())?;
+            result.is_some()
+        };
+        write_txn.commit().map_err(|e| e.to_string())?;
+        
+        if removed {
+            info!(wallet = %wallet_address, "Deleted wallet share from on-chain storage");
+        }
+        Ok(removed)
+    }
+
+    /// Store wallet metadata (creation date, share locations, security settings)
+    pub fn store_wallet_metadata(&self, wallet_address: &str, metadata: &[u8]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(WALLET_METADATA).map_err(|e| e.to_string())?;
+            table.insert(wallet_address, metadata).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        
+        info!(wallet = %wallet_address, "Stored wallet metadata");
+        Ok(())
+    }
+
+    /// Retrieve wallet metadata
+    pub fn get_wallet_metadata(&self, wallet_address: &str) -> Result<Option<Vec<u8>>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WALLET_METADATA).map_err(|e| e.to_string())?;
+        
+        match table.get(wallet_address).map_err(|e| e.to_string())? {
+            Some(access) => Ok(Some(access.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Get all wallet addresses that have shares stored on-chain
+    /// 
+    /// Useful for admin/recovery operations
+    pub fn list_wallet_addresses(&self) -> Result<Vec<String>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
+        
+        let mut addresses = Vec::new();
+        let mut iter = table.iter().map_err(|e| e.to_string())?;
+        while let Some(result) = iter.next() {
+            let (key, _) = result.map_err(|e| e.to_string())?;
+            addresses.push(key.value().to_string());
+        }
+        
+        Ok(addresses)
     }
 }
 

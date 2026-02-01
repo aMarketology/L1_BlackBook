@@ -19,6 +19,7 @@ pub mod poh_blockchain;
 pub mod integration;
 pub mod routes_v2;
 pub mod unified_wallet;
+pub mod wallet_mnemonic;  // BIP-39 24-word wallet with SSS backup
 pub mod consensus;
 pub mod grpc;
 pub mod rpc;

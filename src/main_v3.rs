@@ -52,6 +52,7 @@ mod social_mining;
 mod integration;
 mod routes_v2;
 mod unified_wallet;
+mod wallet_mnemonic;
 mod consensus;
 mod grpc;
 mod storage;
@@ -92,6 +93,9 @@ use poh_blockchain::{
 use unified_wallet::{
     WalletHandlers, FrostDKG, ThresholdSigner, OpaqueAuth, ShardStorage,
 };
+
+// Mnemonic Wallet System (Consumer Track)
+use wallet_mnemonic::handlers::MnemonicHandlers;
 
 // ============================================================================
 // CONSTANTS
@@ -3112,16 +3116,21 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build wallet router with separate state (use wallet_handlers before it's moved)
+    // Build wallet routers with separate states
     let wallet_router = WalletHandlers::router()
         .with_state((*wallet_handlers).clone());
+    
+    let mnemonic_router = MnemonicHandlers::router()
+        .with_state(MnemonicHandlers::new());
     
     // Build the main router with AppState
     let app = Router::new()
         // Public routes at root
         .merge(build_public_routes())
-        // S+ Tier Wallet System (separate state, merged before with_state)
+        // S+ Tier Wallet System (FROST - Institutional Track)
         .merge(wallet_router)
+        // Mnemonic Wallet System (Consumer Track)
+        .merge(mnemonic_router)
         // Legacy routes (auth routes migrated to /wallet/*)
         .nest("/auth", build_auth_routes())
         .nest("/credit", build_credit_routes())
@@ -3192,7 +3201,7 @@ async fn main() {
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
     info!("🚀 Server listening on http://{}", addr);
     info!("");
-    info!("🔐 S+ TIER WALLET ENDPOINTS (FROST + OPAQUE MPC):");
+    info!("🔐 S+ TIER WALLET ENDPOINTS (FROST + OPAQUE MPC - Institutional Track):");
     info!("   POST /wallet/register/start  - Start DKG + OPAQUE registration");
     info!("   POST /wallet/register/round1 - Exchange DKG round 1");
     info!("   POST /wallet/register/round2 - Exchange DKG round 2");
@@ -3204,6 +3213,16 @@ async fn main() {
     info!("   POST /wallet/sign/finish     - Aggregate signatures");
     info!("   GET  /wallet/info/:address   - Wallet public info");
     info!("   GET  /wallet/health          - Wallet system health");
+    info!("");
+    info!("🌱 MNEMONIC WALLET ENDPOINTS (Consumer Track - 24-Word BIP-39):");
+    info!("   POST /mnemonic/create        - Create wallet (Shamir 2-of-3)");
+    info!("   POST /mnemonic/sign          - Sign transaction");
+    info!("   POST /mnemonic/recover       - Recover from 24 words");
+    info!("   POST /mnemonic/export/:addr  - Export mnemonic (requires 2FA)");
+    info!("   POST /mnemonic/share-b       - Store Share B on-chain");
+    info!("   GET  /mnemonic/share-b/:addr - Get Share B (ZKP-gated)");
+    info!("   GET  /mnemonic/info/:addr    - Wallet metadata");
+    info!("   GET  /mnemonic/health        - Health check");
     info!("");
     info!("📡 CORE ENDPOINTS:");
     info!("   GET  /health              - Health check");

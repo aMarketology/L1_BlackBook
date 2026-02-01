@@ -73,6 +73,9 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 # Vault encryption - AES-256-GCM + Argon2id KDF
 aes-gcm = "0.10"
 argon2 = "0.5"
+
+# Async trait support
+async-trait = "0.1"
 zeroize = { version = "1.7", features = ["derive"] }
 bcrypt = "0.15"  # For auth_key hashing in Fork Architecture
 
