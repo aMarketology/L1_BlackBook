@@ -14,6 +14,8 @@
 pub mod social_mining;
 pub mod storage;
 pub mod poh_blockchain;
+pub mod settlement;  // Batch settlements with Merkle proofs
+pub mod vault;       // HashiCorp Vault integration for pepper management
 
 // Stub modules (simplified for MVP)
 pub mod integration;

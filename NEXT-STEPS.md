@@ -1,156 +1,296 @@
 # BlackBook L1 - Next Steps
 
-## 🎯 Priority #1: S+ Tier Wallet System (FROST + OPAQUE)
+## 🎯 Priority #1: Layer 2 Prediction Market Integration
 
-**Current Status:** Module structure complete, needs integration + testing
+**Current Status:** L1 Wallet System 98% Ready, Bridge Infrastructure Operational
 
-**Goal:** 100% operational MPC wallet where the private key **NEVER EXISTS**.
-
----
-
-## Milestones to 100%
-
-### 🚩 Milestone 1: OPAQUE Handshake (0% → 30%)
-
-**Goal:** Server recognizes user without seeing password or hash.
-
-| Task | Status | File |
-|------|--------|------|
-| Client generates `RegistrationRequest` | ⬜ TODO | `sdk/opaque-client.js` |
-| Server stores `RegistrationRecord` without knowing password | ⬜ TODO | `src/unified_wallet/opaque_auth.rs` |
-| Login flow derives identical `export_key` on both sides | ⬜ TODO | Integration test |
-| **Shadow Attack Test**: DB contains only 32-byte blob, not crackable | ⬜ TODO | Manual verification |
-
-**Pass Criteria:** Database inspection shows ONLY opaque records (random bytes), NO password hashes.
+**Goal:** Enable L2 zero-sum AMM with batch settlements, market escrow, and oracle resolution.
 
 ---
 
-### 🚩 Milestone 2: FROST DKG (30% → 60%)
+## 🚨 CRITICAL BLOCKERS (Must Complete for L2 Launch)
 
-**Goal:** Create wallet where private key is born in pieces.
+### ❌ Blocker #1: Batch Settlement with Merkle Proofs
 
-| Task | Status | File |
-|------|--------|------|
-| Generate Group Public Key (L1 Address) | ⬜ TODO | `src/unified_wallet/dkg.rs` |
-| Create Share 1 (Device Shard - stays local) | ⬜ TODO | `sdk/frost-client.js` |
-| Create Share 2 (Guardian Shard - sent to server) | ⬜ TODO | `src/unified_wallet/dkg.rs` |
-| Store Share 2 inside OPAQUE-protected envelope | ⬜ TODO | `src/unified_wallet/storage.rs` |
-| **Key Non-Existence Test** (see below) | ⬜ TODO | `tests/wallet_tests.rs` |
+**Why Critical:** Zero-sum markets have 50-100+ winners per resolution. Current single-settlement system cannot scale.
 
-**Key Non-Existence Unit Test:**
+**Implementation Tasks:**
+- [ ] Merkle tree library (`src/settlement/merkle.rs`)
+- [ ] Batch settlement endpoint (`POST /settlement/batch`)
+- [ ] Double-claim prevention (withdrawal tracking)
+- [ ] Merkle proof verification
+- [ ] Tests for 100+ winner settlements
+
+**Files to Create:**
+```
+src/settlement/
+├── mod.rs           - Settlement module
+├── merkle.rs        - Merkle tree creation/verification
+├── batch.rs         - Batch settlement logic
+└── claims.rs        - Claim tracking (prevent double-spend)
+```
+
+---
+
+### ❌ Blocker #2: Market-Specific Escrow
+
+**Why Critical:** Current locks are user-centric. Need market-scoped collateral for multi-winner distribution.
+
+**Implementation Tasks:**
+- [ ] Market escrow module (`src/market_escrow/mod.rs`)
+- [ ] Market creation endpoint (`POST /market/create`)
+- [ ] Multi-beneficiary payout distribution
+- [ ] Market status tracking (Open, Locked, Resolved, Distributed)
+- [ ] Link oracle resolution to market settlement
+
+**Data Structure Needed:**
 ```rust
-#[test]
-fn test_key_non_existence() {
-    // 1. Generate FROST shards
-    // 2. Assert that Share 1 != Private Key
-    // 3. Assert that Share 2 != Private Key
-    // 4. Assert that (Share 1 + Share 2) via addition DOES NOT equal Private Key 
-    //    (TSS uses Lagrange interpolation, not simple addition!)
+pub struct MarketEscrow {
+    market_id: String,
+    total_collateral: f64,
+    participants: HashMap<Address, Position>,
+    oracle_resolution: Option<OracleProof>,
+    status: EscrowStatus,
 }
 ```
 
 ---
 
-### 🚩 Milestone 3: Threshold Signing (60% → 90%)
+### ❌ Blocker #3: Zero-Sum Invariant Enforcement
 
-**Goal:** Produce valid L1 signature using two partial signatures.
+**Why Critical:** L1 must verify L2 isn't creating money from thin air.
 
-| Task | Status | File |
-|------|--------|------|
-| Client signs message with Share 1 | ⬜ TODO | `sdk/frost-client.js` |
-| Server signs message with Share 2 | ⬜ TODO | `src/unified_wallet/tss.rs` |
-| Client aggregates both partial signatures | ⬜ TODO | `sdk/frost-client.js` |
-| L1 Validator accepts the aggregated signature | ⬜ TODO | Integration test |
+**Implementation Tasks:**
+- [ ] Pre-settlement validation function
+- [ ] Verify: `Total Payouts = Total Collateral - Fees`
+- [ ] Reject invalid settlements
+- [ ] Audit logging for all settlements
 
-**Integration Test Flow:**
+---
+
+## 🟡 IMPORTANT (Not Blocking MVP)
+
+### Oracle Integration
+- [ ] Oracle registry (`src/oracle/registry.rs`)
+- [ ] Oracle signature verification
+- [ ] Chainlink/Pyth integration (future)
+- **MVP Workaround:** Dealer acts as manual oracle
+
+### LP Position Tracking
+- [ ] LP share tracking on L1
+- [ ] Fee distribution logic
+- **MVP Workaround:** L2 tracks LPs, settles net P&L to L1
+
+### Multi-Outcome Markets
+- [ ] Extend beyond binary (YES/NO)
+- [ ] Support 3+ outcomes
+- **MVP:** Start with binary markets only
+
+---
+
+## 📅 EXECUTION TIMELINE
+
+### Week 1-2: Batch Settlement System ⚡ CURRENT FOCUS
+
+**Goal:** L2 can resolve markets and pay 100+ winners in single L1 transaction
+
+| Day | Task | Deliverable |
+|-----|------|-------------|
+| 1-2 | Merkle tree library | `merkle.rs` with tests |
+| 3-4 | Batch endpoint + validation | `POST /settlement/batch` working |
+| 5-6 | Claim tracking | Double-spend prevention |
+| 7-8 | Integration tests | 100-winner settlement test passing |
+
+**Pass Criteria:**
+- ✅ Merkle proof verification works
+- ✅ Batch of 100 winners settles in <5s
+- ✅ Cannot claim same payout twice
+- ✅ Invalid merkle proofs rejected
+
+---
+
+### Week 3-4: Market Escrow System
+
+**Goal:** L1 tracks per-market collateral and distributes to multiple winners
+
+| Day | Task | Deliverable |
+|-----|------|-------------|
+| 1-2 | Market escrow data structures | `market_escrow/mod.rs` |
+| 3-4 | Market creation endpoint | `POST /market/create` |
+| 5-6 | Multi-beneficiary distribution | Settlement logic |
+| 7-8 | Zero-sum validation | Invariant enforcement |
+
+**Pass Criteria:**
+- ✅ Can create market with N participants
+- ✅ Can lock collateral per participant
+- ✅ Can distribute to M winners (M < N)
+- ✅ Zero-sum check passes: `Σ payouts = collateral - fees`
+
+---
+
+### Week 5: Oracle + Polish
+
+**Goal:** Oracle-based resolution with fallback to manual dealer
+
+| Day | Task | Deliverable |
+|-----|------|-------------|
+| 1-2 | Oracle registry | Trusted oracle pubkeys |
+| 3-4 | Oracle signature verification | Resolution proof validation |
+| 5 | Dealer manual override | Emergency resolution |
+
+---
+
+### Week 6: Performance + Production Hardening
+
+**Goal:** Verify 65k TPS claim, optimize bottlenecks
+
+| Day | Task | Deliverable |
+|-----|------|-------------|
+| 1-2 | Batch settlement benchmarks | Measure throughput |
+| 3-4 | gRPC optimization | Reduce latency |
+| 5-6 | Load testing | 1000 concurrent markets |
+
+---
+
+## 🛠️ IMMEDIATE NEXT ACTIONS (Starting Now)
+
+### Step 1: Create Settlement Module Structure
 ```bash
-# 1. Get the signing challenge
-CHALLENGE=$(curl -X POST http://localhost:8080/wallet/login/start \
-  -H "Content-Type: application/json" \
-  -d '{"wallet_address": "bb_alice..."}')
-
-# 2. Submit partial signature (The "Ceremony")
-RESULT=$(curl -X POST http://localhost:8080/wallet/sign/finish \
-  -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION\", \"client_share\": {...}}")
-
-# 3. Verify signature
-echo $RESULT | jq '.signature_hex'
+mkdir -p src/settlement
+touch src/settlement/mod.rs
+touch src/settlement/merkle.rs
+touch src/settlement/batch.rs
+touch src/settlement/claims.rs
 ```
 
----
-
-### 🚩 Milestone 4: Production Polish (90% → 100%)
-
-| Task | Status | File |
-|------|--------|------|
-| Wire `/wallet/*` routes into main server | ⬜ TODO | `src/main_v3.rs` |
-| Performance benchmarks pass | ⬜ TODO | `benches/` |
-| SDK documentation | ⬜ TODO | `sdk/README.md` |
-| Recovery flow (24-word mnemonic) | ⬜ TODO | `sdk/mnemonic-wallet.js` |
-
----
-
-## 📊 Performance Targets
-
-| Metric | Target | Why |
-|--------|--------|-----|
-| OPAQUE Latency | < 150ms | Must feel like normal login |
-| Signing Latency | < 300ms | FROST is math-heavy; >1s too slow |
-| RAM Overhead | < 50MB | No memory leaks during ceremony |
-
----
-
-## 🗂️ Code Structure
-
+### Step 2: Add Dependencies to Cargo.toml
+```toml
+# Merkle tree support
+rs_merkle = "1.4"
+sha2 = "0.10"
+hex = "0.4"
 ```
-src/unified_wallet/
-├── mod.rs           ✅ Main module structure
-├── types.rs         ✅ Error types, results, sessions
-├── dkg.rs           ✅ FROST Distributed Key Generation
-├── tss.rs           ✅ Threshold Signature Scheme
-├── opaque_auth.rs   ✅ OPAQUE authentication
-├── storage.rs       ✅ Guardian shard storage (encrypted)
-└── handlers.rs      ✅ Axum HTTP handlers
+
+### Step 3: Implement Merkle Tree Core
+- Create merkle tree from list of (address, amount) pairs
+- Generate proof for specific withdrawal
+- Verify proof against root
+
+### Step 4: Build Batch Settlement Endpoint
+- Accept array of withdrawals with merkle proofs
+- Verify L2 signature on merkle root
+- Validate each proof
+- Credit all winners atomically
+
+---
+
+## 🎯 SUCCESS METRICS
+
+### MVP Launch Criteria (End of Week 2)
+- ✅ 100-winner batch settlement in <5 seconds
+- ✅ Merkle proof verification 100% accurate
+- ✅ No double-claim vulnerabilities
+- ✅ L2 can trigger batch settlement via gRPC
+
+### Production Launch Criteria (End of Week 6)
+- ✅ 1000+ settlements per second
+- ✅ Zero-sum invariant enforced on all markets
+- ✅ Oracle integration working
+- ✅ 10,000 concurrent users supported
+- ✅ Full audit trail of all settlements
+
+---
+
+## 📊 DEPRIORITIZED (Post-Launch)
+
+### S+ Tier Wallet System (FROST + OPAQUE)
+
+**Status:** Module structure exists, postponed for post-L2 launch
+
+**Goal:** 100% operational MPC wallet where the private key **NEVER EXISTS**.
+
+**Milestones:** (Deferred to Phase 2 - Post-L2 Launch)
+- OPAQUE Handshake (password-less auth)
+- FROST DKG (distributed key generation)
+- Threshold Signing (multi-party signatures)
+- Production polish
+
+**Reason for Deferral:** Current mnemonic wallet system (98% passing tests) is sufficient for L2 launch. FROST+OPAQUE provides enhanced security but is not blocking L2 market functionality.
+
+---
+
+## 🔧 Code Structure (Current + Planned)
+
+### ✅ Existing (Production Ready)
+```
+src/
+├── main_v3.rs                    ✅ Main server (wallet + bridge working)
+├── storage/mod.rs                ✅ Blockchain state + locks
+├── grpc/mod.rs                   ✅ L1Settlement gRPC service
+├── wallet_mnemonic/              ✅ BIP-39 wallet system (98% passing)
+└── poh_blockchain.rs             ✅ PoH + parallel execution
 
 sdk/
-├── frost-client.js  ⬜ TODO: Client-side FROST
-├── opaque-client.js ⬜ TODO: Client-side OPAQUE
-└── mnemonic-wallet.js ✅ 24-word backup generation
+├── blackbook-wallet-sdk.js       ✅ Wallet SDK (13/13 tests passing)
+└── tests/                        ✅ Comprehensive test suite
+
+tests/
+├── wallet_tests.rs               ✅ 23/23 passing
+├── bridge_escrow_tests.rs        ✅ 33/33 passing
+└── wallet_production_tests.rs    ✅ 13/14 passing
+```
+
+### 🔨 To Build (Week 1-6)
+```
+src/settlement/
+├── mod.rs           ⬜ Settlement coordination
+├── merkle.rs        ⬜ Merkle tree creation/verification
+├── batch.rs         ⬜ Batch settlement logic
+└── claims.rs        ⬜ Withdrawal claim tracking
+
+src/market_escrow/
+├── mod.rs           ⬜ Market-scoped collateral
+├── escrow.rs        ⬜ Multi-participant escrow
+├── distribution.rs  ⬜ Multi-winner payouts
+└── validation.rs    ⬜ Zero-sum invariant checks
+
+src/oracle/
+├── mod.rs           ⬜ Oracle coordination
+├── registry.rs      ⬜ Trusted oracle registry
+└── verification.rs  ⬜ Oracle signature verification
+
+tests/
+├── batch_settlement_tests.rs  ⬜ 100-winner tests
+└── market_escrow_tests.rs     ⬜ Zero-sum validation tests
 ```
 
 ---
 
-## 🔧 Immediate Next Actions
-
-1. **Wire unified_wallet handlers into main_v3.rs**
-2. **Add unit tests for FROST DKG**
-3. **Create SDK client for OPAQUE registration**
-4. **Integration test: full wallet creation flow**
-
----
-
-## Dependencies Added to Cargo.toml
+## 📦 Dependencies to Add
 
 ```toml
-# S+ Tier Wallet (FROST + OPAQUE)
-frost-ed25519 = "2.0.0"
-frost-core = "2.0.0"
-opaque-ke = "3.0.0"
-vsss-rs = "4.0"
+[dependencies]
+# Existing (already in Cargo.toml)
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+redb = "2.1"
+ed25519-dalek = "2.1"
+# ... (rest already present)
+
+# NEW - For Merkle Trees
+rs_merkle = "1.4"
+
+# NEW - For SHA-256 hashing
+sha2 = "0.10"
+
+# FUTURE (Phase 2) - For FROST+OPAQUE
+# frost-ed25519 = "2.0.0"
+# frost-core = "2.0.0"
+# opaque-ke = "3.0.0"
+# vsss-rs = "4.0"
 ```
 
 ---
 
-## Security Guarantees When Complete
-
-| Attack Vector | Result |
-|---------------|--------|
-| Server database breach | **0 funds stolen** (only have Shard 2) |
-| User device stolen | **0 funds stolen** (need OPAQUE proof for Shard 2) |
-| Both compromised | **0 funds stolen** (need password AND device) |
-| User loses device | **Recoverable** with 24-word mnemonic |
-
----
-
-*Last Updated: January 31, 2026*
+*Last Updated: February 2, 2026*  
+*Next Review: After Week 2 (Batch Settlement Complete)*

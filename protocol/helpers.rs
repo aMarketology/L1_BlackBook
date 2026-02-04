@@ -52,12 +52,16 @@ pub fn generate_l1_address(public_key_hex: &str) -> String {
 
 /// Validate L1 address format
 /// Valid formats:
-/// - L1_XXXX...XXXX (43 chars: L1_ + 40 hex) - current format
+/// - bb_XXXX...XXXX (35 chars: bb_ + 32 hex lowercase) - unified wallet (mnemonic-based)
+/// - L1_XXXX...XXXX (43 chars: L1_ + 40 hex uppercase) - FROST institutional wallet
 /// - L1XXXX...XXXX (42 chars: L1 + 40 hex) - legacy format without underscore
 /// - Raw public key hex (64 chars)
 pub fn validate_l1_address(address: &str) -> bool {
-    if address.len() == 43 && address.starts_with("L1_") {
-        // Current format: L1_ + 40 hex chars
+    if address.len() == 35 && address.starts_with("bb_") {
+        // Unified wallet format: bb_ + 32 hex chars (lowercase)
+        address[3..].chars().all(|c| c.is_ascii_hexdigit() && c.is_lowercase())
+    } else if address.len() == 43 && address.starts_with("L1_") {
+        // FROST format: L1_ + 40 hex chars (uppercase)
         address[3..].chars().all(|c| c.is_ascii_hexdigit())
     } else if address.len() == 42 && address.starts_with("L1") {
         // Legacy format without underscore
@@ -92,12 +96,12 @@ impl WalletRequired {
 /// 
 /// # Example
 /// ```ignore
-/// validate_wallet_address("bb1_alice_e7c85b377a2bd0c9b4c9e26b5f6b6c33...")?
+/// validate_wallet_address("bb_6b7665632e4d8284c9ff288b6cab2f94")?;
 /// ```
 pub fn validate_wallet_address(address: &str) -> Result<String, String> {
     if address.is_empty() {
         Err("Wallet address cannot be empty".to_string())
-    } else if !address.starts_with("bb1_") && !address.starts_with("0x") && !address.starts_with("L1_") {
+    } else if !address.starts_with("bb_") && !address.starts_with("0x") && !address.starts_with("L1_") {
         Err("Invalid wallet address format".to_string())
     } else {
         Ok(address.to_string())

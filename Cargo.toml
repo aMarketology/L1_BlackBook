@@ -168,7 +168,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "layer1"
-path = "src/main_v3.rs"
+path = "src/main_v4.rs"
 
 # ═══════════════════════════════════════════════════════════════
 # PROFILE CONFIGURATION - Fix Windows linker crashes

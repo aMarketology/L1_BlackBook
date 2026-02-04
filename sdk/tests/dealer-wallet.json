@@ -1,0 +1,47 @@
+{
+  "name": "Dealer",
+  "role": "Market Maker & Oracle Authority",
+  "track": "FROST (Institutional)",
+  "created_at": "2026-02-03T00:01:31.693Z",
+  "l1_address": "L1_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01",
+  "l2_address": "L2_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01",
+  "public_key": "6a2944608156ffc470bdaea36018a3e9bef58db318dc4f8ce86cd9f3e9e690a7",
+  "private_key": "bf7c054ef5ae03ea4daba1e099bb0953b4640e946ed2b442a690e57759abfa96",
+  "frost": {
+    "scheme": "2-of-3 Threshold Signatures",
+    "protocol": "FROST-Ed25519",
+    "shard_1": {
+      "description": "Device Shard",
+      "location": "Local machine / Secure Enclave"
+    },
+    "shard_2": {
+      "description": "Guardian Shard",
+      "location": "BlackBook L1 Network (OPAQUE-protected)"
+    },
+    "shard_3": {
+      "description": "Recovery Shard",
+      "location": "Paper backup / Cold storage"
+    }
+  },
+  "security": {
+    "password_hint": "Dea***",
+    "authentication": "OPAQUE PAKE (Zero-Knowledge)",
+    "signing": "Threshold ceremony (key never fully reconstructed)"
+  },
+  "capabilities": [
+    "Create/approve/reject markets",
+    "Resolve markets with winning outcome",
+    "Fund markets with liquidity",
+    "Sign bridge operations"
+  ],
+  "oracle": {
+    "can_resolve_markets": true,
+    "can_fund_liquidity": true,
+    "can_bridge_operations": true
+  },
+  "signing": {
+    "algorithm": "Ed25519 (via FROST)",
+    "canonical_format": "from|to|amount|timestamp|nonce",
+    "domain_prefix": "BLACKBOOK_L1"
+  }
+}

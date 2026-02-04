@@ -1,0 +1,43 @@
+{
+  "name": "Bob",
+  "role": "Regular User / Bettor",
+  "track": "Mnemonic (Consumer)",
+  "created_at": "2026-02-03T00:01:31.645Z",
+  "bb_address": "bb_d8ed1c2f27ed27081bf11e58bb6eb160",
+  "l2_address": "L2_d8ed1c2f27ed27081bf11e58bb6eb160",
+  "public_key": "d107ea1e684349bb2a67f026fd98ebc28ba12b273b94c498b85dbbd867f62d4a",
+  "private_key": "80c470406b817e178d85788062ef3bfc234dbb276afd2a243c7992c33b271973",
+  "mnemonic_24_words": "valley drink voyage argue pulp truck dad transfer school leopard process van vanish boss climb barrel rude slab diary allow practice delay scout lunch",
+  "sss": {
+    "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+    "share_a": {
+      "description": "Password-bound share (client-side)",
+      "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+    },
+    "share_b": {
+      "description": "L1 blockchain share (ZKP-gated)",
+      "stored_on": "L1 Blockchain"
+    },
+    "share_c": {
+      "description": "Vault-encrypted backup share",
+      "encryption": "AES-256-GCM with peppered nonce"
+    }
+  },
+  "security": {
+    "password": "BobPassword123!",
+    "password_salt": "766b233937c4da287c77c8a3b9363e4f",
+    "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+    "encryption": "AES-256-GCM",
+    "derivation_path": "m/44'/501'/0'/0'"
+  },
+  "capabilities": [
+    "Place bets",
+    "Transfer tokens",
+    "View balance"
+  ],
+  "signing": {
+    "algorithm": "Ed25519",
+    "canonical_format": "from|to|amount|timestamp|nonce",
+    "domain_prefix": "BLACKBOOK_L1"
+  }
+}

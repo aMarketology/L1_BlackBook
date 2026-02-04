@@ -1,0 +1,225 @@
+{
+  "generated_at": "2026-02-03T00:01:31.695Z",
+  "generation_method": "local",
+  "wallets": [
+    {
+      "name": "Alice",
+      "role": "Regular User / Bettor",
+      "track": "Mnemonic (Consumer)",
+      "created_at": "2026-02-03T00:01:31.605Z",
+      "bb_address": "bb_6b7665632e4d8284c9ff288b6cab2f94",
+      "l2_address": "L2_6b7665632e4d8284c9ff288b6cab2f94",
+      "public_key": "3d6d1a0bc67f8fcf566fabe4e0d1fe500561becf1286c2a3f71086435917c3e1",
+      "private_key": "5dba98f70ad9139256ac216101ca3438332d8a42c6ad468677a857596d0e7f40",
+      "mnemonic_24_words": "romance tape leaf devote cable spot evolve few voice spy sword material midnight genius cave pulp spin shoe milk shrimp spike poverty fork brown",
+      "sss": {
+        "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+        "share_a": {
+          "description": "Password-bound share (client-side)",
+          "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+        },
+        "share_b": {
+          "description": "L1 blockchain share (ZKP-gated)",
+          "stored_on": "L1 Blockchain"
+        },
+        "share_c": {
+          "description": "Vault-encrypted backup share",
+          "encryption": "AES-256-GCM with peppered nonce"
+        }
+      },
+      "security": {
+        "password": "AlicePassword123!",
+        "password_salt": "38cc5e93a3783fafb881aeba53dfebe9",
+        "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+        "encryption": "AES-256-GCM",
+        "derivation_path": "m/44'/501'/0'/0'"
+      },
+      "capabilities": [
+        "Place bets",
+        "Transfer tokens",
+        "View balance"
+      ],
+      "signing": {
+        "algorithm": "Ed25519",
+        "canonical_format": "from|to|amount|timestamp|nonce",
+        "domain_prefix": "BLACKBOOK_L1"
+      }
+    },
+    {
+      "name": "Bob",
+      "role": "Regular User / Bettor",
+      "track": "Mnemonic (Consumer)",
+      "created_at": "2026-02-03T00:01:31.645Z",
+      "bb_address": "bb_d8ed1c2f27ed27081bf11e58bb6eb160",
+      "l2_address": "L2_d8ed1c2f27ed27081bf11e58bb6eb160",
+      "public_key": "d107ea1e684349bb2a67f026fd98ebc28ba12b273b94c498b85dbbd867f62d4a",
+      "private_key": "80c470406b817e178d85788062ef3bfc234dbb276afd2a243c7992c33b271973",
+      "mnemonic_24_words": "valley drink voyage argue pulp truck dad transfer school leopard process van vanish boss climb barrel rude slab diary allow practice delay scout lunch",
+      "sss": {
+        "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+        "share_a": {
+          "description": "Password-bound share (client-side)",
+          "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+        },
+        "share_b": {
+          "description": "L1 blockchain share (ZKP-gated)",
+          "stored_on": "L1 Blockchain"
+        },
+        "share_c": {
+          "description": "Vault-encrypted backup share",
+          "encryption": "AES-256-GCM with peppered nonce"
+        }
+      },
+      "security": {
+        "password": "BobPassword123!",
+        "password_salt": "766b233937c4da287c77c8a3b9363e4f",
+        "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+        "encryption": "AES-256-GCM",
+        "derivation_path": "m/44'/501'/0'/0'"
+      },
+      "capabilities": [
+        "Place bets",
+        "Transfer tokens",
+        "View balance"
+      ],
+      "signing": {
+        "algorithm": "Ed25519",
+        "canonical_format": "from|to|amount|timestamp|nonce",
+        "domain_prefix": "BLACKBOOK_L1"
+      }
+    },
+    {
+      "name": "Mac",
+      "role": "Power User / Developer",
+      "track": "Mnemonic (Consumer)",
+      "created_at": "2026-02-03T00:01:31.665Z",
+      "bb_address": "bb_d80f7e335383c9677c26e0cb70cc82e2",
+      "l2_address": "L2_d80f7e335383c9677c26e0cb70cc82e2",
+      "public_key": "6f71fa7114d9d79f4681d6a0193ed6b9f22dfd8eace08b9106e41642a33698f7",
+      "private_key": "0088c6e8d7ae88f86033975e1cb6ccf61d06bc9666953a5947126ee30113d636",
+      "mnemonic_24_words": "little yard valid yard core silly shaft rule monster noise combine arena lecture dizzy job kind pulse bonus better black crystal nephew again very",
+      "sss": {
+        "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+        "share_a": {
+          "description": "Password-bound share (client-side)",
+          "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+        },
+        "share_b": {
+          "description": "L1 blockchain share (ZKP-gated)",
+          "stored_on": "L1 Blockchain"
+        },
+        "share_c": {
+          "description": "Vault-encrypted backup share",
+          "encryption": "AES-256-GCM with peppered nonce"
+        }
+      },
+      "security": {
+        "password": "MacSecurePassword2026!",
+        "password_salt": "19570dfa8fd6a10ca5b840895c864b77",
+        "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+        "encryption": "AES-256-GCM",
+        "derivation_path": "m/44'/501'/0'/0'"
+      },
+      "capabilities": [
+        "Full SDK testing",
+        "Advanced transaction signing",
+        "Cross-chain bridge operations"
+      ],
+      "signing": {
+        "algorithm": "Ed25519",
+        "canonical_format": "from|to|amount|timestamp|nonce",
+        "domain_prefix": "BLACKBOOK_L1"
+      }
+    },
+    {
+      "name": "Apollo",
+      "role": "Heavy Trader / Market Participant",
+      "track": "Mnemonic (Consumer)",
+      "created_at": "2026-02-03T00:01:31.686Z",
+      "bb_address": "bb_59a829316f3a9ecb32d768a155ec2e2c",
+      "l2_address": "L2_59a829316f3a9ecb32d768a155ec2e2c",
+      "public_key": "c2786b9bcce4298eae07b5d9fb5f97901ad5ab7269d57211e3ab15878cc954d1",
+      "private_key": "9a175706e189911a0470e75d6d3c61530880d7d219df8d5ced367e1134d9fb64",
+      "mnemonic_24_words": "able mosquito intact tone organ sunset autumn hybrid tragic insect bundle image fetch maximum crazy blouse cupboard cry open airport goddess nerve near tag",
+      "sss": {
+        "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+        "share_a": {
+          "description": "Password-bound share (client-side)",
+          "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+        },
+        "share_b": {
+          "description": "L1 blockchain share (ZKP-gated)",
+          "stored_on": "L1 Blockchain"
+        },
+        "share_c": {
+          "description": "Vault-encrypted backup share",
+          "encryption": "AES-256-GCM with peppered nonce"
+        }
+      },
+      "security": {
+        "password": "apollo_secure_password_2026",
+        "password_salt": "8d672c7c77e4179dd689e0745908fc59",
+        "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+        "encryption": "AES-256-GCM",
+        "derivation_path": "m/44'/501'/0'/0'"
+      },
+      "capabilities": [
+        "High-frequency trading",
+        "Large volume transactions",
+        "Prediction market participation"
+      ],
+      "signing": {
+        "algorithm": "Ed25519",
+        "canonical_format": "from|to|amount|timestamp|nonce",
+        "domain_prefix": "BLACKBOOK_L1"
+      }
+    },
+    {
+      "name": "Dealer",
+      "role": "Market Maker & Oracle Authority",
+      "track": "FROST (Institutional)",
+      "created_at": "2026-02-03T00:01:31.693Z",
+      "l1_address": "L1_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01",
+      "l2_address": "L2_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01",
+      "public_key": "6a2944608156ffc470bdaea36018a3e9bef58db318dc4f8ce86cd9f3e9e690a7",
+      "private_key": "bf7c054ef5ae03ea4daba1e099bb0953b4640e946ed2b442a690e57759abfa96",
+      "frost": {
+        "scheme": "2-of-3 Threshold Signatures",
+        "protocol": "FROST-Ed25519",
+        "shard_1": {
+          "description": "Device Shard",
+          "location": "Local machine / Secure Enclave"
+        },
+        "shard_2": {
+          "description": "Guardian Shard",
+          "location": "BlackBook L1 Network (OPAQUE-protected)"
+        },
+        "shard_3": {
+          "description": "Recovery Shard",
+          "location": "Paper backup / Cold storage"
+        }
+      },
+      "security": {
+        "password_hint": "Dea***",
+        "authentication": "OPAQUE PAKE (Zero-Knowledge)",
+        "signing": "Threshold ceremony (key never fully reconstructed)"
+      },
+      "capabilities": [
+        "Create/approve/reject markets",
+        "Resolve markets with winning outcome",
+        "Fund markets with liquidity",
+        "Sign bridge operations"
+      ],
+      "oracle": {
+        "can_resolve_markets": true,
+        "can_fund_liquidity": true,
+        "can_bridge_operations": true
+      },
+      "signing": {
+        "algorithm": "Ed25519 (via FROST)",
+        "canonical_format": "from|to|amount|timestamp|nonce",
+        "domain_prefix": "BLACKBOOK_L1"
+      }
+    }
+  ]
+}

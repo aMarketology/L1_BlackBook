@@ -1362,7 +1362,7 @@ mod tests {
         // Open session
         let session = am.open_credit_session("alice", 100.0, "session_1").unwrap();
         assert_eq!(session.locked_amount, 100.0);
-        assert_eq!(session.available_credit, 100.0);
+        assert_eq!(session.available_balance, 100.0);
 
         // Get active session
         let active = am.get_active_session("alice").unwrap();

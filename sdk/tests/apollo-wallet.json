@@ -1,0 +1,43 @@
+{
+  "name": "Apollo",
+  "role": "Heavy Trader / Market Participant",
+  "track": "Mnemonic (Consumer)",
+  "created_at": "2026-02-03T00:01:31.686Z",
+  "bb_address": "bb_59a829316f3a9ecb32d768a155ec2e2c",
+  "l2_address": "L2_59a829316f3a9ecb32d768a155ec2e2c",
+  "public_key": "c2786b9bcce4298eae07b5d9fb5f97901ad5ab7269d57211e3ab15878cc954d1",
+  "private_key": "9a175706e189911a0470e75d6d3c61530880d7d219df8d5ced367e1134d9fb64",
+  "mnemonic_24_words": "able mosquito intact tone organ sunset autumn hybrid tragic insect bundle image fetch maximum crazy blouse cupboard cry open airport goddess nerve near tag",
+  "sss": {
+    "scheme": "2-of-3 Shamir Secret Sharing over GF(256)",
+    "share_a": {
+      "description": "Password-bound share (client-side)",
+      "derivation": "Argon2id-64MB (3 iterations, parallelism 4)"
+    },
+    "share_b": {
+      "description": "L1 blockchain share (ZKP-gated)",
+      "stored_on": "L1 Blockchain"
+    },
+    "share_c": {
+      "description": "Vault-encrypted backup share",
+      "encryption": "AES-256-GCM with peppered nonce"
+    }
+  },
+  "security": {
+    "password": "apollo_secure_password_2026",
+    "password_salt": "8d672c7c77e4179dd689e0745908fc59",
+    "key_derivation": "Argon2id-64MB (3 iterations, parallelism 4)",
+    "encryption": "AES-256-GCM",
+    "derivation_path": "m/44'/501'/0'/0'"
+  },
+  "capabilities": [
+    "High-frequency trading",
+    "Large volume transactions",
+    "Prediction market participation"
+  ],
+  "signing": {
+    "algorithm": "Ed25519",
+    "canonical_format": "from|to|amount|timestamp|nonce",
+    "domain_prefix": "BLACKBOOK_L1"
+  }
+}

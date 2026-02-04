@@ -1,0 +1,80 @@
+# ============================================================================
+# BlackBook L1 - HashiCorp Vault Production Deployment
+# ============================================================================
+# 
+# Usage:
+#   docker-compose up -d              # Start Vault
+#   docker-compose exec vault sh      # Enter Vault container
+#   docker-compose down               # Stop Vault
+#
+# Production Deployment:
+#   1. Set strong TLS certificates
+#   2. Configure external storage (Consul, PostgreSQL, etc.)
+#   3. Use auto-unseal (AWS KMS, Azure Key Vault, GCP CKMS)
+#   4. Set up HA cluster (3-5 nodes)
+# ============================================================================
+
+version: '3.8'
+
+services:
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: blackbook-vault
+    hostname: vault
+    ports:
+      - "8200:8200"
+    environment:
+      # Development mode settings (CHANGE FOR PRODUCTION!)
+      VAULT_DEV_ROOT_TOKEN_ID: "blackbook-dev-root-token"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      # Production would use:
+      # VAULT_ADDR: "https://vault.blackbook.io:8200"
+      # VAULT_CACERT: "/vault/tls/ca.crt"
+    cap_add:
+      - IPC_LOCK  # Required for mlock (memory locking)
+    volumes:
+      - vault-data:/vault/data
+      - vault-logs:/vault/logs
+      - ./config:/vault/config:ro
+      - ./policies:/vault/policies:ro
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - blackbook-network
+    restart: unless-stopped
+    command: server -dev
+    # Production command:
+    # command: server -config=/vault/config/vault.hcl
+
+  vault-init:
+    image: hashicorp/vault:1.15
+    container_name: blackbook-vault-init
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "blackbook-dev-root-token"
+    volumes:
+      - ./init-scripts:/scripts:ro
+    entrypoint: /bin/sh
+    command: /scripts/init-vault.sh
+    networks:
+      - blackbook-network
+
+volumes:
+  vault-data:
+    driver: local
+  vault-logs:
+    driver: local
+
+networks:
+  blackbook-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

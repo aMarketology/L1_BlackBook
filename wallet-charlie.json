@@ -1,0 +1,11 @@
+{
+  "name": "Charlie",
+  "wallet_address": "bb_a79fa4ee7c55bbed16ba06635c359c6d",
+  "public_key": "a79fa4ee7c55bbed16ba06635c359c6dade20724fbb26ad29a0c8e6336717d15",
+  "share_a_bound": "1:8404a868053101fa523e12b8dec3a8aace2c216bad76bb24758d7b83d9a66b8c",
+  "password_salt": "5c133247381625d6abceb5ab099da1ad",
+  "password": "FixedWallet2026!",
+  "security_mode": "Deterministic",
+  "mnemonic_stored": true,
+  "mnemonic": "defy copper amount garlic autumn frequent expand lucky proof jar polar scissors mom bike about where season total hundred life gadget comfort stereo misery"
+}

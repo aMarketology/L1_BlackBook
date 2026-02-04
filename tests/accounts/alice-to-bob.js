@@ -1,0 +1,268 @@
+/**
+ * alice-to-bob.js
+ * 
+ * Test Script: Transfer 50 BB ($5.00 USD) from Alice to Bob
+ * Uses Shamir 2-of-3 Secret Sharing with A+C recovery path
+ * (Password + HashiCorp Vault)
+ * 
+ * Run: node tests/test-accounts/alice-to-bob.js
+ */
+
+const BASE_URL = 'http://localhost:8080';
+
+// Test account credentials
+const ALICE = {
+    password: 'AlicePassword123!',
+    // These will be populated dynamically
+    wallet_address: null,
+    share_a_bound: null,
+    share_c_encrypted: null
+};
+
+const BOB = {
+    password: 'BobPassword123!',
+    wallet_address: null
+};
+
+const TRANSFER_AMOUNT = 50; // 50 BB = $5.00 USD
+
+// Utility: Make HTTP request with detailed logging
+async function request(method, endpoint, body = null) {
+    const url = `${BASE_URL}${endpoint}`;
+    console.log(`\n📡 ${method} ${url}`);
+    if (body) {
+        console.log(`   Body: ${JSON.stringify(body, null, 2)}`);
+    }
+    
+    const options = {
+        method,
+        headers: { 'Content-Type': 'application/json' }
+    };
+    
+    if (body) {
+        options.body = JSON.stringify(body);
+    }
+    
+    try {
+        const response = await fetch(url, options);
+        const text = await response.text();
+        
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch {
+            data = { raw: text };
+        }
+        
+        console.log(`   Status: ${response.status} ${response.statusText}`);
+        console.log(`   Response: ${JSON.stringify(data, null, 2)}`);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${JSON.stringify(data)}`);
+        }
+        
+        return data;
+    } catch (error) {
+        console.error(`   ❌ Error: ${error.message}`);
+        throw error;
+    }
+}
+
+// Step 1: Check server health
+async function checkHealth() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 1: Check Server Health');
+    console.log('='.repeat(60));
+    
+    const health = await request('GET', '/health');
+    console.log(`\n✅ Server is running (v${health.version})`);
+    console.log(`   Total Supply: ${health.total_supply} BB`);
+    console.log(`   Accounts: ${health.account_count}`);
+    return health;
+}
+
+// Step 2: Create or get Alice's wallet
+async function setupAlice() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 2: Setup Alice Wallet');
+    console.log('='.repeat(60));
+    
+    // Create Alice's wallet
+    console.log('\n📝 Creating Alice wallet...');
+    const wallet = await request('POST', '/mnemonic/create', {
+        password: ALICE.password
+    });
+    
+    ALICE.wallet_address = wallet.wallet_address;
+    ALICE.share_a_bound = wallet.share_a_bound;
+    
+    console.log(`\n✅ Alice Wallet Created`);
+    console.log(`   Address: ${ALICE.wallet_address}`);
+    console.log(`   Share A: ${ALICE.share_a_bound}`);
+    
+    return wallet;
+}
+
+// Step 3: Create or get Bob's wallet
+async function setupBob() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 3: Setup Bob Wallet');
+    console.log('='.repeat(60));
+    
+    // Create Bob's wallet
+    console.log('\n📝 Creating Bob wallet...');
+    const wallet = await request('POST', '/mnemonic/create', {
+        password: BOB.password
+    });
+    
+    BOB.wallet_address = wallet.wallet_address;
+    
+    console.log(`\n✅ Bob Wallet Created`);
+    console.log(`   Address: ${BOB.wallet_address}`);
+    
+    return wallet;
+}
+
+// Step 4: Fund Alice's wallet
+async function fundAlice() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 4: Fund Alice Wallet');
+    console.log('='.repeat(60));
+    
+    // Check current balance
+    const beforeBal = await request('GET', `/balance/${ALICE.wallet_address}`);
+    console.log(`\n   Current Balance: ${beforeBal.balance} BB`);
+    
+    if (beforeBal.balance < TRANSFER_AMOUNT) {
+        const mintAmount = 1000; // Mint 1000 BB = $100 USD
+        console.log(`\n💰 Minting ${mintAmount} BB to Alice...`);
+        
+        await request('POST', '/admin/mint', {
+            to: ALICE.wallet_address,
+            amount: mintAmount
+        });
+    }
+    
+    // Verify new balance
+    const afterBal = await request('GET', `/balance/${ALICE.wallet_address}`);
+    console.log(`\n✅ Alice Balance: ${afterBal.balance} BB = $${(afterBal.balance * 0.10).toFixed(2)} USD`);
+    
+    return afterBal;
+}
+
+// Step 5: Get Alice's Share C from HashiCorp Vault
+async function getAliceShareC() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 5: Retrieve Share C from HashiCorp Vault');
+    console.log('='.repeat(60));
+    
+    const shareC = await request('GET', `/mnemonic/share-c/${ALICE.wallet_address}`);
+    ALICE.share_c_encrypted = shareC.share_c_encrypted;
+    
+    console.log(`\n✅ Share C Retrieved`);
+    console.log(`   Encrypted: ${ALICE.share_c_encrypted.substring(0, 40)}...`);
+    
+    return shareC;
+}
+
+// Step 6: Execute Transfer using A+C recovery path
+async function executeTransfer() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 6: Execute Transfer (A+C Recovery Path)');
+    console.log('='.repeat(60));
+    
+    console.log(`\n💸 Transferring ${TRANSFER_AMOUNT} BB ($${(TRANSFER_AMOUNT * 0.10).toFixed(2)} USD)`);
+    console.log(`   From: ${ALICE.wallet_address}`);
+    console.log(`   To:   ${BOB.wallet_address}`);
+    console.log(`   Path: A+C (Password + HashiCorp Vault)`);
+    
+    const transferBody = {
+        from: ALICE.wallet_address,
+        to: BOB.wallet_address,
+        amount: TRANSFER_AMOUNT,
+        password: ALICE.password,
+        share_a_bound: ALICE.share_a_bound,
+        recovery_path: 'ac',
+        share_c_encrypted: ALICE.share_c_encrypted
+    };
+    
+    const result = await request('POST', '/mnemonic/transfer', transferBody);
+    
+    console.log(`\n✅ TRANSFER SUCCESSFUL!`);
+    console.log(`   TX ID: ${result.tx_id}`);
+    console.log(`   Signature: ${result.signature.substring(0, 40)}...`);
+    console.log(`   Recovery Path: ${result.recovery_path_used}`);
+    
+    return result;
+}
+
+// Step 7: Verify final balances
+async function verifyBalances() {
+    console.log('\n' + '='.repeat(60));
+    console.log('STEP 7: Verify Final Balances');
+    console.log('='.repeat(60));
+    
+    const aliceBal = await request('GET', `/balance/${ALICE.wallet_address}`);
+    const bobBal = await request('GET', `/balance/${BOB.wallet_address}`);
+    
+    console.log('\n📊 FINAL BALANCES:');
+    console.log(`   Alice: ${aliceBal.balance} BB = $${(aliceBal.balance * 0.10).toFixed(2)} USD`);
+    console.log(`   Bob:   ${bobBal.balance} BB = $${(bobBal.balance * 0.10).toFixed(2)} USD`);
+    
+    return { alice: aliceBal.balance, bob: bobBal.balance };
+}
+
+// Main test runner
+async function main() {
+    console.log('\n');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║     BLACKBOOK TRANSFER TEST: Alice → Bob (50 BB = $5.00)     ║');
+    console.log('║          Using Shamir 2-of-3 SSS with A+C Recovery           ║');
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log('\n1 BB = $0.10 USD (Fixed Forever)\n');
+    
+    const startTime = Date.now();
+    
+    try {
+        // Run all steps
+        await checkHealth();
+        await setupAlice();
+        await setupBob();
+        await fundAlice();
+        await getAliceShareC();
+        await executeTransfer();
+        const finalBalances = await verifyBalances();
+        
+        // Summary
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+        
+        console.log('\n' + '='.repeat(60));
+        console.log('TEST COMPLETE');
+        console.log('='.repeat(60));
+        console.log(`\n✅ SUCCESS! Transfer completed in ${elapsed}s`);
+        console.log('\n📋 Summary:');
+        console.log(`   • Alice sent ${TRANSFER_AMOUNT} BB ($${(TRANSFER_AMOUNT * 0.10).toFixed(2)}) to Bob`);
+        console.log(`   • Recovery path: A+C (Password + HashiCorp Vault)`);
+        console.log(`   • Alice final: ${finalBalances.alice} BB`);
+        console.log(`   • Bob final: ${finalBalances.bob} BB`);
+        console.log('\n🔐 Security: Mnemonic was reconstructed from Share A + Share C,');
+        console.log('   signed the transaction, and was immediately wiped from memory.\n');
+        
+    } catch (error) {
+        console.log('\n' + '='.repeat(60));
+        console.log('❌ TEST FAILED');
+        console.log('='.repeat(60));
+        console.error(`\nError: ${error.message}`);
+        console.error('\nStack trace:');
+        console.error(error.stack);
+        console.log('\n🔍 Debug Info:');
+        console.log(`   Alice Address: ${ALICE.wallet_address || 'Not set'}`);
+        console.log(`   Bob Address: ${BOB.wallet_address || 'Not set'}`);
+        console.log(`   Share A: ${ALICE.share_a_bound ? ALICE.share_a_bound.substring(0, 30) + '...' : 'Not set'}`);
+        console.log(`   Share C: ${ALICE.share_c_encrypted ? ALICE.share_c_encrypted.substring(0, 30) + '...' : 'Not set'}`);
+        process.exit(1);
+    }
+}
+
+// Run the test
+main();

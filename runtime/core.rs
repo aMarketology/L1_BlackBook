@@ -2261,7 +2261,7 @@ mod tests {
             "alice".to_string(),
             "post123".to_string(),
             0.0,
-            TransactionType::SocialPost,
+            TransactionType::SocialAction,
         )];
         
         let block = Block::new_poh(

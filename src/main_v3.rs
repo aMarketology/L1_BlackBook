@@ -172,6 +172,10 @@ pub struct AppState {
     /// Account metadata - Type-safe PDA accounts (immune to confusion attacks)
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
     
+    /// Nonce tracker - Prevents replay attacks by tracking used nonces
+    /// Format: "address:nonce" -> timestamp
+    pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
+    
     // =========================================================================
     // S+ TIER WALLET SYSTEM (FROST + OPAQUE)
     // =========================================================================
@@ -537,7 +541,15 @@ async fn ledger_handler(
 
 /// Helper to format addresses for display - show meaningful parts
 fn format_address_readable(addr: &str) -> String {
-    if addr.starts_with("L1_") {
+    if addr.starts_with("bb_") {
+        // Show bb_ prefix + first 4 and last 6 chars
+        let hex_part = &addr[3..];
+        if hex_part.len() > 10 {
+            format!("bb_{}...{}", &hex_part[..4], &hex_part[hex_part.len()-6..])
+        } else {
+            addr.to_string()
+        }
+    } else if addr.starts_with("L1_") {
         // Show L1_ prefix + first 4 and last 8 chars
         let hex_part = &addr[3..];
         if hex_part.len() > 12 {
@@ -1318,6 +1330,24 @@ async fn transfer_handler(
             "error": "Signature verification failed"
         })));
     }
+
+    // 5. REPLAY ATTACK PREVENTION - Check nonce hasn't been used
+    let nonce_key = format!("{}:{}", req.payload_fields.from, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Nonce already used - replay attack detected",
+            "nonce": req.nonce,
+            "security_check": "replay_prevention"
+        })));
+    }
+    
+    // Mark nonce as used (with timestamp for potential cleanup)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    state.used_nonces.insert(nonce_key, timestamp);
 
     // =========================================================================
     // IDEAL HYBRID SECURITY CHECKS
@@ -2152,6 +2182,24 @@ async fn admin_burn_handler(
             "error": "Signature verification failed"
         })));
     }
+
+    // 5. REPLAY ATTACK PREVENTION - Check nonce hasn't been used
+    let nonce_key = format!("{}:{}", req.payload_fields.from, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": "Nonce already used - replay attack detected",
+            "nonce": req.nonce,
+            "security_check": "replay_prevention"
+        })));
+    }
+    
+    // Mark nonce as used (with timestamp for potential cleanup)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    state.used_nonces.insert(nonce_key, timestamp);
 
     // Check balance
     let current_balance = state.blockchain.get_balance(&req.payload_fields.from);
@@ -3140,6 +3188,8 @@ async fn main() {
         circuit_breaker,
         fee_market,
         account_metadata,
+        // Nonce tracking for replay attack prevention
+        used_nonces: Arc::new(dashmap::DashMap::new()),
         // S+ Tier Wallet System
         wallet_handlers: wallet_handlers.clone(),
     };

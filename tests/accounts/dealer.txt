@@ -1,0 +1,166 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    🎰 DEALER - Market Maker & Resolution Authority           ║
+║                         System Account (Ed25519 Direct)                      ║
+║                                                                               ║
+║  ⚠️  PRIVATE KEY IN .env - For development/testing ONLY                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              WALLET ADDRESSES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+L1 Address:       L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D
+L2 Address:       L2_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D
+BB Address:       bb_a75e13f6deed980c85adf2d011e72b2d2768ce8d
+
+Public Key:       07943256765557e704e4945aa4d1d56a1b0aac60bd8cc328faa99572aee5e84a
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              AUTHENTICATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Private Key:      🔒 STORED IN .env (DEALER_PRIVATE_KEY)
+                  See environment configuration for deployment
+
+Note: Dealer uses direct Ed25519 keypair, not SSS-based ZKP wallet.
+      This is a system/oracle account with privileged access.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              CAPABILITIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Role: Market Maker & Resolution Authority (Oracle)
+
+Market Operations:
+  ✅ Create new prediction markets
+  ✅ Approve pending markets
+  ✅ Reject invalid markets
+  ✅ Resolve markets with winning outcome
+  ✅ Fund markets with liquidity
+  ✅ Void markets (exceptional circumstances)
+
+Financial Operations:
+  ✅ Sign bridge operations (L1 ↔ L2)
+  ✅ Authorize large transfers
+  ✅ Manage market liquidity pools
+  ✅ Process winning payouts
+
+System Operations:
+  ✅ Oracle data feeds
+  ✅ Price updates
+  ✅ Settlement confirmations
+  ❌ User account access
+  ❌ Modify user balances directly
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              MARKET LIFECYCLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dealer's Role in Market Lifecycle:
+
+1. CREATION
+   └─ Dealer creates market with parameters
+      • Event description
+      • Outcomes (Yes/No or multiple)
+      • Resolution criteria
+      • Expiry timestamp
+
+2. FUNDING
+   └─ Dealer adds initial liquidity
+      • Sets initial odds
+      • Provides backing capital
+
+3. ACTIVE TRADING
+   └─ Users place bets
+      • Dealer may adjust odds
+      • Monitor market integrity
+
+4. RESOLUTION
+   └─ Dealer resolves with outcome
+      • Verify real-world result
+      • Sign resolution transaction
+      • Trigger payout distribution
+
+5. SETTLEMENT
+   └─ System processes payouts
+      • Winners credited automatically
+      • Dealer receives rake/fees
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              API ENDPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create Market:
+  POST /markets/create
+  Headers: Authorization: Bearer {DEALER_TOKEN}
+  Body: { 
+    "event": "Will BTC reach $100k by March 2026?",
+    "outcomes": ["Yes", "No"],
+    "expiry": "2026-03-31T23:59:59Z",
+    "initial_liquidity": 10000
+  }
+
+Approve Market:
+  POST /markets/{id}/approve
+  Headers: Authorization: Bearer {DEALER_TOKEN}
+
+Resolve Market:
+  POST /markets/{id}/resolve
+  Headers: Authorization: Bearer {DEALER_TOKEN}
+  Body: { "winning_outcome": "Yes", "evidence_url": "..." }
+
+Fund Market:
+  POST /markets/{id}/fund
+  Headers: Authorization: Bearer {DEALER_TOKEN}
+  Body: { "amount": 5000 }
+
+Sign Bridge Operation:
+  POST /bridge/sign
+  Headers: Authorization: Bearer {DEALER_TOKEN}
+  Body: { "operation_id": "...", "signature": "..." }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              SECURITY CONSIDERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  CRITICAL: Dealer private key must NEVER be exposed in code or logs
+
+Production Deployment:
+  • Store private key in HSM (Hardware Security Module)
+  • Use environment variables for key access
+  • Enable audit logging for all dealer operations
+  • Implement rate limiting on dealer endpoints
+  • Require multi-signature for high-value operations
+
+Test Environment:
+  • Private key stored in .env file
+  • DO NOT commit .env to version control
+  • Use separate keys for test/staging/production
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                              NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Created: February 2026
+Last Updated: February 1, 2026
+Account Type: System/Oracle (Not a user wallet)
+
+Key Differences from User Wallets:
+  • Direct Ed25519 keypair (no SSS)
+  • Private key in .env, not blockchain/vault
+  • Privileged operations only
+  • No password-based access
+
+Test Scenarios:
+  1. Market creation and approval
+  2. Market resolution with various outcomes
+  3. Bridge operation signing
+  4. Liquidity management
+  5. Multi-market coordination
+  6. Error handling (invalid resolutions)

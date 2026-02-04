@@ -33,29 +33,43 @@ Supabase Role: Stores the Login Hash and the Encrypted Vault.Security: Supabase 
     L2->>L2: Unlock Stake + Mint Winnings
     L2->>L1: AGGRESSIVE FLUSH (Immediate Return)
     L1->>L1: Credit 200 BB (Available)
-Address Scheme:Base: ABC123DEF... (Derived from Master Seed)L1 Address: L1_ABC123... (Used for Transfers/Holding)L2 Address: L2_ABC123... (Used for Order Matching)� The BB Token Economics
+Address Scheme:Base: ABC123DEF... (Derived from Master Seed)L1 Address: L1_ABC123... (Used for Transfers/Holding)L2 Address: L2_ABC123... (Used for Order Matching)💵 The BB Token Economics
 
-## Fixed Value Peg (Immutable)
+## Layer 1: High-Speed Microtransaction Infrastructure
 
-**1 BB = $0.10 USD (Ten Cents) — Forever and Always**
+**BlackBook Layer 1 is NOT a stablecoin.** It is a high-performance blockchain optimized for the microtransactions of the future.
 
-This is not a floating token. BB is a **stable utility token** with a permanent fixed exchange rate:
+### Purpose & Design Philosophy
 
-| BB Amount | USD Value |
-|-----------|-----------|
-| 1 BB      | $0.10     |
-| 10 BB     | $1.00     |
-| 100 BB    | $10.00    |
-| 1,000 BB  | $100.00   |
-| 10,000 BB | $1,000.00 |
+BB (BlackBook) tokens are designed for **speed, scalability, and utility**:
 
-**Why Fixed Value?**
-- **Predictable Economics**: Users always know exactly what their BB is worth
-- **No Speculation**: BB is for utility, not trading
-- **Regulatory Clarity**: Fixed-value tokens have cleaner compliance paths
-- **User Trust**: No rug pulls, no volatility, no surprises
+- **Built for Microtransactions**: Sub-400ms finality enables instant payments for tips, bets, and creator rewards
+- **High-Throughput Settlement**: 65,000+ TPS capacity handles massive transaction volumes
+- **Layer 2 Power Source**: L1 serves as the settlement layer and liquidity backbone for the L2 prediction market
 
-**Backing**: All BB in circulation is backed 1:1 by USD reserves held in regulated custodial accounts.
+**1 BB = $0.10 USD (Target Reference Price)**
+
+BB maintains a **target reference price** (not a peg) of $0.10 USD:
+
+| BB Amount | USD Value (Reference) |
+|-----------|-----------------------|
+| 1 BB      | ~$0.10                |
+| 10 BB     | ~$1.00                |
+| 100 BB    | ~$10.00               |
+| 1,000 BB  | ~$100.00              |
+| 10,000 BB | ~$1,000.00            |
+
+**Why a Reference Price (Not a Peg)?**
+- **Designed for Utility**: BB is built for high-speed transactions, not as a store of value
+- **Microtransaction Optimized**: Lightning-fast finality enables real-time payments for social mining, tips, and bets
+- **L2 Prediction Market Power**: L1 provides the settlement layer and liquidity for the Layer 2 prediction market engine
+- **Market-Driven**: Price discovery happens naturally through supply/demand in the creator economy
+
+**Layer 2 Integration**: The prediction market on Layer 2 relies on L1 for:
+- JIT (Just-In-Time) bridging for bet placement
+- Instant settlement of winnings back to L1
+- High-speed transaction processing for order matching
+- Cross-layer state synchronization with aggressive flushing
 
 ---
 

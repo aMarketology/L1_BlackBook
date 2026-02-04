@@ -1,93 +1,109 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                    🧪 BLACKBOOK TEST ACCOUNTS                                 ║
+║                    🧪 BLACKBOOK TEST ACCOUNTS v3.0                            ║
 ║                                                                               ║
-║  Address derivation: L1_ + SHA256(publicKey).slice(0,40).toUpperCase()       ║
-║  ⚠️  PRIVATE KEYS EXPOSED - For development/testing ONLY                     ║
+║  Security Model: Hybrid Custody (FROST + Mnemonic)                           ║
+║  Address Derivation: L1_ + SHA256(publicKey).slice(0,40).toUpperCase()       ║
+║  ⚠️  PRIVATE KEYS & MNEMONICS EXPOSED - For development/testing ONLY         ║
 ║                                                                               ║
-║  NOTE: ZKP Wallets (Alice, Bob, Mac, Apollo) use password-based SSS          ║
-║        Legacy accounts include raw Ed25519 private keys                      ║
+║  Tracks:                                                                      ║
+║    • Mnemonic (Consumer): 24-word BIP-39 + 2-of-3 SSS + AES-256-GCM         ║
+║    • FROST (Institutional): 2-of-3 Threshold Signatures + OPAQUE             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
+Generated: 2026-02-02
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👤 ALICE - Regular User / Bettor (ZKP Wallet v2.0)
+👤 ALICE - Regular User / Bettor (Mnemonic Track)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-L1 Address:       L1_40B59B2AE14FC3404E40477B557F6F5ED1FAC9DA
-L2 Address:       L2_40B59B2AE14FC3404E40477B557F6F5ED1FAC9DA
+L1 Address:       L1_E1538A035DD007424F634AAC5BF6D9727A3C0819
+L2 Address:       L2_E1538A035DD007424F634AAC5BF6D9727A3C0819
 
-Public Key:       6014625eb1d1c3c828c7a2b3cdea353ad474936dc4e687f4b70eeb6a594a24e0
+Public Key:       7707fe614ad679b84a6cbc128999c1b5cf66cd1e09a5e8a25e2f640210efd18d
+Private Key:      5b8fb7efbdff51362db7feb75dcbc46de2ed9c74d84331aee6904ab8898b5767
+
+24-Word Mnemonic: decrease fuel squirrel buyer game unit age era chaos gossip amused lucky rapid poverty pink humble rabbit ranch grape cannon drop abstract polar below
+
 Password:         AlicePassword123!
-Wallet File:      sdk/tests/alice-zkp-wallet.json
+Password Salt:    4866a5ac52391a1f1bde5977b28cba2b
+Wallet File:      sdk/tests/alice-wallet.json
 
-ZKP Details:
-  Salt:           0c04c605d028635cd9d2997aef8bfb5080a172a078ee94c866fe079ee8663758
-  ZK Commitment:  7ac9fa7f8894fde542f238dbfbbd16bceb90836b9beb913ce19a4b4f195c8e08
+Security:
   Key Derivation: Argon2id-64MB (3 iterations, parallelism 4)
-  SSS:            2-of-3 Shamir Secret Sharing over GF(2^256)
+  SSS Scheme:     2-of-3 Shamir Secret Sharing over GF(256)
   Encryption:     AES-256-GCM with peppered nonce
+  BIP-44 Path:    m/44'/501'/0'/0' (SLIP-10 Ed25519, Solana-compatible)
 
-Recovery:
-  Share A: Derived from password using Argon2id
+Share Distribution:
+  Share A: Derived from password using Argon2id (client-side)
   Share B: Stored on L1 blockchain (retrieved after ZK-proof)
-  Share C: Encrypted in wallet file with pepper
+  Share C: Encrypted in wallet file / HashiCorp Vault
 
-LEGACY (for compatibility):
-  Old L1 Address: L1_52882D768C0F3E7932AAD1813CF8B19058D507A8
-  Old Public Key: c0e349153cbc75e9529b5f1963205cab783463c6835c826a7587e0e0903c6705
-  Old Private Key: 18f2c2e3bcb7a4b5329cfed4bd79bf17df4d47aa1888a6b3d1a1450fb53a8a24
+Capabilities:
+  ✅ Place bets
+  ✅ Transfer tokens
+  ✅ View balance
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👤 BOB - Regular User / Bettor (ZKP Wallet v2.0)
+👤 BOB - Regular User / Bettor (Mnemonic Track)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-L1 Address:       L1_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372
-L2 Address:       L2_83474EAA6FEB5F10A673BC3F4ADC51F611EB4372
+L1 Address:       L1_9046B30119161F4808A85C03D407292152A24275
+L2 Address:       L2_9046B30119161F4808A85C03D407292152A24275
 
-Public Key:       a7d1ac4a4f276b6ac55856c422f2ad2ecae9d11021e4261fa855603739d00ad9
+Public Key:       2123862491cdd1865e06cc684f57e7cbe7dc4377c9492a7687b6b02a09a8ae7d
+Private Key:      e1ba8f967cc7fdf80851082621282075c0b9cec58cc4c2dec5ce2903ef1455d1
+
+24-Word Mnemonic: tornado raven hold choose rubber coil spider power right tumble shock skull shock shoot limit member girl labor business frown input rival rate mad
+
 Password:         BobPassword123!
-Wallet File:      sdk/tests/bob-zkp-wallet.json
+Password Salt:    697286935082df9f8bb61115c8165602
+Wallet File:      sdk/tests/bob-wallet.json
 
-ZKP Details:
-  Salt:           8cd55bf3453c6faa1d9c1217e894a8d5355217631ac8792915379b71a0c6073c
-  ZK Commitment:  85ae8ee0261281521d09e0eb088254a48b21873bb70218c1958a6746281d7233
+Security:
   Key Derivation: Argon2id-64MB (3 iterations, parallelism 4)
-  SSS:            2-of-3 Shamir Secret Sharing over GF(2^256)
+  SSS Scheme:     2-of-3 Shamir Secret Sharing over GF(256)
   Encryption:     AES-256-GCM with peppered nonce
+  BIP-44 Path:    m/44'/501'/0'/0' (SLIP-10 Ed25519, Solana-compatible)
 
-Recovery:
-  Share A: Derived from password using Argon2id
+Share Distribution:
+  Share A: Derived from password using Argon2id (client-side)
   Share B: Stored on L1 blockchain (retrieved after ZK-proof)
-  Share C: Encrypted in wallet file with pepper
+  Share C: Encrypted in wallet file / HashiCorp Vault
 
-LEGACY (for compatibility):
-  Old L1 Address: L1_5DB4B525FB40D6EA6BFD24094C2BC24984BAC433
-  Old Public Key: 582420216093fcff65b0eec2ca2c8227dfc2b6b7428110f36c3fc1349c4b2f5a
-  Old Private Key: e4ac49e5a04ef7dfc6e1a838fdf14597f2d514d0029a82cb45c916293487c25b
+Capabilities:
+  ✅ Place bets
+  ✅ Transfer tokens
+  ✅ View balance
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-👨‍💻 MAC - Power User / Developer (ZKP Wallet v2.0)
+👨‍💻 MAC - Power User / Developer (Mnemonic Track)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-L1 Address:       L1_0CEB3CEC6F37F2C72CDE35231EB7A0B86AC169D5
-L2 Address:       L2_0CEB3CEC6F37F2C72CDE35231EB7A0B86AC169D5
+L1 Address:       L1_BBAF015CB5DB2522EE1B583A178620891544C180
+L2 Address:       L2_BBAF015CB5DB2522EE1B583A178620891544C180
 
-Public Key:       c50c6386112fc120222197bd308f257d7c2c95df6480eb75bea4fcebf127fe50
+Public Key:       54c74820ffa82db9dca554329e521f987f5b60ae60c184422c4b35ec87eaf19e
+Private Key:      d463f17d459cc903d8a81aeafdeace4fd32c6b8d13ab698895aeb99435579126
+
+24-Word Mnemonic: aware regular disagree radio dignity lottery slim diary bike economy case year forget benefit year embody bone leisure mesh habit solution future pet permit
+
 Password:         MacSecurePassword2026!
-Wallet File:      sdk/tests/mac-zkp-wallet.json
+Password Salt:    a349a5a2f2fb8785ac6849dcf8aee6ea
+Wallet File:      sdk/tests/mac-wallet.json
 
-ZKP Details:
-  Salt:           650595535b586a6a7bfbdcd863e8f3d35ba1631db05d79aa66de721c3b9007f5
-  ZK Commitment:  0978b22f41e6a28b35d7c5e08af17afd119fda0bd6875c1fb624b7645c008477
+Security:
   Key Derivation: Argon2id-64MB (3 iterations, parallelism 4)
-  SSS:            2-of-3 Shamir Secret Sharing over GF(2^256)
+  SSS Scheme:     2-of-3 Shamir Secret Sharing over GF(256)
   Encryption:     AES-256-GCM with peppered nonce
+  BIP-44 Path:    m/44'/501'/0'/0' (SLIP-10 Ed25519, Solana-compatible)
 
-Recovery:
-  Share A: Derived from password using Argon2id
+Share Distribution:
+  Share A: Derived from password using Argon2id (client-side)
   Share B: Stored on L1 blockchain (retrieved after ZK-proof)
-  Share C: Encrypted in wallet file with pepper
+  Share C: Encrypted in wallet file / HashiCorp Vault
 
 Capabilities:
   ✅ Full SDK testing and development
@@ -96,27 +112,31 @@ Capabilities:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚀 APOLLO - Heavy Trader / Market Participant (ZKP Wallet v2.0)
+🚀 APOLLO - Heavy Trader / Market Participant (Mnemonic Track)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-L1 Address:       L1_CDCFA0999FB34AD2AD226D1552B37CF9C677D342
-L2 Address:       L2_CDCFA0999FB34AD2AD226D1552B37CF9C677D342
+L1 Address:       L1_EC8FC71050E564E9E934A7394ACE6705EA808647
+L2 Address:       L2_EC8FC71050E564E9E934A7394ACE6705EA808647
 
-Public Key:       5d1136243023c3a301e5449a9c415e776cb63a74b6127e1131f15971b612088b
+Public Key:       d49a03bf45f92bb9d9f9d0a85b4af5e69e46869e0d2e7c7d7b8d1e15807c0542
+Private Key:      6c542c3cfd418343563bbd0866178cdf7dd8c4a6c121bc58211d474b3e65fd48
+
+24-Word Mnemonic: modify phrase follow tunnel castle help brave image slush ill suit woman boost goose spider awful hungry tunnel topic guilt raise lawsuit rely scene
+
 Password:         apollo_secure_password_2026
-Wallet File:      sdk/tests/apollo-zkp-wallet.json
+Password Salt:    f2c1a6ae34b692eeb9f39b9eab1222a5
+Wallet File:      sdk/tests/apollo-wallet.json
 
-ZKP Details:
-  Salt:           fb31ca64a9b187b3820d24442de333584449852858157196889d7f04f598053d
-  ZK Commitment:  095645fbf17181a2b51bdd08cc7eb9d625d78d86c5732e23e4eb4abfd737072b
+Security:
   Key Derivation: Argon2id-64MB (3 iterations, parallelism 4)
-  SSS:            2-of-3 Shamir Secret Sharing over GF(2^256)
+  SSS Scheme:     2-of-3 Shamir Secret Sharing over GF(256)
   Encryption:     AES-256-GCM with peppered nonce
+  BIP-44 Path:    m/44'/501'/0'/0' (SLIP-10 Ed25519, Solana-compatible)
 
-Recovery:
-  Share A: Derived from password using Argon2id
+Share Distribution:
+  Share A: Derived from password using Argon2id (client-side)
   Share B: Stored on L1 blockchain (retrieved after ZK-proof)
-  Share C: Encrypted in wallet file with pepper
+  Share C: Encrypted in wallet file / HashiCorp Vault
 
 Capabilities:
   ✅ High-frequency trading
@@ -125,18 +145,83 @@ Capabilities:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎰 DEALER / ORACLE - Market Maker & Resolution Authority
+🎰 DEALER / ORACLE - Market Maker & Resolution Authority (FROST Track)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-L1 Address:       L1_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D
-L2 Address:       L2_A75E13F6DEED980C85ADF2D011E72B2D2768CE8D
+L1 Address:       L1_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01
+L2 Address:       L2_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01
 
-Public Key:       07943256765557e704e4945aa4d1d56a1b0aac60bd8cc328faa99572aee5e84a
-Private Key:      🔒 STORED IN .env (DEALER_PRIVATE_KEY)
+Public Key:       6a2944608156ffc470bdaea36018a3e9bef58db318dc4f8ce86cd9f3e9e690a7
+Private Key:      bf7c054ef5ae03ea4daba1e099bb0953b4640e946ed2b442a690e57759abfa96
+                  (Also stored in .env as DEALER_PRIVATE_KEY)
 
+Password:         DealerSecure2026!Oracle
+Wallet File:      sdk/tests/dealer-wallet.json
+
+Security (FROST Threshold):
+  Protocol:       FROST-Ed25519 (2-of-3 Threshold Signatures)
+  Authentication: OPAQUE PAKE (Zero-Knowledge Password Auth)
+  
+  Shard 1: Device Shard (Local machine / Secure Enclave)
+  Shard 2: Guardian Shard (BlackBook L1 Network, OPAQUE-protected)
+  Shard 3: Recovery Shard (Paper backup / Cold storage)
+
+  Note: Private key NEVER exists in full during signing - 
+        only partial signatures are combined via FROST protocol.
 
 Capabilities:
   ✅ Create/approve/reject markets
   ✅ Resolve markets with winning outcome
   ✅ Fund markets with liquidity
   ✅ Sign bridge operations
+  ✅ Oracle authority for external data
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 QUICK REFERENCE TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+| Account | L1 Address                                    | Track     |
+|---------|-----------------------------------------------|-----------|
+| Alice   | L1_E1538A035DD007424F634AAC5BF6D9727A3C0819   | Mnemonic  |
+| Bob     | L1_9046B30119161F4808A85C03D407292152A24275   | Mnemonic  |
+| Mac     | L1_BBAF015CB5DB2522EE1B583A178620891544C180   | Mnemonic  |
+| Apollo  | L1_EC8FC71050E564E9E934A7394ACE6705EA808647   | Mnemonic  |
+| Dealer  | L1_C3655C7AA0E5DD9C21DCE65EFE805F902B1C4D01   | FROST     |
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔐 TRANSACTION SIGNING FORMAT (V2 SDK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For TRANSFERS:
+  canonical = "{from}|{to}|{amount}|{timestamp}|{nonce}"
+  payload_hash = SHA256(canonical).hex()
+  domain_prefix = "BLACKBOOK_L1/transfer"
+  message = "{domain_prefix}\n{payload_hash}\n{timestamp}\n{nonce}"
+  signature = Ed25519.sign(private_key, message)
+
+For BURNS:
+  canonical = "{from}|{amount}|{timestamp}|{nonce}"
+  payload_hash = SHA256(canonical).hex()
+  domain_prefix = "BLACKBOOK_L1/admin/burn"
+  message = "{domain_prefix}\n{payload_hash}\n{timestamp}\n{nonce}"
+  signature = Ed25519.sign(private_key, message)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  SECURITY WARNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These accounts are for DEVELOPMENT and TESTING purposes ONLY.
+
+• Private keys and 24-word mnemonics are fully exposed
+• Passwords are stored in plaintext
+• NEVER use these wallets for real funds
+• NEVER commit real credentials to version control
+
+For production wallets:
+• Use POST /mnemonic/create (mnemonics never returned)
+• Use POST /wallet/register/* for FROST wallets
+• Store passwords securely (never in plaintext)
+• Use hardware wallets for high-value accounts
