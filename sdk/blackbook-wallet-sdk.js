@@ -34,7 +34,7 @@
 const BLACKBOOK_CONFIG = {
     // Network endpoints
     L1_RPC_URL: 'http://localhost:8080',
-    MNEMONIC_API_URL: 'http://localhost:3000/mnemonic',
+    MNEMONIC_API_URL: 'http://localhost:8080/mnemonic',  // Unified with L1 server
     
     // Chain configuration
     CHAIN_ID: 1,
@@ -250,13 +250,11 @@ class MnemonicWallet {
             await this.deriveKeypair(bip39, nacl);
         }
 
-        const response = await fetch(`${this.apiUrl}/zkp/challenge`, {
+        // Server endpoint: POST /mnemonic/zkp/challenge/:address
+        const response = await fetch(`${this.apiUrl}/zkp/challenge/${this.walletAddress}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                wallet_address: this.walletAddress,
-                public_key: bytesToHex(this.publicKey)
-            })
+            body: JSON.stringify({})
         });
 
         if (!response.ok) {
@@ -279,19 +277,20 @@ class MnemonicWallet {
             throw new Error('Keypair not derived. Call deriveKeypair() first.');
         }
 
-        // Sign the challenge
-        const messageBytes = new TextEncoder().encode(challenge);
+        // Sign the challenge using the correct message format
+        // Message format: "BLACKBOOK_SHARE_B\n{challenge}\n{address}"
+        const message = `BLACKBOOK_SHARE_B\n${challenge}\n${this.walletAddress}`;
+        const messageBytes = new TextEncoder().encode(message);
         const keyPair = nacl.sign.keyPair.fromSeed(this.privateKey);
         const signature = nacl.sign.detached(messageBytes, keyPair.secretKey);
 
-        const response = await fetch(`${this.apiUrl}/zkp/verify`, {
+        // Server endpoint: POST /mnemonic/share-b/:address
+        const response = await fetch(`${this.apiUrl}/share-b/${this.walletAddress}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                wallet_address: this.walletAddress,
-                challenge: challenge,
-                signature: bytesToHex(signature),
-                public_key: bytesToHex(this.publicKey)
+                public_key: bytesToHex(this.publicKey),
+                signature: bytesToHex(signature)
             })
         });
 

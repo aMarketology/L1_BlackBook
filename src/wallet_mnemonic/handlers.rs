@@ -888,22 +888,13 @@ impl MnemonicHandlers {
         // High-value transaction security: Fetch Vault pepper for >= 1000 BB
         let mut vault_pepper_fetched = false;
         if req.amount >= HIGH_VALUE_THRESHOLD {
-            info!("⚠️  HIGH-VALUE TRANSFER: {} BB from {} to {}. Vault pepper fetch required.", 
+            info!("⚠️  HIGH-VALUE TRANSFER: {} BB from {} to {}. Vault pepper required.", 
                 req.amount, req.from, req.to);
             
-            // Attempt to fetch live pepper from HashiCorp Vault
-            match crate::vault::get_pepper().await {
-                Ok(pepper) => {
-                    info!("✅ Vault pepper fetched successfully for {:.2} BB transfer", req.amount);
-                    // Note: In production, update state.vault_pepper or use directly
-                    // For now, we validate that Vault is accessible
-                    vault_pepper_fetched = true;
-                },
-                Err(e) => {
-                    warn!("❌ Vault pepper fetch failed: {}. Using cached pepper.", e);
-                    // Continue with cached pepper (degraded mode)
-                }
-            }
+            // TODO: Fetch live pepper from HashiCorp Vault in production
+            // For now, use cached pepper (dev/test mode)
+            warn!("⚠️  Using cached pepper (Vault integration pending)");
+            vault_pepper_fetched = false; // Indicates using fallback
         }
         
         // Reconstruct keypair based on recovery path

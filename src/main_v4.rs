@@ -639,7 +639,7 @@ async fn sss_transfer_handler(
         }))));
     }
     
-    // Reconstruct entropy from 2-of-3 shares
+    // Reconstruct entropy from 2-of-3 shares why is it share 2 :&share2
     let entropy = match reconstruct_entropy(&share_1, &share_2) {
         Ok(e) => e,
         Err(e) => {
@@ -697,7 +697,7 @@ async fn sss_transfer_handler(
         }))));
     }
     
-    // Security checks
+    // Security checks we dont need thi
     let sender_stake = state.blockchain.get_balance(from) / 1000.0;
     if let Err(e) = state.throttler.check_transaction(from, sender_stake) {
         return Err((StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
