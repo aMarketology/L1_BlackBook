@@ -69,6 +69,25 @@ const WALLET_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet
 const WALLET_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_metadata");
 
 // ============================================================================
+// TWO-TIER VAULT TABLES
+// ============================================================================
+
+/// Tier 1 USDT Reserve: "state" → Tier1Gateway serialized state (Vec<u8>)
+const TIER1_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier1_state");
+
+/// Tier 2 Inflation Vault: "state" → Tier2InflationVault serialized state (Vec<u8>)
+const TIER2_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier2_state");
+
+/// DIME Vintages: VintageId (String) → DimeVintage serialized (Vec<u8>)
+const DIME_VINTAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("dime_vintages");
+
+/// CPI History: Timestamp (u64) → CPI value as bytes (serialized f64)
+const CPI_HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("cpi_history");
+
+/// DIME Balances: Address (String) → Balance (u64)
+const DIME_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("dime_balances");
+
+// ============================================================================
 // ENHANCED LEDGER ENUMS (Type-Safe Blockchain Integrity)
 // ============================================================================
 

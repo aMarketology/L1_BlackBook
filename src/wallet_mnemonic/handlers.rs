@@ -1603,7 +1603,6 @@ impl MnemonicHandlers {
             wallet_address: metadata.address,
             public_key: metadata.public_key,
             security_mode: match metadata.security_mode {
-                WalletSecurityMode::Threshold(_) => "Threshold".to_string(),
                 WalletSecurityMode::Deterministic(_) => "Deterministic".to_string(),
             },
             created_at: metadata.created_at,

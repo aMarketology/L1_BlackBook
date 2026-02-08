@@ -1,7 +1,11 @@
 //! # Unified Signer Trait
 //!
-//! Abstraction layer that lets the blockchain treat all wallets uniformly,
-//! regardless of whether they use FROST (Institutional) or Mnemonic (Consumer).
+//! Abstraction layer for wallet signing operations.
+//!
+//! ## Current Implementation
+//!
+//! BlackBook L1 MVP uses only Mnemonic (Consumer) wallets.
+//! FROST Institutional wallets will be added via hot upgrade in Phase 2.
 //!
 //! ## Why This Matters
 //!
@@ -9,9 +13,9 @@
 //! 1. The signature is valid Ed25519
 //! 2. It matches the public key on the account
 //!
-//! This trait hides the complexity of:
-//! - FROST: Multi-party ceremony with partial signatures
+//! This trait is designed to support both:
 //! - Mnemonic: Single-party hash after SSS reconstruction
+//! - FROST (Future): Multi-party ceremony with partial signatures
 
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -52,11 +56,10 @@ pub struct SigningResult {
     pub is_threshold: bool,
 }
 
-/// Unified signer interface for both wallet types
+/// Unified signer interface for wallet operations
 /// 
-/// Implementors:
-/// - `FrostSigner` - Institutional track (threshold ceremony)
-/// - `MnemonicSigner` - Consumer track (reconstruct & sign)
+/// Current Implementation: MnemonicSigner (Consumer Track)
+/// Future (Hot Upgrade Phase 2): FrostSigner (Institutional Track)
 #[async_trait]
 pub trait WalletSigner: Send + Sync {
     /// Get the wallet's public key
@@ -65,13 +68,15 @@ pub trait WalletSigner: Send + Sync {
     /// Get the wallet's L1 address
     fn address(&self) -> &str;
     
-    /// Check if this is a threshold wallet (FROST)
+    /// Check if this is a threshold wallet
+    /// Current: Always false (only Mnemonic wallets exist)
+    /// Future: Will return true for FROST wallets
     fn is_threshold(&self) -> bool;
     
     /// Sign a message
     /// 
-    /// For FROST: This initiates a signing ceremony
-    /// For Mnemonic: This reconstructs the key and signs directly
+    /// For Mnemonic: Reconstructs the key and signs directly
+    /// For FROST (Future): Will initiate a signing ceremony
     async fn sign(&self, message: &[u8]) -> Result<SigningResult, SignerError>;
     
     /// Verify a signature (same for both types)
@@ -234,60 +239,6 @@ impl WalletSigner for MnemonicSigner {
 }
 
 // ============================================================================
-// FROST SIGNER (WRAPPER)
-// ============================================================================
-
-// Note: FROST signing is already implemented in src/unified_wallet/tss.rs
-// This is a thin wrapper to implement the WalletSigner trait
-
-use std::sync::Arc;
-
-/// Wrapper to make FROST threshold signer implement WalletSigner
-pub struct FrostSignerWrapper {
-    address: String,
-    public_key: VerifyingKey,
-    // In real implementation, this would hold references to:
-    // - ThresholdSigner from unified_wallet
-    // - Session state
-    // - Commitment data
-    _threshold_signer: Option<()>, // Placeholder
-}
-
-impl FrostSignerWrapper {
-    pub fn new(address: String, public_key: VerifyingKey) -> Self {
-        Self {
-            address,
-            public_key,
-            _threshold_signer: None,
-        }
-    }
-}
-
-#[async_trait]
-impl WalletSigner for FrostSignerWrapper {
-    fn public_key(&self) -> &VerifyingKey {
-        &self.public_key
-    }
-    
-    fn address(&self) -> &str {
-        &self.address
-    }
-    
-    fn is_threshold(&self) -> bool {
-        true
-    }
-    
-    async fn sign(&self, _message: &[u8]) -> Result<SigningResult, SignerError> {
-        // FROST signing requires a multi-round ceremony
-        // This would delegate to the ThresholdSigner in unified_wallet
-        // For now, return an error indicating the ceremony must be used
-        Err(SignerError::SigningError(
-            "FROST signing requires multi-party ceremony. Use /wallet/sign/* endpoints.".to_string()
-        ))
-    }
-}
-
-// ============================================================================
 // SIGNER FACTORY
 // ============================================================================
 
@@ -305,21 +256,6 @@ pub fn create_signer_for_wallet(
     pepper: Option<&[u8]>,
 ) -> Result<Box<dyn WalletSigner>, SignerError> {
     match &metadata.security_mode {
-        WalletSecurityMode::Threshold(_config) => {
-            // Parse public key from hex
-            let pk_bytes = hex::decode(&metadata.public_key)
-                .map_err(|e| SignerError::KeyError(e.to_string()))?;
-            let pk_array: [u8; 32] = pk_bytes.try_into()
-                .map_err(|_| SignerError::KeyError("Invalid public key length".to_string()))?;
-            let public_key = VerifyingKey::from_bytes(&pk_array)
-                .map_err(|e| SignerError::KeyError(e.to_string()))?;
-            
-            Ok(Box::new(FrostSignerWrapper::new(
-                metadata.address.clone(),
-                public_key,
-            )))
-        }
-        
         WalletSecurityMode::Deterministic(config) => {
             // Need password and shares
             let password = password.ok_or_else(|| 

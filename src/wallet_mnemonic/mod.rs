@@ -1,23 +1,25 @@
 //! # Wallet Mnemonic Module - Consumer Track
 //!
-//! This module implements the "Consumer Track" of BlackBook's Hybrid Custody system.
+//! This module implements the Consumer Wallet system for BlackBook L1.
 //! 
-//! ## Architecture: Hybrid Custody (Adaptive Security)
+//! ## Current Implementation: Mnemonic SSS (Shamir Secret Sharing)
 //!
-//! BlackBook supports TWO wallet modes:
-//!
-//! ### 1. Institutional Track (FROST TSS) - `src/unified_wallet/`
-//! - Key is **born distributed** via DKG (never exists in full)
-//! - Signing requires multi-party ceremony
-//! - No recovery phrase (social/guardian recovery)
-//! - Target: DAOs, treasuries, $1M+ accounts
-//!
-//! ### 2. Consumer Track (Mnemonic SSS) - THIS MODULE
+//! BlackBook L1 MVP launches with consumer-grade wallets only:
 //! - Standard BIP-39 (24 words, 256-bit entropy)
-//! - Key CAN exist in full (during signing)
 //! - Shamir 2-of-3 protection at rest
 //! - MetaMask/Ledger exportable
 //! - Target: Everyday users, DeFi traders
+//!
+//! ## Future: FROST Institutional Wallets (Hot Upgrade Phase 2)
+//!
+//! After mainnet launch, the first hot upgrade will add:
+//! - FROST TSS (Threshold Signature Scheme)
+//! - Key born distributed via DKG (never exists in full)
+//! - Multi-party signing ceremony
+//! - Social/guardian recovery
+//! - Target: DAOs, treasuries, $1M+ accounts
+//!
+//! See `docs/HOT_UPGRADE_GUIDE.md` for implementation details.
 //!
 //! ## Security Model
 //!
@@ -48,17 +50,6 @@
 //! ✅ A + C = User + Vault (L1 down)
 //! ❌ B + C = Impossible (no password knowledge)
 //! ```
-//!
-//! ## Comparison with FROST Track
-//!
-//! | Feature          | FROST (Institutional)    | Mnemonic (Consumer)      |
-//! |------------------|--------------------------|--------------------------|
-//! | Key Generation   | DKG (born in pieces)     | BIP-39 (24 words)        |
-//! | Signing          | Multi-party ceremony     | Single-party hash        |
-//! | Trust Model      | Trust in math/network    | Trust in physical backup |
-//! | Recovery         | Guardian shards          | "Paper in the safe"      |
-//! | Portability      | Zero (FROST-only)        | High (MetaMask ready)    |
-//! | Target Users     | $1M+ / DAOs              | Everyday users           |
 
 pub mod mnemonic;
 pub mod sss;
@@ -78,30 +69,13 @@ use serde::{Deserialize, Serialize};
 
 /// Defines which security track a wallet uses.
 /// 
-/// This is the "bridge" that lets the blockchain treat all wallets uniformly
-/// while maintaining different security models underneath.
+/// BlackBook L1 currently supports only the Consumer Track (Deterministic).
+/// FROST Institutional Wallets will be added via hot upgrade in Phase 2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalletSecurityMode {
-    /// Institutional Track: Key exists only as threshold shards.
-    /// Requires FROST ceremony to sign. No recovery phrase.
-    Threshold(ThresholdConfig),
-    
     /// Consumer Track: Key derived from 24-word mnemonic.
     /// Shamir 2-of-3 protection. MetaMask exportable.
     Deterministic(MnemonicConfig),
-}
-
-/// Configuration for FROST threshold wallets
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThresholdConfig {
-    /// Threshold required (e.g., 2 of 3)
-    pub threshold: u16,
-    /// Total number of participants
-    pub participants: u16,
-    /// Guardian shard ID (server-held)
-    pub guardian_shard_id: String,
-    /// Whether this wallet has a recovery guardian
-    pub has_recovery_guardian: bool,
 }
 
 /// Configuration for mnemonic-based wallets

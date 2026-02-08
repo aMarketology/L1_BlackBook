@@ -1,30 +1,19 @@
-//! BlackBook Layer1 Blockchain
+//! BlackBook Layer1 Blockchain - Digital Central Bank & Vault
 //!
-//! Treasury & Blockchain Layer for Sweepstakes
-//!
-//! ## Architecture
-//!
-//! 1. Bridge Contract (Base) - Holds USDC, multi-sig controlled
-//! 2. Wrapped USDC (L1) - 1:1 mint when bridge detects deposit
-//! 3. BlackBook Token ($BB) - Only Cashier mints, only Redemption burns
-//! 4. Cashier Contract - wUSDC → FanGold (L2) + $BB (L1)
-//! 5. Redemption Contract - Burns $BB, releases value
+//! Three Core Jobs:
+//!   1. GATEKEEPER (Tier 1): USDT → $BB at 1:10 ratio
+//!   2. TIME MACHINE (Tier 2): $BB → $DIME with vintage stamps
+//!   3. SSS WALLET: Shamir Secret Sharing for security
 
 // Core modules
-pub mod social_mining;
 pub mod storage;
 pub mod poh_blockchain;
-pub mod settlement;  // Batch settlements with Merkle proofs
-pub mod vault;       // HashiCorp Vault integration for pepper management
+pub mod wallet_mnemonic; // BIP-39 24-word wallet with SSS backup
 
-// Stub modules (simplified for MVP)
-pub mod integration;
-pub mod routes_v2;
-pub mod unified_wallet;
-pub mod wallet_mnemonic;  // BIP-39 24-word wallet with SSS backup
+// Supporting modules (for compatibility)
+pub mod social_mining;
 pub mod consensus;
 pub mod grpc;
-pub mod rpc;
 
 // Infrastructure
 #[path = "../protocol/mod.rs"]
@@ -39,30 +28,37 @@ pub mod runtime;
 // Storage
 pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
 
-// Protocol - Treasury Architecture
+// Protocol - Two-Tier Vault System
 pub use protocol::blockchain::{
+    // Constants
+    USDT_TO_BB_RATIO, TOKEN_DECIMALS, DEFAULT_BASE_CPI,
+    
     // Token Ledgers
-    WusdcLedger, BlackBookLedger,
-    // Contracts
-    BridgeAuthority, CashierContract, RedemptionContract, PendingRelease,
-    // Bundles
-    Bundle,
-    // Events (for L2 indexer)
+    BlackBookLedger, DimeLedger,
+    
+    // Tier 1: USDT → $BB Gateway
+    Tier1Gateway, Tier1Deposit,
+    
+    // Tier 2: $BB → $DIME Vault
+    Tier2Vault, DimeVintage,
+    
+    // Events
     L1Event,
+    
     // Transactions
     Transaction, TxData,
-    // Security
-    AccountSecurity,
-    // State
-    // State
-    L1State,
+    
+    // State & Security
+    L1State, AccountSecurity,
+    
     // Errors
     ChainError,
+    
     // Compliance
     ProofOfReserves,
 };
 
-// Social mining
+// Social mining (legacy compatibility)
 pub use social_mining::{SocialMiningSystem, SocialActionType, SocialAction, DailyLimits};
 
 // Runtime
@@ -81,8 +77,4 @@ pub use poh_blockchain::{
     MAX_TXS_PER_BLOCK, BLOCK_INTERVAL_MS,
 };
 
-// Authentication
-pub use integration::unified_auth::{
-    SignedRequest, AuthError, generate_keypair,
-    CHAIN_ID_L1, CHAIN_ID_L2,
-};
+

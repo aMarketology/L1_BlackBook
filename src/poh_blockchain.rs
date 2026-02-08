@@ -784,7 +784,7 @@ impl BlockProducer {
         Ok(block)
     }
 
-    /// Execute a single transaction using the new treasury architecture
+    /// Execute a single transaction using the Two-Tier Vault architecture
     /// Note: Amounts are in u64 (6 decimals), converted to f64 for storage
     fn execute_transaction(&self, tx: &Transaction) -> Result<(), String> {
         match &tx.data {
@@ -795,7 +795,6 @@ impl BlockProducer {
                     &root_pubkey[..16.min(root_pubkey.len())],
                     &initial_op_pubkey[..16.min(initial_op_pubkey.len())],
                     &kdf_params_hash[..16.min(kdf_params_hash.len())]);
-                // Account is created in L1State, no balance operation here
                 Ok(())
             }
 
@@ -805,48 +804,56 @@ impl BlockProducer {
                     tx.from,
                     &new_op_pubkey[..16.min(new_op_pubkey.len())],
                     &kdf_params_hash[..16.min(kdf_params_hash.len())]);
-                // Key rotation handled in L1State, no balance operation here
                 Ok(())
             }
-
-            TxData::BridgeMint { recipient, amount, base_tx_hash } => {
-                // Bridge mints wUSDC for user (deposit detected on Base)
-                info!("Bridge mint: {} wUSDC to {} (base_tx: {})", 
-                    amount, recipient, &base_tx_hash[..8.min(base_tx_hash.len())]);
-                self.blockchain.credit(recipient, *amount as f64)
+            
+            // ========== Tier 1: USDT → $BB Gateway ==========
+            
+            TxData::DepositUsdt { usdt_amount, external_tx_hash } => {
+                let tx_hash = external_tx_hash.as_deref().unwrap_or("internal");
+                info!("Tier1 deposit: {} deposited {} USDT (tx: {})", 
+                    tx.from, usdt_amount, &tx_hash[..8.min(tx_hash.len())]);
+                // Credit $BB to user (at 1:10 ratio)
+                let bb_amount = usdt_amount * 10;
+                self.blockchain.credit(&tx.from, bb_amount as f64)
             }
             
-            TxData::TransferWusdc { to, amount } => {
-                // Transfer wUSDC between accounts
+            TxData::RedeemBbForUsdt { bb_amount } => {
+                info!("Tier1 redeem: {} redeems {} $BB for USDT", tx.from, bb_amount);
+                self.blockchain.debit(&tx.from, *bb_amount as f64)
+            }
+            
+            // ========== Tier 2: $BB → $DIME Vault ==========
+            
+            TxData::LockBbForDime { bb_amount } => {
+                info!("Tier2 lock: {} locks {} $BB for $DIME", tx.from, bb_amount);
+                // Debit $BB (locked in vault), credit handled separately for $DIME
+                self.blockchain.debit(&tx.from, *bb_amount as f64)
+            }
+            
+            TxData::RedeemDimeVintage { vintage_id } => {
+                info!("Tier2 redeem: {} redeems vintage {}", tx.from, vintage_id);
+                // Balance changes handled in L1State
+                Ok(())
+            }
+            
+            TxData::UpdateCpi { new_cpi_index } => {
+                info!("CPI update: new index {:.4} by {}", new_cpi_index, tx.from);
+                Ok(())
+            }
+            
+            // ========== Token Transfers ==========
+            
+            TxData::TransferBb { to, amount } => {
+                info!("Transfer: {} -> {} ({} $BB)", tx.from, to, amount);
                 self.blockchain.debit(&tx.from, *amount as f64)?;
                 self.blockchain.credit(to, *amount as f64)
             }
             
-            TxData::BuyBundle { bundle_id } => {
-                // User buys bundle - wUSDC to Cashier, $BB minted
-                // Note: The actual bundle logic is in L1State
-                // Here we just log for the PoH chain
-                info!("Bundle purchase: {} bought {}", tx.from, bundle_id);
+            TxData::TransferDime { to, amount } => {
+                info!("Transfer: {} -> {} ({} $DIME)", tx.from, to, amount);
+                // $DIME balances tracked separately in L1State
                 Ok(())
-            }
-            
-            TxData::Redeem { amount } => {
-                // User redeems $BB for wUSDC
-                info!("Redemption: {} redeemed {} $BB", tx.from, amount);
-                Ok(())
-            }
-
-            TxData::Burn { amount } => {
-                // User burns $BB (permanently removing from supply)
-                info!("Burn: {} burned {} $BB", tx.from, amount);
-                self.blockchain.debit(&tx.from, *amount as f64)
-            }
-            
-            TxData::BridgeRelease { user, amount, base_tx_hash } => {
-                // Bridge released USDC on Base, burn wUSDC on L1
-                info!("Bridge release: {} wUSDC from {} (base_tx: {})",
-                    amount, user, &base_tx_hash[..8.min(base_tx_hash.len())]);
-                self.blockchain.debit(user, *amount as f64)
             }
         }
     }

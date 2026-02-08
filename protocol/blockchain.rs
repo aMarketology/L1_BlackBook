@@ -1,13 +1,16 @@
 // ============================================================================
-// BlackBook L1 Protocol - Treasury & Blockchain Layer
+// BlackBook L1 Protocol - Digital Central Bank & Vault
 // ============================================================================
-// Architecture:
-//   1. Bridge Contract (Base) - Holds USDC, multi-sig controlled
-//   2. Wrapped USDC (L1) - 1:1 mint when bridge detects deposit  
-//   3. BlackBook Token ($BB) - Only Cashier mints, only Redemption burns
-//   4. Cashier Contract - wUSDC → FanGold (L2) + $BB (L1)
-//   5. Redemption Contract - Burns $BB, releases value
-//   6. Account Security - Dual Key System (Root/Recovery + Operational/Daily)
+//
+// Three Core Jobs:
+//   1. GATEKEEPER (Tier 1): USDT → $BB at 1:10 ratio
+//   2. TIME MACHINE (Tier 2): $BB → $DIME with vintage stamps (inflation protection)
+//   3. SSS WALLET: Shamir Secret Sharing (handled in wallet_mnemonic module)
+//
+// Invariants:
+//   - Tier 1: vault_usdt * 10 = total_bb_supply (always!)
+//   - Tier 2: sum(vintage_bb_locked) = total_bb_in_vault
+//
 // ============================================================================
 
 use serde::{Deserialize, Serialize};
@@ -15,153 +18,193 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 // ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/// 1 USDT = 10 $BB (fixed ratio)
+pub const USDT_TO_BB_RATIO: u64 = 10;
+
+/// Decimals for all tokens (6, like USDC/USDT)
+pub const TOKEN_DECIMALS: u8 = 6;
+
+/// Default base CPI (100.0 = baseline)
+pub const DEFAULT_BASE_CPI: f64 = 100.0;
+
+/// Oracle PDA address
+pub const CPI_ORACLE_ADDRESS: &str = "CPI_ORACLE_PDA";
+
+/// Tier 1 Gateway PDA
+pub const TIER1_GATEWAY_PDA: &str = "TIER1_GATEWAY_PDA";
+
+/// Tier 2 Vault PDA  
+pub const TIER2_VAULT_PDA: &str = "TIER2_VAULT_PDA";
+
+// ============================================================================
 // TOKENS
 // ============================================================================
 
-/// Wrapped USDC - 1:1 backed by USDC locked on Base
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WusdcLedger {
-    pub balances: HashMap<String, u64>,      // address -> balance (6 decimals)
-    pub total_supply: u64,                    // Must equal USDC locked on Base
-}
-
-/// BlackBook Token ($BB) - The sweepstakes prize token
+/// BlackBook Token ($BB) - 10-cent stablecoin backed by USDT
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlackBookLedger {
-    pub balances: HashMap<String, u64>,      // address -> balance (6 decimals)
+    pub balances: HashMap<String, u64>,  // address -> balance (6 decimals)
+    pub total_supply: u64,
+}
+
+/// DIME Token - Inflation-protected savings token
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DimeLedger {
+    pub balances: HashMap<String, u64>,  // address -> balance (6 decimals)
     pub total_supply: u64,
 }
 
 // ============================================================================
-// ACCOUNT SECURITY
+// TIER 1: USDT → $BB GATEWAY (The Gatekeeper)
 // ============================================================================
 
-/// Account Security Configuration
-/// Implements the "Dual Key" model:
-/// - Root Key: High entropy, offline, SSS-backed. Used only for recovery/rotation.
-/// - Op Key: Password derived (Argon2id), online. Used for daily signing.
+/// Tier 1 Gateway - Manages USDT deposits and $BB minting
+/// INVARIANT: vault_usdt_balance * 10 = total_bb_minted
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier1Gateway {
+    /// Total USDT locked in the reserve vault (6 decimals)
+    pub vault_usdt_balance: u64,
+    
+    /// Total $BB minted through this gateway
+    pub total_bb_minted: u64,
+    
+    /// Deposit history for audit trail
+    pub deposits: Vec<Tier1Deposit>,
+    
+    /// Is gateway active (can pause for emergencies)
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier1Deposit {
+    pub user: String,
+    pub usdt_amount: u64,
+    pub bb_minted: u64,
+    pub timestamp: u64,
+    pub external_tx_hash: Option<String>,
+}
+
+impl Default for Tier1Gateway {
+    fn default() -> Self {
+        Self {
+            vault_usdt_balance: 0,
+            total_bb_minted: 0,
+            deposits: Vec::new(),
+            is_active: true,
+        }
+    }
+}
+
+impl Tier1Gateway {
+    /// Check solvency invariant: vault_usdt * 10 = total_bb
+    pub fn check_solvency(&self) -> bool {
+        self.vault_usdt_balance.checked_mul(USDT_TO_BB_RATIO)
+            .map(|expected| expected == self.total_bb_minted)
+            .unwrap_or(false)
+    }
+}
+
+// ============================================================================
+// TIER 2: $BB → $DIME VAULT (The Time Machine)
+// ============================================================================
+
+/// Tier 2 Inflation Vault - Protects purchasing power with vintages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier2Vault {
+    /// Total $BB locked in this vault
+    pub total_bb_locked: u64,
+    
+    /// Total $DIME outstanding
+    pub total_dime_supply: u64,
+    
+    /// Current CPI index (e.g., 103.2 for 3.2% inflation since launch)
+    pub current_cpi: f64,
+    
+    /// Base CPI at system launch (denominator)
+    pub base_cpi: f64,
+    
+    /// All vintages (vintage_id -> Vintage)
+    pub vintages: HashMap<String, DimeVintage>,
+    
+    /// User's vintage IDs (user -> [vintage_ids])
+    pub user_vintages: HashMap<String, Vec<String>>,
+    
+    /// Is vault active
+    pub is_active: bool,
+    
+    /// Last CPI update timestamp
+    pub last_cpi_update: u64,
+}
+
+/// A DIME Vintage - "stamps" the purchase price forever
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimeVintage {
+    pub id: String,
+    pub owner: String,
+    
+    /// The EXACT $BB amount locked (returned on redemption)
+    pub bb_locked: u64,
+    
+    /// $DIME minted for this vintage
+    pub dime_minted: u64,
+    
+    /// CPI at time of lock (the "stamp")
+    pub cpi_at_lock: f64,
+    
+    /// Timestamp when created
+    pub created_at: u64,
+    
+    /// Has this been redeemed?
+    pub is_redeemed: bool,
+}
+
+impl Default for Tier2Vault {
+    fn default() -> Self {
+        Self {
+            total_bb_locked: 0,
+            total_dime_supply: 0,
+            current_cpi: DEFAULT_BASE_CPI,
+            base_cpi: DEFAULT_BASE_CPI,
+            vintages: HashMap::new(),
+            user_vintages: HashMap::new(),
+            is_active: true,
+            last_cpi_update: 0,
+        }
+    }
+}
+
+impl Tier2Vault {
+    /// Check invariant: sum of unredeemed vintage bb_locked = total_bb_locked
+    pub fn check_invariant(&self) -> bool {
+        let sum: u64 = self.vintages.values()
+            .filter(|v| !v.is_redeemed)
+            .map(|v| v.bb_locked)
+            .sum();
+        sum == self.total_bb_locked
+    }
+    
+    /// Convert $BB to $DIME at current CPI
+    /// Higher CPI = fewer $DIME per $BB
+    pub fn bb_to_dime(&self, bb_amount: u64) -> u64 {
+        let ratio = self.base_cpi / self.current_cpi;
+        (bb_amount as f64 * ratio) as u64
+    }
+}
+
+// ============================================================================
+// ACCOUNT SECURITY (SSS Wallet Support)
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSecurity {
-    pub root_pubkey: String,              // The User's Identity Root
-    pub authorized_op_pubkeys: HashSet<String>, // Keys allowed to sign daily txs
-    pub kdf_params_hash: String,          // Commit to KDF params (prevents downgrade attacks)
+    pub root_pubkey: String,              // Root key (SSS-backed, offline)
+    pub authorized_op_pubkeys: HashSet<String>, // Op keys for daily use
+    pub kdf_params_hash: String,          // KDF commitment
     pub sequence: u64,                    // Replay protection
     pub created_at: u64,
-}
-
-// ============================================================================
-// CONTRACTS / AUTHORITIES
-// ============================================================================
-
-/// Bridge Authority - Multi-sig that controls wUSDC minting
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BridgeAuthority {
-    pub address: String,
-    pub signers: Vec<String>,                // Multi-sig participants
-    pub threshold: u8,                        // Required signatures
-    pub processed_deposits: HashSet<String>, // base_tx_hash -> prevent replay
-}
-
-/// Cashier Contract - The ONLY entity that can mint $BB
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CashierContract {
-    pub address: String,
-    pub wusdc_received: u64,
-    pub bb_minted: u64,
-    pub bundles_sold: u64,
-}
-
-/// Redemption Contract - The ONLY entity that can burn $BB
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RedemptionContract {
-    pub address: String,
-    pub bb_burned: u64,
-    pub wusdc_released: u64,
-    pub pending_releases: Vec<PendingRelease>, // Awaiting bridge confirmation
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingRelease {
-    pub user: String,
-    pub amount: u64,
-    pub timestamp: u64,
-    pub bridge_tx_hash: Option<String>,
-}
-
-// ============================================================================
-// BUNDLE CONFIGURATION
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Bundle {
-    pub id: String,
-    pub name: String,
-    pub price_wusdc: u64,                    // Cost in wUSDC (6 decimals)
-    pub fan_gold_amount: u64,                // FanGold credited on L2
-    pub bb_bonus: u64,                       // $BB minted on L1
-    pub active: bool,
-}
-
-impl Bundle {
-    pub fn starter_pack() -> Self {
-        Bundle {
-            id: "starter_20".to_string(),
-            name: "Starter Pack".to_string(),
-            price_wusdc: 20_000_000,         // $20 (6 decimals)
-            fan_gold_amount: 20_000,         // 20,000 FanGold
-            bb_bonus: 20_000_000,            // 20 $BB (6 decimals)
-            active: true,
-        }
-    }
-    
-    pub fn whale_pack() -> Self {
-        Bundle {
-            id: "whale_100".to_string(),
-            name: "Whale Pack".to_string(),
-            price_wusdc: 100_000_000,        // $100
-            fan_gold_amount: 110_000,        // 110,000 FanGold (10% bonus)
-            bb_bonus: 100_000_000,           // 100 $BB
-            active: true,
-        }
-    }
-}
-
-// ============================================================================
-// EVENTS (For L2 Indexer)
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum L1Event {
-    AccountCreated { user: String, timestamp: u64 },
-    KeyRotated { user: String, timestamp: u64 },
-    
-    WusdcMinted {
-        user: String,
-        amount: u64,
-        base_tx_hash: String,
-    },
-    
-    BundlePurchased {
-        user: String,
-        bundle_id: String,
-        wusdc_spent: u64,
-        bb_received: u64,
-        fan_gold_to_credit: u64,
-        timestamp: u64,
-    },
-    
-    Redeemed {
-        user: String,
-        bb_burned: u64,
-        wusdc_released: u64,
-        timestamp: u64,
-    },
-    
-    BridgeReleased {
-        user: String,
-        amount: u64,
-        base_tx_hash: String,
-    },
 }
 
 // ============================================================================
@@ -175,60 +218,92 @@ pub struct Transaction {
     pub timestamp: u64,
     pub data: TxData,
     pub signature: String,
-    pub signer_pubkey: String, // Explicitly state which key signed this
+    pub signer_pubkey: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TxData {
-    // ========== Security Operations ==========
-    
-    /// Create new account with Root/Op key separation
+    // ========== Account Operations ==========
     CreateAccount {
         root_pubkey: String,
         initial_op_pubkey: String,
-        kdf_params_hash: String, 
+        kdf_params_hash: String,
     },
     
-    /// Rotate Operational Key (Must be signed by ROOT Key)
     RotateOpKey {
         new_op_pubkey: String,
         kdf_params_hash: String,
     },
-
-    // ========== Bridge Operations ==========
     
-    BridgeMint {
-        recipient: String,
-        amount: u64,
-        base_tx_hash: String,
+    // ========== Tier 1: USDT → $BB ==========
+    
+    /// Deposit USDT, mint $BB at 1:10 ratio
+    DepositUsdt {
+        usdt_amount: u64,
+        external_tx_hash: Option<String>,
     },
     
-    // ========== User Operations ==========
+    /// Redeem $BB for USDT
+    RedeemBbForUsdt {
+        bb_amount: u64,
+    },
     
-    TransferWusdc {
+    // ========== Tier 2: $BB → $DIME ==========
+    
+    /// Lock $BB, mint $DIME with vintage stamp
+    LockBbForDime {
+        bb_amount: u64,
+    },
+    
+    /// Redeem vintage for exact original $BB
+    RedeemDimeVintage {
+        vintage_id: String,
+    },
+    
+    // ========== Oracle ==========
+    
+    /// Update CPI index (oracle only)
+    UpdateCpi {
+        new_cpi_index: f64,
+    },
+    
+    // ========== Token Operations ==========
+    
+    /// Transfer $BB between accounts
+    TransferBb {
         to: String,
         amount: u64,
     },
     
-    BuyBundle {
-        bundle_id: String,
-    },
-    
-    Redeem {
+    /// Transfer $DIME between accounts
+    TransferDime {
+        to: String,
         amount: u64,
     },
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum L1Event {
+    AccountCreated { user: String, timestamp: u64 },
     
-    Burn {
-        amount: u64,
-    },
+    // Tier 1 Events
+    UsdtDeposited { user: String, usdt_amount: u64, bb_minted: u64, timestamp: u64 },
+    BbRedeemed { user: String, bb_amount: u64, usdt_released: u64, timestamp: u64 },
     
-    // ========== Bridge Release ==========
+    // Tier 2 Events
+    BbLocked { user: String, bb_amount: u64, dime_minted: u64, vintage_id: String, timestamp: u64 },
+    VintageRedeemed { user: String, vintage_id: String, dime_burned: u64, bb_released: u64, timestamp: u64 },
     
-    BridgeRelease {
-        user: String,
-        amount: u64,
-        base_tx_hash: String,
-    },
+    // Oracle Events
+    CpiUpdated { old_cpi: f64, new_cpi: f64, timestamp: u64 },
+    
+    // Transfer Events
+    BbTransfer { from: String, to: String, amount: u64, timestamp: u64 },
+    DimeTransfer { from: String, to: String, amount: u64, timestamp: u64 },
 }
 
 // ============================================================================
@@ -237,61 +312,33 @@ pub enum TxData {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L1State {
-    // Security Registry
+    // Account registry
     pub accounts: HashMap<String, AccountSecurity>,
     
-    // Token Ledgers
-    pub wusdc: WusdcLedger,
-    pub blackbook: BlackBookLedger,
+    // Token ledgers
+    pub bb_ledger: BlackBookLedger,
+    pub dime_ledger: DimeLedger,
     
-    // Contracts
-    pub bridge: BridgeAuthority,
-    pub cashier: CashierContract,
-    pub redemption: RedemptionContract,
+    // Two-Tier Vault System
+    pub tier1: Tier1Gateway,
+    pub tier2: Tier2Vault,
     
-    // Configuration
-    pub bundles: HashMap<String, Bundle>,
-    
-    // Event Log
+    // Event log
     pub events: Vec<L1Event>,
     
-    pub base_usdc_locked: u64,
+    // Block tracking  
     pub block_height: u64,
 }
 
 impl Default for L1State {
     fn default() -> Self {
-        let mut bundles = HashMap::new();
-        let starter = Bundle::starter_pack();
-        let whale = Bundle::whale_pack();
-        bundles.insert(starter.id.clone(), starter);
-        bundles.insert(whale.id.clone(), whale);
-        
         Self {
             accounts: HashMap::new(),
-            wusdc: WusdcLedger::default(),
-            blackbook: BlackBookLedger::default(),
-            bridge: BridgeAuthority {
-                address: "BRIDGE_AUTHORITY".to_string(),
-                signers: vec!["BRIDGE_SIGNER_1".to_string()],
-                threshold: 1,
-                processed_deposits: HashSet::new(),
-            },
-            cashier: CashierContract {
-                address: "CASHIER_CONTRACT".to_string(),
-                wusdc_received: 0,
-                bb_minted: 0,
-                bundles_sold: 0,
-            },
-            redemption: RedemptionContract {
-                address: "REDEMPTION_CONTRACT".to_string(),
-                bb_burned: 0,
-                wusdc_released: 0,
-                pending_releases: Vec::new(),
-            },
-            bundles,
+            bb_ledger: BlackBookLedger::default(),
+            dime_ledger: DimeLedger::default(),
+            tier1: Tier1Gateway::default(),
+            tier2: Tier2Vault::default(),
             events: Vec::new(),
-            base_usdc_locked: 0,
             block_height: 0,
         }
     }
@@ -309,110 +356,113 @@ pub enum ChainError {
     #[error("Account not found: {0}")]
     AccountNotFound(String),
     
-    #[error("Invalid signature from key: {0}")]
-    InvalidSignature(String),
-    
-    #[error("Unauthorized signer (Key not in authorized list)")]
+    #[error("Unauthorized signer")]
     UnauthorizedSigner,
     
-    #[error("Root Key required for this operation")]
+    #[error("Root key required for this operation")]
     RootKeyRequired,
     
-    #[error("Insufficient wUSDC balance: have {have}, need {need}")]
-    InsufficientWusdc { have: u64, need: u64 },
-    
-    #[error("Insufficient $BB balance: have {have}, need {need}")]
+    #[error("Insufficient $BB: have {have}, need {need}")]
     InsufficientBB { have: u64, need: u64 },
     
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
+    #[error("Insufficient $DIME: have {have}, need {need}")]
+    InsufficientDime { have: u64, need: u64 },
     
-    #[error("Bundle not found: {0}")]
-    BundleNotFound(String),
+    #[error("Insufficient USDT in vault: have {have}, need {need}")]
+    InsufficientVaultUsdt { have: u64, need: u64 },
     
-    #[error("Duplicate bridge deposit: {0}")]
-    DuplicateDeposit(String),
+    #[error("Vintage not found: {0}")]
+    VintageNotFound(String),
     
-    #[error("Solvency violation")]
-    SolvencyViolation,
+    #[error("Vintage already redeemed: {0}")]
+    VintageAlreadyRedeemed(String),
+    
+    #[error("Not vintage owner")]
+    NotVintageOwner,
+    
+    #[error("Solvency violation: Tier 1 invariant broken")]
+    Tier1SolvencyViolation,
+    
+    #[error("Invariant violation: Tier 2 invariant broken")]
+    Tier2InvariantViolation,
+    
+    #[error("Gateway is paused")]
+    GatewayPaused,
+    
+    #[error("Vault is paused")]
+    VaultPaused,
+    
+    #[error("Unauthorized oracle")]
+    UnauthorizedOracle,
+    
+    #[error("Invalid amount")]
+    InvalidAmount,
+    
+    #[error("Overflow")]
+    Overflow,
 }
 
 // ============================================================================
-// STATE MACHINE
+// STATE MACHINE IMPLEMENTATION
 // ============================================================================
 
 impl L1State {
+    /// Apply a transaction to the state
     pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), ChainError> {
-        // 1. Authenticate Sender & Key
-        self.authenticate(tx)?;
+        // Authenticate (skip for account creation)
+        if !matches!(tx.data, TxData::CreateAccount { .. }) {
+            self.authenticate(tx)?;
+        }
         
-        // 2. Route Logic
         match &tx.data {
             TxData::CreateAccount { root_pubkey, initial_op_pubkey, kdf_params_hash } => {
-                self.create_account(&tx.from, root_pubkey, initial_op_pubkey, kdf_params_hash, tx.timestamp)?;
+                self.create_account(&tx.from, root_pubkey, initial_op_pubkey, kdf_params_hash, tx.timestamp)
             }
             
             TxData::RotateOpKey { new_op_pubkey, kdf_params_hash } => {
-                self.rotate_op_key(&tx.from, new_op_pubkey, kdf_params_hash, tx.signer_pubkey.clone(), tx.timestamp)?;
+                self.rotate_op_key(&tx.from, new_op_pubkey, kdf_params_hash, &tx.signer_pubkey, tx.timestamp)
             }
             
-            TxData::BridgeMint { recipient, amount, base_tx_hash } => {
-                self.bridge_mint(&tx.from, recipient, *amount, base_tx_hash)?;
+            TxData::DepositUsdt { usdt_amount, external_tx_hash } => {
+                self.deposit_usdt(&tx.from, *usdt_amount, external_tx_hash.clone(), tx.timestamp)
             }
             
-            TxData::TransferWusdc { to, amount } => {
-                self.transfer_wusdc(&tx.from, to, *amount)?;
+            TxData::RedeemBbForUsdt { bb_amount } => {
+                self.redeem_bb_for_usdt(&tx.from, *bb_amount, tx.timestamp)
             }
             
-            TxData::BuyBundle { bundle_id } => {
-                self.buy_bundle(&tx.from, bundle_id, tx.timestamp)?;
+            TxData::LockBbForDime { bb_amount } => {
+                self.lock_bb_for_dime(&tx.from, *bb_amount, tx.timestamp)
             }
             
-            TxData::Redeem { amount } => {
-                self.redeem(&tx.from, *amount, tx.timestamp)?;
-            }
-
-            TxData::Burn { amount } => {
-                 let bb_bal = self.blackbook.balances.get(&tx.from).copied().unwrap_or(0);
-                 if bb_bal < *amount { return Err(ChainError::InsufficientBB{have: bb_bal, need: *amount}); }
-                 
-                 *self.blackbook.balances.get_mut(&tx.from).unwrap() -= amount;
-                 self.blackbook.total_supply -= amount;
+            TxData::RedeemDimeVintage { vintage_id } => {
+                self.redeem_dime_vintage(&tx.from, vintage_id, tx.timestamp)
             }
             
-            TxData::BridgeRelease { user, amount, base_tx_hash } => {
-                self.bridge_release(&tx.from, user, *amount, base_tx_hash)?;
+            TxData::UpdateCpi { new_cpi_index } => {
+                self.update_cpi(&tx.from, *new_cpi_index, tx.timestamp)
+            }
+            
+            TxData::TransferBb { to, amount } => {
+                self.transfer_bb(&tx.from, to, *amount, tx.timestamp)
+            }
+            
+            TxData::TransferDime { to, amount } => {
+                self.transfer_dime(&tx.from, to, *amount, tx.timestamp)
             }
         }
-        
-        Ok(())
     }
     
-    // ========== Security & Auth ==========
+    // ========== Authentication ==========
     
     fn authenticate(&self, tx: &Transaction) -> Result<(), ChainError> {
-        // Special case: CreateAccount creates the entry, so strict auth is skipped (signature verification still applies to the key used)
-        if let TxData::CreateAccount { .. } = tx.data {
-            // In a real system, we'd verify the signature matches the provided root_pubkey or op_key
-            // Here we assume self-signed by root for creation
+        // Oracle has special auth
+        if tx.from == CPI_ORACLE_ADDRESS {
             return Ok(());
         }
         
-        // 1. Check Account Exists
-        let account = self.accounts.get(&tx.from);
-        
-        // 2. Check Signer is Authorized
-        // NOTE: Bridge/Cashier/Redemption are special "system accounts" without keys in this simple map, 
-        // they are authorized by address check in the logic.
-        if tx.from == self.bridge.address || tx.from == self.cashier.address || tx.from == self.redemption.address {
-            return Ok(());
-        }
-
-        let account = account.ok_or_else(|| ChainError::AccountNotFound(tx.from.clone()))?;
-        
-        // Root key is always valid signer, but business logic may restrict its uses (e.g. CreateAccount only? No, RotateKey uses it.)
-        // But business logic in RotateKey *checks* if signer == root_key.
-        // Here we just check "Is this key KNOWN to the account?"
+        let account = self.accounts.get(&tx.from)
+            .ok_or_else(|| ChainError::AccountNotFound(tx.from.clone()))?;
         
         let is_root = tx.signer_pubkey == account.root_pubkey;
         let is_op = account.authorized_op_pubkeys.contains(&tx.signer_pubkey);
@@ -421,11 +471,10 @@ impl L1State {
             return Err(ChainError::UnauthorizedSigner);
         }
         
-        // 3. Verify Signature (Mock)
-        // verify(tx.hash, tx.signature, tx.signer_pubkey)
-        
         Ok(())
     }
+    
+    // ========== Account Operations ==========
     
     fn create_account(&mut self, address: &str, root: &str, op: &str, kdf: &str, ts: u64) -> Result<(), ChainError> {
         if self.accounts.contains_key(address) {
@@ -451,135 +500,561 @@ impl L1State {
         Ok(())
     }
     
-    fn rotate_op_key(&mut self, user: &str, new_op: &str, kdf: &str, signer: String, ts: u64) -> Result<(), ChainError> {
-        let account = self.accounts.get_mut(user).unwrap();
+    fn rotate_op_key(&mut self, user: &str, new_op: &str, kdf: &str, signer: &str, _ts: u64) -> Result<(), ChainError> {
+        let account = self.accounts.get_mut(user)
+            .ok_or_else(|| ChainError::AccountNotFound(user.to_string()))?;
         
-        // CRITICAL: Only Root Key can rotate/recover
         if signer != account.root_pubkey {
             return Err(ChainError::RootKeyRequired);
         }
         
-        // Revoke old Ops (Logic: Clear list, add new one)
         account.authorized_op_pubkeys.clear();
         account.authorized_op_pubkeys.insert(new_op.to_string());
         account.kdf_params_hash = kdf.to_string();
         
-        self.events.push(L1Event::KeyRotated {
+        Ok(())
+    }
+    
+    // ========== Tier 1: USDT → $BB ==========
+    
+    fn deposit_usdt(&mut self, user: &str, usdt_amount: u64, external_tx: Option<String>, ts: u64) -> Result<(), ChainError> {
+        if !self.tier1.is_active {
+            return Err(ChainError::GatewayPaused);
+        }
+        
+        if usdt_amount == 0 {
+            return Err(ChainError::InvalidAmount);
+        }
+        
+        // Calculate $BB to mint (1:10 ratio)
+        let bb_to_mint = usdt_amount.checked_mul(USDT_TO_BB_RATIO)
+            .ok_or(ChainError::Overflow)?;
+        
+        // Update Tier 1 vault
+        self.tier1.vault_usdt_balance = self.tier1.vault_usdt_balance
+            .checked_add(usdt_amount).ok_or(ChainError::Overflow)?;
+        self.tier1.total_bb_minted = self.tier1.total_bb_minted
+            .checked_add(bb_to_mint).ok_or(ChainError::Overflow)?;
+        
+        // Record deposit
+        self.tier1.deposits.push(Tier1Deposit {
             user: user.to_string(),
+            usdt_amount,
+            bb_minted: bb_to_mint,
+            timestamp: ts,
+            external_tx_hash: external_tx,
+        });
+        
+        // Credit $BB to user
+        *self.bb_ledger.balances.entry(user.to_string()).or_insert(0) += bb_to_mint;
+        self.bb_ledger.total_supply += bb_to_mint;
+        
+        // Verify solvency
+        if !self.tier1.check_solvency() {
+            return Err(ChainError::Tier1SolvencyViolation);
+        }
+        
+        self.events.push(L1Event::UsdtDeposited {
+            user: user.to_string(),
+            usdt_amount,
+            bb_minted: bb_to_mint,
             timestamp: ts,
         });
         
         Ok(())
     }
-
-    // ========== Existing Logic (Bridge/User) ==========
     
-    fn bridge_mint(&mut self, sender: &str, recipient: &str, amount: u64, base_tx_hash: &str) -> Result<(), ChainError> {
-        if sender != self.bridge.address { return Err(ChainError::Unauthorized("Bridge Only".into())); }
-        if self.bridge.processed_deposits.contains(base_tx_hash) { return Err(ChainError::DuplicateDeposit(base_tx_hash.into())); }
+    fn redeem_bb_for_usdt(&mut self, user: &str, bb_amount: u64, ts: u64) -> Result<(), ChainError> {
+        if !self.tier1.is_active {
+            return Err(ChainError::GatewayPaused);
+        }
         
-        *self.wusdc.balances.entry(recipient.to_string()).or_insert(0) += amount;
-        self.wusdc.total_supply += amount;
-        self.base_usdc_locked += amount;
-        self.bridge.processed_deposits.insert(base_tx_hash.to_string());
+        if bb_amount == 0 {
+            return Err(ChainError::InvalidAmount);
+        }
         
-        self.events.push(L1Event::WusdcMinted { user: recipient.into(), amount, base_tx_hash: base_tx_hash.into() });
-        Ok(())
-    }
-    
-    fn transfer_wusdc(&mut self, from: &str, to: &str, amount: u64) -> Result<(), ChainError> {
-        let bal = self.wusdc.balances.get(from).copied().unwrap_or(0);
-        if bal < amount { return Err(ChainError::InsufficientWusdc{have: bal, need: amount}); }
-        *self.wusdc.balances.get_mut(from).unwrap() -= amount;
-        *self.wusdc.balances.entry(to.to_string()).or_insert(0) += amount;
-        Ok(())
-    }
-    
-    fn buy_bundle(&mut self, buyer: &str, bundle_id: &str, ts: u64) -> Result<(), ChainError> {
-        let bundle = self.bundles.get(bundle_id).ok_or_else(|| ChainError::BundleNotFound(bundle_id.into()))?.clone();
+        // Check user has enough $BB
+        let user_bb = self.bb_ledger.balances.get(user).copied().unwrap_or(0);
+        if user_bb < bb_amount {
+            return Err(ChainError::InsufficientBB { have: user_bb, need: bb_amount });
+        }
         
-        // 1. Charge wUSDC
-        let bal = self.wusdc.balances.get(buyer).copied().unwrap_or(0);
-        if bal < bundle.price_wusdc { return Err(ChainError::InsufficientWusdc{have: bal, need: bundle.price_wusdc}); }
-        *self.wusdc.balances.get_mut(buyer).unwrap() -= bundle.price_wusdc;
-        *self.wusdc.balances.entry(self.cashier.address.clone()).or_insert(0) += bundle.price_wusdc;
+        // Calculate USDT to release
+        let usdt_to_release = bb_amount / USDT_TO_BB_RATIO;
         
-        // 2. Mint $BB
-        *self.blackbook.balances.entry(buyer.to_string()).or_insert(0) += bundle.bb_bonus;
-        self.blackbook.total_supply += bundle.bb_bonus;
+        // Check vault has enough USDT
+        if self.tier1.vault_usdt_balance < usdt_to_release {
+            return Err(ChainError::InsufficientVaultUsdt {
+                have: self.tier1.vault_usdt_balance,
+                need: usdt_to_release,
+            });
+        }
         
-        // 3. Update Stats
-        self.cashier.wusdc_received += bundle.price_wusdc;
-        self.cashier.bb_minted += bundle.bb_bonus;
-        self.cashier.bundles_sold += 1;
+        // Burn $BB from user
+        *self.bb_ledger.balances.get_mut(user).unwrap() -= bb_amount;
+        self.bb_ledger.total_supply -= bb_amount;
         
-        self.events.push(L1Event::BundlePurchased {
-            user: buyer.to_string(), bundle_id: bundle_id.into(), wusdc_spent: bundle.price_wusdc,
-            bb_received: bundle.bb_bonus, fan_gold_to_credit: bundle.fan_gold_amount, timestamp: ts
+        // Update Tier 1 vault
+        self.tier1.vault_usdt_balance -= usdt_to_release;
+        self.tier1.total_bb_minted -= bb_amount;
+        
+        // Verify solvency
+        if !self.tier1.check_solvency() {
+            return Err(ChainError::Tier1SolvencyViolation);
+        }
+        
+        self.events.push(L1Event::BbRedeemed {
+            user: user.to_string(),
+            bb_amount,
+            usdt_released: usdt_to_release,
+            timestamp: ts,
         });
+        
         Ok(())
     }
     
-    fn redeem(&mut self, user: &str, amount: u64, ts: u64) -> Result<(), ChainError> {
-        let bb_bal = self.blackbook.balances.get(user).copied().unwrap_or(0);
-        if bb_bal < amount { return Err(ChainError::InsufficientBB{have: bb_bal, need: amount}); }
+    // ========== Tier 2: $BB → $DIME ==========
+    
+    fn lock_bb_for_dime(&mut self, user: &str, bb_amount: u64, ts: u64) -> Result<(), ChainError> {
+        if !self.tier2.is_active {
+            return Err(ChainError::VaultPaused);
+        }
         
-        let cash_bal = self.wusdc.balances.get(&self.cashier.address).copied().unwrap_or(0);
-        if cash_bal < amount { return Err(ChainError::InsufficientWusdc{have: cash_bal, need: amount}); }
+        if bb_amount == 0 {
+            return Err(ChainError::InvalidAmount);
+        }
         
-        // Burn BB
-        *self.blackbook.balances.get_mut(user).unwrap() -= amount;
-        self.blackbook.total_supply -= amount;
+        // Check user has enough $BB
+        let user_bb = self.bb_ledger.balances.get(user).copied().unwrap_or(0);
+        if user_bb < bb_amount {
+            return Err(ChainError::InsufficientBB { have: user_bb, need: bb_amount });
+        }
         
-        // Release wUSDC
-        *self.wusdc.balances.get_mut(&self.cashier.address).unwrap() -= amount;
-        *self.wusdc.balances.entry(user.to_string()).or_insert(0) += amount;
+        // Calculate $DIME to mint (adjusted for CPI)
+        let dime_to_mint = self.tier2.bb_to_dime(bb_amount);
         
-        self.redemption.bb_burned += amount;
-        self.redemption.wusdc_released += amount;
+        // Generate vintage ID
+        let vintage_id = format!("vtg_{}_{}_{}", user, ts, self.tier2.vintages.len());
         
-        self.events.push(L1Event::Redeemed { user: user.into(), bb_burned: amount, wusdc_released: amount, timestamp: ts });
+        // Create vintage (stamps the purchase price)
+        let vintage = DimeVintage {
+            id: vintage_id.clone(),
+            owner: user.to_string(),
+            bb_locked: bb_amount,
+            dime_minted: dime_to_mint,
+            cpi_at_lock: self.tier2.current_cpi,
+            created_at: ts,
+            is_redeemed: false,
+        };
+        
+        // Deduct $BB from user (it's now locked in vault)
+        *self.bb_ledger.balances.get_mut(user).unwrap() -= bb_amount;
+        self.bb_ledger.total_supply -= bb_amount;
+        
+        // Update Tier 2 vault
+        self.tier2.total_bb_locked += bb_amount;
+        self.tier2.total_dime_supply += dime_to_mint;
+        self.tier2.vintages.insert(vintage_id.clone(), vintage);
+        self.tier2.user_vintages.entry(user.to_string()).or_default().push(vintage_id.clone());
+        
+        // Credit $DIME to user
+        *self.dime_ledger.balances.entry(user.to_string()).or_insert(0) += dime_to_mint;
+        self.dime_ledger.total_supply += dime_to_mint;
+        
+        // Verify invariant
+        if !self.tier2.check_invariant() {
+            return Err(ChainError::Tier2InvariantViolation);
+        }
+        
+        self.events.push(L1Event::BbLocked {
+            user: user.to_string(),
+            bb_amount,
+            dime_minted: dime_to_mint,
+            vintage_id,
+            timestamp: ts,
+        });
+        
         Ok(())
     }
     
-    fn bridge_release(&mut self, sender: &str, user: &str, amount: u64, base_tx_hash: &str) -> Result<(), ChainError> {
-        if sender != self.bridge.address { return Err(ChainError::Unauthorized("Bridge Only".into())); }
-        let bal = self.wusdc.balances.get(user).copied().unwrap_or(0);
-        if bal < amount { return Err(ChainError::InsufficientWusdc{have: bal, need: amount}); }
+    fn redeem_dime_vintage(&mut self, user: &str, vintage_id: &str, ts: u64) -> Result<(), ChainError> {
+        if !self.tier2.is_active {
+            return Err(ChainError::VaultPaused);
+        }
         
-        *self.wusdc.balances.get_mut(user).unwrap() -= amount;
-        self.wusdc.total_supply -= amount;
-        self.base_usdc_locked -= amount;
+        // Get vintage
+        let vintage = self.tier2.vintages.get(vintage_id)
+            .ok_or_else(|| ChainError::VintageNotFound(vintage_id.to_string()))?;
         
-        self.events.push(L1Event::BridgeReleased { user: user.into(), amount, base_tx_hash: base_tx_hash.into() });
+        // Verify ownership
+        if vintage.owner != user {
+            return Err(ChainError::NotVintageOwner);
+        }
+        
+        // Verify not already redeemed
+        if vintage.is_redeemed {
+            return Err(ChainError::VintageAlreadyRedeemed(vintage_id.to_string()));
+        }
+        
+        let bb_to_release = vintage.bb_locked;
+        let dime_to_burn = vintage.dime_minted;
+        
+        // Check user has enough $DIME
+        let user_dime = self.dime_ledger.balances.get(user).copied().unwrap_or(0);
+        if user_dime < dime_to_burn {
+            return Err(ChainError::InsufficientDime { have: user_dime, need: dime_to_burn });
+        }
+        
+        // Mark vintage as redeemed
+        self.tier2.vintages.get_mut(vintage_id).unwrap().is_redeemed = true;
+        
+        // Burn $DIME from user
+        *self.dime_ledger.balances.get_mut(user).unwrap() -= dime_to_burn;
+        self.dime_ledger.total_supply -= dime_to_burn;
+        
+        // Update Tier 2 vault
+        self.tier2.total_bb_locked -= bb_to_release;
+        self.tier2.total_dime_supply -= dime_to_burn;
+        
+        // Credit $BB back to user (the EXACT original amount)
+        *self.bb_ledger.balances.entry(user.to_string()).or_insert(0) += bb_to_release;
+        self.bb_ledger.total_supply += bb_to_release;
+        
+        // Verify invariant
+        if !self.tier2.check_invariant() {
+            return Err(ChainError::Tier2InvariantViolation);
+        }
+        
+        self.events.push(L1Event::VintageRedeemed {
+            user: user.to_string(),
+            vintage_id: vintage_id.to_string(),
+            dime_burned: dime_to_burn,
+            bb_released: bb_to_release,
+            timestamp: ts,
+        });
+        
         Ok(())
     }
     
-    // ========== Query ==========
+    // ========== Oracle ==========
     
-    pub fn wusdc_balance(&self, address: &str) -> u64 { self.wusdc.balances.get(address).copied().unwrap_or(0) }
-    pub fn bb_balance(&self, address: &str) -> u64 { self.blackbook.balances.get(address).copied().unwrap_or(0) }
+    fn update_cpi(&mut self, caller: &str, new_cpi: f64, ts: u64) -> Result<(), ChainError> {
+        if caller != CPI_ORACLE_ADDRESS {
+            return Err(ChainError::UnauthorizedOracle);
+        }
+        
+        if new_cpi <= 0.0 {
+            return Err(ChainError::InvalidAmount);
+        }
+        
+        let old_cpi = self.tier2.current_cpi;
+        self.tier2.current_cpi = new_cpi;
+        self.tier2.last_cpi_update = ts;
+        
+        self.events.push(L1Event::CpiUpdated {
+            old_cpi,
+            new_cpi,
+            timestamp: ts,
+        });
+        
+        Ok(())
+    }
     
+    // ========== Token Transfers ==========
+    
+    fn transfer_bb(&mut self, from: &str, to: &str, amount: u64, ts: u64) -> Result<(), ChainError> {
+        if amount == 0 {
+            return Err(ChainError::InvalidAmount);
+        }
+        
+        let from_bal = self.bb_ledger.balances.get(from).copied().unwrap_or(0);
+        if from_bal < amount {
+            return Err(ChainError::InsufficientBB { have: from_bal, need: amount });
+        }
+        
+        *self.bb_ledger.balances.get_mut(from).unwrap() -= amount;
+        *self.bb_ledger.balances.entry(to.to_string()).or_insert(0) += amount;
+        
+        self.events.push(L1Event::BbTransfer {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount,
+            timestamp: ts,
+        });
+        
+        Ok(())
+    }
+    
+    fn transfer_dime(&mut self, from: &str, to: &str, amount: u64, ts: u64) -> Result<(), ChainError> {
+        if amount == 0 {
+            return Err(ChainError::InvalidAmount);
+        }
+        
+        let from_bal = self.dime_ledger.balances.get(from).copied().unwrap_or(0);
+        if from_bal < amount {
+            return Err(ChainError::InsufficientDime { have: from_bal, need: amount });
+        }
+        
+        *self.dime_ledger.balances.get_mut(from).unwrap() -= amount;
+        *self.dime_ledger.balances.entry(to.to_string()).or_insert(0) += amount;
+        
+        self.events.push(L1Event::DimeTransfer {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount,
+            timestamp: ts,
+        });
+        
+        Ok(())
+    }
+    
+    // ========== Query Methods ==========
+    
+    pub fn bb_balance(&self, address: &str) -> u64 {
+        self.bb_ledger.balances.get(address).copied().unwrap_or(0)
+    }
+    
+    pub fn dime_balance(&self, address: &str) -> u64 {
+        self.dime_ledger.balances.get(address).copied().unwrap_or(0)
+    }
+    
+    pub fn get_user_vintages(&self, user: &str) -> Vec<&DimeVintage> {
+        self.tier2.user_vintages.get(user)
+            .map(|ids| ids.iter().filter_map(|id| self.tier2.vintages.get(id)).collect())
+            .unwrap_or_default()
+    }
+    
+    /// Proof of reserves - shows the system is solvent
     pub fn proof_of_reserves(&self) -> ProofOfReserves {
         ProofOfReserves {
-            wusdc_total_supply: self.wusdc.total_supply,
-            base_usdc_locked: self.base_usdc_locked,
-            bb_total_supply: self.blackbook.total_supply,
-            cashier_wusdc: self.wusdc.balances.get(&self.cashier.address).copied().unwrap_or(0),
-            bundles_sold: self.cashier.bundles_sold,
-            total_redeemed: self.redemption.bb_burned,
-            is_solvent: self.wusdc.total_supply == self.base_usdc_locked,
+            // Tier 1
+            tier1_usdt_locked: self.tier1.vault_usdt_balance,
+            tier1_bb_minted: self.tier1.total_bb_minted,
+            tier1_solvent: self.tier1.check_solvency(),
+            
+            // Tier 2
+            tier2_bb_locked: self.tier2.total_bb_locked,
+            tier2_dime_supply: self.tier2.total_dime_supply,
+            tier2_valid: self.tier2.check_invariant(),
+            
+            // Overall
+            bb_total_supply: self.bb_ledger.total_supply,
+            dime_total_supply: self.dime_ledger.total_supply,
+            current_cpi: self.tier2.current_cpi,
         }
     }
 }
 
+// ============================================================================
+// PROOF OF RESERVES
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofOfReserves {
-    pub wusdc_total_supply: u64,
-    pub base_usdc_locked: u64,
+    // Tier 1: USDT → $BB
+    pub tier1_usdt_locked: u64,
+    pub tier1_bb_minted: u64,
+    pub tier1_solvent: bool,
+    
+    // Tier 2: $BB → $DIME
+    pub tier2_bb_locked: u64,
+    pub tier2_dime_supply: u64,
+    pub tier2_valid: bool,
+    
+    // Totals
     pub bb_total_supply: u64,
-    pub cashier_wusdc: u64,
-    pub bundles_sold: u64,
-    pub total_redeemed: u64,
-    pub is_solvent: bool,
+    pub dime_total_supply: u64,
+    pub current_cpi: f64,
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_test_state() -> L1State {
+        L1State::default()
+    }
+    
+    fn create_account_tx(address: &str) -> Transaction {
+        Transaction {
+            hash: format!("tx_{}", address),
+            from: address.to_string(),
+            timestamp: 1000,
+            data: TxData::CreateAccount {
+                root_pubkey: format!("root_{}", address),
+                initial_op_pubkey: format!("op_{}", address),
+                kdf_params_hash: "argon2id".to_string(),
+            },
+            signature: "sig".to_string(),
+            signer_pubkey: format!("root_{}", address),
+        }
+    }
+    
+    #[test]
+    fn test_tier1_deposit_and_redeem() {
+        let mut state = create_test_state();
+        
+        // Create account
+        state.apply_transaction(&create_account_tx("alice")).unwrap();
+        
+        // Deposit 100 USDT (100_000_000 with 6 decimals)
+        let deposit_tx = Transaction {
+            hash: "tx_deposit".to_string(),
+            from: "alice".to_string(),
+            timestamp: 2000,
+            data: TxData::DepositUsdt {
+                usdt_amount: 100_000_000,
+                external_tx_hash: Some("base_tx_123".to_string()),
+            },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        
+        state.apply_transaction(&deposit_tx).unwrap();
+        
+        // Should have 1000 $BB (10x ratio)
+        assert_eq!(state.bb_balance("alice"), 1_000_000_000);
+        assert_eq!(state.tier1.vault_usdt_balance, 100_000_000);
+        assert!(state.tier1.check_solvency());
+        
+        // Redeem 500 $BB for 50 USDT
+        let redeem_tx = Transaction {
+            hash: "tx_redeem".to_string(),
+            from: "alice".to_string(),
+            timestamp: 3000,
+            data: TxData::RedeemBbForUsdt { bb_amount: 500_000_000 },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        
+        state.apply_transaction(&redeem_tx).unwrap();
+        
+        assert_eq!(state.bb_balance("alice"), 500_000_000);
+        assert_eq!(state.tier1.vault_usdt_balance, 50_000_000);
+        assert!(state.tier1.check_solvency());
+    }
+    
+    #[test]
+    fn test_tier2_lock_and_vintage() {
+        let mut state = create_test_state();
+        
+        // Create account and deposit
+        state.apply_transaction(&create_account_tx("alice")).unwrap();
+        
+        let deposit_tx = Transaction {
+            hash: "tx_deposit".to_string(),
+            from: "alice".to_string(),
+            timestamp: 2000,
+            data: TxData::DepositUsdt { usdt_amount: 100_000_000, external_tx_hash: None },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&deposit_tx).unwrap();
+        
+        // Lock 500 $BB for $DIME
+        let lock_tx = Transaction {
+            hash: "tx_lock".to_string(),
+            from: "alice".to_string(),
+            timestamp: 3000,
+            data: TxData::LockBbForDime { bb_amount: 500_000_000 },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&lock_tx).unwrap();
+        
+        // Should have 500 $BB remaining, and 500 $DIME
+        assert_eq!(state.bb_balance("alice"), 500_000_000);
+        assert_eq!(state.dime_balance("alice"), 500_000_000);
+        assert_eq!(state.tier2.total_bb_locked, 500_000_000);
+        assert!(state.tier2.check_invariant());
+        
+        // Get vintage
+        let vintages = state.get_user_vintages("alice");
+        assert_eq!(vintages.len(), 1);
+        assert_eq!(vintages[0].bb_locked, 500_000_000);
+    }
+    
+    #[test]
+    fn test_vintage_preserves_value() {
+        let mut state = create_test_state();
+        
+        // Setup
+        state.apply_transaction(&create_account_tx("alice")).unwrap();
+        let deposit_tx = Transaction {
+            hash: "tx1".to_string(),
+            from: "alice".to_string(),
+            timestamp: 1000,
+            data: TxData::DepositUsdt { usdt_amount: 100_000_000, external_tx_hash: None },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&deposit_tx).unwrap();
+        
+        // Lock $BB at CPI 100
+        let lock_tx = Transaction {
+            hash: "tx2".to_string(),
+            from: "alice".to_string(),
+            timestamp: 2000,
+            data: TxData::LockBbForDime { bb_amount: 500_000_000 },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&lock_tx).unwrap();
+        
+        let vintage_id = state.get_user_vintages("alice")[0].id.clone();
+        
+        // Simulate 50% inflation: CPI goes to 150
+        let cpi_tx = Transaction {
+            hash: "tx3".to_string(),
+            from: CPI_ORACLE_ADDRESS.to_string(),
+            timestamp: 3000,
+            data: TxData::UpdateCpi { new_cpi_index: 150.0 },
+            signature: "oracle_sig".to_string(),
+            signer_pubkey: "oracle".to_string(),
+        };
+        state.apply_transaction(&cpi_tx).unwrap();
+        
+        // Redeem vintage - should get EXACT original 500 $BB back
+        let redeem_tx = Transaction {
+            hash: "tx4".to_string(),
+            from: "alice".to_string(),
+            timestamp: 4000,
+            data: TxData::RedeemDimeVintage { vintage_id },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&redeem_tx).unwrap();
+        
+        // Should have original 1000 $BB back
+        assert_eq!(state.bb_balance("alice"), 1_000_000_000);
+        assert_eq!(state.dime_balance("alice"), 0);
+    }
+    
+    #[test]
+    fn test_proof_of_reserves() {
+        let mut state = create_test_state();
+        
+        state.apply_transaction(&create_account_tx("alice")).unwrap();
+        
+        let deposit_tx = Transaction {
+            hash: "tx1".to_string(),
+            from: "alice".to_string(),
+            timestamp: 1000,
+            data: TxData::DepositUsdt { usdt_amount: 100_000_000, external_tx_hash: None },
+            signature: "sig".to_string(),
+            signer_pubkey: "op_alice".to_string(),
+        };
+        state.apply_transaction(&deposit_tx).unwrap();
+        
+        let proof = state.proof_of_reserves();
+        
+        assert_eq!(proof.tier1_usdt_locked, 100_000_000);
+        assert_eq!(proof.tier1_bb_minted, 1_000_000_000);
+        assert!(proof.tier1_solvent);
+        assert!(proof.tier2_valid);
+    }
 }

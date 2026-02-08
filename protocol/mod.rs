@@ -1,31 +1,39 @@
-//! Layer1 Protocol - Treasury & Blockchain Layer
+//! Layer1 Protocol - Digital Central Bank & Vault
 //!
-//! Architecture:
-//!   1. Bridge Contract (Base) - Holds USDC, multi-sig controlled
-//!   2. Wrapped USDC (L1) - 1:1 mint when bridge detects deposit
-//!   3. BlackBook Token ($BB) - Only Cashier mints, only Redemption burns
-//!   4. Cashier Contract - wUSDC → FanGold (L2) + $BB (L1)
-//!   5. Redemption Contract - Burns $BB, releases value
+//! Three Core Jobs:
+//!   1. GATEKEEPER (Tier 1): USDT → $BB at 1:10 ratio
+//!   2. TIME MACHINE (Tier 2): $BB → $DIME with vintage stamps
+//!   3. SSS WALLET: Shamir Secret Sharing (in wallet_mnemonic)
 
 pub mod blockchain;
 pub mod helpers;
 
 // Re-export core types
 pub use blockchain::{
+    // Constants
+    USDT_TO_BB_RATIO, TOKEN_DECIMALS, DEFAULT_BASE_CPI,
+    
     // Token Ledgers
-    WusdcLedger, BlackBookLedger,
-    // Contracts
-    BridgeAuthority, CashierContract, RedemptionContract, PendingRelease,
-    // Bundles
-    Bundle,
-    // Events (for L2 indexer)
+    BlackBookLedger, DimeLedger,
+    
+    // Tier 1: USDT → $BB Gateway
+    Tier1Gateway, Tier1Deposit,
+    
+    // Tier 2: $BB → $DIME Vault
+    Tier2Vault, DimeVintage,
+    
+    // Events
     L1Event,
+    
     // Transactions
     Transaction, TxData,
-    // State
+    
+    // State & Security
     L1State, AccountSecurity,
+    
     // Errors
     ChainError,
+    
     // Compliance
     ProofOfReserves,
 };

@@ -66,14 +66,10 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 mod social_mining;
-mod integration;
-mod routes_v2;
-mod unified_wallet;
 mod wallet_mnemonic;
 mod consensus;
 mod grpc;
 mod storage;
-mod settlement;
 
 #[path = "../protocol/mod.rs"]
 mod protocol;
@@ -88,7 +84,6 @@ mod poh_blockchain;
 
 use social_mining::SocialMiningSystem;
 use storage::{ConcurrentBlockchain, AssetManager, TransactionRecord, TxType, AuthType};
-use integration::unified_auth::SignedRequest;
 
 // PoH & Consensus Infrastructure
 use runtime::{
@@ -114,20 +109,8 @@ use poh_blockchain::{
     TurbineShredder, TurbinePropagator, TURBINE_FANOUT,
 };
 
-// S+ Tier Wallet System (FROST + OPAQUE)
-use unified_wallet::{
-    WalletHandlers, FrostDKG, ThresholdSigner, OpaqueAuth, ShardStorage,
-};
-
 // Mnemonic Wallet System (Consumer Track)
 use wallet_mnemonic::handlers::MnemonicHandlers;
-
-// Settlement System (Batch Markets with Merkle Proofs)
-use settlement::{
-    BatchSettlement, BatchSettlementManager, Withdrawal, SettlementStatus,
-    MerkleProof, ClaimRegistry, SettlementError, SettlementResult,
-    create_merkle_tree, verify_merkle_proof,
-};
 
 // ============================================================================
 // CONSTANTS
@@ -217,23 +200,6 @@ pub struct AppState {
     
     /// Nonce tracker - Replay attack prevention
     pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
-    
-    // =========================================================================
-    // WALLET SYSTEMS
-    // =========================================================================
-    
-    /// S+ Tier wallet handlers (FROST TSS + OPAQUE)
-    pub wallet_handlers: Arc<WalletHandlers>,
-    
-    // =========================================================================
-    // SETTLEMENT SYSTEM
-    // =========================================================================
-    
-    /// Batch settlement manager for prediction markets
-    pub settlement_manager: Arc<BatchSettlementManager>,
-    
-    /// L2 public keys for signature verification
-    pub l2_public_keys: Arc<dashmap::DashMap<String, String>>,
 }
 
 // ============================================================================
@@ -916,240 +882,6 @@ async fn simple_transfer_handler(
 }
 
 // ============================================================================
-// SETTLEMENT HANDLERS (Batch Markets + Merkle Proofs)
-// ============================================================================
-
-/// Request for submitting a batch settlement
-#[derive(Deserialize)]
-struct SubmitBatchRequest {
-    batch_id: String,
-    market_id: String,
-    merkle_root: String,
-    total_winners: u32,
-    total_payout: u64,
-    total_collateral: u64,
-    fees_collected: u64,
-    l2_signature: String,
-    l2_public_key: String,
-    #[serde(default)]
-    withdrawals: Option<Vec<WithdrawalItem>>,
-}
-
-#[derive(Deserialize, Clone)]
-struct WithdrawalItem {
-    address: String,
-    amount: u64,
-}
-
-/// POST /settlement/batch - Submit batch settlement from L2
-/// 
-/// L2 submits merkle root representing all winners, users claim individually.
-async fn settlement_batch_handler(
-    State(state): State<AppState>,
-    Json(req): Json<SubmitBatchRequest>,
-) -> impl IntoResponse {
-    // Verify L2 signature
-    if !verify_l2_signature(&req.l2_signature, &req.l2_public_key, &req.batch_id, &req.merkle_root) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "success": false,
-            "error": "Invalid L2 signature"
-        })));
-    }
-    
-    // Validate zero-sum invariant
-    if req.total_payout > req.total_collateral - req.fees_collected {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "success": false,
-            "error": "Zero-sum violation: payouts exceed available collateral",
-            "total_payout": req.total_payout,
-            "total_collateral": req.total_collateral,
-            "fees": req.fees_collected
-        })));
-    }
-    
-    // Create batch settlement
-    let settlement = BatchSettlement {
-        batch_id: req.batch_id.clone(),
-        market_id: req.market_id.clone(),
-        merkle_root: req.merkle_root.clone(),
-        total_winners: req.total_winners,
-        total_payout: req.total_payout,
-        total_collateral: req.total_collateral,
-        fees_collected: req.fees_collected,
-        l2_signature: req.l2_signature,
-        l2_public_key: req.l2_public_key.clone(),
-        timestamp: current_timestamp(),
-        withdrawals: req.withdrawals.map(|w| {
-            w.into_iter().map(|item| Withdrawal {
-                address: item.address,
-                amount: item.amount,
-                merkle_proof: None,
-            }).collect()
-        }),
-    };
-    
-    // Submit to settlement manager
-    match state.settlement_manager.submit_batch(settlement) {
-        Ok(batch_id) => {
-            info!("📦 Batch settlement submitted: {} ({} winners, {} payout)",
-                batch_id, req.total_winners, req.total_payout);
-            
-            // Store L2 public key for future verification
-            state.l2_public_keys.insert(req.market_id.clone(), req.l2_public_key);
-            
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "batch_id": batch_id,
-                "market_id": req.market_id,
-                "total_winners": req.total_winners,
-                "total_payout": req.total_payout,
-                "status": "pending",
-                "message": "Batch submitted. Users can now claim via /settlement/claim"
-            })))
-        }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "success": false,
-                "error": format!("{}", e)
-            })))
-        }
-    }
-}
-
-/// Request for claiming a withdrawal
-#[derive(Deserialize)]
-struct ClaimRequest {
-    batch_id: String,
-    address: String,
-    amount: u64,
-    merkle_proof: MerkleProofInput,
-}
-
-#[derive(Deserialize)]
-struct MerkleProofInput {
-    proof_hashes: Vec<String>,
-    proof_indices: Vec<usize>,
-    leaf_index: usize,
-}
-
-/// POST /settlement/claim - Claim individual withdrawal with merkle proof
-async fn settlement_claim_handler(
-    State(state): State<AppState>,
-    Json(req): Json<ClaimRequest>,
-) -> impl IntoResponse {
-    // Convert proof input to MerkleProof
-    let merkle_proof = MerkleProof {
-        proof_hashes: req.merkle_proof.proof_hashes,
-        proof_indices: req.merkle_proof.proof_indices,
-        leaf_index: req.merkle_proof.leaf_index,
-    };
-    
-    // Create withdrawal with proof
-    let withdrawal = Withdrawal {
-        address: req.address.clone(),
-        amount: req.amount,
-        merkle_proof: Some(merkle_proof),
-    };
-    
-    // Process the claim
-    match state.settlement_manager.process_claim(&req.batch_id, &withdrawal) {
-        Ok(tx_hash) => {
-            // Credit the user's L1 balance
-            let amount_f64 = req.amount as f64 / 1_000_000.0; // Convert from smallest unit
-            if let Err(e) = state.blockchain.credit(&req.address, amount_f64) {
-                error!("Failed to credit claimed amount: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "success": false,
-                    "error": "Claim verified but credit failed"
-                })));
-            }
-            
-            info!("💰 Claim processed: {} received {} from batch {}",
-                req.address, amount_f64, req.batch_id);
-            
-            // Log transaction
-            let tx_record = TransactionRecord::new(
-                TxType::Unlock,
-                &format!("SETTLEMENT_{}", req.batch_id),
-                &req.address,
-                amount_f64,
-                0,
-                0.0,
-                amount_f64,
-                state.blockchain.get_balance(&req.address),
-                AuthType::SystemInternal,
-            );
-            let _ = state.blockchain.log_transaction(tx_record);
-            
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "tx_hash": tx_hash,
-                "batch_id": req.batch_id,
-                "address": req.address,
-                "amount": req.amount,
-                "amount_credited": amount_f64,
-                "new_balance": state.blockchain.get_balance(&req.address),
-                "message": "Withdrawal claimed successfully"
-            })))
-        }
-        Err(e) => {
-            let (status, error_type) = match &e {
-                SettlementError::AlreadyClaimed => (StatusCode::CONFLICT, "already_claimed"),
-                SettlementError::InvalidMerkleProof => (StatusCode::BAD_REQUEST, "invalid_proof"),
-                SettlementError::BatchNotFound(_) => (StatusCode::NOT_FOUND, "batch_not_found"),
-                _ => (StatusCode::BAD_REQUEST, "claim_failed"),
-            };
-            
-            (status, Json(serde_json::json!({
-                "success": false,
-                "error": format!("{}", e),
-                "error_type": error_type
-            })))
-        }
-    }
-}
-
-/// GET /settlement/batch/:batch_id - Get batch settlement status
-async fn settlement_batch_status_handler(
-    State(state): State<AppState>,
-    Path(batch_id): Path<String>,
-) -> impl IntoResponse {
-    match state.settlement_manager.get_batch(&batch_id) {
-        Some(record) => Json(serde_json::json!({
-            "success": true,
-            "batch_id": batch_id,
-            "market_id": record.settlement.market_id,
-            "status": format!("{:?}", record.status),
-            "total_winners": record.settlement.total_winners,
-            "total_payout": record.settlement.total_payout,
-            "claims_processed": record.claims_processed,
-            "submitted_at": record.submitted_at,
-            "completed_at": record.completed_at,
-        })),
-        None => Json(serde_json::json!({
-            "success": false,
-            "error": "Batch not found"
-        }))
-    }
-}
-
-/// GET /settlement/claim/:batch_id/:address - Check if address has claimed
-async fn settlement_claim_status_handler(
-    State(state): State<AppState>,
-    Path((batch_id, address)): Path<(String, String)>,
-) -> impl IntoResponse {
-    let withdrawal_id = settlement::claims::generate_withdrawal_id(&batch_id, &address, 0);
-    let is_claimed = state.settlement_manager.is_claimed(&batch_id, &withdrawal_id);
-    
-    Json(serde_json::json!({
-        "success": true,
-        "batch_id": batch_id,
-        "address": address,
-        "is_claimed": is_claimed
-    }))
-}
-
-// ============================================================================
 // POH & CONSENSUS HANDLERS
 // ============================================================================
 
@@ -1540,37 +1272,6 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Verify L2 signature on batch settlement
-fn verify_l2_signature(signature: &str, public_key: &str, batch_id: &str, merkle_root: &str) -> bool {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-    
-    // Decode public key
-    let pubkey_bytes = match hex::decode(public_key) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return false,
-    };
-    
-    // Decode signature
-    let sig_bytes = match hex::decode(signature) {
-        Ok(b) if b.len() == 64 => b,
-        _ => return false,
-    };
-    
-    // Create verifying key
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    
-    // Create signature
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
-    
-    // Message: batch_id|merkle_root
-    let message = format!("{}|{}", batch_id, merkle_root);
-    
-    verifying_key.verify(message.as_bytes(), &signature).is_ok()
-}
-
 // ============================================================================
 // ROUTER BUILDERS
 // ============================================================================
@@ -1584,14 +1285,6 @@ fn build_public_routes() -> Router<AppState> {
         .route("/transfer/simple", post(simple_transfer_handler))
         .route("/transfer", post(sss_transfer_handler))
         .route("/ledger", get(ledger_handler))
-}
-
-fn build_settlement_routes() -> Router<AppState> {
-    Router::new()
-        .route("/batch", post(settlement_batch_handler))
-        .route("/batch/:batch_id", get(settlement_batch_status_handler))
-        .route("/claim", post(settlement_claim_handler))
-        .route("/claim/:batch_id/:address", get(settlement_claim_status_handler))
 }
 
 fn build_poh_routes() -> Router<AppState> {
@@ -1791,25 +1484,12 @@ async fn main() {
     // ========================================================================
     // 6. INITIALIZE WALLET SYSTEMS
     // ========================================================================
-    let frost_dkg = Arc::new(FrostDKG::new());
-    let threshold_signer = Arc::new(ThresholdSigner::new());
-    let opaque_auth = Arc::new(OpaqueAuth::new());
-    let shard_storage = Arc::new(ShardStorage::new());
-    
-    let wallet_handlers = Arc::new(WalletHandlers::new(
-        frost_dkg,
-        threshold_signer,
-        opaque_auth,
-        shard_storage,
-    ));
-    info!("🔐 S+ Tier Wallet System initialized");
+    // FROST/OPAQUE removed for Tier 1 MVP
 
     // ========================================================================
     // 7. INITIALIZE SETTLEMENT SYSTEM
     // ========================================================================
-    let settlement_manager = Arc::new(BatchSettlementManager::new());
-    let l2_public_keys: Arc<dashmap::DashMap<String, String>> = Arc::new(dashmap::DashMap::new());
-    info!("📦 Settlement system initialized");
+    // Settlement removed for L1 cleanup
 
     // ========================================================================
     // 8. WIRE UP SEALEVEL EXECUTION LOOP
@@ -1892,9 +1572,6 @@ async fn main() {
         fee_market,
         account_metadata,
         used_nonces: Arc::new(dashmap::DashMap::new()),
-        wallet_handlers: wallet_handlers.clone(),
-        settlement_manager,
-        l2_public_keys,
     };
 
     // ========================================================================
@@ -1904,9 +1581,6 @@ async fn main() {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-
-    let wallet_router = WalletHandlers::router()
-        .with_state((*wallet_handlers).clone());
     
     let mnemonic_handlers = MnemonicHandlers::with_blockchain(Arc::new(state.blockchain.clone()));
     let mnemonic_router = MnemonicHandlers::router()
@@ -1914,9 +1588,7 @@ async fn main() {
     
     let app = Router::new()
         .merge(build_public_routes())
-        .merge(wallet_router)
         .merge(mnemonic_router)
-        .nest("/settlement", build_settlement_routes())
         .nest("/poh", build_poh_routes())
         .nest("/sealevel", build_sealevel_routes())
         .nest("/credit", build_credit_routes())

@@ -1,102 +1,180 @@
-This version integrates the Unified Wallet (Fork Architecture), the Dual-Prefix (L1/L2) System, and explicitly positions BlackBook as a High-Performance Solana Competitor by detailing the advanced engine features (Turbine, Gulf Stream, Borsh, Sealevel).🏴 The BlackBook Protocol Manifesto (V2)Vision StatementBlackBook is a high-performance Layer 1 blockchain engineered to compete directly with Solana. We are building the Financial Layer for the Creator Economy by combining:Solana-Grade Performance: 65,000+ TPS using Proof of History (PoH), Turbine™ propagation, and Sealevel™ parallel processing.Zero-Knowledge Auth: A revolutionary "Fork" architecture that offers Web2 usability with strictly Non-Custodial security.Unified Dual-Layer State: A seamless JIT (Just-In-Time) bridge between the Settlement Layer (L1) and the Prediction Engine (L2).Engagement Consensus: The first blockchain where authentic social interaction (likes, posts, bets) validates the network.We are not just a blockchain. We are the bank your audience runs.🏗️ Core Architecture 1: The High-Performance EngineBlackBook does not rely on slow, sequential block processing. We utilize a multi-threaded, pipelined architecture written in Rust.1. Proof of History (PoH) & The Verifiable Delay Function (VDF)We utilize a cryptographic clock that proves the passage of time between events.Mechanism: A recursive SHA-256 hash chain that runs locally on validators.Benefit: Sub-second finality (~400ms slots). Validators do not need to wait for network consensus to order transactions; the order is cryptographically embedded in the ledger itself.2. Turbine™ & Shredding (Block Propagation)Instead of sending full blocks to every node (flooding), BlackBook uses Erasure Coding:Shredding: Blocks are broken into tiny packets called "Shreds."Turbine Tree: Shreds are propagated through a randomized tree of validators.Result: Bandwidth usage is minimized, allowing the network to scale to gigabits of data per second without clogging.3. Sealevel™ (Parallel Runtime)Standard blockchains (EVM) process transactions one by one. BlackBook processes them in Parallel.Smart Contracts (Borsh): All state serialization uses Borsh (Binary Object Representation Serializer for Hashing) for maximum speed and deterministic byte layout.Scatter/Gather: Transactions that touch different account states are executed simultaneously on different CPU cores.🔐 Core Architecture 2: The Unified "Fork" WalletWe have solved the "User Experience vs. Self-Custody" trilemma using a novel Client-Side Derivation architecture.1. The "Fork" Authentication (Zero-Knowledge Login)BlackBook uses a Split-Key Derivation process. The user's password never leaves their device in a usable form.Plaintext┌─────────────────────────────────────────────────────────────────┐
-│                    THE "FORK" ARCHITECTURE                      │
-│            (Client-Side Derivation Logic - Bun/Rust)            │
-└─────────────────────────────────────────────────────────────────┘
+# The BlackBook Manifesto
 
-User Input: "CorrectBatteryStaple"
-       │
-       ▼
-[ Client-Side RAM ]
-1. Generate/Fetch Salt (Public)
-2. THE FORK (Split Derivation):
+> **BlackBook L1 is a high-speed settlement layer. It's a Digital Central Bank for the creator economy.**
 
-       PATH A (Authentication)               PATH B (Decryption)
-       SHA256(Pwd + Salt + "AUTH")           Argon2(Pwd + Salt + "WALLET")
-               │                                      │
-               ▼                                      ▼
-       [ Login Hash ]                         [ Wallet Key ]
-       (Sent to Supabase)                     (NEVER SENT)
-               │                                      │
-               │                                      ▼
-       [ Supabase DB ]                        [ AES-256-GCM ]
-       Verifies Hash, returns                 Decrypts Vault locally
-       Encrypted Vault                        to reveal Master Seed
-Supabase Role: Stores the Login Hash and the Encrypted Vault.Security: Supabase cannot unlock the vault because they never receive the Wallet Key.2. The Unified Dual-Prefix System (L1 + L2)Users have One Identity but Two Functional States. We use JIT (Just-In-Time) Bridging and Aggressive Flushing to manage this invisible complexity.The Golden Rule: L2.available must ALWAYS be ZERO.L1 (Settlement): The "Bank Account." Holds all spendable funds.L2 (Engine): The "Casino Floor." Holds only funds currently locked in active bets.Code snippetsequenceDiagram
-    participant L1 as L1 (Bank)
-    participant L2 as L2 (Casino)
-    
-    Note over L1, L2: User places 100 BB Bet
-    L1->>L2: JIT Bridge 100 BB (Atomic Debit/Credit)
-    L2->>L2: Lock 100 BB (Escrow)
-    
-    Note over L1, L2: User WINS 200 BB
-    L2->>L2: Unlock Stake + Mint Winnings
-    L2->>L1: AGGRESSIVE FLUSH (Immediate Return)
-    L1->>L1: Credit 200 BB (Available)
-Address Scheme:Base: ABC123DEF... (Derived from Master Seed)L1 Address: L1_ABC123... (Used for Transfers/Holding)L2 Address: L2_ABC123... (Used for Order Matching)💵 The BB Token Economics
-
-## Layer 1: High-Speed Microtransaction Infrastructure
-
-**BlackBook Layer 1 is NOT a stablecoin.** It is a high-performance blockchain optimized for the microtransactions of the future.
-
-### Purpose & Design Philosophy
-
-BB (BlackBook) tokens are designed for **speed, scalability, and utility**:
-
-- **Built for Microtransactions**: Sub-400ms finality enables instant payments for tips, bets, and creator rewards
-- **High-Throughput Settlement**: 65,000+ TPS capacity handles massive transaction volumes
-- **Layer 2 Power Source**: L1 serves as the settlement layer and liquidity backbone for the L2 prediction market
-
-**1 BB = $0.10 USD (Target Reference Price)**
-
-BB maintains a **target reference price** (not a peg) of $0.10 USD:
-
-| BB Amount | USD Value (Reference) |
-|-----------|-----------------------|
-| 1 BB      | ~$0.10                |
-| 10 BB     | ~$1.00                |
-| 100 BB    | ~$10.00               |
-| 1,000 BB  | ~$100.00              |
-| 10,000 BB | ~$1,000.00            |
-
-**Why a Reference Price (Not a Peg)?**
-- **Designed for Utility**: BB is built for high-speed transactions, not as a store of value
-- **Microtransaction Optimized**: Lightning-fast finality enables real-time payments for social mining, tips, and bets
-- **L2 Prediction Market Power**: L1 provides the settlement layer and liquidity for the Layer 2 prediction market engine
-- **Market-Driven**: Price discovery happens naturally through supply/demand in the creator economy
-
-**Layer 2 Integration**: The prediction market on Layer 2 relies on L1 for:
-- JIT (Just-In-Time) bridging for bet placement
-- Instant settlement of winnings back to L1
-- High-speed transaction processing for order matching
-- Cross-layer state synchronization with aggressive flushing
+Instead of a human banker deciding what your money is worth, BlackBook uses hard-coded math to ensure perfect solvency.
 
 ---
 
-💎 The Social Mining Economy
+## The Two Core Jobs (L1 Responsibilities)
 
-We replace Proof-of-Work (Energy) with Proof-of-Engagement (Social).
+BlackBook L1 is designed to do TWO things perfectly:
 
-The "Engagement Ledger"
+---
 
-Every "Like," "Comment," and "Post" is a signed transaction validated by the network.
+### 1. The Gatekeeper (USDT → $BB)
 
-| Action | Reward (BB) | USD Value | Validator Function |
-|--------|-------------|-----------|-------------------|
-| Daily Check-in | 1.00 BB | $0.10 | Proves Liveness |
-| High-Quality Post | 0.50 BB | $0.05 | Validated by Curator Nodes (AI) |
-| Referral | 5.00 BB | $0.50 | Validated by Graph Analysis |
-| Validation | Variable | Variable | Nodes earn % of betting fees |
+**Goal:** Turn external USDT into fast, reliable internal currency.
 
-Anti-Sybil Mechanism:We use Reputation Decay. Accounts that stop engaging see their "Mining Power" (Multiplier) decay over time, preventing early adopters from sitting passively on stack.🛠️ Technology StackComponentTechnologyPerformance RoleLanguageRustZero-cost abstractions, memory safety without GCRuntimeSealevel™Parallel transaction processingConsensusPoH + Tower BFTSub-second finality (~400ms)SerializationBorshHigh-performance, deterministic binary layoutTransportQUIC + TurbineUDP-based packet propagationDatabaseRocksDB (Ledger)High-throughput Key-Value storageClient DBSupabase (Postgres)Encrypted Vault & Salt storageFrontendBun + ReactFast client-side hashing & derivation📡 API Spec (Borsh Optimized)All high-performance endpoints expect Borsh-serialized binary data, not JSON.Transaction RPCPOST /rpc/send_transactionPayload (Base64 encoded Borsh):Ruststruct SignedTransaction {
-    sender: [u8; 32],
-    signature: [u8; 64],
-    message: Message, // Instructions, Nonce, RecentBlockhash
-}
-Dual-Balance RPCGET /rpc/get_dual_balance/:addressResponse (JSON for UI):JSON{
-  "base_address": "ABC...",
-  "l1": { "available": 500.0, "locked": 0.0 },
-  "l2": { "available": 0.0, "locked": 100.0 }, // Invariant Enforced
-  "total_equity": 600.0
-}
-🛡️ Security Model1. The "Not Your Keys" GuaranteeFact: The BlackBook servers never receive the Private Key, the Mnemonic, or the Wallet Derivation Password.Fact: If Supabase is breached, attackers receive only Salt (Public) and AES-Encrypted Blobs (Useless without password).2. L2 State InvariantFact: The L2 Ledger rejects any state transition that results in L2.available > 0.Result: Funds cannot be "trapped" or "lost" on the prediction layer. They strictly exist in a binary state: In-Flight (L1) or At-Risk (L2-Locked).ConclusionBlackBook represents the next evolution of Layer 1 blockchains. We have moved beyond the "Slow & Expensive" era of legacy chains.By adopting Solana's architecture (PoH, Turbine, Sealevel) and fusing it with our proprietary Fork Auth and Social Mining protocols, we are building the first blockchain capable of running a global, decentralized creator economy at the speed of social media.Speed. Sovereignty. Social.This is BlackBook.
+**What it does:**
+- Watches for USDT coming in from a bridge
+- For every 1 USDT received, locks it in a "Digital Safe" (the Vault)
+- Mints exactly 10 $BB tokens for the user
+
+**The Iron Rule:**
+```
+vault_usdt × 10 = total_bb_supply
+```
+
+L1 must **never** allow more than 10 $BB to exist for every 1 USDT in the vault. This makes $BB a rock-solid, 10-cent stablecoin.
+
+**Bridge Tracking:**
+```
+L1 tracks: bb_locked_on_l2
+When user bridges to L2: Lock $BB on L1, emit event
+When user bridges from L2: Unlock $BB on L1
+```
+
+---
+
+### 2. The Invisible Security (Wallet SSS)
+
+**Goal:** Make the blockchain impossible to hack, while keeping it easy for a human to use.
+
+**What it does:**
+- Takes the "Master Key" (your 24 words)
+- Cuts it into 3 pieces (Shards) using Shamir's Secret Sharing
+- Hides these pieces in different places (your phone, your cloud, a backup card)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    SHARD DISTRIBUTION                    │
+├──────────────────────────────────────────────────────────┤
+│  Shard A (Phone)  +  Shard B (Cloud)  =  ✓ Reconstruct  │
+│  Shard A (Phone)  +  Shard C (Backup) =  ✓ Reconstruct  │
+│  Shard B (Cloud)  +  Shard C (Backup) =  ✓ Reconstruct  │
+│                                                          │
+│  Any Single Shard Alone              =  ✗ Worthless     │
+└──────────────────────────────────────────────────────────┘
+```
+
+**The Payoff:**
+- No single piece is enough to steal your money
+- The L1 only "assembles" the key inside high-speed memory for a split second to sign your transaction
+- Then it **instantly deletes it**
+
+---
+
+## L2: The Time Machine (Not L1 Responsibility)
+
+**The Inflation-Protected Betting Layer**
+
+L2 handles the "Time Machine" (Job 2) - protecting users from inflation:
+
+**What L2 does:**
+- User locks $BB on L1 → L2 mints $DIME with vintage stamp
+- All betting happens in $DIME (inflation-protected)
+- CPI oracle updates monthly on L2
+- When redeeming: Burn $DIME on L2 → Unlock $BB on L1
+
+**Why L2?**
+- Keeps L1 simple (pure settlement)
+- Betting logic stays on application layer
+- Vintage tracking doesn't clutter settlement layer
+
+```
+User Flow:
+1. Deposit USDT → $BB on L1 (10:1 ratio)
+2. Bridge $BB to L2 → Mints $DIME with vintage stamp
+3. Bet in $DIME on L2 (inflation-protected)
+4. Win payout in $DIME 
+│                    (Settlement Layer Only)                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │               TIER 1 VAULT (Gatekeeper)                 │  │
+│   │                                                         │  │
+│   │        USDT ────► Lock in Vault ────► Mint $BB         │  │
+│   │                                                         │  │
+│   │        Invariant: vault_usdt × 10 = total_bb           │  │
+│   │        Bridge Tracking: bb_locked_on_l2                │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │                    SSS WALLET                           │  │
+│   │                 (Invisible Security)                    │  │
+│   │                                                         │  │
+│   │    24-Word Mnemonic → 3 Shards (2-of-3 threshold)      │  │
+│   │    BIP-39 + Argon2id + AES-256-GCM                     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │              HIGH-PERFORMANCE ENGINE                    │  │
+│   │                                                         │  │
+│   │    Proof of History (PoH) • Sealevel Parallel Runtime  │  │
+│   │    65,000+ TPS • Sub-400ms Finality                    │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Bridge Events
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        BLACKBOOK L2                             │
+│                    (Application Layer)                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │            TIER 2 VAULT (Time Machine)                  │  │
+│   │                                                         │  │
+│   │     Lock $BB on L1 ────► Mint $DIME with Vintage       │  │
+│   │                                                         │  │
+│   │     CPI Oracle Updates • Vintage Stamps                │  │
+│   │     All Betting in $DIME (Inflation Protected)
+## Architecture Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        BLACKBOOK L1                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────┐      ┌─────────────────┐                 │
+│   │   TIER 1 VAULT  │      │   TIER 2 VAULT  │                 │
+│   │   (Gatekeeper)  │      │  (Time Machine) │                 │
+│   │                 │      │                 │                 │
+│   │  USDT ──────────┼──────┼──► $BB ─────────┼───► $DIME       │
+│   │                 │      │                 │                 │
+│   │  1:10 Ratio     │      │  CPI Vintage    │                 │
+│   │  Solvency ✓     │      │  Stamps ✓       │                 │
+│   └─────────────────┘      └─────────────────┘                 │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │                    SSS WALLET                           │  │
+│   │                 (Invisible Security)                    │  │
+│   │                                                         │  │
+│   │    24-Word Mnemonic → 3 Shards (2-of-3 threshold)      │  │
+│   │    BIP-39 + Argon2id + AES-256-GCM                     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │              HIGH-PERFORMANCE ENGINE                    │  │
+│   │                                                         │  │
+│   │    Proof of History (PoH) • Sealevel Parallel Runtime  │  │
+│   │    65,000+ TPS • Sub-400ms Finality                    │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Promise
+
+**We are not just a blockchain. We are the bank your money deserves.**
+
+- No hidden debt
+- No inflation theft
+- No single point of failure
+- No waiting
+
+*BlackBook: Where math replaces trust.*
