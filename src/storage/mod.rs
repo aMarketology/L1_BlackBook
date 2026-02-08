@@ -59,6 +59,18 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
+/// FROST Wallet Share B storage: WalletID (String) → SecretShare (Vec<u8>)
+/// Share B is stored in ReDB for server-side custody (2-of-3 threshold)
+const FROST_SHARE_B: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_share_b");
+
+/// FROST PublicKeyPackage storage: WalletID (String) → PublicKeyPackage (Vec<u8>)
+/// Needed for signature aggregation and verification
+const FROST_PUB_KEY_PKG: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_pub_key_pkg");
+
+/// FROST Public Key storage: WalletID (String) → PublicKey (Vec<u8>)
+/// Maps wallet_id (derived from group public key) to the actual key bytes
+const FROST_PUB_KEY: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_pub_key");
+
 /// Wallet Share B storage: WalletAddress (String) → EncryptedShare (Vec<u8>)
 /// Share B is stored on-chain for institutional-grade custody recovery
 /// The share is encrypted with the user's password-derived key
@@ -368,6 +380,10 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(PROCESSED_BRIDGE_TXS)?;
             let _ = write_txn.open_table(WALLET_SHARES)?;
             let _ = write_txn.open_table(WALLET_METADATA)?;
+            // FROST wallet tables
+            let _ = write_txn.open_table(FROST_SHARE_B)?;
+            let _ = write_txn.open_table(FROST_PUB_KEY_PKG)?;
+            let _ = write_txn.open_table(FROST_PUB_KEY)?;
         }
         write_txn.commit()?;
         
@@ -888,6 +904,80 @@ impl ConcurrentBlockchain {
         }
         
         Ok(addresses)
+    }
+    
+    // ========================================================================
+    // FROST WALLET STORAGE (ReDB-backed)
+    // ========================================================================
+    
+    /// Store FROST Share B (server-side custody share)
+    pub fn store_frost_share_b(&self, wallet_id: &str, share_data: &[u8]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(FROST_SHARE_B).map_err(|e| e.to_string())?;
+            table.insert(wallet_id, share_data).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        info!(wallet_id = %wallet_id, "Stored FROST Share B in ReDB");
+        Ok(())
+    }
+    
+    /// Retrieve FROST Share B
+    pub fn get_frost_share_b(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(FROST_SHARE_B).map_err(|e| e.to_string())?;
+        
+        match table.get(wallet_id) {
+            Ok(Some(data)) => Ok(data.value().to_vec()),
+            Ok(None) => Err(format!("Share B not found for wallet: {}", wallet_id)),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+    /// Store FROST PublicKeyPackage (needed for aggregation)
+    pub fn store_frost_pub_key_package(&self, wallet_id: &str, pkg_data: &[u8]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(FROST_PUB_KEY_PKG).map_err(|e| e.to_string())?;
+            table.insert(wallet_id, pkg_data).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    
+    /// Retrieve FROST PublicKeyPackage
+    pub fn get_frost_pub_key_package(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(FROST_PUB_KEY_PKG).map_err(|e| e.to_string())?;
+        
+        match table.get(wallet_id) {
+            Ok(Some(data)) => Ok(data.value().to_vec()),
+            Ok(None) => Err(format!("PublicKeyPackage not found for wallet: {}", wallet_id)),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+    /// Store FROST Public Key
+    pub fn store_frost_pub_key(&self, wallet_id: &str, pub_key_data: &[u8]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(FROST_PUB_KEY).map_err(|e| e.to_string())?;
+            table.insert(wallet_id, pub_key_data).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    
+    /// Retrieve FROST Public Key
+    pub fn get_frost_pub_key(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(FROST_PUB_KEY).map_err(|e| e.to_string())?;
+        
+        match table.get(wallet_id) {
+            Ok(Some(data)) => Ok(data.value().to_vec()),
+            Ok(None) => Err(format!("Public key not found for wallet: {}", wallet_id)),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 

@@ -1,17 +1,15 @@
-//! BlackBook Layer1 Blockchain - Digital Central Bank & Vault
+//! BlackBook L1 — Digital Central Bank
 //!
-//! Three Core Jobs:
-//!   1. GATEKEEPER (Tier 1): USDT → $BB at 1:10 ratio
-//!   2. TIME MACHINE (Tier 2): $BB → $DIME with vintage stamps
-//!   3. SSS WALLET: Shamir Secret Sharing for security
+//! Two Core Jobs (see MANIFESTO.md):
+//!   1. GATEKEEPER: USDT → $BB at 1:10 ratio (vault solvency)
+//!   2. INVISIBLE SECURITY: SSS 2-of-3 Shamir wallets (key never whole)
+//!
+//! Engine: Solana-style PoH + Sealevel parallel execution
 
 // Core modules
 pub mod storage;
 pub mod poh_blockchain;
-pub mod wallet_mnemonic; // BIP-39 24-word wallet with SSS backup
-
-// Supporting modules (for compatibility)
-pub mod social_mining;
+pub mod wallet_unified; // Hybrid FROST + Mnemonic
 pub mod consensus;
 pub mod grpc;
 
@@ -28,7 +26,7 @@ pub mod runtime;
 // Storage
 pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
 
-// Protocol - Two-Tier Vault System
+// Protocol — Tier 1 Vault (Gatekeeper)
 pub use protocol::blockchain::{
     // Constants
     USDT_TO_BB_RATIO, TOKEN_DECIMALS, DEFAULT_BASE_CPI,
@@ -58,10 +56,7 @@ pub use protocol::blockchain::{
     ProofOfReserves,
 };
 
-// Social mining (legacy compatibility)
-pub use social_mining::{SocialMiningSystem, SocialActionType, SocialAction, DailyLimits};
-
-// Runtime
+// Runtime — Solana-style consensus
 pub use runtime::{
     PoHConfig, PoHService, SharedPoHService, 
     create_poh_service, run_poh_clock,

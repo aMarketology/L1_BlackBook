@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 mod social_mining;
-mod wallet_mnemonic;
+mod wallet_unified;
 mod consensus;
 mod grpc;
 mod storage;
@@ -110,7 +110,7 @@ use poh_blockchain::{
 };
 
 // Mnemonic Wallet System (Consumer Track)
-use wallet_mnemonic::handlers::MnemonicHandlers;
+use wallet_unified::handlers::UnifiedWalletState;
 
 // ============================================================================
 // CONSTANTS
@@ -560,8 +560,8 @@ async fn sss_transfer_handler(
     Json(req): Json<SSSTransferRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     use ed25519_dalek::{SigningKey, Signer};
-    use crate::wallet_mnemonic::sss::{SecureShare, reconstruct_entropy};
-    use crate::wallet_mnemonic::mnemonic::{entropy_to_mnemonic, mnemonic_to_seed};
+    // use crate::wallet_mnemonic::sss::{SecureShare, reconstruct_entropy};
+    // use crate::wallet_mnemonic::mnemonic::{entropy_to_mnemonic, mnemonic_to_seed};
     use bip39::{Language, Mnemonic};
     
     let from = &req.from;
@@ -1582,13 +1582,13 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
     
-    let mnemonic_handlers = MnemonicHandlers::with_blockchain(Arc::new(state.blockchain.clone()));
-    let mnemonic_router = MnemonicHandlers::router()
-        .with_state(mnemonic_handlers);
+    let unified_state = Arc::new(UnifiedWalletState::new(Arc::new(state.blockchain.clone())));
+    let unified_router = wallet_unified::handlers::router()
+        .with_state(unified_state);
     
     let app = Router::new()
         .merge(build_public_routes())
-        .merge(mnemonic_router)
+        .merge(unified_router)
         .nest("/poh", build_poh_routes())
         .nest("/sealevel", build_sealevel_routes())
         .nest("/credit", build_credit_routes())

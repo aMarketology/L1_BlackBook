@@ -137,11 +137,11 @@ pub struct ErrorResponse {
 ///     "wallet": "0x123..."
 /// }))
 /// ```
-pub fn json_success_data<T: Serialize>(data: T) -> warp::reply::Json {
-    warp::reply::json(&serde_json::json!({
+pub fn json_success_data<T: Serialize>(data: T) -> serde_json::Value {
+    serde_json::json!({
         "success": true,
         "data": data
-    }))
+    })
 }
 
 /// Creates a simple JSON success response with a message.
@@ -150,13 +150,13 @@ pub fn json_success_data<T: Serialize>(data: T) -> warp::reply::Json {
 /// ```ignore
 /// json_success("wallet_created", "Wallet created successfully")
 /// ```
-pub fn json_success(action: &str, message: &str) -> warp::reply::Json {
-    warp::reply::json(&serde_json::json!({
+pub fn json_success(action: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
         "success": true,
         "action": action,
         "message": message,
         "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
+    })
 }
 
 /// Creates a JSON error response.
@@ -165,24 +165,24 @@ pub fn json_success(action: &str, message: &str) -> warp::reply::Json {
 /// ```ignore
 /// json_error("invalid_amount", "Amount must be greater than 0")
 /// ```
-pub fn json_error(error_code: &str, message: &str) -> warp::reply::Json {
-    warp::reply::json(&serde_json::json!({
+pub fn json_error(error_code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
         "success": false,
         "error": error_code,
         "message": message,
         "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
+    })
 }
 
 /// Creates a JSON error response with additional details.
-pub fn json_error_with_details<T: Serialize>(error_code: &str, message: &str, details: T) -> warp::reply::Json {
-    warp::reply::json(&serde_json::json!({
+pub fn json_error_with_details<T: Serialize>(error_code: &str, message: &str, details: T) -> serde_json::Value {
+    serde_json::json!({
         "success": false,
         "error": error_code,
         "message": message,
         "details": details,
         "timestamp": chrono::Utc::now().to_rfc3339()
-    }))
+    })
 }
 
 // ============================================================================
