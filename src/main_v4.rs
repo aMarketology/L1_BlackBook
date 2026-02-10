@@ -68,7 +68,6 @@ use serde::{Deserialize, Serialize};
 mod social_mining;
 mod wallet_unified;
 mod consensus;
-mod grpc;
 mod storage;
 
 #[path = "../protocol/mod.rs"]
@@ -1596,20 +1595,6 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state.clone());
-
-    // ========================================================================
-    // 11. START GRPC SERVER
-    // ========================================================================
-    let grpc_blockchain = Arc::new(state.blockchain.clone());
-    let grpc_assets = Arc::new(state.assets.clone());
-    let grpc_pipeline = state.pipeline.clone();
-    tokio::spawn(async move {
-        let addr: SocketAddr = "0.0.0.0:50051".parse().unwrap();
-        info!("🌐 gRPC server starting on {}", addr);
-        if let Err(e) = grpc::start_grpc_server_with_pipeline(grpc_blockchain, grpc_assets, grpc_pipeline, addr).await {
-            error!("❌ gRPC server error: {}", e);
-        }
-    });
 
     // ========================================================================
     // 12. START BACKGROUND TASKS

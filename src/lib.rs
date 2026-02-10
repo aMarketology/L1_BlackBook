@@ -11,7 +11,6 @@ pub mod storage;
 pub mod poh_blockchain;
 pub mod wallet_unified; // Hybrid FROST + Mnemonic
 pub mod consensus;
-pub mod grpc;
 pub mod supabase;
 pub mod vault_manager;
 

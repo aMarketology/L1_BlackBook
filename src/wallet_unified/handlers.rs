@@ -9,6 +9,7 @@ use tracing::{info, warn, error};
 use super::security;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+use base64::prelude::*;
 
 use crate::storage::ConcurrentBlockchain;
 
@@ -77,16 +78,6 @@ pub struct CreateResponse {
     pub address: String,            // Public Address (Ed25519)
 }
 
-#[derive(Deserialize)]
-pub struct GetShareBRequest {
-    pub wallet_id: String,
-}
-
-#[derive(Serialize)]
-pub struct GetShareBResponse {
-    pub encrypted_share_b: String,  // Encrypted with Server Master Key
-}
-
 #[derive(Serialize)]
 pub struct ShardBResponse {
     pub shard_b: String,
@@ -96,22 +87,19 @@ pub struct ShardBResponse {
 /// Internal wrapper for Shard B storage
 #[derive(Serialize, Deserialize)]
 struct ShardBContainer {
-    encrypted_blob: String,         // Encrypted with SERVER_MASTER_KEY
-    pin_hash: String,               // Argon2 Hash
-    threshold: u64,                 // Limit above which PIN is required
+    shard_b_data: String,           // Encrypted with server master key
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
-pub struct SignRequest {
+pub struct SSSTransferRequest {
     #[zeroize(skip)]
-    pub wallet_id: String,
+    pub from_wallet_id: String,
     #[zeroize(skip)]
-    pub message: String,
+    pub to_address: String,
+    #[zeroize(skip)]
+    pub amount: f64,
     pub share_a: String,            // User provides encrypted Share A
     pub password: String,           // To decrypt Share A
-    pub pin: Option<String>,        // Required if amount > threshold
-    #[zeroize(skip)]
-    pub amount: u64,                // Transaction amount
 }
 
 // ============================================================================
@@ -189,29 +177,14 @@ pub async fn create_hybrid_wallet(
     let pub_key_bytes = verifying_key.serialize().unwrap();
     let wallet_id = hex::encode(&pub_key_bytes);
 
-    // 5. SHARD B (Cloud): Encrypt with SERVER KEY + Store Metadata
-    // Note: We use to_vec() which copies, so we must be careful with the source
-    let mut share_b_bytes = serde_json::to_vec(&share_b).unwrap();
+    // 5. SHARD B (Cloud): Encrypt with Server Master Key (At-Rest Encryption)
+    let share_b_bytes = serde_json::to_vec(&share_b).unwrap();
+    let master_key = get_server_master_key()?;
+    let encrypted_share_b = security::encrypt_with_secret(&master_key, &share_b_bytes)
+        .map_err(|e| err(format!("Failed to encrypt Share B: {}", e)))?;
     
-    let server_key = get_server_master_key()?;
-    let encrypted_share_b = security::encrypt_with_secret(&server_key, &share_b_bytes)
-        .map_err(|e| err(format!("Server B encryption failed: {}", e)))?;
-    
-    // Wipe raw Share B bytes
-    share_b_bytes.zeroize();
-
-    let pin_hash = if let Some(p) = &req.pin {
-        security::hash_secret(p)
-    } else {
-        String::new()
-    };
-
-    let threshold = req.daily_limit.unwrap_or(1_000_000);
-
     let container = ShardBContainer {
-        encrypted_blob: encrypted_share_b.clone(),
-        pin_hash: pin_hash.clone(), // Clone to keep pin_hash valid for Supabase call
-        threshold,
+        shard_b_data: encrypted_share_b, // Now contains salt:nonce:ciphertext
     };
     let container_bytes = serde_json::to_vec(&container).unwrap();
 
@@ -219,28 +192,7 @@ pub async fn create_hybrid_wallet(
     state.blockchain.store_frost_share_b(&wallet_id, &container_bytes)
         .map_err(|e| err(format!("Failed to store Share B in ReDB: {}", e)))?;
 
-    // SYNC TO SUPABASE (User Vault)
-    if let Ok(claims) = validate_jwt(&headers) {
-        // We have a user ID! Sync Share B to Supabase
-        // Note: wallet_id is the public address (Ed25519)
-        if let Err(e) = state.supabase.store_encrypted_shard_b(
-            &claims.sub, 
-            &req.username, 
-            &wallet_id, 
-            &wallet_id, // root_pubkey same as wallet_id here
-            threshold as f64,
-            &pin_hash,
-            &container_bytes
-        ).await {
-            // Log but don't fail? Or fail transaction? 
-            // Better to fail so we don't end up with desync.
-            error!("❌ Failed to sync Share B to Supabase: {}", e);
-            return Err(err(format!("Failed to sync vault: {}", e)));
-        }
-        info!("☁️  Synced Share B to Supabase User Vault for {}", claims.sub);
-    } else {
-        warn!("⚠️  Created Wallet without Supabase Sync (Unauthenticated)");
-    }
+    info!("✅ Shard B stored in ReDB for wallet {}", wallet_id);
 
     // Store PublicKeyPackage
     let pk_pkg_bytes = serde_json::to_vec(&pub_key_package).unwrap();
@@ -293,7 +245,7 @@ pub async fn create_hybrid_wallet(
         warn!("⚠️  Skipping Vault Storage for Shard C (Unauthenticated)");
     }
 
-    info!("✅ BlackBook Wallet created: {} (Threshold: {})", wallet_id, threshold);
+    info!("✅ BlackBook Wallet created: {}", wallet_id);
 
     let response = CreateResponse {
         wallet_id: wallet_id.clone(),
@@ -313,47 +265,21 @@ pub async fn create_hybrid_wallet(
     Ok(Json(response))
 }
 
-pub async fn get_share_b(
+pub async fn transfer_with_sss(
     State(state): State<Arc<UnifiedWalletState>>,
     headers: HeaderMap,
-    Json(req): Json<GetShareBRequest>,
-) -> Result<Json<GetShareBResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // Check Auth
-    if let Err(e) = validate_jwt(&headers) {
-        // Allow fallback for legacy tests if needed, or enforce.
-        // For security, should enforce. But for tests without mock headers, it will break.
-        // Let's enforce it and fix tests later if requested.
-        warn!("⛔ Unauthenticated access to Share B denied.");
-        // return Err(e); // COMMENTED for integration test continuity until SDK sends headers
+    Json(req): Json<SSSTransferRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Validate input
+    if req.amount <= 0.0 {
+        return Err(err("Amount must be positive"));
     }
 
-    let encrypted_blob = state.blockchain.get_frost_share_b(&req.wallet_id)
-        .map_err(|e| err(format!("Share B not found: {}", e)))?;
-    
-    // We can return the container bytes or just the inner encrypted blob.
-    // The previous implementation returned the blob.
-    // The Container includes pin_hash and threshold.
-    // Let's return the internal encrypted blob from the container.
-    
-    let container: ShardBContainer = serde_json::from_slice(&encrypted_blob)
-        .map_err(|_| err("Shard B corrupted (v2 migration needed?)"))?;
-
-    // Note: This blob is now encrypted with SERVER_MASTER_KEY, not User PIN.
-    // Client cannot use this directly without Server Key.
-    // This endpoint effectively returns opaque data for backup.
-    
-    Ok(Json(GetShareBResponse {
-        encrypted_share_b: container.encrypted_blob
-    }))
-}
-
-pub async fn sign_hybrid_tx(
-    State(state): State<Arc<UnifiedWalletState>>,
-    headers: HeaderMap,
-    Json(req): Json<SignRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // 0. Verify Auth
-    // validate_jwt(&headers)?; // Optional for now
+    // Check balance
+    let balance = state.blockchain.get_balance(&req.from_wallet_id);
+    if balance < req.amount {
+        return Err(err(format!("Insufficient balance: {} < {}", balance, req.amount)));
+    }
 
     // 1. DECRYPT Share A (Client encrypted with password)
     let mut share_a_decrypted = security::decrypt_with_secret(&req.password, &req.share_a)
@@ -362,71 +288,56 @@ pub async fn sign_hybrid_tx(
         .map_err(|_| err("Malformed Share A after decryption"))?;
 
     // 2. FETCH Share B Container
-    let container_bytes = state.blockchain.get_frost_share_b(&req.wallet_id)
+    let container_bytes = state.blockchain.get_frost_share_b(&req.from_wallet_id)
         .map_err(|e| err(format!("Share B not found: {}", e)))?;
     
     let container: ShardBContainer = serde_json::from_slice(&container_bytes)
         .map_err(|_| err("Shard B corrupted"))?;
 
-    // 3. POLICY CHECK: Threshold & PIN
-    if req.amount > container.threshold {
-        info!("💰 High Value Transaction ({} > {}): Validating PIN...", req.amount, container.threshold);
-        // PIN Required
-        let pin = req.pin.as_ref().ok_or_else(|| {
-            (StatusCode::FORBIDDEN, Json(json!({ "error": "PIN required for this amount" })))
-        })?;
-        
-        // Verify PIN Hash
-        if !security::verify_secret(pin, &container.pin_hash) {
-            warn!("⛔ Invalid PIN attempt for wallet {}", req.wallet_id);
-            return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "Invalid PIN" }))));
+    // 3. DECRYPT Share B (Server Master Key) - with backward compatibility
+    let master_key = get_server_master_key()?;
+    let share_b_bytes = match security::decrypt_with_secret(&master_key, &container.shard_b_data) {
+        Ok(decrypted) => decrypted,
+        Err(_) => {
+            // Fallback: Try Base64 decode for old wallets (before master key encryption)
+            warn!("⚠️  Shard B not encrypted - using legacy Base64 format");
+            BASE64_STANDARD.decode(&container.shard_b_data)
+                .map_err(|_| err("Failed to decrypt Shard B (Server Key)"))?
         }
-        info!("✅ PIN Verified.");
-    } else {
-        info!("✅ Small Transaction ({} <= {}): No PIN required.", req.amount, container.threshold);
-    }
-
-    // 4. DECRYPT Share B (Using Server Key)
-    let mut server_key = get_server_master_key()?;
-    let mut share_b_decrypted = security::decrypt_with_secret(&server_key, &container.encrypted_blob)
-        .map_err(|e| err(format!("Server Internal Error: Failed to decrypt Share B: {}", e)))?;
+    };
     
-    let share_b: frost::keys::SecretShare = serde_json::from_slice(&share_b_decrypted)
-        .map_err(|_| err("Malformed Share B after decryption"))?;
+    let share_b: frost::keys::SecretShare = serde_json::from_slice(&share_b_bytes)
+        .map_err(|_| err("Malformed Share B"))?;
 
-    // 5. Load Public Key Package from ReDB
-    let pk_pkg_bytes = state.blockchain.get_frost_pub_key_package(&req.wallet_id)
+    // 4. Load Public Key Package from ReDB
+    let pk_pkg_bytes = state.blockchain.get_frost_pub_key_package(&req.from_wallet_id)
         .map_err(|e| err(format!("PublicKeyPackage not found: {}", e)))?;
     let pub_key_package: frost::keys::PublicKeyPackage = serde_json::from_slice(&pk_pkg_bytes)
         .map_err(|_| err("Bad PublicKeyPackage format"))?;
 
-    // 4. Construct KeyPackages
-    // If TryFrom fails, check API compatibility or version.
+    // 5. Construct KeyPackages
     let pkg_a = frost::keys::KeyPackage::try_from(share_a.clone()).map_err(|e| err(e.to_string()))?;
     let pkg_b = frost::keys::KeyPackage::try_from(share_b.clone()).map_err(|e| err(e.to_string()))?;
 
-    // 5. Simulated Signing
+    // 6. Sign Transaction with FROST
     let mut rng = OsRng;
-    let message = req.message.as_bytes();
+    let tx_message = format!("{}:{}:{}", req.from_wallet_id, req.to_address, req.amount);
+    let message = tx_message.as_bytes();
 
     // Round 1: Commitments
-    // KeyPackage in 2.x should expose signing_share() or secret_share() or similar.
-    // If this fails, we need to inspect the KeyPackage API.
     let (nonces_a, commitments_a) = frost::round1::commit(pkg_a.signing_share(), &mut rng);
     let (nonces_b, commitments_b) = frost::round1::commit(pkg_b.signing_share(), &mut rng);
 
-    // Aggregate Commitments
     let mut commitments_map = std::collections::BTreeMap::new();
     commitments_map.insert(*share_a.identifier(), commitments_a);
     commitments_map.insert(*share_b.identifier(), commitments_b);
     
     let signing_package = frost::SigningPackage::new(commitments_map, message);
 
-    // Round 2: Signature Shares (using KeyPackage)
+    // Round 2: Signature Shares
     let sig_share_a = frost::round2::sign(&signing_package, &nonces_a, &pkg_a).map_err(|e| err(e.to_string()))?;
     let sig_share_b = frost::round2::sign(&signing_package, &nonces_b, &pkg_b).map_err(|e| err(e.to_string()))?;
 
-    // Aggregate Final Signature (using PublicKeyPackage)
     let mut sig_shares = std::collections::BTreeMap::new();
     sig_shares.insert(*share_a.identifier(), sig_share_a);
     sig_shares.insert(*share_b.identifier(), sig_share_b);
@@ -434,22 +345,31 @@ pub async fn sign_hybrid_tx(
     let signature = frost::aggregate(&signing_package, &sig_shares, &pub_key_package)
         .map_err(|e| err(e.to_string()))?;
 
-    info!("✅ Transaction signed successfully for wallet {}", req.wallet_id);
+    info!("✅ Transaction signed with FROST for wallet {}", req.from_wallet_id);
 
-    // Explicitly zeroize sensitive data from memory
+    // 7. Execute Transfer on Blockchain
+    state.blockchain.transfer(&req.from_wallet_id, &req.to_address, req.amount)
+        .map_err(|e| err(format!("Transfer failed: {}", e)))?;
+
+    info!("💸 Transfer: {} → {} : {} BB", req.from_wallet_id, req.to_address, req.amount);
+
+    // Zeroize sensitive data
     share_a_decrypted.zeroize();
-    share_b_decrypted.zeroize();
-    server_key.zeroize();
     
     Ok(Json(json!({
+        "success": true,
         "signature": hex::encode(signature.serialize().unwrap()),
-        "status": "signed_with_frost_2_of_3",
-        "wallet_id": req.wallet_id
+        "from": req.from_wallet_id,
+        "to": req.to_address,
+        "amount": req.amount,
+        "from_balance": state.blockchain.get_balance(&req.from_wallet_id),
+        "to_balance": state.blockchain.get_balance(&req.to_address)
     })))
 }
 
 #[derive(Deserialize)]
 pub struct GetShardBRequest {
+    pub wallet_id: String,
     pub pin: Option<String>,
 }
 
@@ -502,53 +422,19 @@ pub async fn get_shard_b_handler(
     headers: HeaderMap,
     Json(req): Json<GetShardBRequest>,
 ) -> Result<Json<ShardBResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // 1. Extract and Verify JWT via the Bouncer
-    let auth_header = headers.get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| err("Unauthorized"))?;
-
-    let user_id = state.supabase.verify_user(auth_header).await
-        .map_err(|e| err(format!("JWT Verification Failed: {}", e)))?;
-
-    // 2. Fetch the "Peppered" Shard B Container from the database
-    let container_bytes = state.supabase.fetch_encrypted_shard_b(&user_id).await
-        .map_err(|e| err(format!("Failed to fetch Shard B: {}", e)))?;
-
-    // 2b. Decrypt the container to check PIN before releasing payload
-    // Note: In our architecture, the stored blob is the ShardBContainer (serialized)
-    // AND it is encrypted (by us manually? No, store_encrypted_shard_b receives encrypted_blob)
-    // Wait, in create_hybrid_wallet:
-    // let container = ShardBContainer { encrypted_blob: encrypted_share_b ... }
-    // let container_bytes = to_vec(&container)
-    // store_encrypted_shard_b(..., &container_bytes)
-    // So Supabase stores the JSON of the container as HEX.
-    // fetch_encrypted_shard_b returns this JSON bytes.
+    // Simple SSS: Just return Shard B from storage
+    // No PIN, no encryption beyond what SSS provides
+    
+    let container_bytes = state.blockchain.get_frost_share_b(&req.wallet_id)
+        .map_err(|e| err(format!("Shard B not found: {}", e)))?;
     
     let container: ShardBContainer = serde_json::from_slice(&container_bytes)
-        .map_err(|_| err("Remote Shard B corrupted or invalid format"))?;
+        .map_err(|_| err("Shard B corrupted"))?;
 
-    // 3. THE BOUNCER: Verify PIN
-    // Logic: If the wallet was created with a PIN (pin_hash is not empty), we MUST verify it.
-    if !container.pin_hash.is_empty() {
-        if let Some(pin) = &req.pin {
-            state.supabase.verify_pin(pin, &container.pin_hash)
-                 .map_err(|e| (StatusCode::FORBIDDEN, Json(json!({ "error": e }))))?;
-            info!("🔓 PIN Verified for User {}", user_id);
-        } else {
-             warn!("⛔ Missing PIN for protected Shard B check (User: {})", user_id);
-             return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "PIN Required to access this shard" }))));
-        }
-    }
+    info!("✅ Shard B retrieved for wallet {}", req.wallet_id);
 
-    // 4. Un-pepper using the SERVER_MASTER_KEY
-    // The container.encrypted_blob is what we want to decrypt.
-    let server_key = get_server_master_key()?;
-    let raw_shard_b = security::decrypt_with_secret(&server_key, &container.encrypted_blob)
-        .map_err(|e| err(format!("Failed to decrypt Shard B: {}", e)))?;
-
-    // 5. Send back to the Frontend
     Ok(Json(ShardBResponse {
-        shard_b: hex::encode(raw_shard_b),
+        shard_b: container.shard_b_data,
         status: "Released".to_string(),
     }))
 }
@@ -556,10 +442,9 @@ pub async fn get_shard_b_handler(
 pub fn router() -> Router<Arc<UnifiedWalletState>> {
     Router::new()
         .route("/wallet/create", post(create_hybrid_wallet))
-        .route("/wallet/share_b", post(get_share_b))
+        .route("/transfer", post(transfer_with_sss))
         .route("/wallet/secure/shard-b", post(get_shard_b_handler))
-        .route("/wallet/secure/recover-shard-c", post(recover_shard_c)) // ✅ NEW Recovery Route
-        .route("/wallet/sign", post(sign_hybrid_tx))
+        .route("/wallet/secure/recover-shard-c", post(recover_shard_c))
 }
 
 // Helper

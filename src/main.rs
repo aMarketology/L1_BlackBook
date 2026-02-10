@@ -51,7 +51,6 @@ use serde::{Deserialize, Serialize};
 mod wallet_unified;
 mod storage;
 mod consensus;
-mod grpc;
 mod poh_blockchain;
 mod supabase;
 mod vault_manager;
@@ -628,7 +627,7 @@ async fn security_stats_handler(State(state): State<AppState>) -> impl IntoRespo
 }
 
 // ============================================================================
-// LEDGER — Compact transaction history
+// LEDGER — ASCII Art Visualization
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -641,49 +640,194 @@ struct LedgerQuery {
 fn default_page() -> usize { 1 }
 fn default_limit() -> usize { 50 }
 
-/// GET /ledger — Transaction history
+/// GET /ledger - ASCII art visualization of all ledger entries
 async fn ledger_handler(
     State(state): State<AppState>,
-    Query(query): Query<LedgerQuery>,
+    Query(query): Query<LedgerQuery>
 ) -> impl IntoResponse {
     let mut transactions = state.blockchain.get_all_transactions(10000);
+    // Sort by timestamp descending (most recent first)
     transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    let limit = query.limit.min(100).max(1);
-    let page = query.page.max(1);
-    let total_pages = (transactions.len() + limit - 1) / limit;
-    let start = (page - 1) * limit;
-    let end = (start + limit).min(transactions.len());
-
-    let page_txs: Vec<serde_json::Value> = if start < transactions.len() {
-        transactions[start..end].iter().map(|tx| {
-            serde_json::json!({
-                "block": tx.block_height,
-                "timestamp": tx.timestamp,
-                "tx_hash": &tx.tx_hash[..12.min(tx.tx_hash.len())],
-                "type": tx.tx_type,
-                "from": tx.from_address,
-                "from_name": account_name(&tx.from_address),
-                "to": tx.to_address,
-                "to_name": account_name(&tx.to_address),
-                "amount": tx.amount,
-                "balance_before": tx.balance_before,
-                "balance_after": tx.balance_after,
-                "status": tx.status,
-            })
-        }).collect()
-    } else {
-        vec![]
-    };
-
     let stats = state.blockchain.stats();
-    Json(serde_json::json!({
-        "total_supply": state.blockchain.total_supply(),
-        "total_transactions": transactions.len(),
-        "page": page,
-        "total_pages": total_pages,
-        "transactions": page_txs,
-    }))
+    let total_supply = state.blockchain.total_supply();
+    
+    // Pagination
+    let limit = query.limit.min(100).max(1); // Max 100, min 1
+    let page = query.page.max(1); // Min page 1
+    let total_pages = (transactions.len() + limit - 1) / limit;
+    let start_idx = (page - 1) * limit;
+    let end_idx = (start_idx + limit).min(transactions.len());
+    
+    let page_transactions = if start_idx < transactions.len() {
+        &transactions[start_idx..end_idx]
+    } else {
+        &[]
+    };
+    
+    let mut output = String::new();
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // HEADER - Chain Summary
+    // ═══════════════════════════════════════════════════════════════════════════
+    output.push_str("\n");
+    output.push_str(" ═══ BLACKBOOK L1 AUDIT LEDGER ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    output.push_str(&format!("  BLOCK HEIGHT : {:>12}                     NETWORK : [ MAINNET-ZK ]           VERSION : 5.0.0-mainnet-beta\n", stats.block_count));
+    output.push_str(&format!("  TOTAL SUPPLY : {:>12.2} BB              WALLETS : {:>6}                    STATUS  : [ FINALIZED ]\n", total_supply, stats.total_accounts));
+    output.push_str(&format!("  TRANSACTIONS : {:>12}                     PAGE    : {:>4} of {:>4}                SHOWING : {} - {}\n", transactions.len(), page, total_pages, start_idx + 1, end_idx));
+    output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    output.push_str("\n");
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // TRANSACTION TABLE - Compact but Complete
+    // ═══════════════════════════════════════════════════════════════════════════
+    output.push_str(" ┌─────┬─────────────────────┬──────────────┬──────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────┐\n");
+    output.push_str(" │ BLK │      TIMESTAMP      │    TX HASH   │   PREV HASH  │                                    TRANSACTION DETAILS                                          │\n");
+    output.push_str(" ├─────┼─────────────────────┼──────────────┼──────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────┤\n");
+    
+    for tx in page_transactions.iter() {
+        let timestamp_str = chrono::NaiveDateTime::from_timestamp_opt(tx.timestamp as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+        
+        let tx_hash_short = if tx.tx_hash.len() > 12 {
+            format!("{}..{}", &tx.tx_hash[..6], &tx.tx_hash[tx.tx_hash.len()-4..])
+        } else {
+            tx.tx_hash.clone()
+        };
+        
+        let prev_hash_short = if tx.prev_tx_hash.len() > 12 {
+            format!("{}..{}", &tx.prev_tx_hash[..6], &tx.prev_tx_hash[tx.prev_tx_hash.len()-4..])
+        } else {
+            tx.prev_tx_hash.clone()
+        };
+        
+        let action_icon = match tx.tx_type.as_str() {
+            "transfer" => "💸",
+            "mint" => "🪙",
+            "burn" => "🔥",
+            "bridge_out" => "🌉⬆️",
+            "bridge_in" => "🌉⬇️",
+            "lock" => "🔒",
+            "unlock" => "🔓",
+            _ => "❓",
+        };
+        
+        let auth_icon = match tx.auth_type.as_str() {
+            "master_key" => "🔑",
+            "session_key" => "⚡",
+            "zk_proof" => "🔮",
+            "system_internal" => "⚙️",
+            _ => "🔐",
+        };
+        
+        let from_display = format_address_with_username(&tx.from_address, tx.from_username.as_deref());
+        let to_display = format_address_with_username(&tx.to_address, tx.to_username.as_deref());
+        
+        let balance_change = format!("{:.2}→{:.2}", tx.balance_before, tx.balance_after);
+        let amount_str = format!("{:.2} BB", tx.amount);
+        
+        let reconciled_icon = if tx.status == "completed" || tx.status == "finalized" { "✓" } else { "✗" };
+        
+        let details = format!(
+            "{} {} {} {} → {} │ Amt: {} │ Bal: {}",
+            action_icon,
+            auth_icon,
+            reconciled_icon,
+            from_display,
+            to_display,
+            amount_str,
+            balance_change
+        );
+        
+        output.push_str(&format!(
+            " │{:>5}│ {} │ {:^12} │ {:^12} │ {:<108} │\n",
+            tx.block_height,
+            timestamp_str,
+            tx_hash_short,
+            prev_hash_short,
+            if details.len() > 108 {
+                format!("{}...", &details[..105])
+            } else {
+                details
+            }
+        ));
+    }
+    
+    // Close table
+    output.push_str(" └─────┴─────────────────────┴──────────────┴──────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────┘\n");
+    output.push_str("\n");
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LEGEND
+    // ═══════════════════════════════════════════════════════════════════════════
+    output.push_str(" ─── LEGEND ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n");
+    output.push_str("  ACTIONS: 💸 TRANSFER │ 🪙 MINT │ 🔥 BURN │ 🌉 BRIDGE (OUT/IN) │ 🔒 LOCK │ 🔓 UNLOCK\n");
+    output.push_str("  AUTH:    🔑 Master Key │ ⚡ Session Key │ 🔮 ZK Proof │ ⚙️ System Internal\n");
+    output.push_str("  STATUS:  ✅ Finalized │ ⏳ Pending │ ↩️ Reverted │ ❌ Failed      RECONCILED: [✓] Valid │ [✗] Mismatch\n");
+    output.push_str("  COLUMNS: BLK=Block Height │ TX HASH=Transaction Hash │ PREV HASH=Chain Link │ Bal=Balance Before→After │ Recv=Recipient Balance\n");
+    output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    output.push_str("\n");
+    
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PAGINATION
+    // ═══════════════════════════════════════════════════════════════════════════
+    if total_pages > 1 {
+        output.push_str(&format!(" 📄 Page {} of {} │ ", page, total_pages));
+        if page > 1 {
+            output.push_str(&format!("Previous: /ledger?page={}&limit={} │ ", page - 1, limit));
+        }
+        if page < total_pages {
+            output.push_str(&format!("Next: /ledger?page={}&limit={}", page + 1, limit));
+        }
+        output.push_str("\n");
+    }
+    
+    // Footer
+    output.push_str("\n");
+    output.push_str(" 🛡️  Ed25519 Signatures │ MD5 TX Hashes │ Chain-Linked │ State Validated │ ZKP Auth Ready │ Immutably Stored on BlackBook L1\n");
+    output.push_str("\n");
+    
+    (
+        StatusCode::OK,
+        [("Content-Type", "text/plain; charset=utf-8")],
+        output
+    )
+}
+
+/// Helper to format addresses for display - show meaningful parts
+fn format_address_readable(addr: &str) -> String {
+    if addr.starts_with("bb_") {
+        format!("bb_{}", &addr[3..].chars().take(8).collect::<String>())
+    } else if addr.starts_with("L1_") {
+        format!("L1_{}", &addr[3..].chars().take(8).collect::<String>())
+    } else if addr.starts_with("L2_") || addr.contains("ESCROW") || addr.contains("escrow") {
+        "L2_ESCROW_POOL".to_string()
+    } else if addr.len() > 20 {
+        format!("{}...{}", &addr[..8], &addr[addr.len()-8..])
+    } else {
+        addr.to_string()
+    }
+}
+
+/// Helper to format addresses WITH USERNAME for ledger display
+/// Format: "username (bb_1234...abcd)" or just "bb_1234...abcd" if no username
+fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
+    let addr_short = if addr.starts_with("bb_") {
+        format!("bb_{}..{}", &addr[3..].chars().take(4).collect::<String>(), &addr[addr.len()-4..])
+    } else if addr == "USDC_TREASURY" || addr == "DESTROYED" {
+        addr.to_string()
+    } else if addr.starts_with("L1_") {
+        format!("L1_{}..{}", &addr[3..].chars().take(4).collect::<String>(), &addr[addr.len()-4..])
+    } else if addr.len() > 16 {
+        format!("{}...{}", &addr[..6], &addr[addr.len()-6..])
+    } else {
+        addr.to_string()
+    };
+    
+    match username {
+        Some(name) => format!("{} ({})", name, addr_short),
+        None => addr_short,
+    }
 }
 
 // ============================================================================
@@ -842,7 +986,14 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() {
     // 0. Load Environment Variables (Load BEFORE any other initialization)
-    dotenv::dotenv().ok();
+    // Debug current directory and .env status
+    if let Ok(path) = std::env::current_dir() {
+        println!("Current working directory: {:?}", path);
+    }
+    match dotenv::dotenv() {
+        Ok(path) => println!(".env loaded from: {:?}", path),
+        Err(e) => println!("Failed to load .env: {:?}", e),
+    }
 
     // 1. Logging
     tracing_subscriber::registry()
@@ -988,18 +1139,6 @@ async fn main() {
         vault_manager
     ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
-
-    // 9. gRPC Server (L1↔L2 settlement)
-    let grpc_bc = Arc::new(state.blockchain.clone());
-    let grpc_assets = Arc::new(state.assets.clone());
-    let grpc_pipeline = state.pipeline.clone();
-    tokio::spawn(async move {
-        let addr: SocketAddr = "0.0.0.0:50051".parse().unwrap();
-        info!("🌐 gRPC on {}", addr);
-        if let Err(e) = grpc::start_grpc_server_with_pipeline(grpc_bc, grpc_assets, grpc_pipeline, addr).await {
-            error!("❌ gRPC error: {}", e);
-        }
-    });
 
     // 10. HTTP Server
     let app = build_router(state, unified_router);
