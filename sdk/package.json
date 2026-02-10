@@ -1,0 +1,10 @@
+{
+  "name": "blackbook-sdk",
+  "version": "1.0.0",
+  "description": "BlackBook Wallet SDK - Phase 1",
+  "main": "blackbook_sdk.js",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "argon2": "^0.31.0"
+  }
+}

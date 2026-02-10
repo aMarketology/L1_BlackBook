@@ -7,11 +7,15 @@
 //
 // Run: cargo test --test wallet_integration_tests
 
+mod test_helpers;
+
 use layer1::storage::ConcurrentBlockchain;
-use layer1::wallet_unified::handlers::{UnifiedWalletState, CreateResponse};
+use layer1::wallet_unified::handlers::{UnifiedWalletState, CreateResponse, CreateWalletRequest, SignRequest};
+use layer1::vault_manager::VaultManager;
 use std::sync::Arc;
 use tempfile::tempdir;
 use serde_json::json;
+use test_helpers::{create_mock_supabase, create_empty_headers};
 
 // ============================================================================
 // TEST 01: Wallet Creation
@@ -22,11 +26,20 @@ async fn test_01_create_frost_wallet() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Create wallet
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let result = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await;
 
     assert!(result.is_ok(), "Wallet creation should succeed");
@@ -59,11 +72,20 @@ async fn test_02_share_b_persistence() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Create wallet
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let result = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await;
     
     let response = result.unwrap().0;
@@ -95,25 +117,38 @@ async fn test_03_frost_signature_generation() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Create wallet
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let create_result = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await.unwrap().0;
     
     let wallet_id = create_result.wallet_id;
     let share_a = create_result.share_a;
 
     // Sign a message
-    let sign_request = layer1::wallet_unified::handlers::SignRequest {
+    let sign_request = SignRequest {
         wallet_id: wallet_id.clone(),
         message: "test_transaction_data".to_string(),
         share_a: share_a.clone(),
+        password: "test_password".to_string(),
+        pin: Some("1234".to_string()),
+        amount: 100,
     };
 
     let sign_result = layer1::wallet_unified::handlers::sign_hybrid_tx(
         axum::extract::State(state.clone()),
+        create_empty_headers(),
         axum::extract::Json(sign_request)
     ).await;
 
@@ -140,16 +175,28 @@ async fn test_04_multiple_wallets_isolation() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
+
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
 
     // Create wallet 1
     let wallet1 = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request.clone())
     ).await.unwrap().0;
     
     // Create wallet 2
     let wallet2 = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await.unwrap().0;
 
     // Verify wallets are different
@@ -179,22 +226,35 @@ async fn test_05_invalid_share_a_rejection() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Create wallet
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let wallet = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await.unwrap().0;
 
     // Attempt to sign with invalid Share A
-    let sign_request = layer1::wallet_unified::handlers::SignRequest {
+    let sign_request = SignRequest {
         wallet_id: wallet.wallet_id.clone(),
         message: "test".to_string(),
         share_a: "invalid_hex_data".to_string(),
+        password: "test_password".to_string(),
+        pin: Some("1234".to_string()),
+        amount: 100,
     };
 
     let sign_result = layer1::wallet_unified::handlers::sign_hybrid_tx(
         axum::extract::State(state.clone()),
+        create_empty_headers(),
         axum::extract::Json(sign_request)
     ).await;
 
@@ -212,17 +272,23 @@ async fn test_06_nonexistent_wallet_rejection() {
     // Setup
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Attempt to sign with non-existent wallet
-    let sign_request = layer1::wallet_unified::handlers::SignRequest {
+    let sign_request = SignRequest {
         wallet_id: "nonexistent_wallet_id_12345".to_string(),
         message: "test".to_string(),
         share_a: "aabbccdd".to_string(),
+        password: "test_password".to_string(),
+        pin: Some("1234".to_string()),
+        amount: 100,
     };
 
     let sign_result = layer1::wallet_unified::handlers::sign_hybrid_tx(
         axum::extract::State(state.clone()),
+        create_empty_headers(),
         axum::extract::Json(sign_request)
     ).await;
 
@@ -248,10 +314,19 @@ async fn test_07_redb_durability_after_restart() {
     // Phase 1: Create wallet
     {
         let blockchain = Arc::new(ConcurrentBlockchain::new(path).unwrap());
-        let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+        let supabase = create_mock_supabase();
+        let vault = Arc::new(VaultManager::new_mock());
+        let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
         
+        let request = CreateWalletRequest {
+            password: Some("test_password".to_string()),
+            pin: Some("1234".to_string()),
+            daily_limit: Some(10000),
+        };
         let wallet = layer1::wallet_unified::handlers::create_hybrid_wallet(
-            axum::extract::State(state.clone())
+            axum::extract::State(state.clone()),
+            create_empty_headers(),
+            axum::Json(request)
         ).await.unwrap().0;
         
         wallet_id = wallet.wallet_id.clone();
@@ -280,7 +355,9 @@ async fn test_07_redb_durability_after_restart() {
 async fn test_08_concurrent_wallet_creation() {
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Create 10 wallets concurrently
     let mut handles = vec![];
@@ -288,8 +365,15 @@ async fn test_08_concurrent_wallet_creation() {
     for _ in 0..10 {
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
+            let request = CreateWalletRequest {
+                password: Some("test_password".to_string()),
+                pin: Some("1234".to_string()),
+                daily_limit: Some(10000),
+            };
             layer1::wallet_unified::handlers::create_hybrid_wallet(
-                axum::extract::State(state_clone)
+                axum::extract::State(state_clone),
+                create_empty_headers(),
+                axum::Json(request)
             ).await
         });
         handles.push(handle);
@@ -319,10 +403,19 @@ async fn test_08_concurrent_wallet_creation() {
 async fn test_09_share_size_validation() {
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let wallet = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await.unwrap().0;
 
     // Verify Share A is hex-encoded and reasonable size
@@ -349,11 +442,20 @@ async fn test_09_share_size_validation() {
 async fn test_10_full_wallet_workflow() {
     let temp_dir = tempdir().unwrap();
     let blockchain = Arc::new(ConcurrentBlockchain::new(temp_dir.path().to_str().unwrap()).unwrap());
-    let state = Arc::new(UnifiedWalletState::new(blockchain.clone()));
+    let supabase = create_mock_supabase();
+    let vault = Arc::new(VaultManager::new_mock());
+    let state = Arc::new(UnifiedWalletState::new(blockchain.clone(), supabase, vault));
 
     // Step 1: Create wallet
+    let request = CreateWalletRequest {
+        password: Some("test_password".to_string()),
+        pin: Some("1234".to_string()),
+        daily_limit: Some(10000),
+    };
     let wallet = layer1::wallet_unified::handlers::create_hybrid_wallet(
-        axum::extract::State(state.clone())
+        axum::extract::State(state.clone()),
+        create_empty_headers(),
+        axum::Json(request)
     ).await.unwrap().0;
     
     println!("Created wallet: {}", wallet.wallet_id);
@@ -363,14 +465,18 @@ async fn test_10_full_wallet_workflow() {
     println!("Share B verified in ReDB");
 
     // Step 3: Sign message
-    let sign_request = layer1::wallet_unified::handlers::SignRequest {
+    let sign_request = SignRequest {
         wallet_id: wallet.wallet_id.clone(),
         message: "transfer:alice:bob:100".to_string(),
         share_a: wallet.share_a.clone(),
+        password: "test_password".to_string(),
+        pin: Some("1234".to_string()),
+        amount: 100,
     };
 
     let signature = layer1::wallet_unified::handlers::sign_hybrid_tx(
         axum::extract::State(state.clone()),
+        create_empty_headers(),
         axum::extract::Json(sign_request)
     ).await.unwrap().0;
     

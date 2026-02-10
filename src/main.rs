@@ -53,6 +53,8 @@ mod storage;
 mod consensus;
 mod grpc;
 mod poh_blockchain;
+mod supabase;
+mod vault_manager;
 
 #[path = "../protocol/mod.rs"]
 mod protocol;
@@ -65,6 +67,8 @@ mod runtime;
 
 use storage::{ConcurrentBlockchain, AssetManager, TransactionRecord, TxType, AuthType};
 use wallet_unified::handlers::UnifiedWalletState;
+use supabase::SupabaseManager;
+use vault_manager::VaultManager;
 
 // Solana-style consensus infrastructure
 use runtime::{
@@ -129,6 +133,7 @@ pub struct AppState {
     // Core blockchain (ReDB + DashMap cache)
     pub blockchain: ConcurrentBlockchain,
     pub assets: AssetManager,
+    pub supabase: Arc<SupabaseManager>,
 
     // Solana-style consensus
     pub poh: SharedPoHService,
@@ -766,7 +771,7 @@ async fn credit_settle_handler(
 // ROUTER
 // ============================================================================
 
-fn build_router(state: AppState, mnemonic_router: Router) -> Router {
+fn build_router(state: AppState, wallet_router: Router) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -778,7 +783,7 @@ fn build_router(state: AppState, mnemonic_router: Router) -> Router {
         .route("/stats", get(stats_handler))
         .route("/balance/{address}", get(balance_handler))
         .route("/ledger", get(ledger_handler))
-        // Transfers
+        // Transfers (Submission)
         .route("/transfer/simple", post(signed_transfer_handler))
         // PoH & Consensus
         .route("/poh/status", get(poh_status_handler))
@@ -798,9 +803,9 @@ fn build_router(state: AppState, mnemonic_router: Router) -> Router {
         .route("/admin/security/stats", get(security_stats_handler))
         .with_state(state);
 
-    // Merge mnemonic router (has its own state) with app routes
+    // Merge wallet router (Unified FROST+SSS) with app routes
     app_routes
-        .merge(mnemonic_router)
+        .merge(wallet_router)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }
@@ -836,6 +841,9 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    // 0. Load Environment Variables (Load BEFORE any other initialization)
+    dotenv::dotenv().ok();
+
     // 1. Logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env()
@@ -875,6 +883,8 @@ async fn main() {
         }
     };
     let assets = AssetManager::new();
+    let supabase = Arc::new(SupabaseManager::new());
+    info!("🔐 Supabase Vault initialized");
 
     // 4. Consensus Infrastructure
     let current_slot = Arc::new(AtomicU64::new(0));
@@ -953,6 +963,7 @@ async fn main() {
     let state = AppState {
         blockchain,
         assets,
+        supabase,
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
         leader_schedule,
@@ -969,7 +980,13 @@ async fn main() {
     };
 
     // 8. Unified Wallet Router (FROST + SSS + Mnemonic)
-    let unified_state = Arc::new(UnifiedWalletState::new(Arc::new(state.blockchain.clone())));
+    let vault_manager = Arc::new(VaultManager::new().expect("CRITICAL: Vault Connection Required for Production"));
+
+    let unified_state = Arc::new(UnifiedWalletState::new(
+        Arc::new(state.blockchain.clone()),
+        state.supabase.clone(),
+        vault_manager
+    ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
     // 9. gRPC Server (L1↔L2 settlement)
@@ -989,21 +1006,20 @@ async fn main() {
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
 
     info!("");
-    info!("🚀 Listening on http://{}", addr);
+    info!("rocket Listening on http://{}", addr);
     info!("");
     info!("📡 ENDPOINTS:");
     info!("   GET  /health                    Health check");
     info!("   GET  /balance/{{address}}         Balance lookup");
-    info!("   POST /transfer                  SSS 2-of-3 transfer");
-    info!("   POST /transfer/simple           Ed25519 signed transfer");
+    info!("   POST /transfer/simple           Broadcast Signed TX");
     info!("   GET  /ledger                    Transaction history");
     info!("");
-    info!("🔐 WALLET (BIP-39 + SSS + ZKP):");
-    info!("   POST /mnemonic/create           Create wallet");
-    info!("   POST /mnemonic/sign             Sign transaction");
-    info!("   POST /mnemonic/transfer         Transfer via SSS");
-    info!("   POST /mnemonic/zkp/challenge/{{addr}}  ZKP challenge");
-    info!("   POST /mnemonic/share-b/{{addr}}  Get Share B (ZKP)");
+    info!("🔐 UNIFIED WALLET (FROST 2-of-3):");
+    info!("   POST /wallet/create             Create (Triple-Write)");
+    info!("   POST /wallet/sign               Sign (FROST Aggregation)");
+    info!("   POST /wallet/share_b            Get Cloud Shard (ReDB)");
+    info!("   POST /wallet/secure/shard-b     Get Cloud Shard (Supabase)");
+    info!("   POST /wallet/secure/recover-shard-c  Get Vault Shard (Recovery)");
     info!("");
     info!("⚡ ENGINE:");
     info!("   GET  /poh/status                PoH clock");

@@ -135,6 +135,8 @@ prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"
 frost-ed25519 = "2.2.0"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto", "use_pem"] }
+supabase-jwt = "0.1.1"
 
 [dev-dependencies]
 # Testing utilities
