@@ -48,6 +48,11 @@ use crate::runtime::{
 };
 use crate::protocol::{Transaction, TxData};
 
+#[cfg(feature = "svm")]
+use crate::svm::runtime::BlackBookSVM;
+#[cfg(feature = "svm")]
+use solana_sdk::{hash::Hash as SvmHash, pubkey::Pubkey};
+
 // ============================================================================
 // CONSTANTS - TUNED FOR HIGH THROUGHPUT
 // ============================================================================
@@ -592,6 +597,10 @@ pub struct BlockProducer {
     
     /// Our validator identity
     validator_id: String,
+
+    /// SVM execution engine (Phase 1C: routes TransferBb through native Rust path)
+    #[cfg(feature = "svm")]
+    svm: Arc<std::sync::Mutex<BlackBookSVM>>,
 }
 
 impl BlockProducer {
@@ -605,7 +614,19 @@ impl BlockProducer {
     ) -> Self {
         // Genesis hash
         let genesis_hash = "0".repeat(64);
-        
+
+        #[cfg(feature = "svm")]
+        let svm = {
+            use sha2::{Sha256, Digest};
+            let hash_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
+            let genesis = SvmHash::new_from_array(hash_bytes);
+            let bb_svm = BlackBookSVM::new(
+                Arc::clone(&blockchain.svm_accounts),
+                genesis,
+            );
+            Arc::new(std::sync::Mutex::new(bb_svm))
+        };
+
         info!("🏭 BlockProducer initialized for validator: {}", validator_id);
         
         Self {
@@ -617,6 +638,8 @@ impl BlockProducer {
             blocks: Arc::new(RwLock::new(Vec::new())),
             latest_hash: Arc::new(RwLock::new(genesis_hash)),
             validator_id,
+            #[cfg(feature = "svm")]
+            svm,
         }
     }
 
@@ -681,6 +704,22 @@ impl BlockProducer {
             
             (hash, seq, entries, epoch)
         };
+
+        // Advance the SVM slot so intra-block transactions have a valid blockhash.
+        #[cfg(feature = "svm")]
+        {
+            let slot_bytes: [u8; 32] = {
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(poh_hash.as_bytes());
+                h.update(&slot.to_le_bytes());
+                h.finalize().into()
+            };
+            let slot_hash = SvmHash::new_from_array(slot_bytes);
+            if let Ok(mut svm) = self.svm.lock() {
+                svm.advance_slot(slot, slot_hash);
+            }
+        }
 
         // Collect transactions
         let transactions: Vec<Transaction> = {
@@ -770,6 +809,17 @@ impl BlockProducer {
             schedule.record_slot_production(&self.validator_id, slot);
         }
 
+        // Flush SVM dirty accounts to ReDB for this block
+        #[cfg(feature = "svm")]
+        {
+            if let Ok(mut svm) = self.svm.lock() {
+                match svm.end_of_block() {
+                    Ok(n) => info!("💾 SVM flush: {} accounts persisted for slot {}", n, slot),
+                    Err(e) => warn!("SVM flush error at slot {}: {}", slot, e),
+                }
+            }
+        }
+
         // Advance slot counter
         self.current_slot.fetch_add(1, Ordering::Relaxed);
 
@@ -846,8 +896,21 @@ impl BlockProducer {
             
             TxData::TransferBb { to, amount } => {
                 info!("Transfer: {} -> {} ({} $BB)", tx.from, to, amount);
-                self.blockchain.debit(&tx.from, *amount as f64)?;
-                self.blockchain.credit(to, *amount as f64)
+
+                #[cfg(feature = "svm")]
+                {
+                    if let Err(e) = self.execute_transfer_via_svm(&tx.from, to, *amount) {
+                        return Err(e);
+                    }
+                    return Ok(());
+                }
+
+                // Legacy path (svm feature disabled)
+                #[cfg(not(feature = "svm"))]
+                {
+                    self.blockchain.debit(&tx.from, *amount as f64)?;
+                    self.blockchain.credit(to, *amount as f64)
+                }
             }
             
             TxData::TransferDime { to, amount } => {
@@ -856,6 +919,102 @@ impl BlockProducer {
                 Ok(())
             }
         }
+    }
+
+    // =========================================================================
+    // SVM EXECUTION HELPERS (feature = "svm")
+    // =========================================================================
+
+    /// Execute a $BB transfer through the SVM execution engine.
+    ///
+    /// **Lazy migration:** If the sender account is not yet in `svm_accounts`
+    /// (i.e. it's a wallet that pre-dates the SVM), we seed it from the legacy
+    /// f64 balance table _once_, on first transfer. After that the SVM is the
+    /// single source of truth for that account.
+    ///
+    /// `amount` is in $BB units (matching the `TransferBb.amount` field).
+    /// Conversion to lamports happens here — the only place in the call tree.
+    #[cfg(feature = "svm")]
+    fn execute_transfer_via_svm(
+        &self,
+        from_addr: &str,
+        to_addr: &str,
+        amount_bb: u64,
+    ) -> Result<(), String> {
+        use crate::svm::types::LAMPORTS_PER_BB;
+        use solana_sdk::account::{AccountSharedData, ReadableAccount};
+
+        let svm_guard = self.svm.lock()
+            .map_err(|e| format!("SVM lock poisoned: {e}"))?;
+
+        // --- Address parsing ---
+        let from_pk = Self::legacy_addr_to_pubkey(from_addr)
+            .map_err(|e| format!("Invalid from address: {e}"))?;
+        let to_pk = Self::legacy_addr_to_pubkey(to_addr)
+            .map_err(|e| format!("Invalid to address: {e}"))?;
+
+        // --- Lamport conversion (f64→u64 boundary — ONCE, here only) ---
+        let lamports = amount_bb
+            .checked_mul(LAMPORTS_PER_BB)
+            .ok_or("Transfer amount overflows u64 lamports")?;
+
+        // --- Lazy migration: seed sender if not yet in SVM ---
+        if svm_guard.accounts_db.get_account(&from_pk).is_none() {
+            let legacy_bb = self.blockchain.get_balance(from_addr); // f64 in $BB
+            let seed_lamports = (legacy_bb * LAMPORTS_PER_BB as f64) as u64;
+            let seeded = AccountSharedData::new(
+                seed_lamports,
+                0,
+                &solana_sdk::system_program::id(),
+            );
+            svm_guard.accounts_db.store_account(&from_pk, seeded);
+            tracing::info!(
+                address = %from_addr,
+                lamports = seed_lamports,
+                "SVM: lazily migrated legacy account"
+            );
+        }
+
+        // --- Build transfer request with the slot's current blockhash ---
+        let recent_blockhash = svm_guard.current_blockhash();
+        let req = crate::svm::runtime::TransferRequest {
+            tx_id: format!("bp_{}", uuid_hex()),
+            from: from_pk,
+            to: to_pk,
+            lamports,
+            recent_blockhash,
+        };
+
+        let result = svm_guard.execute_transfer(&req);
+
+        if result.success {
+            tracing::debug!(
+                from = %from_addr,
+                to   = %to_addr,
+                bb   = amount_bb,
+                cu   = result.compute_units_consumed,
+                "SVM transfer executed"
+            );
+            Ok(())
+        } else {
+            Err(result.error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown SVM error".into()))
+        }
+    }
+
+    /// Deterministically derive a Solana `Pubkey` from a legacy `bb_<hex>` address.
+    ///
+    /// Strategy: strip the `bb_` prefix (if present), then SHA-256 hash the
+    /// raw bytes of the remaining string to produce a stable 32-byte key.
+    /// This is Option A from the migration design doc — explicit, reversible
+    /// via the ADDRESS_MAP table (Phase 3A.3), and collision-free in practice.
+    #[cfg(feature = "svm")]
+    fn legacy_addr_to_pubkey(addr: &str) -> Result<Pubkey, String> {
+        use sha2::{Sha256, Digest};
+        let stripped = addr.strip_prefix("bb_").unwrap_or(addr);
+        let bytes: [u8; 32] = Sha256::digest(stripped.as_bytes()).into();
+        Ok(Pubkey::new_from_array(bytes))
     }
 
     /// Compute merkle state root from current account balances
@@ -1028,6 +1187,18 @@ pub fn verify_chain(blocks: &[FinalizedBlock]) -> bool {
     }
 
     true
+}
+
+// ============================================================================
+// INTERNAL UTILITIES
+// ============================================================================
+
+/// Generate a short unique hex string for intra-block transaction IDs.
+#[cfg(feature = "svm")]
+fn uuid_hex() -> String {
+    use rand::Rng;
+    let n: u64 = rand::thread_rng().gen();
+    format!("{:016x}", n)
 }
 
 // ============================================================================

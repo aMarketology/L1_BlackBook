@@ -14,6 +14,9 @@ pub mod consensus;
 pub mod supabase;
 pub mod vault_manager;
 
+#[cfg(feature = "svm")]
+pub mod svm;
+
 // Infrastructure
 #[path = "../protocol/mod.rs"]
 pub mod protocol;

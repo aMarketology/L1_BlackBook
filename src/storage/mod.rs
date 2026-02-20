@@ -39,6 +39,9 @@ use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
 use tracing::{info, error, warn};
 
+#[cfg(feature = "svm")]
+use crate::svm::accounts_db::SvmAccountsDB;
+
 // ============================================================================
 // REDB TABLE DEFINITIONS (Type-Safe!)
 // ============================================================================
@@ -356,6 +359,10 @@ pub struct ConcurrentBlockchain {
     
     /// Total supply tracker
     total_supply: Arc<AtomicU64>,
+    
+    /// SVM Accounts Database (Phase 1 integration)
+    #[cfg(feature = "svm")]
+    pub svm_accounts: Arc<SvmAccountsDB>,
 }
 
 impl ConcurrentBlockchain {
@@ -384,6 +391,15 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(FROST_SHARE_B)?;
             let _ = write_txn.open_table(FROST_PUB_KEY_PKG)?;
             let _ = write_txn.open_table(FROST_PUB_KEY)?;
+            
+            // SVM tables (behind feature flag)
+            #[cfg(feature = "svm")]
+            {
+                let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
+                let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
+                let _ = write_txn.open_table(crate::svm::accounts_db::BLOCKHASH_QUEUE)?;
+                let _ = write_txn.open_table(crate::svm::accounts_db::SVM_SIGNATURES)?;
+            }
         }
         write_txn.commit()?;
         
@@ -411,21 +427,30 @@ impl ConcurrentBlockchain {
                 let mut iter = bridge_table.iter()?;
                 while let Some(result) = iter.next() {
                     let (key, value) = result?;
-                    processed_bridge_txs.insert(key.value().to_string(), value.value().to_string());
+                    let tx_hash = key.value().to_string();
+                    let status = value.value().to_string();
+                    processed_bridge_txs.insert(tx_hash, status);
                 }
             }
         }
-        
+
         let account_count = cache.len();
         let bridge_tx_count = processed_bridge_txs.len();
         info!(accounts = account_count, total_supply = total, processed_bridge_txs = bridge_tx_count, "Database loaded");
-        
+
+        let db_arc = Arc::new(db);
+
+        #[cfg(feature = "svm")]
+        let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e| e.to_string())?);
+
         Ok(Self {
-            db: Arc::new(db),
+            db: db_arc,
             cache,
             processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
-            total_supply: Arc::new(AtomicU64::new((total * 1_000_000.0) as u64)), // Store as micro-units
+            total_supply: Arc::new(AtomicU64::new((total * 1_000_000.0) as u64)),
+            #[cfg(feature = "svm")]
+            svm_accounts,
         })
     }
 

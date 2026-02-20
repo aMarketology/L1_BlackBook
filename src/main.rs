@@ -55,6 +55,9 @@ mod poh_blockchain;
 mod supabase;
 mod vault_manager;
 
+#[cfg(feature = "svm")]
+mod svm;
+
 #[path = "../protocol/mod.rs"]
 mod protocol;
 #[path = "../runtime/mod.rs"]

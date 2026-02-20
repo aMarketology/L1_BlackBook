@@ -9,6 +9,16 @@ default = []
 # Enable this feature for development admin endpoints (mint/burn)
 # cargo run --features unsafe_admin
 unsafe_admin = []
+# SVM (Solana Virtual Machine) execution layer — Phase 1 implementation
+# cargo build --features svm
+# All SVM code lives behind this flag until Phase 2 promotion
+svm = [
+    "dep:solana-sdk",
+    "dep:solana-program",
+    "dep:solana-program-runtime",
+    "dep:solana-system-program",
+    "dep:solana_rbpf",
+]
 
 [dependencies]
 # Core async runtime
@@ -111,6 +121,24 @@ rs_merkle = "1.4"
 # bincode removed - Borsh is deterministic (required for Merkle proofs)
 
 # ═══════════════════════════════════════════════════════════════
+# SVM: Solana Virtual Machine execution layer (optional feature)
+# Pin exact versions — Solana sub-crates have tight internal coupling.
+# Versions confirmed working together in Phase 0 verification.
+# Update solana-versions.txt at repo root when these change.
+# ═══════════════════════════════════════════════════════════════
+solana-sdk            = { version = "2.1", optional = true }
+solana-program        = { version = "2.1", optional = true }
+solana-program-runtime = { version = "2.1", optional = true }
+solana-system-program = { version = "2.1", optional = true }
+# solana-rbpf tracks Solana's internal versioning (0.8.x for Agave 2.1)
+solana_rbpf           = { version = "0.8", optional = true }
+
+# Windows build fix: solana-secp256r1-program (transitive via solana-sdk)
+# requires OpenSSL. Force "vendored" so it compiles from source rather than
+# requiring a system OpenSSL installation. One-time compile cost, then cached.
+openssl               = { version = "0.10", features = ["vendored"] }
+
+# ═══════════════════════════════════════════════════════════════
 # PHASE 9: P2P DISTRIBUTED NETWORK (Proof of Engagement)
 # ═══════════════════════════════════════════════════════════════
 # libp2p - Industry-standard P2P (Ethereum 2.0, IPFS, Polkadot)
@@ -154,6 +182,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "layer1"
 path = "src/main.rs"
+
+[[example]]
+name = "stress_test"
+path = "examples/stress_test.rs"
 
 # ═══════════════════════════════════════════════════════════════
 # PROFILE CONFIGURATION - Fix Windows linker crashes

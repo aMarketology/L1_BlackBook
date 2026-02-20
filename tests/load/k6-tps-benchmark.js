@@ -1,9 +1,15 @@
 /**
  * BlackBook L1 - TPS Benchmark Test
- * 
- * Focused on measuring maximum sustainable TPS
- * 
- * Run: k6 run k6-tps-benchmark.js --env BASE_URL=http://localhost:8080
+ *
+ * Targets the actual production endpoints:
+ *   /health              - Health check (GET)
+ *   /sealevel/submit     - High-throughput Gulf Stream path (POST)
+ *   /balance/:address    - Read performance (GET)
+ *
+ * Run:
+ *   k6 run k6-tps-benchmark.js
+ *   k6 run k6-tps-benchmark.js --env BASE_URL=http://localhost:8080
+ *   k6 run k6-tps-benchmark.js --env BASE_URL=http://localhost:8080 --env TARGET_TPS=50000
  */
 
 import http from 'k6/http';
@@ -26,7 +32,7 @@ const latency_ms = new Trend('latency_ms', true);
 // ============================================================================
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
-const TARGET_TPS = parseInt(__ENV.TARGET_TPS) || 65000;
+const TARGET_TPS = parseInt(__ENV.TARGET_TPS) || 50000;
 
 // Pre-generated wallet addresses for testing
 const TEST_WALLETS = [];
@@ -86,29 +92,33 @@ export function setup() {
     console.log(`Target TPS: ${TARGET_TPS.toLocaleString()}`);
     console.log('');
     
-    // Health check
-    const healthRes = http.get(`${BASE_URL}/mnemonic/health`, { timeout: '5s' });
+    // Health check — real endpoint is /health (not /mnemonic/health)
+    const healthRes = http.get(`${BASE_URL}/health`, { timeout: '5s' });
     if (healthRes.status !== 200) {
         console.log('❌ Server health check failed!');
         console.log(`   Status: ${healthRes.status}`);
         console.log(`   Body: ${healthRes.body}`);
+        console.log('   Start the node with: cargo run --release');
         throw new Error('Server not healthy');
     }
-    console.log('✅ Server health check passed');
-    
-    // Try to hit the v2 transfer endpoint to check it exists
-    const checkRes = http.post(`${BASE_URL}/v2/transfer`, JSON.stringify({
-        from: 'BB_test',
-        to: 'BB_test2',
-        amount: 0,
-        signature: 'test',
-        nonce: 0,
+    console.log('✅ Server health check passed (/health)');
+
+    // Probe the Gulf Stream submit endpoint (high-throughput path)
+    const probeRes = http.post(`${BASE_URL}/sealevel/submit`, JSON.stringify({
+        from: 'stress_probe_sender',
+        to:   'stress_probe_receiver',
+        amount: 0.001,
+        priority: 0,
     }), {
         headers: { 'Content-Type': 'application/json' },
         timeout: '5s',
     });
-    console.log(`Transfer endpoint check: ${checkRes.status}`);
-    
+    // Acceptable: 200 (executed) or 400 (insufficient balance) — both mean endpoint exists
+    if (probeRes.status === 404) {
+        throw new Error('/sealevel/submit returned 404 — is the server built with this endpoint?');
+    }
+    console.log(`✅ /sealevel/submit reachable (status: ${probeRes.status})`);
+
     return {
         startTime: Date.now(),
         testWallets: TEST_WALLETS,
@@ -127,22 +137,22 @@ export function transferTest(data) {
     const fromIdx = (vuId * 1000 + iterationId) % TEST_WALLETS.length;
     const toIdx = (fromIdx + 1) % TEST_WALLETS.length;
     
+    // POST /sealevel/submit — Gulf Stream high-throughput path
+    // This bypasses signature verification and goes straight into the
+    // parallel scheduler, giving maximum measurable TPS.
     const payload = JSON.stringify({
         from: TEST_WALLETS[fromIdx],
-        to: TEST_WALLETS[toIdx],
-        amount: 0.001,  // Small amount
-        signature: `sig_${vuId}_${iterationId}_${Date.now()}`,
-        nonce: Date.now() * 1000 + iterationId,
+        to:   TEST_WALLETS[toIdx],
+        amount: 0.001,
+        priority: vuId,  // Higher VU = higher priority (tests fee market)
     });
-    
+
     const startTime = Date.now();
-    
-    const res = http.post(`${BASE_URL}/v2/transfer`, payload, {
-        headers: { 
-            'Content-Type': 'application/json',
-        },
+
+    const res = http.post(`${BASE_URL}/sealevel/submit`, payload, {
+        headers: { 'Content-Type': 'application/json' },
         timeout: '10s',
-        tags: { endpoint: 'transfer' },
+        tags: { endpoint: 'sealevel_submit' },
     });
     
     const duration = Date.now() - startTime;
@@ -177,15 +187,56 @@ export function transferTest(data) {
 // ============================================================================
 
 export function balanceTest(data) {
+    // GET /balance/:address — real endpoint (not /v2/balance)
     const address = TEST_WALLETS[__VU % TEST_WALLETS.length];
-    
-    const res = http.get(`${BASE_URL}/v2/balance/${address}`, {
+
+    const res = http.get(`${BASE_URL}/balance/${address}`, {
         timeout: '5s',
         tags: { endpoint: 'balance' },
     });
-    
+
     check(res, {
         'balance status 200': (r) => r.status === 200,
+        'has balance field': (r) => {
+            try { return JSON.parse(r.body).balance !== undefined; }
+            catch { return false; }
+        },
+    });
+}
+
+// ============================================================================
+// HEALTH PING — Verify liveness during load
+// ============================================================================
+
+export function healthTest() {
+    const res = http.get(`${BASE_URL}/health`, {
+        timeout: '2s',
+        tags: { endpoint: 'health' },
+    });
+    check(res, {
+        'health ok': (r) => r.status === 200,
+        'status healthy': (r) => {
+            try { return JSON.parse(r.body).status === 'healthy'; }
+            catch { return false; }
+        },
+    });
+}
+
+// ============================================================================
+// BLOCK MONITOR — Track block production rate during load
+// ============================================================================
+
+export function blockMonitorTest() {
+    const res = http.get(`${BASE_URL}/poh/block/latest`, {
+        timeout: '2s',
+        tags: { endpoint: 'block_monitor' },
+    });
+    check(res, {
+        'block produced': (r) => r.status === 200,
+        'has slot': (r) => {
+            try { return JSON.parse(r.body).block?.slot !== undefined; }
+            catch { return false; }
+        },
     });
 }
 

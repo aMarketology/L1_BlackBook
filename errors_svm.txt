@@ -1,0 +1,280 @@
+﻿cargo : warning: unused import: `error`
+At line:1 char:1
++ cargo build --features svm 2>&1 | Out-File -FilePath errors_svm.txt - ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: unused import: `error`:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  --> src\storage\mod.rs:40:21
+   |
+40 | use tracing::{info, error, warn};
+   |                     ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Algorithm`, `DecodingKey`, `Validation`, and `decode`
+  --> src\wallet_unified\handlers.rs:10:20
+   |
+10 | use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+   |                    ^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `rand::RngCore`
+  --> src\wallet_unified\security.rs:12:5
+   |
+12 | use rand::RngCore;
+   |     ^^^^^^^^^^^^^
+
+warning: unused import: `warn`
+ --> src\vault_manager.rs:4:28
+  |
+4 | use tracing::{info, error, warn};
+  |                            ^^^^
+
+warning: unused import: `BorshSerialize`
+  --> src\svm\accounts_db.rs:41:13
+   |
+41 | use borsh::{BorshSerialize, BorshDeserialize};
+   |             ^^^^^^^^^^^^^^
+
+warning: unused import: `warn`
+  --> src\svm\runtime.rs:36:22
+   |
+36 | use tracing::{debug, warn};
+   |                      ^^^^
+
+warning: unused import: `signature::Signature`
+  --> src\svm\runtime.rs:47:5
+   |
+47 |     signature::Signature,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SvmError`
+  --> src\svm\tx_adapter.rs:26:25
+   |
+26 | use crate::svm::types::{SvmError, LAMPORTS_PER_BB};
+   |                         ^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+  --> src\..\runtime\core.rs:18:5
+   |
+18 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `debug`
+  --> src\..\runtime\core.rs:24:27
+   |
+24 | use tracing::{info, warn, debug};
+   |                           ^^^^^
+
+warning: unused import: `debug`
+  --> src\..\runtime\consensus.rs:32:21
+   |
+32 | use tracing::{info, debug};
+   |                     ^^^^^
+
+warning: unused variable: `expected_leader`
+   --> src\poh_blockchain.rs:112:26
+    |
+112 |     pub fn verify(&self, expected_leader: &str) -> bool {
+    |                          ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expected_leader`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `headers`
+   --> src\wallet_unified\handlers.rs:270:5
+    |
+270 |     headers: HeaderMap,
+    |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_headers`
+
+warning: unused variable: `headers`
+   --> src\wallet_unified\handlers.rs:422:5
+    |
+422 |     headers: HeaderMap,
+    |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_headers`
+
+warning: constant `TIER1_STATE` is never used
+  --> src\storage\mod.rs:91:7
+   |
+91 | const TIER1_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier1_state");
+   |       ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `TIER2_STATE` is never used
+  --> src\storage\mod.rs:94:7
+   |
+94 | const TIER2_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier2_state");
+   |       ^^^^^^^^^^^
+
+warning: constant `DIME_VINTAGES` is never used
+  --> src\storage\mod.rs:97:7
+   |
+97 | const DIME_VINTAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("dime_vintages");
+   |       ^^^^^^^^^^^^^
+
+warning: constant `CPI_HISTORY` is never used
+   --> src\storage\mod.rs:100:7
+    |
+100 | const CPI_HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("cpi_history");
+    |       ^^^^^^^^^^^
+
+warning: constant `DIME_BALANCES` is never used
+   --> src\storage\mod.rs:103:7
+    |
+103 | const DIME_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("dime_balances");
+    |       ^^^^^^^^^^^^^
+
+warning: field `processed_bridge_txs` is never read
+   --> src\storage\mod.rs:355:5
+    |
+346 | pub struct ConcurrentBlockchain {
+    |            -------------------- field in this struct
+...
+355 |     processed_bridge_txs: Arc<DashMap<String, String>>,
+    |     ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `ConcurrentBlockchain` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `max_compute_units` is never read
+   --> src\svm\runtime.rs:159:5
+    |
+151 | pub struct BlackBookSVM {
+    |            ------------ field in this struct
+...
+159 |     max_compute_units: u64,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: `layer1` (lib) generated 21 warnings (run `cargo fix --lib -p layer1` to apply 14 suggestions)
+   Compiling layer1 v5.0.0 (C:\Users\maxd1\OneDrive\Documents\GitHub\L1_BlackBook)
+error[E0433]: failed to resolve: unresolved import
+  --> src\storage\mod.rs:43:12
+   |
+43 | use crate::svm::accounts_db::SvmAccountsDB;
+   |            ^^^
+   |            |
+   |            unresolved import
+   |            help: a similar path exists: `layer1::svm`
+
+error[E0433]: failed to resolve: unresolved import
+   --> src\storage\mod.rs:398:53
+    |
+398 |                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
+    |                                                     ^^^ unresolved import
+    |
+help: a similar path exists
+    |
+398 |                 let _ = write_txn.open_table(crate::layer1::svm::accounts_db::SVM_ACCOUNTS)?;
+    |                                                     ++++++++
+help: consider importing this module
+    |
+ 36 + use layer1::svm::accounts_db;
+    |
+help: if you import `accounts_db`, refer to it directly
+    |
+398 -                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
+398 +                 let _ = write_txn.open_table(accounts_db::SVM_ACCOUNTS)?;
+    |
+
+error[E0433]: failed to resolve: unresolved import
+   --> src\storage\mod.rs:399:53
+    |
+399 |                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
+    |                                                     ^^^ unresolved import
+    |
+help: a similar path exists
+    |
+399 |                 let _ = write_txn.open_table(crate::layer1::svm::accounts_db::SVM_PROGRAMS)?;
+    |                                                     ++++++++
+help: consider importing this module
+    |
+ 36 + use layer1::svm::accounts_db;
+    |
+help: if you import `accounts_db`, refer to it directly
+    |
+399 -                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
+399 +                 let _ = write_txn.open_table(accounts_db::SVM_PROGRAMS)?;
+    |
+
+error[E0433]: failed to resolve: unresolved import
+   --> src\storage\mod.rs:400:53
+    |
+400 |                 let _ = write_txn.open_table(crate::svm::accounts_db::BLOCKHASH_QUEUE)?;
+    |                                                     ^^^ unresolved import
+    |
+help: a similar path exists
+    |
+400 |                 let _ = write_txn.open_table(crate::layer1::svm::accounts_db::BLOCKHASH_QUEUE)?;
+    |                                                     ++++++++
+help: consider importing this module
+    |
+ 36 + use layer1::svm::accounts_db;
+    |
+help: if you import `accounts_db`, refer to it directly
+    |
+400 -                 let _ = write_txn.open_table(crate::svm::accounts_db::BLOCKHASH_QUEUE)?;
+400 +                 let _ = write_txn.open_table(accounts_db::BLOCKHASH_QUEUE)?;
+    |
+
+error[E0433]: failed to resolve: unresolved import
+   --> src\storage\mod.rs:401:53
+    |
+401 |                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_SIGNATURES)?;
+    |                                                     ^^^ unresolved import
+    |
+help: a similar path exists
+    |
+401 |                 let _ = write_txn.open_table(crate::layer1::svm::accounts_db::SVM_SIGNATURES)?;
+    |                                                     ++++++++
+help: consider importing this module
+    |
+ 36 + use layer1::svm::accounts_db;
+    |
+help: if you import `accounts_db`, refer to it directly
+    |
+401 -                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_SIGNATURES)?;
+401 +                 let _ = write_txn.open_table(accounts_db::SVM_SIGNATURES)?;
+    |
+
+warning: use of deprecated associated function `chrono::NaiveDateTime::from_timestamp_opt`: use `DateTime::from_timestamp` instead
+   --> src\main.rs:688:52
+    |
+688 |         let timestamp_str = chrono::NaiveDateTime::from_timestamp_opt(tx.timestamp as i64, 0)
+    |                                                    ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+error[E0282]: type annotations needed
+   --> src\storage\mod.rs:444:86
+    |
+444 |         let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e| e.to_string())?);
+    |                                                                                      ^  - type must be known at this point
+    |
+help: consider giving this closure parameter an explicit type
+    |
+444 |         let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e: /* Type */| e.to_string())?);
+    |                                                                                       ++++++++++++
+
+warning: unused variable: `headers`
+   --> src\wallet_unified\handlers.rs:270:5
+    |
+270 |     headers: HeaderMap,
+    |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_headers`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `expected_leader`
+   --> src\poh_blockchain.rs:112:26
+    |
+112 |     pub fn verify(&self, expected_leader: &str) -> bool {
+    |                          ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expected_leader`
+
+warning: unused variable: `current_slot`
+   --> src\main.rs:163:9
+    |
+163 |     let current_slot = state.current_slot.load(Ordering::Relaxed);
+    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_current_slot`
+
+Some errors have detailed explanations: E0282, E0433.
+For more information about an error, try `rustc --explain E0282`.
+warning: `layer1` (bin "layer1") generated 5 warnings (1 duplicate)
+error: could not compile `layer1` (bin "layer1") due to 6 previous errors; 5 warnings emitted

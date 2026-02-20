@@ -601,6 +601,12 @@ pub struct ParallelScheduler {
     current_batch_size: AtomicU64,
     pub total_processed: AtomicU64,
     pub total_batches: AtomicU64,
+
+    /// SVM accounts database — when set, Transfer transactions execute via
+    /// SvmAccountsDB.system_transfer() instead of the legacy f64 balance map.
+    /// DashMap hot_state is lock-free so parallel threads never contend here.
+    #[cfg(feature = "svm")]
+    svm_db: Option<Arc<crate::svm::SvmAccountsDB>>,
 }
 
 impl ParallelScheduler {
@@ -619,7 +625,17 @@ impl ParallelScheduler {
             current_batch_size: AtomicU64::new(OPTIMAL_BATCH_SIZE as u64),
             total_processed: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
+            #[cfg(feature = "svm")]
+            svm_db: None,
         }
+    }
+
+    /// Attach an SVM accounts database so Transfer transactions go through
+    /// the lamport-based execution path instead of the legacy f64 map.
+    #[cfg(feature = "svm")]
+    pub fn with_svm(mut self, db: Arc<crate::svm::SvmAccountsDB>) -> Self {
+        self.svm_db = Some(db);
+        self
     }
 
     pub fn get_batch_size(&self) -> usize {
@@ -674,15 +690,32 @@ impl ParallelScheduler {
         batches
     }
 
-    /// Execute batch with lock acquisition (thread-safe parallel)
+    /// Execute batch with lock acquisition (thread-safe parallel).
+    /// When the `svm` feature is enabled and an SvmAccountsDB is attached,
+    /// `TransactionType::Transfer` transactions are routed through the lamport
+    /// execution path; all other types use the legacy f64 balance map.
     pub fn execute_batch_with_locks(&self, batch: Vec<Transaction>, balances: &DashMap<String, f64>) -> Vec<TransactionResult> {
         let len = batch.len();
         let lm = self.lock_manager.clone();
 
+        #[cfg(feature = "svm")]
+        let svm_db_ref = self.svm_db.clone();
+
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
                 while !lm.try_acquire_locks(tx) { std::hint::spin_loop(); }
-                let result = Self::execute_single(tx, balances);
+                let result = {
+                    #[cfg(feature = "svm")]
+                    {
+                        match (&tx.tx_type, &svm_db_ref) {
+                            (TransactionType::Transfer, Some(db)) =>
+                                Self::execute_single_svm(tx, db),
+                            _ => Self::execute_single(tx, balances),
+                        }
+                    }
+                    #[cfg(not(feature = "svm"))]
+                    { Self::execute_single(tx, balances) }
+                };
                 lm.release_locks(tx);
                 result
             }).collect()
@@ -690,6 +723,30 @@ impl ParallelScheduler {
 
         self.total_processed.fetch_add(len as u64, Ordering::Relaxed);
         results
+    }
+
+    /// Execute a single Transfer via SvmAccountsDB (lamport path).
+    /// Address strings are mapped to Pubkeys via SHA-256 so they stay
+    /// consistent with BlockProducer's `legacy_addr_to_pubkey`.
+    #[cfg(feature = "svm")]
+    fn execute_single_svm(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
+        use sha2::{Sha256, Digest};
+        use solana_sdk::pubkey::Pubkey;
+        use crate::svm::LAMPORTS_PER_BB;
+
+        let addr_to_pk = |addr: &str| -> Pubkey {
+            let stripped = addr.strip_prefix("bb_").unwrap_or(addr);
+            Pubkey::new_from_array(Sha256::digest(stripped.as_bytes()).into())
+        };
+
+        let from_pk = addr_to_pk(&tx.from);
+        let to_pk   = addr_to_pk(&tx.to);
+        let lamports = (tx.amount * LAMPORTS_PER_BB as f64) as u64;
+
+        match db.system_transfer(&from_pk, &to_pk, lamports) {
+            Ok(()) => TransactionResult { tx_id: tx.id.clone(), success: true, error: None },
+            Err(e) => TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(e.to_string()) },
+        }
     }
 
     fn execute_single(tx: &Transaction, balances: &DashMap<String, f64>) -> TransactionResult {
