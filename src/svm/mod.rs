@@ -29,6 +29,7 @@ pub mod tx_adapter;
 // Re-export the most-used types at the svm:: level for ergonomic imports.
 pub use types::{
     StoredAccount,
+    StoredTransactionResult,
     SvmError,
     TransactionExecutionResult,
     LAMPORTS_PER_BB,
@@ -43,6 +44,8 @@ pub use accounts_db::{
     SVM_PROGRAMS,
     BLOCKHASH_QUEUE,
     SVM_SIGNATURES,
+    SVM_TX_LOG,
+    SVM_ADDR_SIGS,
 };
 
 #[cfg(feature = "svm")]

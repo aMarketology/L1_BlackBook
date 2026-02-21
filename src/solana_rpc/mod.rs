@@ -1,0 +1,794 @@
+// ============================================================================
+// BLACKBOOK L1 — SOLANA JSON-RPC 2.0 SERVER  (Phase 2A)
+// ============================================================================
+//
+// Exposes a Solana-compatible JSON-RPC endpoint on port 8899 so that any
+// Solana wallet (OneKey, Phantom, Backpack, …) or tool (solana CLI, anchor,
+// solscan) can connect to the BlackBook L1 node as if it were a Solana
+// cluster.
+//
+// Phase 2A implements all READ-ONLY methods.
+// Phase 2B will add sendTransaction, getTransaction, getBlock.
+//
+// Design principles:
+//  - Return types mirror Solana mainnet-beta JSON-RPC responses exactly.
+//  - No solana-account-decoder dependency; encode manually using base64/base58.
+//  - All methods are async; the server is driven by tokio.
+//  - Entire module is behind `#[cfg(feature = "svm")]`.
+//
+// Run:  cargo build --features svm
+// Test: cargo test --features svm --test rpc_tests
+// ============================================================================
+
+use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
+
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::core::RpcResult;
+use jsonrpsee::types::ErrorObjectOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use solana_sdk::{
+    account::ReadableAccount,
+    hash::Hash,
+    pubkey::Pubkey,
+};
+use tracing::info;
+use base64::engine::{Engine, general_purpose::STANDARD as B64};
+
+use crate::svm::{SvmAccountsDB, BlackBookSVM};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Solana-compatible response wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Solana `RpcResponse<T>` — wraps every read-method result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcResponse<T: Serialize + Clone> {
+    pub context: RpcContext,
+    pub value: T,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcContext {
+    pub slot: u64,
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+}
+
+impl RpcContext {
+    fn current(slot: u64) -> Self {
+        Self { slot, api_version: "BB-5.0".into() }
+    }
+}
+
+/// Solana `UiAccount` — returned by getAccountInfo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiAccount {
+    pub lamports: u64,
+    pub data: UiAccountData,
+    pub owner: String,
+    pub executable: bool,
+    pub rent_epoch: u64,
+    pub space: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UiAccountData {
+    /// [base64_data, encoding_string]
+    Binary(String, String),
+    /// Empty account has no data
+    Empty([String; 0]),
+}
+
+/// getLatestBlockhash value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcBlockhash {
+    pub blockhash: String,
+    pub last_valid_block_height: u64,
+}
+
+/// getEpochInfo
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcEpochInfo {
+    pub epoch: u64,
+    pub slot_index: u64,
+    pub slots_in_epoch: u64,
+    pub absolute_slot: u64,
+    pub block_height: u64,
+    pub transaction_count: u64,
+}
+
+/// getVersion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RpcVersionInfo {
+    pub solana_core: String,
+    pub feature_set: u32,
+}
+
+/// Config objects (optional params — ignored in Phase 2A, accepted for compatibility)
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RpcAccountInfoConfig {
+    pub encoding: Option<String>,
+    pub commitment: Option<String>,
+    pub min_context_slot: Option<u64>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2B — Write method response types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// sendTransaction config (accepted for compatibility — encoding matters)
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTransactionConfig {
+    pub encoding: Option<String>,
+    pub skip_preflight: Option<bool>,
+    pub preflight_commitment: Option<String>,
+    pub max_retries: Option<u64>,
+    pub min_context_slot: Option<u64>,
+}
+
+/// getTransaction response — mirrors Solana's `EncodedConfirmedTransactionWithStatusMeta`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcConfirmedTransaction {
+    pub slot: u64,
+    pub transaction: RpcEncodedTransaction,
+    pub meta: RpcTransactionMeta,
+    pub block_time: Option<i64>,
+}
+
+/// Encoded transaction (simplified: we return account keys + signature)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcEncodedTransaction {
+    pub signatures: Vec<String>,
+    pub message: RpcTransactionMessage,
+}
+
+/// Transaction message (simplified)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionMessage {
+    pub account_keys: Vec<String>,
+    pub recent_blockhash: String,
+    pub instructions: Vec<RpcCompiledInstruction>,
+}
+
+/// Compiled instruction (simplified)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcCompiledInstruction {
+    pub program_id_index: u8,
+    pub accounts: Vec<u8>,
+    pub data: String,
+}
+
+/// Transaction metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionMeta {
+    pub err: Option<RpcTransactionError>,
+    pub fee: u64,
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
+    pub compute_units_consumed: Option<u64>,
+}
+
+/// Transaction error (Solana-compatible shape)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcTransactionError {
+    #[serde(rename = "InstructionError")]
+    pub instruction_error: Option<(u8, String)>,
+}
+
+/// getSignaturesForAddress response entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+    pub err: Option<RpcTransactionError>,
+    pub memo: Option<String>,
+    pub block_time: Option<i64>,
+    pub confirmation_status: Option<String>,
+}
+
+/// getSignaturesForAddress config
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetSignaturesConfig {
+    pub limit: Option<usize>,
+    pub before: Option<String>,
+    pub until: Option<String>,
+    pub commitment: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON-RPC trait (proc macro generates BlackBookRpcServer trait + RpcModule)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Slots per epoch on BlackBook L1 (matches Solana mainnet).
+pub const SLOTS_PER_EPOCH: u64 = 432_000;
+
+/// Rent is disabled on BlackBook L1 — all accounts are permanently exempt.
+/// Matches Solana's `minimum_balance` formula at 0 bytes plus overhead,
+/// so wallets that call this don't break.
+const LAMPORTS_PER_BYTE_YEAR: u64 = 3_480;
+const RENT_EXEMPT_THRESHOLD: u64 = 2; // years before exempt
+
+#[rpc(server)]
+pub trait BlackBookRpc {
+    /// Health probe. Returns `"ok"` when the node is running.
+    #[method(name = "getHealth")]
+    async fn get_health(&self) -> RpcResult<String>;
+
+    /// Node software version.
+    #[method(name = "getVersion")]
+    async fn get_version(&self) -> RpcResult<RpcVersionInfo>;
+
+    /// Network genesis hash — unique identifier for BlackBook L1.
+    /// Wallets use this to detect they are talking to the right network.
+    #[method(name = "getGenesisHash")]
+    async fn get_genesis_hash(&self) -> RpcResult<String>;
+
+    /// Latest confirmed slot.
+    #[method(name = "getSlot")]
+    async fn get_slot(&self) -> RpcResult<u64>;
+
+    /// Block height (same as slot on BlackBook L1).
+    #[method(name = "getBlockHeight")]
+    async fn get_block_height(&self) -> RpcResult<u64>;
+
+    /// Lamport balance for a base58-encoded public key.
+    #[method(name = "getBalance")]
+    async fn get_balance(&self, pubkey: String) -> RpcResult<RpcResponse<u64>>;
+
+    /// Full account state for a base58-encoded public key.
+    #[method(name = "getAccountInfo")]
+    async fn get_account_info(
+        &self,
+        pubkey: String,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Option<UiAccount>>>;
+
+    /// Latest valid blockhash and its last-valid block height.
+    /// Wallets call this before building every transaction.
+    #[method(name = "getLatestBlockhash")]
+    async fn get_latest_blockhash(&self) -> RpcResult<RpcResponse<RpcBlockhash>>;
+
+    /// Current epoch statistics.
+    #[method(name = "getEpochInfo")]
+    async fn get_epoch_info(&self) -> RpcResult<RpcEpochInfo>;
+
+    /// Minimum lamports required to store `data_len` bytes rent-free.
+    #[method(name = "getMinimumBalanceForRentExemption")]
+    async fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> RpcResult<u64>;
+
+    /// Check if one or more accounts exist.
+    #[method(name = "getMultipleAccounts")]
+    async fn get_multiple_accounts(
+        &self,
+        pubkeys: Vec<String>,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<Option<UiAccount>>>>;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 2B — Write methods
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Submit a signed transaction for execution.
+    ///
+    /// Accepts a base64-encoded serialized transaction. Returns the
+    /// transaction signature (base58) on success.
+    ///
+    /// The transaction is executed immediately (not queued) in Phase 2B.
+    /// Phase 6 will add Gulf Stream forwarding for async submission.
+    #[method(name = "sendTransaction")]
+    async fn send_transaction(
+        &self,
+        data: String,
+        config: Option<SendTransactionConfig>,
+    ) -> RpcResult<String>;
+
+    /// Retrieve a confirmed transaction by its signature (base58).
+    #[method(name = "getTransaction")]
+    async fn get_transaction(
+        &self,
+        signature: String,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<Option<RpcConfirmedTransaction>>;
+
+    /// Get recent transaction signatures for an address.
+    #[method(name = "getSignaturesForAddress")]
+    async fn get_signatures_for_address(
+        &self,
+        address: String,
+        config: Option<GetSignaturesConfig>,
+    ) -> RpcResult<Vec<RpcSignatureInfo>>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Implementation struct
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct BlackBookRpcImpl {
+    pub svm_db:       Arc<SvmAccountsDB>,
+    pub svm:          Arc<Mutex<BlackBookSVM>>,
+    pub current_slot: Arc<AtomicU64>,
+    /// base58-encoded SHA256("BLACKBOOK_L1_GENESIS_2025")
+    pub genesis_hash: String,
+}
+
+impl BlackBookRpcImpl {
+    pub fn new(
+        svm_db:       Arc<SvmAccountsDB>,
+        svm:          Arc<Mutex<BlackBookSVM>>,
+        current_slot: Arc<AtomicU64>,
+    ) -> Self {
+        // Compute genesis hash once at startup — same bytes as BlockProducer
+        let genesis_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
+        let genesis_hash = bs58::encode(genesis_bytes).into_string();
+
+        info!("🔌 BlackBookRpc created  genesis_hash={}", genesis_hash);
+
+        Self { svm_db, svm, current_slot, genesis_hash }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Internal helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn slot(&self) -> u64 {
+        self.current_slot.load(Ordering::Relaxed)
+    }
+
+    fn ctx(&self) -> RpcContext {
+        RpcContext::current(self.slot())
+    }
+
+    /// Parse a base58 pubkey string into a `Pubkey`, returning a JSON-RPC error on bad input.
+    fn parse_pubkey(s: &str) -> RpcResult<Pubkey> {
+        let bytes = bs58::decode(s)
+            .into_vec()
+            .map_err(|e| error_invalid_params(format!("Invalid base58 pubkey '{}': {}", s, e)))?;
+
+        let arr: [u8; 32] = bytes.try_into()
+            .map_err(|_| error_invalid_params(format!("Pubkey '{}' is not 32 bytes", s)))?;
+
+        Ok(Pubkey::new_from_array(arr))
+    }
+
+    /// Encode a `Pubkey` as base58.
+    fn pk_to_b58(pk: &Pubkey) -> String {
+        bs58::encode(pk.to_bytes()).into_string()
+    }
+
+    /// Get the latest blockhash from the SVM.
+    fn latest_blockhash(&self) -> Hash {
+        self.svm.lock()
+            .map(|svm| svm.current_blockhash())
+            .unwrap_or_default()
+    }
+
+    /// Convert a blockhash `Hash` to base58 (matches Solana's `Hash::to_string()`).
+    fn hash_to_b58(hash: &Hash) -> String {
+        bs58::encode(hash.to_bytes()).into_string()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RPC method implementations
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl BlackBookRpcServer for BlackBookRpcImpl {
+    async fn get_health(&self) -> RpcResult<String> {
+        Ok("ok".into())
+    }
+
+    async fn get_version(&self) -> RpcResult<RpcVersionInfo> {
+        Ok(RpcVersionInfo {
+            solana_core: "BB-5.0.0-svm".into(),
+            // Non-zero feature_set — wallets use this to detect cluster capabilities.
+            // BB-L1 epoch 1: 0xBB500000
+            feature_set: 0xBB50_0000,
+        })
+    }
+
+    async fn get_genesis_hash(&self) -> RpcResult<String> {
+        Ok(self.genesis_hash.clone())
+    }
+
+    async fn get_slot(&self) -> RpcResult<u64> {
+        Ok(self.slot())
+    }
+
+    async fn get_block_height(&self) -> RpcResult<u64> {
+        Ok(self.slot()) // block height == slot on single-chain BB L1
+    }
+
+    async fn get_balance(&self, pubkey: String) -> RpcResult<RpcResponse<u64>> {
+        let pk = Self::parse_pubkey(&pubkey)?;
+        let lamports = self.svm_db.get_lamports(&pk);
+        Ok(RpcResponse { context: self.ctx(), value: lamports })
+    }
+
+    async fn get_account_info(
+        &self,
+        pubkey: String,
+        _config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Option<UiAccount>>> {
+        let pk = Self::parse_pubkey(&pubkey)?;
+        let account = self.svm_db.get_account(&pk);
+
+        let ui = account.map(|acct| {
+            let data_bytes = acct.data().to_vec();
+            let encoded = B64.encode(&data_bytes);
+            UiAccount {
+                lamports: acct.lamports(),
+                data: if data_bytes.is_empty() {
+                    UiAccountData::Binary(String::new(), "base64".into())
+                } else {
+                    UiAccountData::Binary(encoded, "base64".into())
+                },
+                owner: Self::pk_to_b58(acct.owner()),
+                executable: acct.executable(),
+                rent_epoch: acct.rent_epoch(),
+                space: data_bytes.len(),
+            }
+        });
+
+        Ok(RpcResponse { context: self.ctx(), value: ui })
+    }
+
+    async fn get_latest_blockhash(&self) -> RpcResult<RpcResponse<RpcBlockhash>> {
+        let hash = self.latest_blockhash();
+        let slot  = self.slot();
+        Ok(RpcResponse {
+            context: self.ctx(),
+            value: RpcBlockhash {
+                blockhash: Self::hash_to_b58(&hash),
+                last_valid_block_height: slot.saturating_add(150),
+            },
+        })
+    }
+
+    async fn get_epoch_info(&self) -> RpcResult<RpcEpochInfo> {
+        let slot       = self.slot();
+        let epoch      = slot / SLOTS_PER_EPOCH;
+        let slot_index = slot % SLOTS_PER_EPOCH;
+
+        Ok(RpcEpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch: SLOTS_PER_EPOCH,
+            absolute_slot: slot,
+            block_height: slot,
+            transaction_count: 0, // TODO: add to BlockProducer stats in 2B
+        })
+    }
+
+    async fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> RpcResult<u64> {
+        // On BlackBook L1, all accounts are permanently rent-exempt (rent_epoch = u64::MAX).
+        // Return the same formula Solana uses so wallets that need ≥ X lamports don't break.
+        // Formula: minimum = (128 + data_len) * LAMPORTS_PER_BYTE_YEAR * RENT_EXEMPT_THRESHOLD
+        let minimum = (128 + data_len as u64)
+            .saturating_mul(LAMPORTS_PER_BYTE_YEAR)
+            .saturating_mul(RENT_EXEMPT_THRESHOLD);
+        Ok(minimum)
+    }
+
+    async fn get_multiple_accounts(
+        &self,
+        pubkeys: Vec<String>,
+        _config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<Option<UiAccount>>>> {
+        let mut accounts = Vec::with_capacity(pubkeys.len());
+
+        for pk_str in &pubkeys {
+            let pk = Self::parse_pubkey(pk_str)?;
+            let ui = self.svm_db.get_account(&pk).map(|acct| {
+                let data_bytes = acct.data().to_vec();
+                let encoded = B64.encode(&data_bytes);
+                UiAccount {
+                    lamports:   acct.lamports(),
+                    data:       UiAccountData::Binary(encoded, "base64".into()),
+                    owner:      Self::pk_to_b58(acct.owner()),
+                    executable: acct.executable(),
+                    rent_epoch: acct.rent_epoch(),
+                    space:      data_bytes.len(),
+                }
+            });
+            accounts.push(ui);
+        }
+
+        Ok(RpcResponse { context: self.ctx(), value: accounts })
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 2B — Write method implementations
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn send_transaction(
+        &self,
+        data: String,
+        config: Option<SendTransactionConfig>,
+    ) -> RpcResult<String> {
+        use crate::svm::{TransferRequest, StoredTransactionResult};
+
+        // 1. Determine encoding (default: base58 for Solana CLI, base64 for wallets)
+        let encoding = config
+            .as_ref()
+            .and_then(|c| c.encoding.clone())
+            .unwrap_or_else(|| "base58".into());
+
+        let tx_bytes = match encoding.as_str() {
+            "base64" => B64.decode(&data).map_err(|e|
+                error_invalid_params(format!("Invalid base64 transaction: {}", e)))?,
+            "base58" | _ => bs58::decode(&data).into_vec().map_err(|e|
+                error_invalid_params(format!("Invalid base58 transaction: {}", e)))?,
+        };
+
+        // 2. Deserialize as a Solana VersionedTransaction
+        let versioned_tx: solana_sdk::transaction::VersionedTransaction =
+            bincode::deserialize(&tx_bytes).map_err(|e|
+                error_invalid_params(format!("Failed to deserialize transaction: {}", e)))?;
+
+        // 3. Extract the first signature as the transaction ID
+        let signature = versioned_tx.signatures.first()
+            .ok_or_else(|| error_invalid_params("Transaction has no signatures"))?;
+        let sig_b58 = bs58::encode(signature.as_ref()).into_string();
+
+        // 4. Check for replay — persistent dedup across restarts
+        if self.svm_db.signature_exists(&sig_b58) {
+            return Err(error_already_processed(format!(
+                "Transaction {} already processed", sig_b58
+            )));
+        }
+
+        // 5. Extract message fields
+        let message = versioned_tx.message;
+        let account_keys = message.static_account_keys();
+        let recent_blockhash = *message.recent_blockhash();
+
+        // 6. Validate blockhash
+        {
+            let svm = self.svm.lock().map_err(|e|
+                error_internal(format!("SVM lock poisoned: {}", e)))?;
+            let bh = Hash::new_from_array(recent_blockhash.to_bytes());
+            if !svm.is_valid_blockhash(&bh) {
+                return Err(error_invalid_params(
+                    "Blockhash not found — transaction may be stale. Call getLatestBlockhash first."
+                ));
+            }
+        }
+
+        // 7. Parse instructions — route system transfers
+        //    Phase 2B supports System Program transfers only.
+        //    Future phases add SPL Token, Anchor programs, etc.
+        let instructions = message.instructions();
+
+        if instructions.is_empty() {
+            return Err(error_invalid_params("Transaction contains no instructions"));
+        }
+
+        // For Phase 2B: support the System Program transfer instruction
+        let ix = &instructions[0];
+        let program_id = account_keys[ix.program_id_index as usize];
+
+        if program_id != solana_sdk::system_program::id() {
+            return Err(error_invalid_params(format!(
+                "Unsupported program: {}. Phase 2B only supports System Program transfers.",
+                bs58::encode(program_id.to_bytes()).into_string()
+            )));
+        }
+
+        // System Program transfer: instruction data = [2,0,0,0] + u64 lamports LE
+        // SystemInstruction::Transfer = index 2
+        if ix.data.len() < 12 {
+            return Err(error_invalid_params(
+                "System instruction data too short for a transfer"
+            ));
+        }
+
+        let ix_type = u32::from_le_bytes([ix.data[0], ix.data[1], ix.data[2], ix.data[3]]);
+        if ix_type != 2 {
+            return Err(error_invalid_params(format!(
+                "Unsupported System instruction type: {}. Expected Transfer (2).",
+                ix_type
+            )));
+        }
+
+        let lamports = u64::from_le_bytes([
+            ix.data[4], ix.data[5], ix.data[6], ix.data[7],
+            ix.data[8], ix.data[9], ix.data[10], ix.data[11],
+        ]);
+
+        // Accounts for System transfer: [0] = from (signer), [1] = to
+        if ix.accounts.len() < 2 {
+            return Err(error_invalid_params(
+                "System transfer requires at least 2 account keys"
+            ));
+        }
+        let from = account_keys[ix.accounts[0] as usize];
+        let to = account_keys[ix.accounts[1] as usize];
+
+        // 8. Build TransferRequest and execute
+        let slot = self.slot();
+        let transfer_req = TransferRequest {
+            tx_id: sig_b58.clone(),
+            from,
+            to,
+            lamports,
+            recent_blockhash: Hash::new_from_array(recent_blockhash.to_bytes()),
+        };
+
+        let result = {
+            let svm = self.svm.lock().map_err(|e|
+                error_internal(format!("SVM lock poisoned: {}", e)))?;
+            svm.execute_transfer(&transfer_req)
+        };
+
+        // 9. If execution failed, return the error
+        if !result.success {
+            let err_msg = result.error.as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Unknown execution error".into());
+            return Err(error_transaction_failed(err_msg));
+        }
+
+        // 10. Persist the transaction result to the tx log + address index
+        let account_keys_b58: Vec<String> = vec![
+            bs58::encode(from.to_bytes()).into_string(),
+            bs58::encode(to.to_bytes()).into_string(),
+        ];
+
+        let stored = StoredTransactionResult::from_execution(&result, slot, account_keys_b58);
+        self.svm_db.store_transaction_result(&stored).map_err(|e|
+            error_internal(format!("Failed to persist tx result: {}", e)))?;
+
+        // 11. Flush dirty accounts to ReDB so the transfer is durable
+        self.svm_db.flush_block().map_err(|e|
+            error_internal(format!("Failed to flush accounts: {}", e)))?;
+
+        info!(
+            signature = %sig_b58,
+            from = %bs58::encode(from.to_bytes()).into_string(),
+            to = %bs58::encode(to.to_bytes()).into_string(),
+            lamports = lamports,
+            "✅ sendTransaction executed and persisted"
+        );
+
+        // Return the signature — this is what Solana wallets display
+        Ok(sig_b58)
+    }
+
+    async fn get_transaction(
+        &self,
+        signature: String,
+        _config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<Option<RpcConfirmedTransaction>> {
+        let stored = self.svm_db.get_transaction_result(&signature)
+            .map_err(|e| error_internal(format!("Failed to read tx log: {}", e)))?;
+
+        let Some(tx) = stored else {
+            return Ok(None);
+        };
+
+        // Build Solana-compatible response
+        let meta = RpcTransactionMeta {
+            err: if tx.success {
+                None
+            } else {
+                Some(RpcTransactionError {
+                    instruction_error: Some((0, tx.error_msg.clone())),
+                })
+            },
+            fee: tx.fee,
+            pre_balances: vec![], // Not tracked in Phase 2B — requires snapshot
+            post_balances: vec![],
+            compute_units_consumed: Some(tx.compute_units_consumed),
+        };
+
+        let resp = RpcConfirmedTransaction {
+            slot: tx.slot,
+            transaction: RpcEncodedTransaction {
+                signatures: vec![tx.signature.clone()],
+                message: RpcTransactionMessage {
+                    account_keys: tx.account_keys.clone(),
+                    recent_blockhash: String::new(), // Not stored in Phase 2B
+                    instructions: vec![], // Simplified — tx already executed
+                },
+            },
+            meta,
+            block_time: Some(tx.block_time),
+        };
+
+        Ok(Some(resp))
+    }
+
+    async fn get_signatures_for_address(
+        &self,
+        address: String,
+        config: Option<GetSignaturesConfig>,
+    ) -> RpcResult<Vec<RpcSignatureInfo>> {
+        let limit = config.as_ref().and_then(|c| c.limit).unwrap_or(1000).min(1000);
+
+        let results = self.svm_db.get_signatures_for_address(&address, limit)
+            .map_err(|e| error_internal(format!("Failed to query signatures: {}", e)))?;
+
+        let infos: Vec<RpcSignatureInfo> = results.into_iter().map(|tx| {
+            RpcSignatureInfo {
+                signature: tx.signature,
+                slot: tx.slot,
+                err: if tx.success {
+                    None
+                } else {
+                    Some(RpcTransactionError {
+                        instruction_error: Some((0, tx.error_msg)),
+                    })
+                },
+                memo: None,
+                block_time: Some(tx.block_time),
+                confirmation_status: Some("finalized".into()),
+            }
+        }).collect();
+
+        Ok(infos)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Server lifecycle  
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start the Solana JSON-RPC server on the given address (e.g. `"0.0.0.0:8899"`).
+/// Returns the server handle — dropping it stops the server.
+/// Call `tokio::spawn(async move { handle.stopped().await })` to run in background.
+pub async fn start_rpc_server(
+    rpc: BlackBookRpcImpl,
+    addr: &str,
+) -> Result<jsonrpsee::server::ServerHandle, Box<dyn std::error::Error>> {
+    use jsonrpsee::server::Server;
+
+    let server = Server::builder()
+        .build(addr)
+        .await?;
+
+    let module = rpc.into_rpc();
+    let handle = server.start(module);
+
+    info!("🔌 Solana JSON-RPC server listening on {addr}  (Phase 2A+2B: getBalance, sendTransaction, getTransaction, …)");
+    Ok(handle)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn error_invalid_params(msg: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32602, msg.into(), None::<()>)
+}
+
+/// Transaction already processed (replay protection).
+fn error_already_processed(msg: impl Into<String>) -> ErrorObjectOwned {
+    // Solana uses -32002 for "Transaction simulation failed" class
+    ErrorObjectOwned::owned(-32002, msg.into(), None::<()>)
+}
+
+/// Internal server error (storage failure, lock poison, etc.)
+fn error_internal(msg: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32603, msg.into(), None::<()>)
+}
+
+/// Transaction execution failed (insufficient funds, etc.)
+fn error_transaction_failed(msg: impl Into<String>) -> ErrorObjectOwned {
+    // -32003: "Transaction precompile verification failure" (Solana convention)
+    ErrorObjectOwned::owned(-32003, msg.into(), None::<()>)
+}

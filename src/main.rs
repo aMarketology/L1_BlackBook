@@ -58,6 +58,9 @@ mod vault_manager;
 #[cfg(feature = "svm")]
 mod svm;
 
+#[cfg(feature = "svm")]
+mod solana_rpc;
+
 #[path = "../protocol/mod.rs"]
 mod protocol;
 #[path = "../runtime/mod.rs"]
@@ -1143,6 +1146,12 @@ async fn main() {
     ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
+    // Extract Arcs for RPC before state is moved into build_router
+    #[cfg(feature = "svm")]
+    let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
+    #[cfg(feature = "svm")]
+    let rpc_current_slot = Arc::clone(&state.current_slot);
+
     // 10. HTTP Server
     let app = build_router(state, unified_router);
     let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
@@ -1178,6 +1187,35 @@ async fn main() {
     info!("");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    // 11. Solana JSON-RPC server on port 8899 (Phase 2A)
+    #[cfg(feature = "svm")]
+    {
+        use std::sync::Mutex;
+        use svm::BlackBookSVM;
+        use solana_rpc::{BlackBookRpcImpl, start_rpc_server};
+        use solana_sdk::hash::Hash;
+        use sha2::{Sha256, Digest as _};
+
+        // Compute the same genesis hash used by BlockProducer
+        let genesis_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
+        let rpc_genesis_hash = Hash::new_from_array(genesis_bytes);
+        let rpc_svm = Arc::new(Mutex::new(
+            BlackBookSVM::new(Arc::clone(&rpc_svm_accounts), rpc_genesis_hash)
+        ));
+
+        let rpc_impl = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);
+        match start_rpc_server(rpc_impl, "0.0.0.0:8899").await {
+            Ok(handle) => {
+                info!("🔌 Solana JSON-RPC on port 8899");
+                tokio::spawn(async move { handle.stopped().await });
+            }
+            Err(e) => {
+                error!("⚠️  Solana RPC failed to start: {}", e);
+            }
+        }
+    }
+
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await

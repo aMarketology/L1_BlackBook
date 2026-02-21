@@ -1,5 +1,38 @@
 # BB_SVM: Embedded Solana Virtual Machine Upgrade Plan
 
+## 📍 Current Implementation Status — Feb 19, 2026
+
+**Phase 1 is complete. Phase 2 (Solana JSON-RPC) is starting now.**
+
+### What's live behind `--features svm`
+
+| Layer | Component | File(s) | Status |
+|-------|-----------|---------|--------|
+| Storage | `SvmAccountsDB` — DashMap hot_state + ReDB flush | `src/svm/accounts_db.rs` | ✅ Operational |
+| Storage | 4 SVM ReDB tables: `svm_accounts`, `svm_programs`, `blockhash_queue`, `svm_signatures` | `src/storage/mod.rs` | ✅ Coexisting with legacy `accounts` table |
+| Types | `StoredAccount` (Borsh wire), `SvmError`, `TransactionExecutionResult`, constants | `src/svm/types.rs` | ✅ |
+| Runtime | `BlackBookSVM` — native Rust System Program transfers, 150-slot blockhash queue | `src/svm/runtime.rs` | ✅ |
+| Adapter | `TxData` → `TransferRequest` routing | `src/svm/tx_adapter.rs` | ✅ |
+| Execution | `BlockProducer::execute_transfer_via_svm()` — lazy f64→lamport migration | `src/poh_blockchain.rs` | ✅ |
+| Scheduling | `ParallelScheduler::with_svm()` + `execute_single_svm()` | `runtime/core.rs` | ✅ |
+| Tests | 20/20 SVM tests green across 5 test files | `tests/svm_*.rs` | ✅ |
+
+### What's NOT yet live
+- Solana JSON-RPC server (port 8899) — **Phase 2A is next**
+- `sendTransaction` / `getTransaction` — Phase 2B
+- rBPF VM for arbitrary BPF programs — Phase 3
+- SPL Token / `$BB` token mint — Phase 3
+- Anchor programs (Tier1/Tier2 Vault, Oracle) — Phase 4
+- OneKey bridge — Phase 5
+
+### Key architectural decisions made during Phase 1
+- **Native Rust ≡ rBPF** for System Program: `system_transfer` in `SvmAccountsDB` mirrors Solana's System Program semantics exactly (checked arithmetic, u64 lamports, RENT_EPOCH_EXEMPT). Full rBPF VM added in Phase 3 for BPF `.so` programs.
+- **Lazy migration**: first `TransferBb` from a legacy address seeds the SVM from the f64 balance. Zero forced migration event.
+- **SHA-256 deterministic key mapping**: `legacy_addr_to_pubkey` = SHA256(stripped address) → consistent across `BlockProducer` and `ParallelScheduler`.
+- **No `BlackBookSVM` Mutex in hot path**: `ParallelScheduler` accesses `Arc<SvmAccountsDB>` directly (DashMap = lock-free reads/writes). The `BlackBookSVM` Mutex is only acquired for `advance_slot()` and `end_of_block()` at block boundaries.
+
+---
+
 ## Executive Summary
 
 BlackBook L1 currently runs a custom execution engine: transactions hit Axum REST endpoints, get verified via Ed25519, and are processed by hand-written Rust logic that debits/credits f64 balances in ReDB. This works — but it means **zero compatibility** with Solana wallets (OneKey, Phantom), explorers (Solscan), or the Anchor smart contract framework.

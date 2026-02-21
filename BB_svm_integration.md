@@ -6,6 +6,45 @@
 
 ---
 
+## 🗺️ Progress Dashboard — Updated Feb 19, 2026
+
+| Phase | Milestone | Status | Tests | Notes |
+|-------|-----------|--------|-------|-------|
+| 0 | Pre-flight (feature flags, Cargo.toml) | ✅ **COMPLETE** | — | `cargo build` clean both with/without `--features svm` |
+| 1A | `SvmAccountsDB`, `StoredAccount`, ReDB tables, storage wiring | ✅ **COMPLETE** | 5/5 ✅ | `tests/svm_accounts_tests.rs` |
+| 1B.1 | `BlackBookSVM` native Rust transfers + blockhash queue (150-slot ring) | ✅ **COMPLETE** | 5/5 ✅ | `tests/svm_runtime_tests.rs` |
+| 1B.2 | rBPF `InvokeContext` for System Program | ⏭ **DEFERRED** | — | Used plan fallback: native Rust path is correct and sufficient. Revisit in Phase 3. |
+| 1C | Wire SVM into `BlockProducer` (dual-path `TransferBb` + lazy migration) | ✅ **COMPLETE** | 3/3 ✅ | `tests/svm_block_production_tests.rs` |
+| 1D | Wire SVM into `ParallelScheduler` (`with_svm()` builder, `execute_single_svm`) | ✅ **COMPLETE** | 4/4 ✅ | `tests/svm_parallel_tests.rs` |
+| 1E | Lamport conservation fuzzing (10,000 transfers, overflow, parallel) | ✅ **COMPLETE** | 3/3 ✅ | `tests/svm_invariant_tests.rs` |
+| **→ 2A** | **Solana JSON-RPC read methods (port 8899)** | **🔜 NEXT** | — | `jsonrpsee` — `getBalance`, `getAccountInfo`, `getLatestBlockhash`, … |
+| 2B | `sendTransaction`, `getTransaction`, `getBlock` | ❌ Not started | — | OneKey integration entry point |
+| 2C | `simulateTransaction` + dry-run rBPF | ❌ Not started | — | |
+| 3 | SPL Token Program + `$BB` token mint | ❌ Not started | — | |
+| 4 | Anchor programs (Tier1 Vault, Tier2 Vault, Oracle) | ❌ Not started | — | |
+| 5 | OneKey bridge + co-signing service | ❌ Not started | — | |
+| 6 | Compute budget tightening, mainnet hardening | ❌ Not started | — | |
+
+### What was built vs the plan
+
+**Implemented exactly as planned:** 1A, 1B.1 (native Rust path), 1C (dual-path + lazy migration), Phase 0.
+
+**Different from plan but better:**
+- **1B.2 (rBPF InvokeContext):** The plan included a fallback — "If `InvokeContext` setup is too painful, implement System Program logic directly in Rust." We took the fallback. The `system_transfer` logic in `SvmAccountsDB` is semantically identical to Solana's System Program, but runs without the VM overhead. rBPF VM is wired in Phase 3 for actual BPF `.so` programs.
+- **1D:** Instead of adding `BlackBookSVM` to `ParallelScheduler`, we wired `Arc<SvmAccountsDB>` directly. This gives parallel threads lock-free DashMap reads/writes with zero Mutex contention — better than going through `BlackBookSVM`'s Mutex.
+- **1E:** Added a third test (`test_parallel_lamport_conservation`) beyond the spec's 4 tests, covering concurrent rayon execution on disjoint account pairs.
+
+### Key invariants established (must never regress)
+- `LAMPORTS_PER_BB = 1_000_000_000` — one BB = one billion lamports
+- `RENT_EPOCH_EXEMPT = u64::MAX` — all accounts exempt from rent forever
+- Global conservation: `Σ lamports = constant` across all transfers
+- `cargo build` (no `--features svm`) compiles clean — zero legacy regressions
+- All 20 SVM tests: `cargo test --features svm --test svm_accounts_tests --test svm_runtime_tests --test svm_block_production_tests --test svm_parallel_tests --test svm_invariant_tests`
+
+---
+
+---
+
 ## Phase 0: Pre-Flight Checks (Day 1)
 
 ### 0.1 — Verify Solana Crate Compatibility

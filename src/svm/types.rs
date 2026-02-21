@@ -25,6 +25,7 @@
 // ============================================================================
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use chrono;
 use thiserror::Error;
 
 #[cfg(feature = "svm")]
@@ -301,6 +302,65 @@ impl TransactionExecutionResult {
             error: Some(error),
             compute_units_consumed: 0,
             lamport_deltas: vec![],
+        }
+    }
+}
+
+// ============================================================================
+// STORED TRANSACTION RESULT — Phase 2B ReDB wire format
+// ============================================================================
+
+/// Borsh-serializable transaction result stored in SVM_TX_LOG.
+///
+/// This is the on-disk format for confirmed transactions. `getTransaction`
+/// reads this back and converts it into a Solana-compatible JSON response.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct StoredTransactionResult {
+    /// Transaction signature (base58-encoded).
+    pub signature: String,
+
+    /// Slot in which this transaction was processed.
+    pub slot: u64,
+
+    /// Whether execution succeeded.
+    pub success: bool,
+
+    /// Error message if execution failed (empty string on success).
+    pub error_msg: String,
+
+    /// Compute units actually consumed.
+    pub compute_units_consumed: u64,
+
+    /// Fee charged in lamports (Phase 1: always 0; Phase 6: priority fee market).
+    pub fee: u64,
+
+    /// Accounts involved in this transaction (base58-encoded pubkeys).
+    pub account_keys: Vec<String>,
+
+    /// Net lamport changes per account: (pubkey_b58, delta_i64).
+    pub lamport_deltas: Vec<(String, i64)>,
+
+    /// Block time (Unix timestamp in seconds).
+    pub block_time: i64,
+}
+
+impl StoredTransactionResult {
+    /// Create from a `TransactionExecutionResult` after it has been confirmed.
+    pub fn from_execution(
+        result: &TransactionExecutionResult,
+        slot: u64,
+        account_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            signature: result.tx_id.clone(),
+            slot,
+            success: result.success,
+            error_msg: result.error.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+            compute_units_consumed: result.compute_units_consumed,
+            fee: 0, // Phase 1: no fees
+            account_keys,
+            lamport_deltas: result.lamport_deltas.clone(),
+            block_time: chrono::Utc::now().timestamp(),
         }
     }
 }

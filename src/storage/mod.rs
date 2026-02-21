@@ -399,6 +399,9 @@ impl ConcurrentBlockchain {
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
                 let _ = write_txn.open_table(crate::svm::accounts_db::BLOCKHASH_QUEUE)?;
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_SIGNATURES)?;
+                // Phase 2B tables
+                let _ = write_txn.open_table(crate::svm::accounts_db::SVM_TX_LOG)?;
+                let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ADDR_SIGS)?;
             }
         }
         write_txn.commit()?;

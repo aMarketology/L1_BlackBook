@@ -17,6 +17,9 @@ pub mod vault_manager;
 #[cfg(feature = "svm")]
 pub mod svm;
 
+#[cfg(feature = "svm")]
+pub mod solana_rpc;
+
 // Infrastructure
 #[path = "../protocol/mod.rs"]
 pub mod protocol;

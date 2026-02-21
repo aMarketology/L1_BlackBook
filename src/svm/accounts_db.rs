@@ -74,6 +74,20 @@ pub const BLOCKHASH_QUEUE: TableDefinition<u64, &[u8]> =
 pub const SVM_SIGNATURES: TableDefinition<&[u8], u64> =
     TableDefinition::new("svm_signatures");
 
+// ═══════════════════════════════════════════════════════════════
+// Phase 2B: Transaction log + address index tables
+// ═══════════════════════════════════════════════════════════════
+
+/// Transaction log: Signature (base58 string bytes) → StoredTransactionResult (borsh)
+/// Stores the full execution result for every confirmed transaction.
+pub const SVM_TX_LOG: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("svm_tx_log");
+
+/// Address → signature index: "addr:signature" composite key → slot (u64)
+/// Supports getSignaturesForAddress by prefix scanning for "addr:*".
+pub const SVM_ADDR_SIGS: TableDefinition<&str, u64> =
+    TableDefinition::new("svm_addr_sigs");
+
 // ============================================================================
 // SERDE HELPERS — u64 key tag for hot_state iteration
 // ============================================================================
@@ -170,6 +184,9 @@ impl SvmAccountsDB {
             let _ = write_txn.open_table(SVM_PROGRAMS)?;
             let _ = write_txn.open_table(BLOCKHASH_QUEUE)?;
             let _ = write_txn.open_table(SVM_SIGNATURES)?;
+            // Phase 2B tables
+            let _ = write_txn.open_table(SVM_TX_LOG)?;
+            let _ = write_txn.open_table(SVM_ADDR_SIGS)?;
         }
         write_txn.commit()?;
 
@@ -458,5 +475,149 @@ impl SvmAccountsDB {
             .iter()
             .map(|e| e.value().lamports())
             .fold(0u64, |acc, l| acc.saturating_add(l))
+    }
+
+    // ========================================================================
+    // TRANSACTION LOG — Phase 2B: persistent tx results + address index
+    // ========================================================================
+    //
+    // These methods write to SVM_TX_LOG, SVM_SIGNATURES, and SVM_ADDR_SIGS
+    // tables. They are called after a transaction has been confirmed and the
+    // block is committed.
+    //
+    // FLOW:
+    //   1. execute_transfer() builds TransactionExecutionResult (in-memory)
+    //   2. end_of_block() flushes accounts (existing)
+    //   3. store_transaction_result() persists the tx log + signature index
+    //      (called from the RPC sendTransaction path after execution)
+    //
+    // For getTransaction: read from SVM_TX_LOG by signature.
+    // For getSignaturesForAddress: prefix-scan SVM_ADDR_SIGS for "addr:*".
+
+    /// Persist a confirmed transaction result to the tx log and address index.
+    ///
+    /// This makes the transaction discoverable via `getTransaction` and
+    /// `getSignaturesForAddress`. The write is a single ACID ReDB transaction.
+    pub fn store_transaction_result(
+        &self,
+        result: &crate::svm::types::StoredTransactionResult,
+    ) -> Result<(), SvmError> {
+        let serialized = borsh::to_vec(result)
+            .map_err(|e| SvmError::SerializationError(e.to_string()))?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            // 1. Store in tx log: signature → full result
+            let mut tx_log = write_txn.open_table(SVM_TX_LOG)?;
+            tx_log.insert(result.signature.as_str(), serialized.as_slice())?;
+
+            // 2. Store in signature dedup table
+            let mut sigs = write_txn.open_table(SVM_SIGNATURES)?;
+            let sig_bytes = result.signature.as_bytes();
+            sigs.insert(sig_bytes, result.slot)?;
+
+            // 3. Index each involved address → this signature
+            let mut addr_sigs = write_txn.open_table(SVM_ADDR_SIGS)?;
+            for addr in &result.account_keys {
+                // Composite key: "addr:signature" so we can prefix-scan by address
+                let composite = format!("{}:{}", addr, result.signature);
+                addr_sigs.insert(composite.as_str(), result.slot)?;
+            }
+        }
+        write_txn.commit()?;
+
+        debug!(
+            signature = %result.signature,
+            slot = result.slot,
+            success = result.success,
+            accounts = result.account_keys.len(),
+            "Transaction result persisted to ReDB"
+        );
+        Ok(())
+    }
+
+    /// Look up a confirmed transaction by its signature (base58).
+    ///
+    /// Returns `None` if the transaction has not been confirmed yet or
+    /// does not exist in the log.
+    pub fn get_transaction_result(
+        &self,
+        signature: &str,
+    ) -> Result<Option<crate::svm::types::StoredTransactionResult>, SvmError> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+        let table = read_txn.open_table(SVM_TX_LOG)
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+
+        match table.get(signature) {
+            Ok(Some(val_guard)) => {
+                let bytes: &[u8] = val_guard.value();
+                let stored = crate::svm::types::StoredTransactionResult::try_from_slice(bytes)
+                    .map_err(|e| SvmError::SerializationError(e.to_string()))?;
+                Ok(Some(stored))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(SvmError::StorageError(e.to_string())),
+        }
+    }
+
+    /// Check if a signature has already been processed (persistent dedup).
+    ///
+    /// Complements the in-memory `seen_tx_ids` in BlackBookSVM. This catches
+    /// replays across restarts where the in-memory set has been cleared.
+    pub fn signature_exists(&self, signature: &str) -> bool {
+        let Ok(read_txn) = self.db.begin_read() else { return false };
+        let Ok(table) = read_txn.open_table(SVM_TX_LOG) else { return false };
+        matches!(table.get(signature), Ok(Some(_)))
+    }
+
+    /// Get all transaction signatures for a given address (base58-encoded pubkey).
+    ///
+    /// Returns signatures ordered by slot (newest first), up to `limit` entries.
+    /// Supports the `getSignaturesForAddress` RPC method.
+    pub fn get_signatures_for_address(
+        &self,
+        address: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::svm::types::StoredTransactionResult>, SvmError> {
+        let read_txn = self.db.begin_read()
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+        let addr_table = read_txn.open_table(SVM_ADDR_SIGS)
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+        let tx_table = read_txn.open_table(SVM_TX_LOG)
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+
+        // Prefix scan: all keys starting with "address:"
+        let prefix = format!("{}:", address);
+        let mut signatures = Vec::new();
+
+        // ReDB range scan: from "addr:" to "addr;", where ';' is one past ':'
+        let range_end = format!("{};", address);
+        let range = addr_table.range(prefix.as_str()..range_end.as_str())
+            .map_err(|e| SvmError::StorageError(e.to_string()))?;
+
+        for entry in range {
+            let (key_guard, _slot) = entry.map_err(|e| SvmError::StorageError(e.to_string()))?;
+            let composite_key: &str = key_guard.value();
+
+            // Extract the signature from "addr:signature"
+            if let Some(sig) = composite_key.strip_prefix(&prefix) {
+                // Look up the full tx result
+                if let Ok(Some(val_guard)) = tx_table.get(sig) {
+                    let bytes: &[u8] = val_guard.value();
+                    if let Ok(stored) = crate::svm::types::StoredTransactionResult::try_from_slice(bytes) {
+                        signatures.push(stored);
+                    }
+                }
+            }
+
+            if signatures.len() >= limit {
+                break;
+            }
+        }
+
+        // Sort by slot descending (newest first) — Solana convention
+        signatures.sort_by(|a, b| b.slot.cmp(&a.slot));
+        Ok(signatures)
     }
 }
