@@ -19,13 +19,9 @@
 //       Rounding: floor (truncate) — the sender never sends more than intended.
 //
 // ============================================================================
-
-#[cfg(feature = "svm")]
 use solana_sdk::{hash::Hash, pubkey::Pubkey};
 
 use crate::svm::types::{SvmError, LAMPORTS_PER_BB};
-
-#[cfg(feature = "svm")]
 use crate::svm::runtime::TransferRequest;
 
 // ============================================================================
@@ -37,7 +33,6 @@ use crate::svm::runtime::TransferRequest;
 /// The block producer inspects this and sends work to the right path.
 pub enum TxRoute {
     /// Hand to SVM (Phase 1: transfers only).
-    #[cfg(feature = "svm")]
     Svm(TransferRequest),
 
     /// Keep on the legacy path (vault ops, DIME, etc.)
@@ -61,7 +56,6 @@ pub enum TxRoute {
 ///   - `TxRoute::Svm(_)` if the tx can execute through the SVM.
 ///   - `TxRoute::Legacy` if the tx must use the existing execution path.
 ///   - `TxRoute::Reject(_)` if the tx is structurally invalid.
-#[cfg(feature = "svm")]
 pub fn route_transaction(
     tx_id: &str,
     from_pubkey: &Pubkey,
@@ -131,7 +125,6 @@ pub fn route_transaction(
 }
 
 /// Parse a 64-character hex string into a Pubkey.
-#[cfg(feature = "svm")]
 fn hex_to_pubkey(s: &str) -> Result<Pubkey, String> {
     let bytes = hex::decode(s).map_err(|e| format!("hex decode: {}", e))?;
     if bytes.len() != 32 {

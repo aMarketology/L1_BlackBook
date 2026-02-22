@@ -4,12 +4,12 @@ use serde_json::json;
 use std::sync::Arc;
 use bip39::Mnemonic;
 use rand::rngs::OsRng;
-use frost_ed25519 as frost;
+use sharks::{Sharks, Share};
+use ed25519_dalek::{SigningKey as Ed25519SigningKey, Signer};
 use tracing::{info, warn, error};
 use super::security;
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use zeroize::{Zeroize, ZeroizeOnDrop};
-use base64::prelude::*;
 
 use crate::storage::ConcurrentBlockchain;
 
@@ -139,226 +139,168 @@ pub async fn create_hybrid_wallet(
     headers: HeaderMap,
     Json(req): Json<CreateWalletRequest>,
 ) -> Result<Json<CreateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // 0. Verify Auth (Log only for now)
     if let Ok(claims) = validate_jwt(&headers) {
         info!("🔐 Authenticated CreateWallet: {}", claims.sub);
     } else {
-        warn!("⚠️  Unauthenticated CreateWallet! Check logs for JWT failure details.");
+        warn!("⚠️  Unauthenticated CreateWallet!");
     }
 
-    // 1. Generate Mnemonic (BIP-39 Standard)
+    // 1. BIP-39 mnemonic (24 words — user can import this into any SVM wallet)
     let mut rng = OsRng;
     let mut entropy = [0u8; 32];
     use rand::RngCore;
     rng.fill_bytes(&mut entropy);
     let mnemonic = Mnemonic::from_entropy(&entropy).map_err(|e| err(e.to_string()))?;
-    
-    // SECURITY CRITICAL: Wipe raw entropy from memory immediately
     entropy.zeroize();
-    
-    // 2. Bootstrap FROST Keys (2-of-3 Shamir Secret Sharing)
-    let max_signers = 3;
-    let min_signers = 2;
-    let (shares, pub_key_package) = frost::keys::generate_with_dealer(
-        max_signers, min_signers, frost::keys::IdentifierList::Default, &mut rng
-    ).map_err(|e| err(e.to_string()))?;
 
-    // 3. Distribute Shares (ID 1=A, 2=B, 3=C per BlackBook spec)
-    let id1 = frost::Identifier::try_from(1u16).unwrap();
-    let id2 = frost::Identifier::try_from(2u16).unwrap();
-    let id3 = frost::Identifier::try_from(3u16).unwrap();
-    
-    let share_a = shares.get(&id1).unwrap(); // User's Active shard
-    let share_b = shares.get(&id2).unwrap(); // Cloud shard
-    let share_c = shares.get(&id3).unwrap(); // Recovery shard
+    // 2. Derive 64-byte BIP-39 seed, take first 32 bytes as Ed25519 keypair seed
+    let bip39_seed_full = mnemonic.to_seed("");
+    let mut seed_32: [u8; 32] = bip39_seed_full[..32].try_into().unwrap();
 
-    // 4. Public Key Setup
-    let verifying_key = pub_key_package.verifying_key();
-    let pub_key_bytes = verifying_key.serialize().unwrap();
-    let wallet_id = hex::encode(&pub_key_bytes);
+    // 3. Derive standard Ed25519 keypair (Solana / SVM compatible)
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let verifying_key = signing_key.verifying_key();
+    let pub_key_bytes = verifying_key.to_bytes();
+    let address = bs58::encode(&pub_key_bytes).into_string(); // Solana-format base58
+    let wallet_id = address.clone();
 
-    // 5. SHARD B (Cloud): Encrypt with Server Master Key (At-Rest Encryption)
-    let share_b_bytes = serde_json::to_vec(&share_b).unwrap();
+    // 4. Shamir 2-of-3 split the 32-byte seed
+    //    Any 2 of the 3 shares reconstruct the full seed → keypair → sign transactions
+    //    This is importable: reconstruct seed → base58 privkey → import into Nightly/svmseek
+    let shark = Sharks(2u8);
+    let raw_shares: Vec<Vec<u8>> = shark
+        .dealer(&seed_32[..])
+        .take(3)
+        .map(|s| Vec::from(&s))
+        .collect();
+    seed_32.zeroize();
+
+    // 5. Share B — encrypt with server master key, store in ReDB
     let master_key = get_server_master_key()?;
-    let encrypted_share_b = security::encrypt_with_secret(&master_key, &share_b_bytes)
+    let encrypted_share_b = security::encrypt_with_secret(&master_key, &raw_shares[1])
         .map_err(|e| err(format!("Failed to encrypt Share B: {}", e)))?;
-    
-    let container = ShardBContainer {
-        shard_b_data: encrypted_share_b, // Now contains salt:nonce:ciphertext
-    };
+    let container = ShardBContainer { shard_b_data: encrypted_share_b };
     let container_bytes = serde_json::to_vec(&container).unwrap();
-
-    // Store Container in ReDB
     state.blockchain.store_frost_share_b(&wallet_id, &container_bytes)
-        .map_err(|e| err(format!("Failed to store Share B in ReDB: {}", e)))?;
-
-    info!("✅ Shard B stored in ReDB for wallet {}", wallet_id);
-
-    // Store PublicKeyPackage
-    let pk_pkg_bytes = serde_json::to_vec(&pub_key_package).unwrap();
-    state.blockchain.store_frost_pub_key_package(&wallet_id, &pk_pkg_bytes)
-        .map_err(|e| err(format!("Failed to store PublicKeyPackage: {}", e)))?;
+        .map_err(|e| err(format!("Failed to store Share B: {}", e)))?;
     state.blockchain.store_frost_pub_key(&wallet_id, &pub_key_bytes)
         .map_err(|e| err(format!("Failed to store public key: {}", e)))?;
+    info!("✅ Share B stored for wallet {}", wallet_id);
 
-    // 6. SHARD A (Active): Encrypt with Password
-    let mut share_a_bytes = serde_json::to_vec(share_a).unwrap();
+    // 6. Share A — encrypt with user password, return to client for localStorage/Supabase
     let (final_share_a, is_encrypted) = if let Some(password) = &req.password {
-        match security::encrypt_with_secret(password, &share_a_bytes) {
-            Ok(ciphertext) => (ciphertext, true),
-            Err(e) => return Err(err(format!("Share A encryption failed: {}", e)))
+        match security::encrypt_with_secret(password, &raw_shares[0]) {
+            Ok(ct) => (ct, true),
+            Err(e) => return Err(err(format!("Share A encryption failed: {}", e))),
         }
     } else {
-        warn!("⚠️ No Password provided! Returning Share A unencrypted (NOT RECOMMENDED)");
-        (hex::encode(&share_a_bytes), false)
+        warn!("⚠️  No password — Share A returned unencrypted");
+        (hex::encode(&raw_shares[0]), false)
     };
-    // Wipe raw Share A
-    share_a_bytes.zeroize();
-
-    // SYNC SHARD A TO SUPABASE
     if let Ok(claims) = validate_jwt(&headers) {
-        if let Err(e) = state.supabase.store_encrypted_shard_a(&claims.sub, &req.username, &wallet_id, &wallet_id, &final_share_a).await {
-             error!("❌ Failed to sync Share A to Supabase: {}", e);
-             return Err(err(format!("Failed to sync Shard A: {}", e)));
+        if let Err(e) = state.supabase
+            .store_encrypted_shard_a(&claims.sub, &req.username, &wallet_id, &wallet_id, &final_share_a)
+            .await
+        {
+            error!("❌ Failed to sync Share A to Supabase: {}", e);
         } else {
-             info!("☁️  Synced Share A to Supabase User Vault");
+            info!("☁️  Share A synced to Supabase");
         }
     }
 
-    // 7. SHARD C (Recovery): Return raw
-    // Note: Shard C is designed to be printed/written down, so it leaves the server "naked" 
-    // but protected by physical security (paper/safe). 
-    let mut share_c_bytes = serde_json::to_vec(share_c).unwrap();
-    let share_c_hex = hex::encode(&share_c_bytes);
-    share_c_bytes.zeroize();
-
-    // SYNC SHARD C TO SUPABASE (Hidden Vault) --> REPLACED WITH HASHICORP VAULT
+    // 7. Share C — return raw hex (user writes offline / HashiCorp Vault backup)
+    let share_c_hex = hex::encode(&raw_shares[2]);
     if let Ok(claims) = validate_jwt(&headers) {
         if let Err(e) = state.vault.store_shard_c(&claims.sub, &share_c_hex).await {
-             error!("❌ Failed to sync Share C to HashiCorp Vault: {}", e);
-             warn!("⚠️  Continuing wallet creation without Vault backup. Shard C will be in JSON only.");
-             // Non-blocking: Allow wallet creation to proceed
+            warn!("⚠️  HashiCorp Vault backup skipped: {}", e);
         } else {
-             info!("🔒 Synced Share C to HashiCorp Vault Secrets for {}", claims.sub);
+            info!("🔒 Share C stored in HashiCorp Vault");
         }
-    } else {
-        warn!("⚠️  Skipping Vault Storage for Shard C (Unauthenticated)");
     }
 
-    info!("✅ BlackBook Wallet created: {}", wallet_id);
-
-    let response = CreateResponse {
+    info!("✅ BlackBook wallet created: {} (SVM-compatible Ed25519)", wallet_id);
+    Ok(Json(CreateResponse {
         wallet_id: wallet_id.clone(),
-        mnemonic: mnemonic.to_string(), // Mnemonic string will be dropped after response serialization
+        mnemonic: mnemonic.to_string(),
         share_a: final_share_a,
         share_a_is_encrypted: is_encrypted,
         share_c: share_c_hex,
-        public_key: wallet_id.clone(),
+        public_key: bs58::encode(&pub_key_bytes).into_string(),
         address: wallet_id,
-    };
-    
-    // Explicitly drop mnemonic to ensure destruction (Rust ownership rules help here)
-    // The 'mnemonic' variable is consumed into 'response' and then JSON serialized.
-    // Ideally we would overwrite the string memory, but standard String/BIP39 impl 
-    // makes that hard without unsafe code. We rely on entropy zeroization above.
-
-    Ok(Json(response))
+    }))
 }
 
 pub async fn transfer_with_sss(
     State(state): State<Arc<UnifiedWalletState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(req): Json<SSSTransferRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // Validate input
     if req.amount <= 0.0 {
         return Err(err("Amount must be positive"));
     }
-
-    // Check balance
     let balance = state.blockchain.get_balance(&req.from_wallet_id);
     if balance < req.amount {
         return Err(err(format!("Insufficient balance: {} < {}", balance, req.amount)));
     }
 
-    // 1. DECRYPT Share A (Client encrypted with password)
-    let mut share_a_decrypted = security::decrypt_with_secret(&req.password, &req.share_a)
+    // 1. Decrypt Share A (user provides encrypted blob + password)
+    let mut share_a_bytes = security::decrypt_with_secret(&req.password, &req.share_a)
         .map_err(|e| err(format!("Failed to decrypt Share A: {}", e)))?;
-    let share_a: frost::keys::SecretShare = serde_json::from_slice(&share_a_decrypted)
-        .map_err(|_| err("Malformed Share A after decryption"))?;
 
-    // 2. FETCH Share B Container
+    // 2. Fetch + decrypt Share B from ReDB
     let container_bytes = state.blockchain.get_frost_share_b(&req.from_wallet_id)
         .map_err(|e| err(format!("Share B not found: {}", e)))?;
-    
     let container: ShardBContainer = serde_json::from_slice(&container_bytes)
         .map_err(|_| err("Shard B corrupted"))?;
-
-    // 3. DECRYPT Share B (Server Master Key) - with backward compatibility
     let master_key = get_server_master_key()?;
-    let share_b_bytes = match security::decrypt_with_secret(&master_key, &container.shard_b_data) {
-        Ok(decrypted) => decrypted,
-        Err(_) => {
-            // Fallback: Try Base64 decode for old wallets (before master key encryption)
-            warn!("⚠️  Shard B not encrypted - using legacy Base64 format");
-            BASE64_STANDARD.decode(&container.shard_b_data)
-                .map_err(|_| err("Failed to decrypt Shard B (Server Key)"))?
-        }
-    };
-    
-    let share_b: frost::keys::SecretShare = serde_json::from_slice(&share_b_bytes)
+    let mut share_b_bytes = security::decrypt_with_secret(&master_key, &container.shard_b_data)
+        .map_err(|e| err(format!("Failed to decrypt Share B: {}", e)))?;
+
+    // 3. Reconstruct 32-byte seed from 2 Shamir shares
+    let shark = Sharks(2u8);
+    let share_a = Share::try_from(share_a_bytes.as_slice())
+        .map_err(|_| err("Malformed Share A"))?;
+    let share_b = Share::try_from(share_b_bytes.as_slice())
         .map_err(|_| err("Malformed Share B"))?;
+    let mut seed_bytes = shark
+        .recover(&[share_a, share_b])
+        .map_err(|e| err(format!("Share reconstruction failed: {}", e)))?;
+    if seed_bytes.len() < 32 {
+        seed_bytes.zeroize();
+        return Err(err("Reconstructed seed too short"));
+    }
+    let mut seed_32: [u8; 32] = seed_bytes[..32].try_into().unwrap();
 
-    // 4. Load Public Key Package from ReDB
-    let pk_pkg_bytes = state.blockchain.get_frost_pub_key_package(&req.from_wallet_id)
-        .map_err(|e| err(format!("PublicKeyPackage not found: {}", e)))?;
-    let pub_key_package: frost::keys::PublicKeyPackage = serde_json::from_slice(&pk_pkg_bytes)
-        .map_err(|_| err("Bad PublicKeyPackage format"))?;
+    // 4. Derive standard Ed25519 signing key and verify it matches the wallet address
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+    if derived_address != req.from_wallet_id {
+        seed_32.zeroize();
+        seed_bytes.zeroize();
+        return Err(err("Share reconstruction produced wrong address — wrong shares or password"));
+    }
 
-    // 5. Construct KeyPackages
-    let pkg_a = frost::keys::KeyPackage::try_from(share_a.clone()).map_err(|e| err(e.to_string()))?;
-    let pkg_b = frost::keys::KeyPackage::try_from(share_b.clone()).map_err(|e| err(e.to_string()))?;
-
-    // 6. Sign Transaction with FROST
-    let mut rng = OsRng;
+    // 5. Sign the transfer message
     let tx_message = format!("{}:{}:{}", req.from_wallet_id, req.to_address, req.amount);
-    let message = tx_message.as_bytes();
+    let signature = signing_key.sign(tx_message.as_bytes());
+    let sig_hex = hex::encode(signature.to_bytes());
 
-    // Round 1: Commitments
-    let (nonces_a, commitments_a) = frost::round1::commit(pkg_a.signing_share(), &mut rng);
-    let (nonces_b, commitments_b) = frost::round1::commit(pkg_b.signing_share(), &mut rng);
+    // Zeroize key material immediately after signing
+    seed_32.zeroize();
+    seed_bytes.zeroize();
+    share_a_bytes.zeroize();
+    share_b_bytes.zeroize();
 
-    let mut commitments_map = std::collections::BTreeMap::new();
-    commitments_map.insert(*share_a.identifier(), commitments_a);
-    commitments_map.insert(*share_b.identifier(), commitments_b);
-    
-    let signing_package = frost::SigningPackage::new(commitments_map, message);
+    info!("✅ Transfer signed for wallet {}", req.from_wallet_id);
 
-    // Round 2: Signature Shares
-    let sig_share_a = frost::round2::sign(&signing_package, &nonces_a, &pkg_a).map_err(|e| err(e.to_string()))?;
-    let sig_share_b = frost::round2::sign(&signing_package, &nonces_b, &pkg_b).map_err(|e| err(e.to_string()))?;
-
-    let mut sig_shares = std::collections::BTreeMap::new();
-    sig_shares.insert(*share_a.identifier(), sig_share_a);
-    sig_shares.insert(*share_b.identifier(), sig_share_b);
-
-    let signature = frost::aggregate(&signing_package, &sig_shares, &pub_key_package)
-        .map_err(|e| err(e.to_string()))?;
-
-    info!("✅ Transaction signed with FROST for wallet {}", req.from_wallet_id);
-
-    // 7. Execute Transfer on Blockchain
+    // 6. Execute transfer on-chain
     state.blockchain.transfer(&req.from_wallet_id, &req.to_address, req.amount)
         .map_err(|e| err(format!("Transfer failed: {}", e)))?;
-
     info!("💸 Transfer: {} → {} : {} BB", req.from_wallet_id, req.to_address, req.amount);
 
-    // Zeroize sensitive data
-    share_a_decrypted.zeroize();
-    
     Ok(Json(json!({
         "success": true,
-        "signature": hex::encode(signature.serialize().unwrap()),
+        "signature": sig_hex,
         "from": req.from_wallet_id,
         "to": req.to_address,
         "amount": req.amount,

@@ -1,0 +1,19 @@
+{
+  "version": "2.0-shamir",
+  "created": "2026-02-21",
+  "user": {
+    "username": "Apollo_v2",
+    "password": "ApolloPass2026!",
+    "pin": "7890",
+    "daily_limit": 25000
+  },
+  "wallet": {
+    "wallet_id": "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb",
+    "address": "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb",
+    "public_key": "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb",
+    "mnemonic": "dawn document hub fitness cliff rely dumb future mail easily solar miracle rug trip steak tiger valve damage rich clever exit bring pair giant",
+    "share_a": "QvDxphMkvCQeP8yfYyP/cQ:6bb182943226443d33bb8827:dd218cc8503ba1558d278fe4ac9e86b8aeeac41f5436fd0f6f60c8616ece717f1df6f4fccd11fd8afcf739fce92664ec6d",
+    "share_a_is_encrypted": true,
+    "share_c": "032b55e6d93177069ed2c187d19bd1b9a3c020bbc7c67ff210287337ea1a2c3816"
+  }
+}

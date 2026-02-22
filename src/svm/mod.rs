@@ -25,6 +25,7 @@ pub mod types;
 pub mod accounts_db;
 pub mod runtime;
 pub mod tx_adapter;
+pub mod spl_token;
 
 // Re-export the most-used types at the svm:: level for ergonomic imports.
 pub use types::{
@@ -47,8 +48,23 @@ pub use accounts_db::{
     SVM_TX_LOG,
     SVM_ADDR_SIGS,
 };
-
-#[cfg(feature = "svm")]
 pub use runtime::{BlackBookSVM, TransferRequest, BlockhashQueue};
 
 pub use tx_adapter::{bb_to_lamports, lamports_to_bb};
+
+// Re-export SPL Token types and helpers
+pub use spl_token::{
+    SplTokenEngine,
+    usdc_mint_address,
+    usdc_mint_bytes,
+    derive_ata_address,
+    USDC_DECIMALS,
+    USDC_UNIT,
+    SPL_TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    MintLayout,
+    TokenAccountLayout,
+    MintResult,
+    TransferTokenResult,
+    TokenAccountInfo,
+};

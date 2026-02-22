@@ -605,7 +605,6 @@ pub struct ParallelScheduler {
     /// SVM accounts database — when set, Transfer transactions execute via
     /// SvmAccountsDB.system_transfer() instead of the legacy f64 balance map.
     /// DashMap hot_state is lock-free so parallel threads never contend here.
-    #[cfg(feature = "svm")]
     svm_db: Option<Arc<crate::svm::SvmAccountsDB>>,
 }
 
@@ -625,14 +624,12 @@ impl ParallelScheduler {
             current_batch_size: AtomicU64::new(OPTIMAL_BATCH_SIZE as u64),
             total_processed: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
-            #[cfg(feature = "svm")]
             svm_db: None,
         }
     }
 
     /// Attach an SVM accounts database so Transfer transactions go through
     /// the lamport-based execution path instead of the legacy f64 map.
-    #[cfg(feature = "svm")]
     pub fn with_svm(mut self, db: Arc<crate::svm::SvmAccountsDB>) -> Self {
         self.svm_db = Some(db);
         self
@@ -697,15 +694,12 @@ impl ParallelScheduler {
     pub fn execute_batch_with_locks(&self, batch: Vec<Transaction>, balances: &DashMap<String, f64>) -> Vec<TransactionResult> {
         let len = batch.len();
         let lm = self.lock_manager.clone();
-
-        #[cfg(feature = "svm")]
         let svm_db_ref = self.svm_db.clone();
 
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
                 while !lm.try_acquire_locks(tx) { std::hint::spin_loop(); }
                 let result = {
-                    #[cfg(feature = "svm")]
                     {
                         match (&tx.tx_type, &svm_db_ref) {
                             (TransactionType::Transfer, Some(db)) =>
@@ -713,8 +707,6 @@ impl ParallelScheduler {
                             _ => Self::execute_single(tx, balances),
                         }
                     }
-                    #[cfg(not(feature = "svm"))]
-                    { Self::execute_single(tx, balances) }
                 };
                 lm.release_locks(tx);
                 result
@@ -728,7 +720,6 @@ impl ParallelScheduler {
     /// Execute a single Transfer via SvmAccountsDB (lamport path).
     /// Address strings are mapped to Pubkeys via SHA-256 so they stay
     /// consistent with BlockProducer's `legacy_addr_to_pubkey`.
-    #[cfg(feature = "svm")]
     fn execute_single_svm(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
         use sha2::{Sha256, Digest};
         use solana_sdk::pubkey::Pubkey;

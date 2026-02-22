@@ -165,6 +165,10 @@ pub struct PoRSnapshot {
     pub total_reserves: u64,
     /// Total USDT backing (should be total_reserves / 10)
     pub total_usdt_backing: u64,
+    /// Total USDC SPL token supply on BlackBook L1
+    pub usdc_spl_supply: u64,
+    /// Number of USDC token accounts (ATAs)
+    pub usdc_token_accounts: usize,
     /// The full Merkle tree (stored for proof generation)
     #[serde(skip)]
     pub tree: Option<MerkleTree>,
@@ -352,6 +356,22 @@ impl PoRManager {
         balances: HashMap<String, u64>,
         total_usdt_backing: u64,
     ) -> PoRSnapshot {
+        self.take_snapshot_with_usdc(snapshot_id, timestamp, balances, total_usdt_backing, 0, 0)
+    }
+
+    /// Take a new snapshot including USDC SPL token reserve data.
+    ///
+    /// `usdc_spl_supply` — total USDC supply from the SPL Token mint
+    /// `usdc_token_accounts` — number of ATAs holding USDC
+    pub fn take_snapshot_with_usdc(
+        &mut self,
+        snapshot_id: u64,
+        timestamp: u64,
+        balances: HashMap<String, u64>,
+        total_usdt_backing: u64,
+        usdc_spl_supply: u64,
+        usdc_token_accounts: usize,
+    ) -> PoRSnapshot {
         // Convert balances to leaves
         let leaves: Vec<AccountLeaf> = balances
             .into_iter()
@@ -384,6 +404,8 @@ impl PoRManager {
             total_accounts,
             total_reserves,
             total_usdt_backing,
+            usdc_spl_supply,
+            usdc_token_accounts,
             tree: Some(tree),
         };
         

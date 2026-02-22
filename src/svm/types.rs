@@ -27,10 +27,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono;
 use thiserror::Error;
-
-#[cfg(feature = "svm")]
 use solana_sdk::account::AccountSharedData;
-#[cfg(feature = "svm")]
 use solana_sdk::pubkey::Pubkey;
 
 // ============================================================================
@@ -140,8 +137,6 @@ impl StoredAccount {
 // ============================================================================
 // CONVERSIONS — AccountSharedData ↔ StoredAccount
 // ============================================================================
-
-#[cfg(feature = "svm")]
 impl From<&AccountSharedData> for StoredAccount {
     fn from(acc: &AccountSharedData) -> Self {
         use solana_sdk::account::ReadableAccount;
@@ -155,8 +150,6 @@ impl From<&AccountSharedData> for StoredAccount {
         }
     }
 }
-
-#[cfg(feature = "svm")]
 impl From<StoredAccount> for AccountSharedData {
     fn from(stored: StoredAccount) -> Self {
         use solana_sdk::account::Account;

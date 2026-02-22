@@ -311,6 +311,77 @@ pub trait BlackBookRpc {
         address: String,
         config: Option<GetSignaturesConfig>,
     ) -> RpcResult<Vec<RpcSignatureInfo>>;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 2C — Token & fee methods (OneKey / Phantom compatibility)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// SPL Token accounts owned by `pubkey` matching a filter.
+    #[method(name = "getTokenAccountsByOwner")]
+    async fn get_token_accounts_by_owner(
+        &self,
+        pubkey: String,
+        filter: serde_json::Value,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<serde_json::Value>>>;
+
+    /// Get the total supply of an SPL token mint.
+    #[method(name = "getTokenSupply")]
+    async fn get_token_supply(
+        &self,
+        mint: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>>;
+
+    /// Get the token balance of a specific token account (ATA).
+    #[method(name = "getTokenAccountBalance")]
+    async fn get_token_account_balance(
+        &self,
+        account: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>>;
+
+    /// Fee the network would charge for a given message.
+    #[method(name = "getFeeForMessage")]
+    async fn get_fee_for_message(
+        &self,
+        message: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<Option<u64>>>;
+
+    /// Recent prioritization fees — empty on BlackBook L1.
+    #[method(name = "getRecentPrioritizationFees")]
+    async fn get_recent_prioritization_fees(
+        &self,
+        addresses: Option<Vec<String>>,
+    ) -> RpcResult<Vec<serde_json::Value>>;
+
+    /// Check if blockhashes are still valid.
+    #[method(name = "isBlockhashValid")]
+    async fn is_blockhash_valid(
+        &self,
+        blockhash: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<bool>>;
+
+    /// Returns identity pubkey of the node.
+    #[method(name = "getIdentity")]
+    async fn get_identity(&self) -> RpcResult<serde_json::Value>;
+
+    /// Supply info (total, circulating, non-circulating).
+    #[method(name = "getSupply")]
+    async fn get_supply(
+        &self,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>>;
+
+    /// Signature statuses for one or more tx signatures.
+    #[method(name = "getSignatureStatuses")]
+    async fn get_signature_statuses(
+        &self,
+        signatures: Vec<String>,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<Vec<Option<serde_json::Value>>>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,7 +402,7 @@ impl BlackBookRpcImpl {
         svm:          Arc<Mutex<BlackBookSVM>>,
         current_slot: Arc<AtomicU64>,
     ) -> Self {
-        // Compute genesis hash once at startup — same bytes as BlockProducer
+        // Compute genesis hash once at startup — BlackBook L1 identity
         let genesis_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
         let genesis_hash = bs58::encode(genesis_bytes).into_string();
 
@@ -389,23 +460,25 @@ impl BlackBookRpcImpl {
 #[async_trait::async_trait]
 impl BlackBookRpcServer for BlackBookRpcImpl {
     async fn get_health(&self) -> RpcResult<String> {
+        info!("📡 RPC ← getHealth");
         Ok("ok".into())
     }
 
     async fn get_version(&self) -> RpcResult<RpcVersionInfo> {
+        info!("📡 RPC ← getVersion");
         Ok(RpcVersionInfo {
             solana_core: "BB-5.0.0-svm".into(),
-            // Non-zero feature_set — wallets use this to detect cluster capabilities.
-            // BB-L1 epoch 1: 0xBB500000
             feature_set: 0xBB50_0000,
         })
     }
 
     async fn get_genesis_hash(&self) -> RpcResult<String> {
+        info!("📡 RPC ← getGenesisHash");
         Ok(self.genesis_hash.clone())
     }
 
     async fn get_slot(&self) -> RpcResult<u64> {
+        info!("📡 RPC ← getSlot → {}", self.slot());
         Ok(self.slot())
     }
 
@@ -416,6 +489,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     async fn get_balance(&self, pubkey: String) -> RpcResult<RpcResponse<u64>> {
         let pk = Self::parse_pubkey(&pubkey)?;
         let lamports = self.svm_db.get_lamports(&pk);
+        info!("📡 RPC ← getBalance({pubkey}) → {lamports} lamports");
         Ok(RpcResponse { context: self.ctx(), value: lamports })
     }
 
@@ -424,6 +498,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         pubkey: String,
         _config: Option<RpcAccountInfoConfig>,
     ) -> RpcResult<RpcResponse<Option<UiAccount>>> {
+        info!("📡 RPC ← getAccountInfo({pubkey})");
         let pk = Self::parse_pubkey(&pubkey)?;
         let account = self.svm_db.get_account(&pk);
 
@@ -448,6 +523,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     }
 
     async fn get_latest_blockhash(&self) -> RpcResult<RpcResponse<RpcBlockhash>> {
+        info!("📡 RPC ← getLatestBlockhash");
         let hash = self.latest_blockhash();
         let slot  = self.slot();
         Ok(RpcResponse {
@@ -460,6 +536,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     }
 
     async fn get_epoch_info(&self) -> RpcResult<RpcEpochInfo> {
+        info!("📡 RPC ← getEpochInfo");
         let slot       = self.slot();
         let epoch      = slot / SLOTS_PER_EPOCH;
         let slot_index = slot % SLOTS_PER_EPOCH;
@@ -742,6 +819,259 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
 
         Ok(infos)
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 2C — Token & fee stubs (OneKey / Phantom compatibility)
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn get_token_accounts_by_owner(
+        &self,
+        pubkey: String,
+        filter: serde_json::Value,
+        _config: Option<RpcAccountInfoConfig>,
+    ) -> RpcResult<RpcResponse<Vec<serde_json::Value>>> {
+        info!("📡 RPC ← getTokenAccountsByOwner({pubkey})");
+
+        use crate::svm::spl_token::{SplTokenEngine, usdc_mint_bytes, SPL_TOKEN_PROGRAM_ID, USDC_DECIMALS};
+
+        // Parse the wallet pubkey
+        let wallet_bytes = bs58::decode(&pubkey)
+            .into_vec()
+            .map_err(|_| error_invalid_params("Invalid base58 pubkey"))?;
+        if wallet_bytes.len() != 32 {
+            return Err(error_invalid_params("Pubkey must be 32 bytes"));
+        }
+        let mut wallet_arr = [0u8; 32];
+        wallet_arr.copy_from_slice(&wallet_bytes);
+        let wallet_pk = Pubkey::new_from_array(wallet_arr);
+
+        // Determine which mint to filter by.
+        // Solana clients send: { "mint": "<base58>" } or { "programId": "<base58>" }
+        let mint_bytes = if let Some(mint_str) = filter.get("mint").and_then(|v| v.as_str()) {
+            let mb = bs58::decode(mint_str).into_vec()
+                .map_err(|_| error_invalid_params("Invalid mint base58"))?;
+            if mb.len() != 32 {
+                return Err(error_invalid_params("Mint must be 32 bytes"));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&mb);
+            arr
+        } else {
+            // Default to USDC mint (or return all known token accounts)
+            usdc_mint_bytes()
+        };
+
+        let accounts = SplTokenEngine::get_token_accounts_for_owner(
+            &self.svm_db,
+            &mint_bytes,
+            &wallet_pk,
+        );
+
+        // Format response exactly like Solana's getTokenAccountsByOwner
+        let value: Vec<serde_json::Value> = accounts.into_iter().map(|acct| {
+            let raw_base64 = B64.encode(&acct.raw_data);
+            serde_json::json!({
+                "pubkey": acct.address,
+                "account": {
+                    "data": [raw_base64, "base64"],
+                    "executable": false,
+                    "lamports": 1_000_000_000u64,
+                    "owner": bs58::encode(SPL_TOKEN_PROGRAM_ID).into_string(),
+                    "rentEpoch": 18446744073709551615u64,
+                    "space": 165,
+                },
+                "parsed": {
+                    "info": {
+                        "isNative": false,
+                        "mint": acct.mint,
+                        "owner": acct.owner,
+                        "state": "initialized",
+                        "tokenAmount": {
+                            "amount": acct.amount.to_string(),
+                            "decimals": acct.decimals,
+                            "uiAmount": acct.amount as f64 / 10f64.powi(acct.decimals as i32),
+                            "uiAmountString": format!("{:.prec$}", acct.amount as f64 / 10f64.powi(acct.decimals as i32), prec = acct.decimals as usize),
+                        }
+                    },
+                    "type": "account"
+                }
+            })
+        }).collect();
+
+        Ok(RpcResponse { context: self.ctx(), value })
+    }
+
+    async fn get_token_supply(
+        &self,
+        mint: String,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>> {
+        info!("📡 RPC ← getTokenSupply({mint})");
+
+        use crate::svm::spl_token::{SplTokenEngine, MintLayout, USDC_DECIMALS};
+
+        let mint_bytes_vec = bs58::decode(&mint)
+            .into_vec()
+            .map_err(|_| error_invalid_params("Invalid base58 mint"))?;
+        if mint_bytes_vec.len() != 32 {
+            return Err(error_invalid_params("Mint must be 32 bytes"));
+        }
+        let mut mint_arr = [0u8; 32];
+        mint_arr.copy_from_slice(&mint_bytes_vec);
+
+        let supply = SplTokenEngine::get_mint_supply(&self.svm_db, &mint_arr)
+            .map_err(|e| error_invalid_params(&format!("Mint error: {:?}", e)))?;
+
+        // Read decimals from the actual mint account
+        let decimals = self.svm_db.get_account(&Pubkey::new_from_array(mint_arr))
+            .and_then(|acct| MintLayout::from_bytes(acct.data()).ok())
+            .map(|m| m.decimals)
+            .unwrap_or(USDC_DECIMALS);
+
+        let ui_amount = supply as f64 / 10f64.powi(decimals as i32);
+
+        Ok(RpcResponse {
+            context: self.ctx(),
+            value: serde_json::json!({
+                "amount": supply.to_string(),
+                "decimals": decimals,
+                "uiAmount": ui_amount,
+                "uiAmountString": format!("{:.prec$}", ui_amount, prec = decimals as usize),
+            }),
+        })
+    }
+
+    async fn get_token_account_balance(
+        &self,
+        account: String,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>> {
+        info!("📡 RPC ← getTokenAccountBalance({account})");
+
+        use crate::svm::spl_token::TokenAccountLayout;
+
+        let acct_bytes = bs58::decode(&account)
+            .into_vec()
+            .map_err(|_| error_invalid_params("Invalid base58 account"))?;
+        if acct_bytes.len() != 32 {
+            return Err(error_invalid_params("Account must be 32 bytes"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&acct_bytes);
+        let acct_pk = Pubkey::new_from_array(arr);
+
+        let stored = self.svm_db.get_account(&acct_pk)
+            .ok_or_else(|| error_invalid_params("Token account not found"))?;
+
+        if stored.data().len() != 165 {
+            return Err(error_invalid_params("Not a token account (data != 165 bytes)"));
+        }
+
+        let layout = TokenAccountLayout::from_bytes(stored.data())
+            .map_err(|e| error_invalid_params(&format!("Parse error: {}", e)))?;
+
+        // Read decimals from the mint
+        use crate::svm::spl_token::{MintLayout, USDC_DECIMALS};
+        let decimals = self.svm_db.get_account(&Pubkey::new_from_array(layout.mint))
+            .and_then(|m| MintLayout::from_bytes(m.data()).ok())
+            .map(|m| m.decimals)
+            .unwrap_or(USDC_DECIMALS);
+
+        let ui_amount = layout.amount as f64 / 10f64.powi(decimals as i32);
+
+        Ok(RpcResponse {
+            context: self.ctx(),
+            value: serde_json::json!({
+                "amount": layout.amount.to_string(),
+                "decimals": decimals,
+                "uiAmount": ui_amount,
+                "uiAmountString": format!("{:.prec$}", ui_amount, prec = decimals as usize),
+            }),
+        })
+    }
+
+    async fn get_fee_for_message(
+        &self,
+        _message: String,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<Option<u64>>> {
+        info!("📡 RPC ← getFeeForMessage");
+        // BlackBook L1 tx fee: 5000 lamports (same as Solana)
+        Ok(RpcResponse { context: self.ctx(), value: Some(5000) })
+    }
+
+    async fn get_recent_prioritization_fees(
+        &self,
+        _addresses: Option<Vec<String>>,
+    ) -> RpcResult<Vec<serde_json::Value>> {
+        info!("📡 RPC ← getRecentPrioritizationFees");
+        // No priority fees on BlackBook L1
+        Ok(vec![])
+    }
+
+    async fn is_blockhash_valid(
+        &self,
+        blockhash: String,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<bool>> {
+        info!("📡 RPC ← isBlockhashValid({blockhash})");
+        let hash_bytes = bs58::decode(&blockhash)
+            .into_vec()
+            .map_err(|_| error_invalid_params("Invalid base58 blockhash"))?;
+        if hash_bytes.len() != 32 {
+            return Err(error_invalid_params("Blockhash must be 32 bytes"));
+        }
+        let hash = Hash::new_from_array(hash_bytes.try_into().unwrap());
+        let valid = self.svm.lock().unwrap().is_valid_blockhash(&hash);
+        Ok(RpcResponse { context: self.ctx(), value: valid })
+    }
+
+    async fn get_identity(&self) -> RpcResult<serde_json::Value> {
+        info!("📡 RPC ← getIdentity");
+        // Use genesis hash as the node identity pubkey
+        Ok(serde_json::json!({
+            "identity": self.genesis_hash
+        }))
+    }
+
+    async fn get_supply(
+        &self,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>> {
+        // Sum actual lamports across all on-chain accounts
+        let total = self.svm_db.total_lamports();
+        info!("📡 RPC ← getSupply → {} lamports ({:.2} BB)", total, total as f64 / 1_000_000_000.0);
+        Ok(RpcResponse {
+            context: self.ctx(),
+            value: serde_json::json!({
+                "total": total,
+                "circulating": total,
+                "nonCirculating": 0u64,
+                "nonCirculatingAccounts": []
+            }),
+        })
+    }
+
+    async fn get_signature_statuses(
+        &self,
+        signatures: Vec<String>,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<Vec<Option<serde_json::Value>>>> {
+        info!("📡 RPC ← getSignatureStatuses({} sigs)", signatures.len());
+        let mut statuses = Vec::with_capacity(signatures.len());
+        for sig in &signatures {
+            // Check if we have the tx in our DB
+            let tx = self.svm_db.get_transaction_result(sig).ok().flatten();
+            let status = tx.map(|t| serde_json::json!({
+                "slot": t.slot,
+                "confirmations": null,
+                "err": null,
+                "confirmationStatus": "finalized"
+            }));
+            statuses.push(status);
+        }
+        Ok(RpcResponse { context: self.ctx(), value: statuses })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -756,15 +1086,25 @@ pub async fn start_rpc_server(
     addr: &str,
 ) -> Result<jsonrpsee::server::ServerHandle, Box<dyn std::error::Error>> {
     use jsonrpsee::server::Server;
+    use tower_http::cors::{CorsLayer, Any};
+
+    // Allow all origins so OneKey / Phantom desktop (Electron) can connect
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let middleware = tower::ServiceBuilder::new().layer(cors);
 
     let server = Server::builder()
+        .set_http_middleware(middleware)
         .build(addr)
         .await?;
 
     let module = rpc.into_rpc();
     let handle = server.start(module);
 
-    info!("🔌 Solana JSON-RPC server listening on {addr}  (Phase 2A+2B: getBalance, sendTransaction, getTransaction, …)");
+    info!("🔌 BlackBook L1 JSON-RPC server listening on {addr}  (CORS=*, Solana-compatible)");
     Ok(handle)
 }
 

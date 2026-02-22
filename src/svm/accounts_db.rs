@@ -42,8 +42,6 @@ use borsh::{BorshSerialize, BorshDeserialize};
 use tracing::{info, warn, debug};
 
 use crate::svm::types::{StoredAccount, SvmError, RENT_EPOCH_EXEMPT};
-
-#[cfg(feature = "svm")]
 use solana_sdk::{
     account::AccountSharedData,
     account::ReadableAccount,
@@ -92,10 +90,7 @@ pub const SVM_ADDR_SIGS: TableDefinition<&str, u64> =
 // SERDE HELPERS — u64 key tag for hot_state iteration
 // ============================================================================
 
-/// Intern Pubkey as [u8;32] for DashMap key (works without svm feature too).
-/// Inside #[cfg(feature = "svm")] blocks we use Pubkey directly.
-#[cfg(not(feature = "svm"))]
-pub type AccountKey = [u8; 32];
+
 
 // ============================================================================
 // SEALEVEL HOT-STATE WRAPPER (feature-independent shell)
@@ -153,12 +148,7 @@ pub struct SvmAccountsDB {
     /// Hot in-memory state — the VM's working set during a block.
     /// DashMap provides lock-free concurrent reads and fine-grained shard
     /// locks for writes. The scheduler does NOT need an external mutex.
-    #[cfg(feature = "svm")]
     pub hot_state: Arc<DashMap<Pubkey, AccountSharedData>>,
-
-    /// Non-SVM build: store raw bytes to keep the struct compilable.
-    #[cfg(not(feature = "svm"))]
-    pub hot_state: Arc<DashMap<[u8; 32], StoredAccount>>,
 
     /// Set of accounts mutated since the last flush.
     /// Populated by store_account; consumed by flush_block.
@@ -191,10 +181,7 @@ impl SvmAccountsDB {
         write_txn.commit()?;
 
         // Warm hot_state from persisted accounts
-        #[cfg(feature = "svm")]
         let hot_state: Arc<DashMap<Pubkey, AccountSharedData>> = Arc::new(DashMap::new());
-        #[cfg(not(feature = "svm"))]
-        let hot_state: Arc<DashMap<[u8; 32], StoredAccount>> = Arc::new(DashMap::new());
 
         let mut loaded = 0usize;
         {
@@ -214,15 +201,10 @@ impl SvmAccountsDB {
 
                     match StoredAccount::try_from_slice(val_bytes) {
                         Ok(stored) => {
-                            #[cfg(feature = "svm")]
                             {
                                 let pubkey = Pubkey::new_from_array(key_arr);
                                 let account: AccountSharedData = stored.into();
                                 hot_state.insert(pubkey, account);
-                            }
-                            #[cfg(not(feature = "svm"))]
-                            {
-                                hot_state.insert(key_arr, stored);
                             }
                             loaded += 1;
                         }
@@ -251,35 +233,21 @@ impl SvmAccountsDB {
     ///
     /// Returns `None` if the account has never been created.
     /// O(1) — DashMap shard lookup, no I/O.
-    #[cfg(feature = "svm")]
     pub fn get_account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         self.hot_state.get(pubkey).map(|r| r.clone())
     }
 
     /// Returns `true` if the account exists in hot state.
-    #[cfg(feature = "svm")]
     pub fn account_exists(&self, pubkey: &Pubkey) -> bool {
         self.hot_state.contains_key(pubkey)
     }
 
     /// Returns current lamport balance, or 0 if the account does not exist.
-    #[cfg(feature = "svm")]
     pub fn get_lamports(&self, pubkey: &Pubkey) -> u64 {
         self.hot_state
             .get(pubkey)
             .map(|acc| acc.lamports())
             .unwrap_or(0)
-    }
-
-    // Non-SVM feature variants (keep the struct usable in all builds)
-    #[cfg(not(feature = "svm"))]
-    pub fn get_account_raw(&self, key: &[u8; 32]) -> Option<StoredAccount> {
-        self.hot_state.get(key).map(|r| r.clone())
-    }
-
-    #[cfg(not(feature = "svm"))]
-    pub fn get_lamports_raw(&self, key: &[u8; 32]) -> u64 {
-        self.hot_state.get(key).map(|s| s.lamports).unwrap_or(0)
     }
 
     // ========================================================================
@@ -293,7 +261,6 @@ impl SvmAccountsDB {
     ///
     /// INVARIANT: rent_epoch is always set to RENT_EPOCH_EXEMPT here.
     /// Accounts on BlackBook L1 never pay rent.
-    #[cfg(feature = "svm")]
     pub fn store_account(&self, pubkey: &Pubkey, mut account: AccountSharedData) {
         account.set_rent_epoch(RENT_EPOCH_EXEMPT);
         self.dirty.mark(pubkey.to_bytes());
@@ -305,7 +272,6 @@ impl SvmAccountsDB {
     /// independently locked).
     ///
     /// INVARIANT: rent_epoch is always set to RENT_EPOCH_EXEMPT.
-    #[cfg(feature = "svm")]
     pub fn store_accounts_batch(&self, updates: &[(Pubkey, AccountSharedData)]) {
         for (pubkey, account) in updates {
             let mut account = account.clone();
@@ -344,7 +310,6 @@ impl SvmAccountsDB {
             let mut table = write_txn.open_table(SVM_ACCOUNTS)?;
 
             for key_bytes in &dirty_keys {
-                #[cfg(feature = "svm")]
                 {
                     let pubkey = Pubkey::new_from_array(*key_bytes);
                     if let Some(account) = self.hot_state.get(&pubkey) {
@@ -355,14 +320,6 @@ impl SvmAccountsDB {
                     }
                     // If account was deleted (lamports=0), tombstone it
                     // (leave in table with 0 lamports — account stays but empty)
-                }
-                #[cfg(not(feature = "svm"))]
-                {
-                    if let Some(stored) = self.hot_state.get(key_bytes) {
-                        let serialized = borsh::to_vec(stored.value())
-                            .map_err(|e| SvmError::SerializationError(e.to_string()))?;
-                        table.insert(key_bytes.as_slice(), serialized.as_slice())?;
-                    }
                 }
             }
         }
@@ -387,7 +344,6 @@ impl SvmAccountsDB {
     //   2. to_lamports + amount <= u64::MAX              (zero-sum: no creation)
     //   3. Both accounts land in hot_state after transfer (storage always updated)
     //
-    #[cfg(feature = "svm")]
     pub fn system_transfer(
         &self,
         from: &Pubkey,
@@ -468,7 +424,6 @@ impl SvmAccountsDB {
     /// Compute total lamports across all hot-state accounts.
     ///
     /// Used by proof-of-reserves: the sum must equal total BB supply × LAMPORTS_PER_BB.
-    #[cfg(feature = "svm")]
     pub fn total_lamports(&self) -> u64 {
         use solana_sdk::account::ReadableAccount;
         self.hot_state

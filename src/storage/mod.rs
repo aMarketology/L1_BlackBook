@@ -38,8 +38,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
 use tracing::{info, error, warn};
-
-#[cfg(feature = "svm")]
 use crate::svm::accounts_db::SvmAccountsDB;
 
 // ============================================================================
@@ -361,7 +359,6 @@ pub struct ConcurrentBlockchain {
     total_supply: Arc<AtomicU64>,
     
     /// SVM Accounts Database (Phase 1 integration)
-    #[cfg(feature = "svm")]
     pub svm_accounts: Arc<SvmAccountsDB>,
 }
 
@@ -393,7 +390,6 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(FROST_PUB_KEY)?;
             
             // SVM tables (behind feature flag)
-            #[cfg(feature = "svm")]
             {
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
@@ -442,8 +438,6 @@ impl ConcurrentBlockchain {
         info!(accounts = account_count, total_supply = total, processed_bridge_txs = bridge_tx_count, "Database loaded");
 
         let db_arc = Arc::new(db);
-
-        #[cfg(feature = "svm")]
         let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e| e.to_string())?);
 
         Ok(Self {
@@ -452,7 +446,6 @@ impl ConcurrentBlockchain {
             processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
             total_supply: Arc::new(AtomicU64::new((total * 1_000_000.0) as u64)),
-            #[cfg(feature = "svm")]
             svm_accounts,
         })
     }

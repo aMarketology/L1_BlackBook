@@ -47,10 +47,7 @@ use crate::runtime::{
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
 use crate::protocol::{Transaction, TxData};
-
-#[cfg(feature = "svm")]
 use crate::svm::runtime::BlackBookSVM;
-#[cfg(feature = "svm")]
 use solana_sdk::{hash::Hash as SvmHash, pubkey::Pubkey};
 
 // ============================================================================
@@ -599,7 +596,6 @@ pub struct BlockProducer {
     validator_id: String,
 
     /// SVM execution engine (Phase 1C: routes TransferBb through native Rust path)
-    #[cfg(feature = "svm")]
     svm: Arc<std::sync::Mutex<BlackBookSVM>>,
 }
 
@@ -614,8 +610,6 @@ impl BlockProducer {
     ) -> Self {
         // Genesis hash
         let genesis_hash = "0".repeat(64);
-
-        #[cfg(feature = "svm")]
         let svm = {
             use sha2::{Sha256, Digest};
             let hash_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
@@ -638,7 +632,6 @@ impl BlockProducer {
             blocks: Arc::new(RwLock::new(Vec::new())),
             latest_hash: Arc::new(RwLock::new(genesis_hash)),
             validator_id,
-            #[cfg(feature = "svm")]
             svm,
         }
     }
@@ -706,7 +699,6 @@ impl BlockProducer {
         };
 
         // Advance the SVM slot so intra-block transactions have a valid blockhash.
-        #[cfg(feature = "svm")]
         {
             let slot_bytes: [u8; 32] = {
                 use sha2::{Sha256, Digest};
@@ -810,7 +802,6 @@ impl BlockProducer {
         }
 
         // Flush SVM dirty accounts to ReDB for this block
-        #[cfg(feature = "svm")]
         {
             if let Ok(mut svm) = self.svm.lock() {
                 match svm.end_of_block() {
@@ -896,8 +887,6 @@ impl BlockProducer {
             
             TxData::TransferBb { to, amount } => {
                 info!("Transfer: {} -> {} ({} $BB)", tx.from, to, amount);
-
-                #[cfg(feature = "svm")]
                 {
                     if let Err(e) = self.execute_transfer_via_svm(&tx.from, to, *amount) {
                         return Err(e);
@@ -905,12 +894,7 @@ impl BlockProducer {
                     return Ok(());
                 }
 
-                // Legacy path (svm feature disabled)
-                #[cfg(not(feature = "svm"))]
-                {
-                    self.blockchain.debit(&tx.from, *amount as f64)?;
-                    self.blockchain.credit(to, *amount as f64)
-                }
+
             }
             
             TxData::TransferDime { to, amount } => {
@@ -934,7 +918,6 @@ impl BlockProducer {
     ///
     /// `amount` is in $BB units (matching the `TransferBb.amount` field).
     /// Conversion to lamports happens here — the only place in the call tree.
-    #[cfg(feature = "svm")]
     fn execute_transfer_via_svm(
         &self,
         from_addr: &str,
@@ -1009,7 +992,6 @@ impl BlockProducer {
     /// raw bytes of the remaining string to produce a stable 32-byte key.
     /// This is Option A from the migration design doc — explicit, reversible
     /// via the ADDRESS_MAP table (Phase 3A.3), and collision-free in practice.
-    #[cfg(feature = "svm")]
     fn legacy_addr_to_pubkey(addr: &str) -> Result<Pubkey, String> {
         use sha2::{Sha256, Digest};
         let stripped = addr.strip_prefix("bb_").unwrap_or(addr);
@@ -1194,7 +1176,6 @@ pub fn verify_chain(blocks: &[FinalizedBlock]) -> bool {
 // ============================================================================
 
 /// Generate a short unique hex string for intra-block transaction IDs.
-#[cfg(feature = "svm")]
 fn uuid_hex() -> String {
     use rand::Rng;
     let n: u64 = rand::thread_rng().gen();

@@ -49,16 +49,13 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 mod wallet_unified;
+mod wallet_page;
 mod storage;
 mod consensus;
 mod poh_blockchain;
 mod supabase;
 mod vault_manager;
-
-#[cfg(feature = "svm")]
 mod svm;
-
-#[cfg(feature = "svm")]
 mod solana_rpc;
 
 #[path = "../protocol/mod.rs"]
@@ -120,11 +117,18 @@ const DEALER_PUBKEY: &str = "6a2944608156ffc470bdaea36018a3e9bef58db318dc4f8ce86
 /// Known test accounts (for display names in ledger)
 fn account_name(addr: &str) -> Option<&'static str> {
     match addr {
-        "bb_7707fe614ad679b84a6cbc128999c1b5" => Some("Alice"),
-        "bb_2123862491cdd1865e06cc684f57e7cb" => Some("Bob"),
-        "bb_54c74820ffa82db9dca554329e521f98" => Some("Mac"),
-        "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6" => Some("Apollo"),
-        "bb_6a2944608156ffc470bdaea36018a3e9" => Some("Dealer"),
+        // v2 Shamir wallets (current)
+        "GWj5GobRe4ir2sJ8ag9F7NaZKd8BhbWDcMCQAnpCPozV" => Some("Max"),
+        "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk" => Some("Alice"),
+        "mmyQSriTrPjrLfquDYZYgAJEAYAoiiDT8srCoLGSdZd"  => Some("Bob"),
+        "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb" => Some("Apollo"),
+        "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp" => Some("Dealer"),
+        // v1 FROST wallets (legacy)
+        "bb_7707fe614ad679b84a6cbc128999c1b5" => Some("Alice (v1)"),
+        "bb_2123862491cdd1865e06cc684f57e7cb" => Some("Bob (v1)"),
+        "bb_54c74820ffa82db9dca554329e521f98" => Some("Max (v1)"),
+        "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6" => Some("Apollo (v1)"),
+        "bb_6a2944608156ffc470bdaea36018a3e9" => Some("Dealer (v1)"),
         _ => None,
     }
 }
@@ -156,6 +160,9 @@ pub struct AppState {
     pub fee_market: Arc<LocalizedFeeMarket>,
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
     pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
+
+    // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
+    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, f64)>>,
 }
 
 // ============================================================================
@@ -534,6 +541,84 @@ async fn admin_burn_handler(
     }
 }
 
+// ============================================================================
+// FAUCET — Public token mint (max 100 BB per address per epoch)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct FaucetRequest {
+    to: String,
+    amount: f64,
+}
+
+/// POST /faucet — Mint up to 100 BB to any address (rate-limited per epoch)
+async fn faucet_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FaucetRequest>,
+) -> impl IntoResponse {
+    const MAX_FAUCET_BB: f64 = 100.0;
+
+    if req.to.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Missing 'to' address"
+        })));
+    }
+    let amount = req.amount.min(MAX_FAUCET_BB).max(0.0);
+    if amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Amount must be between 0 and 100 BB"
+        })));
+    }
+
+    // Determine current epoch (432,000 slots per epoch, ~2 days at 400ms)
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+    let current_epoch = current_slot / 432_000;
+
+    // Rate-limit: one faucet per address per epoch, up to 100 BB total
+    {
+        let mut entry = state.faucet_claims.entry(req.to.clone()).or_insert((current_epoch, 0.0));
+        let (claimed_epoch, claimed_total) = entry.value_mut();
+
+        // Reset if new epoch
+        if *claimed_epoch != current_epoch {
+            *claimed_epoch = current_epoch;
+            *claimed_total = 0.0;
+        }
+
+        let remaining = MAX_FAUCET_BB - *claimed_total;
+        if remaining <= 0.0 {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                "error": "Faucet limit reached for this epoch (100 BB)",
+                "epoch": current_epoch,
+                "claimed": *claimed_total,
+                "next_epoch_slot": (current_epoch + 1) * 432_000
+            })));
+        }
+
+        let mint_amount = amount.min(remaining);
+
+        match state.blockchain.credit(&req.to, mint_amount) {
+            Ok(_) => {
+                *claimed_total += mint_amount;
+                info!("🚰 FAUCET: {} BB → {} (epoch {})", mint_amount, req.to, current_epoch);
+                return (StatusCode::OK, Json(serde_json::json!({
+                    "success": true,
+                    "minted": mint_amount,
+                    "to": req.to,
+                    "new_balance": state.blockchain.get_balance(&req.to),
+                    "epoch": current_epoch,
+                    "remaining_this_epoch": MAX_FAUCET_BB - *claimed_total
+                })));
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("Mint failed: {}", e)
+                })));
+            }
+        }
+    }
+}
+
 /// POST /admin/dealer/settle — Dealer settles L2 receipts in batch
 ///
 /// Flow: L2 sends receipts of losing bets → Dealer mints to self → pays winners
@@ -595,31 +680,131 @@ async fn dealer_settle_handler(
     }))
 }
 
+// ============================================================================
+// ADMIN — Wallet Hot Upgrade Migration
+// ============================================================================
+
+/// Request body for POST /admin/wallet/migrate
+#[derive(Deserialize)]
+struct MigrateWalletsRequest {
+    /// List of (name, old_address, new_address) mappings
+    mappings: Vec<MigrateMapping>,
+    /// Whether to drain old wallets to zero after migration (default: true)
+    #[serde(default = "default_true")]
+    drain_old: bool,
+    /// Whether to copy Share B data (only for same-format migrations)
+    #[serde(default)]
+    migrate_shares: bool,
+}
+
+#[derive(Deserialize)]
+struct MigrateMapping {
+    name: String,
+    old_address: String,
+    new_address: String,
+}
+
+fn default_true() -> bool { true }
+
+/// POST /admin/wallet/migrate — Execute a wallet balance migration
+///
+/// Atomically transfers all balances from old addresses to new addresses.
+/// Used when wallet structure changes (e.g. FROST v1 → Shamir v2).
+///
+/// This is safe to run while the server is live. Each wallet transfer is
+/// atomic via ReDB MVCC. The endpoint is idempotent — running it again
+/// on already-migrated (zero balance) wallets is a no-op.
+async fn wallet_migrate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<MigrateWalletsRequest>,
+) -> impl IntoResponse {
+    use wallet_unified::migration::*;
+
+    let mappings: Vec<(&str, &str, &str)> = req.mappings.iter()
+        .map(|m| (m.name.as_str(), m.old_address.as_str(), m.new_address.as_str()))
+        .collect();
+
+    let plan = build_balance_migration_plan(
+        WalletVersion::V1Frost,
+        WalletVersion::V2Shamir,
+        mappings,
+        req.migrate_shares,
+    );
+
+    // Override drain setting from request
+    let plan = MigrationPlan {
+        drain_old_wallets: req.drain_old,
+        ..plan
+    };
+
+    let report = execute_migration(&state.blockchain, &plan);
+
+    let status = if report.failed == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::PARTIAL_CONTENT
+    };
+
+    (status, Json(serde_json::json!(report)))
+}
+
 /// GET /admin/accounts — View all known account balances
 async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let known = vec![
-        ("Alice",  "bb_7707fe614ad679b84a6cbc128999c1b5"),
-        ("Bob",    "bb_2123862491cdd1865e06cc684f57e7cb"),
-        ("Mac",    "bb_54c74820ffa82db9dca554329e521f98"),
-        ("Apollo", "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6"),
-        ("Dealer", "bb_6a2944608156ffc470bdaea36018a3e9"),
+    // v1 FROST wallets (legacy — may have zero balance after migration)
+    let v1_wallets = vec![
+        ("Alice (v1)",  "bb_7707fe614ad679b84a6cbc128999c1b5"),
+        ("Bob (v1)",    "bb_2123862491cdd1865e06cc684f57e7cb"),
+        ("Max (v1)",    "bb_54c74820ffa82db9dca554329e521f98"),
+        ("Apollo (v1)", "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6"),
+        ("Dealer (v1)", "bb_6a2944608156ffc470bdaea36018a3e9"),
     ];
 
-    let accounts: Vec<serde_json::Value> = known.iter().map(|(name, addr)| {
-        serde_json::json!({
+    // v2 Shamir wallets (current — SVM-compatible Ed25519)
+    let v2_wallets = vec![
+        ("Max",    "GWj5GobRe4ir2sJ8ag9F7NaZKd8BhbWDcMCQAnpCPozV"),
+        ("Alice",  "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk"),
+        ("Bob",    "mmyQSriTrPjrLfquDYZYgAJEAYAoiiDT8srCoLGSdZd"),
+        ("Apollo", "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb"),
+        ("Dealer", "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp"),
+    ];
+
+    let mut accounts: Vec<serde_json::Value> = Vec::new();
+
+    // Add v2 wallets first (active)
+    for (name, addr) in &v2_wallets {
+        let balance = state.blockchain.get_balance(addr);
+        accounts.push(serde_json::json!({
             "name": name,
             "address": addr,
-            "balance": state.blockchain.get_balance(addr),
+            "balance": balance,
+            "version": "v2-shamir",
             "role": if *name == "Dealer" { "admin" } else { "user" },
-        })
-    }).collect();
+            "active": true,
+        }));
+    }
+
+    // Add v1 wallets (legacy — only if they still have balance)
+    for (name, addr) in &v1_wallets {
+        let balance = state.blockchain.get_balance(addr);
+        if balance > 0.0 {
+            accounts.push(serde_json::json!({
+                "name": name,
+                "address": addr,
+                "balance": balance,
+                "version": "v1-frost",
+                "role": "legacy",
+                "active": false,
+            }));
+        }
+    }
 
     let total_supply = state.blockchain.total_supply();
 
     Json(serde_json::json!({
         "accounts": accounts,
         "total_supply": total_supply,
-        "dealer_address": DEALER_ADDRESS,
+        "dealer_address": "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp",
+        "wallet_version": "v2-shamir",
     }))
 }
 
@@ -630,6 +815,234 @@ async fn security_stats_handler(State(state): State<AppState>) -> impl IntoRespo
         "circuit_breaker": state.circuit_breaker.get_stats(),
         "fee_market": state.fee_market.get_stats(),
     }))
+}
+
+// ============================================================================
+// USDC SPL TOKEN ENDPOINTS
+// ============================================================================
+
+#[derive(Deserialize)]
+struct UsdcMintRequest {
+    /// Recipient wallet address (base58)
+    to: String,
+    /// Amount in human USDC (e.g. 100.50 = 100_500_000 smallest units)
+    amount: f64,
+}
+
+#[derive(Deserialize)]
+struct UsdcTransferRequest {
+    /// Sender wallet address (base58)
+    from: String,
+    /// Recipient wallet address (base58)
+    to: String,
+    /// Amount in human USDC
+    amount: f64,
+}
+
+#[derive(Deserialize)]
+struct UsdcBalanceQuery {
+    /// Optional mint address (defaults to USDC if omitted)
+    mint: Option<String>,
+}
+
+/// POST /admin/usdc/mint — Mint USDC tokens to a wallet's ATA
+///
+/// Called when bridge deposits arrive or for initial liquidity seeding.
+/// Only the Dealer (mint authority) should call this in production.
+async fn usdc_mint_handler(
+    State(state): State<AppState>,
+    Json(req): Json<UsdcMintRequest>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+
+    if req.amount <= 0.0 || req.to.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid mint parameters (amount must be > 0)"
+        })));
+    }
+
+    // Convert human USDC to smallest units (6 decimals)
+    let raw_amount = (req.amount * USDC_UNIT as f64) as u64;
+
+    let wallet_bytes = match bs58::decode(&req.to).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&v);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid base58 wallet address"
+        }))),
+    };
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let mint = usdc_mint_bytes();
+
+    match SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_amount) {
+        Ok(result) => {
+            info!("💵 USDC MINT: {} USDC → {} (ATA: {})", req.amount, req.to, result.ata);
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "minted_usdc": req.amount,
+                "raw_amount": result.amount,
+                "to": req.to,
+                "ata": result.ata,
+                "mint": result.mint,
+                "new_total_supply": result.new_supply,
+            })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("{:?}", e)
+        }))),
+    }
+}
+
+/// POST /usdc/transfer — Transfer USDC between wallets
+async fn usdc_transfer_handler(
+    State(state): State<AppState>,
+    Json(req): Json<UsdcTransferRequest>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+
+    if req.amount <= 0.0 || req.from.is_empty() || req.to.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid transfer parameters"
+        })));
+    }
+
+    let raw_amount = (req.amount * USDC_UNIT as f64) as u64;
+
+    let parse_pubkey = |addr: &str| -> Result<solana_sdk::pubkey::Pubkey, String> {
+        let bytes = bs58::decode(addr).into_vec().map_err(|e| format!("Invalid base58: {}", e))?;
+        if bytes.len() != 32 { return Err("Address must be 32 bytes".into()); }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(solana_sdk::pubkey::Pubkey::new_from_array(arr))
+    };
+
+    let from_pubkey = match parse_pubkey(&req.from) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
+    };
+    let to_pubkey = match parse_pubkey(&req.to) {
+        Ok(pk) => pk,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
+    };
+
+    let mint = usdc_mint_bytes();
+
+    match SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &from_pubkey, &to_pubkey, raw_amount) {
+        Ok(result) => {
+            info!("💵 USDC TRANSFER: {} USDC  {} → {}", req.amount, req.from, req.to);
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "amount_usdc": req.amount,
+                "raw_amount": result.amount,
+                "from": req.from,
+                "to": req.to,
+                "from_ata": result.from_ata,
+                "to_ata": result.to_ata,
+                "from_balance": result.from_balance,
+                "to_balance": result.to_balance,
+            })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("{:?}", e)
+        }))),
+    }
+}
+
+/// GET /usdc/balance/{address} — Get USDC balance for a wallet
+async fn usdc_balance_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, usdc_mint_address, USDC_DECIMALS, USDC_UNIT};
+
+    let wallet_bytes = match bs58::decode(&address).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&v);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid base58 wallet address"
+        }))),
+    };
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let mint = usdc_mint_bytes();
+
+    let raw_balance = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
+    let human_balance = raw_balance as f64 / USDC_UNIT as f64;
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "address": address,
+        "usdc_balance": human_balance,
+        "raw_balance": raw_balance,
+        "decimals": USDC_DECIMALS,
+        "mint": usdc_mint_address(),
+    })))
+}
+
+/// GET /usdc/supply — Get total USDC supply on BlackBook L1
+async fn usdc_supply_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, usdc_mint_address, USDC_DECIMALS, USDC_UNIT};
+
+    let mint = usdc_mint_bytes();
+    match SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &mint) {
+        Ok(supply) => {
+            let human_supply = supply as f64 / USDC_UNIT as f64;
+            (StatusCode::OK, Json(serde_json::json!({
+                "mint": usdc_mint_address(),
+                "total_supply": human_supply,
+                "raw_supply": supply,
+                "decimals": USDC_DECIMALS,
+            })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("{:?}", e)
+        }))),
+    }
+}
+
+/// GET /usdc/accounts/{address} — Get all USDC token accounts for a wallet
+/// (Used by wallets to discover ATAs)
+async fn usdc_accounts_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+
+    let wallet_bytes = match bs58::decode(&address).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&v);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid base58 wallet address"
+        }))),
+    };
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let mint = usdc_mint_bytes();
+
+    let accounts = SplTokenEngine::get_token_accounts_for_owner(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
+    let result: Vec<serde_json::Value> = accounts.iter().map(|a| {
+        serde_json::json!({
+            "address": a.address,
+            "mint": a.mint,
+            "owner": a.owner,
+            "balance_usdc": a.amount as f64 / USDC_UNIT as f64,
+            "raw_balance": a.amount,
+            "decimals": a.decimals,
+        })
+    }).collect();
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "owner": address,
+        "token_accounts": result,
+    })))
 }
 
 // ============================================================================
@@ -928,6 +1341,8 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .allow_headers(Any);
 
     let app_routes = Router::new()
+        // Web Wallet UI
+        .route("/wallet", get(wallet_page::wallet_page_handler))
         // Public
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
@@ -946,11 +1361,21 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .route("/credit/open", post(credit_open_handler))
         .route("/credit/settle", post(credit_settle_handler))
         // Admin (Dealer)
+        // Faucet (public)
+        .route("/faucet", post(faucet_handler))
+        // Admin (Dealer)
         .route("/admin/mint", post(admin_mint_handler))
         .route("/admin/burn", post(admin_burn_handler))
         .route("/admin/dealer/settle", post(dealer_settle_handler))
+        .route("/admin/wallet/migrate", post(wallet_migrate_handler))
         .route("/admin/accounts", get(admin_accounts_handler))
         .route("/admin/security/stats", get(security_stats_handler))
+        // USDC SPL Token
+        .route("/admin/usdc/mint", post(usdc_mint_handler))
+        .route("/usdc/transfer", post(usdc_transfer_handler))
+        .route("/usdc/balance/{address}", get(usdc_balance_handler))
+        .route("/usdc/supply", get(usdc_supply_handler))
+        .route("/usdc/accounts/{address}", get(usdc_accounts_handler))
         .with_state(state);
 
     // Merge wallet router (Unified FROST+SSS) with app routes
@@ -1134,6 +1559,7 @@ async fn main() {
         fee_market,
         account_metadata,
         used_nonces: Arc::new(dashmap::DashMap::new()),
+        faucet_claims: Arc::new(dashmap::DashMap::new()),
     };
 
     // 8. Unified Wallet Router (FROST + SSS + Mnemonic)
@@ -1147,10 +1573,84 @@ async fn main() {
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
     // Extract Arcs for RPC before state is moved into build_router
-    #[cfg(feature = "svm")]
     let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
-    #[cfg(feature = "svm")]
     let rpc_current_slot = Arc::clone(&state.current_slot);
+
+    // Bootstrap the USDC SPL Token Mint (idempotent — no-op if already exists)
+    {
+        use svm::SplTokenEngine;
+        // Dealer v2 wallet is the mint authority for USDC on BlackBook L1
+        let dealer_v2_bytes = bs58::decode("3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp")
+            .into_vec().unwrap();
+        let mut dealer_key = [0u8; 32];
+        dealer_key.copy_from_slice(&dealer_v2_bytes);
+        let mint_authority = solana_sdk::pubkey::Pubkey::new_from_array(dealer_key);
+
+        match SplTokenEngine::bootstrap_usdc_mint(&rpc_svm_accounts, &mint_authority) {
+            Ok(mint_addr) => info!("💵 USDC Mint: {}", mint_addr),
+            Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 9b. Sync legacy L1 balances → SVM AccountsDB
+    // ═══════════════════════════════════════════════════════════════
+    // Wallet extensions (Backpack, Nightly, Phantom) read balances via
+    // the Solana JSON-RPC `getBalance` which queries the SVM accounts DB.
+    // Legacy L1 balances live in the f64 cache — we seed them into SVM
+    // so wallets show correct balances immediately on connect.
+    {
+        use crate::svm::types::LAMPORTS_PER_BB;
+        use solana_sdk::account::AccountSharedData;
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut synced = 0u32;
+        for entry in state.blockchain.cache.iter() {
+            let addr = entry.key();
+            let bb_balance = *entry.value();
+
+            // Skip legacy bb_ prefixed addresses (v1 wallets aren't base58 pubkeys)
+            if addr.starts_with("bb_") {
+                continue;
+            }
+
+            // Parse as Solana pubkey
+            let pk = match bs58::decode(addr.as_str()).into_vec() {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Pubkey::new_from_array(arr)
+                }
+                _ => continue, // skip non-pubkey addresses
+            };
+
+            // Seed if SVM has no account or has 0 lamports but legacy has balance
+            let lamports = (bb_balance * LAMPORTS_PER_BB as f64) as u64;
+            if lamports > 0 {
+                let existing = rpc_svm_accounts.get_account(&pk);
+                let existing_lamports = existing.as_ref()
+                    .map(|a| {
+                        use solana_sdk::account::ReadableAccount;
+                        a.lamports()
+                    })
+                    .unwrap_or(0);
+
+                if existing_lamports == 0 {
+                    let account = AccountSharedData::new(
+                        lamports,
+                        0,
+                        &solana_sdk::system_program::id(),
+                    );
+                    rpc_svm_accounts.store_account(&pk, account);
+                    synced += 1;
+                    info!("💰 SVM sync: {} → {} lamports ({} BB)", addr, lamports, bb_balance);
+                }
+            }
+        }
+        if synced > 0 {
+            info!("✅ Synced {} legacy accounts → SVM AccountsDB", synced);
+        }
+    }
 
     // 10. HTTP Server
     let app = build_router(state, unified_router);
@@ -1183,13 +1683,19 @@ async fn main() {
     info!("   POST /admin/dealer/settle       Batch L2 settlement");
     info!("   GET  /admin/accounts            All account balances");
     info!("");
+    info!("💵 USDC SPL TOKEN:");
+    info!("   POST /admin/usdc/mint           Mint USDC to wallet");
+    info!("   POST /usdc/transfer             Transfer USDC");
+    info!("   GET  /usdc/balance/{{address}}    USDC balance");
+    info!("   GET  /usdc/supply               Total USDC supply");
+    info!("   GET  /usdc/accounts/{{address}}   Token accounts");
+    info!("");
     info!("🌐 gRPC: 0.0.0.0:50051");
     info!("");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
-    // 11. Solana JSON-RPC server on port 8899 (Phase 2A)
-    #[cfg(feature = "svm")]
+    // 11. Solana JSON-RPC server on port 8899 (Phase 2A+2B)
     {
         use std::sync::Mutex;
         use svm::BlackBookSVM;
@@ -1203,6 +1709,28 @@ async fn main() {
         let rpc_svm = Arc::new(Mutex::new(
             BlackBookSVM::new(Arc::clone(&rpc_svm_accounts), rpc_genesis_hash)
         ));
+
+        // Slot ticker: advance the shared slot counter + SVM blockhash queue
+        // every 600ms (matching PoH slot interval). This keeps OneKey / Phantom
+        // from treating the node as stale.
+        let ticker_slot = rpc_current_slot.clone();
+        let ticker_svm = Arc::clone(&rpc_svm);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(600));
+            loop {
+                interval.tick().await;
+                let new_slot = ticker_slot.fetch_add(1, Ordering::Relaxed) + 1;
+                // Advance the SVM blockhash queue so getLatestBlockhash always returns
+                // a fresh hash and sendTransaction doesn't reject "stale blockhash".
+                if let Ok(mut svm) = ticker_svm.lock() {
+                    let slot_hash_bytes: [u8; 32] = Sha256::digest(
+                        format!("BB_SLOT_{}", new_slot).as_bytes()
+                    ).into();
+                    svm.advance_slot(new_slot, Hash::new_from_array(slot_hash_bytes));
+                }
+            }
+        });
+        info!("🕐 Slot ticker started (600ms intervals → advancing slot + blockhash)");
 
         let rpc_impl = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);
         match start_rpc_server(rpc_impl, "0.0.0.0:8899").await {

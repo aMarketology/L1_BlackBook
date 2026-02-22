@@ -13,11 +13,7 @@ pub mod wallet_unified; // Hybrid FROST + Mnemonic
 pub mod consensus;
 pub mod supabase;
 pub mod vault_manager;
-
-#[cfg(feature = "svm")]
 pub mod svm;
-
-#[cfg(feature = "svm")]
 pub mod solana_rpc;
 
 // Infrastructure

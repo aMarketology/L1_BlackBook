@@ -1,5 +1,5 @@
 # BB SVM Integration — Checklist
-> Last updated: Feb 20, 2026  
+> Last updated: Feb 21, 2026  
 > Build command: `cargo build --features svm`  
 > Test suite: `cargo test --features svm`
 
@@ -109,18 +109,24 @@
   - [x] `test_rpc_get_slot`
   - [x] `test_rpc_get_epoch_info`
 
-### 2B — Write Methods ← **NEXT**
-- [ ] `sendTransaction` — base64 decode → `VersionedTransaction` → submit to Gulf Stream
-- [ ] `getTransaction` — lookup by signature in `SVM_SIGNATURES` ReDB table
-- [ ] `getSignaturesForAddress` — new secondary index table in ReDB
-- [ ] `getBlock` — map `FinalizedBlock` → `UiConfirmedBlock`
-- [ ] Signature dedup via `SVM_SIGNATURES` table (reject replay)
-- [ ] **Tests — `tests/rpc_send_tests.rs`**
-  - [ ] `test_send_transaction_system_transfer`
-  - [ ] `test_send_transaction_rejected_when_insufficient_funds`
-  - [ ] `test_send_transaction_rejects_replay`
-  - [ ] `test_get_transaction_returns_confirmed`
-  - [ ] `test_get_signatures_for_address`
+### 2B — Write Methods ← **COMPLETE**
+- [x] `sendTransaction` — base64 decode → `VersionedTransaction` → execute System Program transfer
+- [x] `getTransaction` — lookup by signature in `SVM_TX_LOG` ReDB table
+- [x] `getSignaturesForAddress` — secondary index table `SVM_ADDR_SIGS` in ReDB (prefix scan by address)
+- [x] Signature dedup via `SVM_TX_LOG` table (reject replay across restarts)
+- [x] `StoredTransactionResult` Borsh type for persistent tx log
+- [x] `SvmAccountsDB::store_transaction_result()`, `get_transaction_result()`, `get_signatures_for_address()`
+- [x] `cargo build --features svm` — **clean ✅**
+- [x] `cargo build` (no svm flag) — **clean ✅** (zero regressions)
+- [x] **Tests — `tests/rpc_send_tests.rs` — 5/5 ✅**
+  - [x] `test_send_transaction_system_transfer`
+  - [x] `test_send_transaction_rejected_when_insufficient_funds`
+  - [x] `test_send_transaction_rejects_replay`
+  - [x] `test_get_transaction_returns_confirmed`
+  - [x] `test_get_signatures_for_address`
+
+### 2B — Deferred to Phase 2B.2
+- [ ] `getBlock` — map `FinalizedBlock` → `UiConfirmedBlock` (requires block-level storage integration)
 
 ### 2C — simulateTransaction
 - [ ] `simulateTransaction` — dry-run without committing state
@@ -207,7 +213,7 @@ curl -s -X POST http://localhost:8899 \
 | `Σ lamports = constant` across all transfers | `test_global_lamport_conservation` |
 | `cargo build` (no svm flag) compiles clean | CI |
 | `cargo build --features svm` compiles clean | CI |
-| All 29 SVM+RPC tests pass | `cargo test --features svm` |
+| All 34 SVM+RPC tests pass | `cargo test --features svm` |
 
 ---
 
@@ -221,7 +227,8 @@ curl -s -X POST http://localhost:8899 \
 | `tests/svm_parallel_tests.rs` | 4 | ✅ |
 | `tests/svm_invariant_tests.rs` | 3 | ✅ |
 | `tests/rpc_tests.rs` | 9 | ✅ |
-| **Total** | **29** | **29/29 ✅** |
+| `tests/rpc_send_tests.rs` | 5 | ✅ |
+| **Total** | **34** | **34/34 ✅** |
 
 ---
 
@@ -231,11 +238,14 @@ curl -s -X POST http://localhost:8899 \
 # Full SVM build
 cargo build --features svm
 
-# All SVM tests (29 tests)
-cargo test --features svm --test svm_accounts_tests --test svm_runtime_tests --test svm_block_production_tests --test svm_parallel_tests --test svm_invariant_tests --test rpc_tests
+# All SVM tests (34 tests)
+cargo test --features svm --test svm_accounts_tests --test svm_runtime_tests --test svm_block_production_tests --test svm_parallel_tests --test svm_invariant_tests --test rpc_tests --test rpc_send_tests
 
-# RPC tests only
+# RPC read tests only (Phase 2A)
 cargo test --features svm --test rpc_tests
+
+# RPC write tests only (Phase 2B)
+cargo test --features svm --test rpc_send_tests
 
 # Run the server (port 8080 HTTP + port 8899 Solana RPC)
 cargo run --features svm

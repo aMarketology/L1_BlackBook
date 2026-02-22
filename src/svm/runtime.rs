@@ -39,8 +39,6 @@ use crate::svm::accounts_db::SvmAccountsDB;
 use crate::svm::types::{
     SvmError, TransactionExecutionResult, MAX_COMPUTE_UNITS, MAX_RECENT_BLOCKHASHES,
 };
-
-#[cfg(feature = "svm")]
 use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
@@ -60,7 +58,6 @@ pub struct BlockhashQueue {
     /// (slot, hash_bytes) ordered from oldest→newest.
     entries: VecDeque<(u64, [u8; 32])>,
     /// Quick O(1) lookup: hash bytes → slot it was recorded at.
-    #[cfg(feature = "svm")]
     index: DashMap<[u8; 32], u64>,
 }
 
@@ -68,19 +65,16 @@ impl BlockhashQueue {
     pub fn new() -> Self {
         Self {
             entries: VecDeque::with_capacity(MAX_RECENT_BLOCKHASHES as usize + 1),
-            #[cfg(feature = "svm")]
             index: DashMap::new(),
         }
     }
 
     /// Seed the queue with the genesis hash at slot 0.
-    #[cfg(feature = "svm")]
     pub fn seed_genesis(&mut self, genesis_hash: Hash) {
         self.record(0, genesis_hash);
     }
 
     /// Record a new blockhash for `slot` and evict entries older than 150 slots.
-    #[cfg(feature = "svm")]
     pub fn record(&mut self, slot: u64, hash: Hash) {
         let bytes = hash.to_bytes();
         self.entries.push_back((slot, bytes));
@@ -95,7 +89,6 @@ impl BlockhashQueue {
     }
 
     /// Returns `true` if the hash is in the recent window.
-    #[cfg(feature = "svm")]
     pub fn is_valid(&self, hash: &Hash) -> bool {
         let bytes = hash.to_bytes();
         self.index.contains_key(&bytes)
@@ -111,7 +104,6 @@ impl BlockhashQueue {
     }
 
     /// Return the most recently recorded hash, or `None` if the queue is empty.
-    #[cfg(feature = "svm")]
     pub fn latest_hash(&self) -> Option<Hash> {
         self.entries.back().map(|(_, bytes)| Hash::new_from_array(*bytes))
     }
@@ -126,7 +118,6 @@ impl BlockhashQueue {
 /// During the transition period, the legacy `TxData::TransferBb` variant is
 /// converted to this struct by the tx_adapter. Future phases will replace
 /// this with a full `SanitizedTransaction`.
-#[cfg(feature = "svm")]
 #[derive(Debug, Clone)]
 pub struct TransferRequest {
     /// Transaction identifier (hex-encoded, used as idempotency key).
@@ -182,7 +173,6 @@ impl BlackBookSVM {
     ///
     /// `genesis_hash` seeds the blockhash queue so that slot-0 transactions
     /// have a valid recent blockhash to reference.
-    #[cfg(feature = "svm")]
     pub fn new(accounts_db: Arc<SvmAccountsDB>, genesis_hash: Hash) -> Self {
         let mut blockhash_queue = BlockhashQueue::new();
         blockhash_queue.seed_genesis(genesis_hash);
@@ -190,18 +180,6 @@ impl BlackBookSVM {
         Self {
             accounts_db,
             blockhash_queue,
-            max_compute_units: MAX_COMPUTE_UNITS,
-            seen_tx_ids: DashMap::new(),
-            current_slot: 0,
-        }
-    }
-
-    /// Variant for builds without the svm feature (keeps type available).
-    #[cfg(not(feature = "svm"))]
-    pub fn new_stub(accounts_db: Arc<SvmAccountsDB>) -> Self {
-        Self {
-            accounts_db,
-            blockhash_queue: BlockhashQueue::new(),
             max_compute_units: MAX_COMPUTE_UNITS,
             seen_tx_ids: DashMap::new(),
             current_slot: 0,
@@ -216,7 +194,6 @@ impl BlackBookSVM {
     ///
     /// Records the new blockhash into the queue and advances the slot counter.
     /// The `slot_hash` is the PoH hash for this slot (from `PoHService`).
-    #[cfg(feature = "svm")]
     pub fn advance_slot(&mut self, slot: u64, slot_hash: Hash) {
         self.current_slot = slot;
         self.blockhash_queue.record(slot, slot_hash);
@@ -230,14 +207,11 @@ impl BlackBookSVM {
     // ========================================================================
     // BLOCKHASH VALIDATION
     // ========================================================================
-
-    #[cfg(feature = "svm")]
     pub fn is_valid_blockhash(&self, hash: &Hash) -> bool {
         self.blockhash_queue.is_valid(hash)
     }
 
     /// Return the most recent blockhash in the queue (for seeding tx requests).
-    #[cfg(feature = "svm")]
     pub fn current_blockhash(&self) -> Hash {
         self.blockhash_queue
             .latest_hash()
@@ -261,7 +235,6 @@ impl BlackBookSVM {
     ///
     /// Returns a `TransactionExecutionResult` that the scheduler records in the
     /// block. The scheduler calls `flush_block()` after the batch completes.
-    #[cfg(feature = "svm")]
     pub fn execute_transfer(
         &self,
         req: &TransferRequest,
@@ -309,7 +282,6 @@ impl BlackBookSVM {
     /// Rayon can call this method on multiple threads simultaneously because
     /// `SvmAccountsDB::system_transfer` uses `DashMap` sharding internally.
     /// Conflicts are resolved upstream by `AccountLockManager`.
-    #[cfg(feature = "svm")]
     pub fn execute_transfer_batch(
         &self,
         requests: &[TransferRequest],

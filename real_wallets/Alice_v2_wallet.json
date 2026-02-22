@@ -1,0 +1,19 @@
+{
+  "version": "2.0-shamir",
+  "created": "2026-02-21",
+  "user": {
+    "username": "Alice_v2",
+    "password": "AlicePass2026!",
+    "pin": "5678",
+    "daily_limit": 10000
+  },
+  "wallet": {
+    "wallet_id": "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk",
+    "address": "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk",
+    "public_key": "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk",
+    "mnemonic": "submit wait art soldier innocent now legal you arctic salt burden lady theme gain shed chimney panel smooth resist civil whisper siege crawl dish",
+    "share_a": "Ut80UKhIBf0rnAv3JKch5g:fcf4d1dcab1a005bc00af55f:add77557ffdac3a1b3a72d57b758b3264b5b29831e38b8e8e11de70de4eda02ee0d4d476f5f5922a1e5f433ab9891f3b61",
+    "share_a_is_encrypted": true,
+    "share_c": "035c81e8e955eb479698fbb4b003fd27b5156f2fe0113a04623cc1ff0bd55210be"
+  }
+}

@@ -1,1 +1,0 @@
-cargo run --features svm --example stress_test -- --accounts 50000 --txs 25000 --seconds 10

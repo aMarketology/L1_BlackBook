@@ -1,0 +1,19 @@
+{
+  "version": "2.0-shamir",
+  "created": "2026-02-21",
+  "user": {
+    "username": "Dealer_v2",
+    "password": "DealerPass2026!",
+    "pin": "3456",
+    "daily_limit": 100000
+  },
+  "wallet": {
+    "wallet_id": "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp",
+    "address": "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp",
+    "public_key": "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp",
+    "mnemonic": "wait captain puzzle flee make bench mixture able display awful eye flash offer account extra space dentist gate fluid leaf nerve pitch ozone caution",
+    "share_a": "x95f1Jxd2SN0rI0Z1+pTTA:bef830181637646eaa978bbb:72c3b498e75110c9fccd5331a67d42ad6e39712a7988ce7d38aaab0ab16fa6d13a7371d3f3f146569deb22de322b47cb7b",
+    "share_a_is_encrypted": true,
+    "share_c": "032c5188f6b6e4af7a3fc7175beafbfcd9bae5a86a793bf79b3ca24e49baedbd8f"
+  }
+}
