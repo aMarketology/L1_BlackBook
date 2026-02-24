@@ -8,10 +8,11 @@ use sharks::{Sharks, Share};
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, Signer};
 use tracing::{info, warn, error};
 use super::security;
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+// jsonwebtoken::{decode, DecodingKey, Validation, Algorithm} — reserved for JWT auth hardening
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::storage::ConcurrentBlockchain;
+use crate::poh_blockchain::BlockProducer;
 
 use crate::supabase::SupabaseManager;
 use crate::vault_manager::VaultManager;
@@ -35,12 +36,19 @@ pub struct UnifiedWalletState {
     pub blockchain: Arc<ConcurrentBlockchain>,
     pub supabase: Arc<SupabaseManager>,
     pub vault: Arc<VaultManager>,
+    /// Block producer — records executed transactions into PoH blocks
+    pub block_producer: Arc<BlockProducer>,
 }
 
 impl UnifiedWalletState {
-    pub fn new(blockchain: Arc<ConcurrentBlockchain>, supabase: Arc<SupabaseManager>, vault: Arc<VaultManager>) -> Self {
+    pub fn new(
+        blockchain: Arc<ConcurrentBlockchain>,
+        supabase: Arc<SupabaseManager>,
+        vault: Arc<VaultManager>,
+        block_producer: Arc<BlockProducer>,
+    ) -> Self {
         info!("✅ Unified Wallet initialized with ReDB storage & Supabase Vault & HashiCorp Vault");
-        Self { blockchain, supabase, vault }
+        Self { blockchain, supabase, vault, block_producer }
     }
 }
 
@@ -300,10 +308,35 @@ pub async fn transfer_with_sss(
 
     info!("✅ Transfer signed for wallet {}", req.from_wallet_id);
 
-    // 6. Execute transfer on-chain
-    state.blockchain.transfer(&req.from_wallet_id, &req.to_address, req.amount)
-        .map_err(|e| err(format!("Transfer failed: {}", e)))?;
+    // 6. Execute transfer on-chain with SVM receipt (for explorer + getSignaturesForAddress)
+    state.blockchain.transfer_with_receipt(
+        &req.from_wallet_id,
+        &req.to_address,
+        req.amount,
+        &sig_hex,
+        crate::storage::AuthType::SSS,
+    ).map_err(|e| err(format!("Transfer failed: {}", e)))?;
     info!("💸 Transfer: {} → {} : {} BB", req.from_wallet_id, req.to_address, req.amount);
+
+    // Record in PoH block (already executed — just needs ordering proof)
+    {
+        use crate::protocol::{Transaction as ProtoTx, TxData};
+        let tx = ProtoTx {
+            hash: uuid::Uuid::new_v4().to_string(),
+            from: req.from_wallet_id.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            data: TxData::TransferBb {
+                to: req.to_address.clone(),
+                amount: (req.amount * 1_000_000_000.0) as u64,
+            },
+            signature: sig_hex.clone(),
+            signer_pubkey: req.from_wallet_id.clone(),
+        };
+        state.block_producer.record_executed_transaction(tx);
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -368,7 +401,7 @@ pub async fn recover_shard_c(
 
 pub async fn get_shard_b_handler(
     State(state): State<Arc<UnifiedWalletState>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(req): Json<GetShardBRequest>,
 ) -> Result<Json<ShardBResponse>, (StatusCode, Json<serde_json::Value>)> {
     // Simple SSS: Just return Shard B from storage
@@ -416,7 +449,7 @@ pub struct SSSVerifyResponse {
 }
 
 pub async fn verify_sss_handler(
-    State(state): State<Arc<UnifiedWalletState>>,
+    State(_state): State<Arc<UnifiedWalletState>>,
     Json(req): Json<SSSVerifyRequest>,
 ) -> Result<Json<SSSVerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
     // 1. Decode / decrypt shard 1

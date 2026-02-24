@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::svm::accounts_db::SvmAccountsDB;
 use crate::svm::types::{
@@ -42,7 +42,7 @@ use crate::svm::types::{
 use solana_sdk::{
     hash::Hash,
     pubkey::Pubkey,
-    signature::Signature,
+
 };
 
 // ============================================================================

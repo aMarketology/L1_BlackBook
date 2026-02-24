@@ -11,29 +11,5 @@ pub mod helpers;
 // Re-export core types
 pub use blockchain::{
     // Constants
-    USDT_TO_BB_RATIO, TOKEN_DECIMALS, DEFAULT_BASE_CPI,
-    
-    // Token Ledgers
-    BlackBookLedger, DimeLedger,
-    
-    // Tier 1: USDT → $BB Gateway
-    Tier1Gateway, Tier1Deposit,
-    
-    // Tier 2: $BB → $DIME Vault
-    Tier2Vault, DimeVintage,
-    
-    // Events
-    L1Event,
-    
-    // Transactions
     Transaction, TxData,
-    
-    // State & Security
-    L1State, AccountSecurity,
-    
-    // Errors
-    ChainError,
-    
-    // Compliance
-    ProofOfReserves,
 };

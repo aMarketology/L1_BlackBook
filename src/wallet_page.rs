@@ -231,6 +231,7 @@ footer{text-align:center;padding:32px 0 16px;color:var(--fg3);font-size:0.72rem;
     <button class="tab" onclick="switchTab('dashboard')">Dashboard</button>
     <button class="tab" onclick="switchTab('sss-test')">SSS Recovery Test</button>
     <button class="tab" onclick="switchTab('send')">Send BB</button>
+    <button class="tab" onclick="switchTab('explorer')">Explorer</button>
   </div>
 
   <!-- Stats Bar (always visible) -->
@@ -591,6 +592,35 @@ footer{text-align:center;padding:32px 0 16px;color:var(--fg3);font-size:0.72rem;
     </div>
   </div>
 
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- TAB 5: EXPLORER                                             -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div class="tab-content" id="tab-explorer">
+    <div class="panels">
+      <div class="panel" style="flex:2">
+        <h2><span class="icon">🔍</span> Recent Blocks</h2>
+        <div id="explorerBlocks" style="max-height:500px;overflow-y:auto">
+          <div class="empty">Loading blocks…</div>
+        </div>
+      </div>
+      <div class="panel" style="flex:1">
+        <h2><span class="icon">📊</span> Network Stats</h2>
+        <div class="stats-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <div class="stat-card"><div class="label">Slot</div><div class="value" id="expSlot">—</div></div>
+          <div class="stat-card"><div class="label">Epoch</div><div class="value" id="expEpoch">—</div></div>
+          <div class="stat-card"><div class="label">TPS (10 blocks)</div><div class="value" id="expTps">—</div></div>
+          <div class="stat-card"><div class="label">Block Rate</div><div class="value" id="expBlockRate">—</div></div>
+          <div class="stat-card"><div class="label">Tower Root</div><div class="value" id="expTowerRoot">—</div></div>
+          <div class="stat-card"><div class="label">Confirmed Slots</div><div class="value" id="expConfirmed">—</div></div>
+          <div class="stat-card"><div class="label">Data Shreds</div><div class="value" id="expDataShreds">—</div></div>
+          <div class="stat-card"><div class="label">FEC Shreds</div><div class="value" id="expFecShreds">—</div></div>
+        </div>
+        <h3 style="margin-top:12px">Validator</h3>
+        <div class="stat-card"><div class="label">Identity</div><div class="value" style="font-size:0.7rem" id="expValidator">—</div></div>
+      </div>
+    </div>
+  </div>
+
   <footer>
     BlackBook L1 — Digital Central Bank &nbsp;|&nbsp; Node RPC: <span id="rpcUrl"></span> &nbsp;|&nbsp; Genesis: <span id="genesisHash">—</span>
   </footer>
@@ -635,6 +665,7 @@ function switchTab(tab) {
 
   if (tab === 'dashboard') { refreshBalances(); }
   if (tab === 'send') { refreshBalances(); }
+  if (tab === 'explorer') { refreshExplorer(); }
   if (tab === 'sss-test') {
     if (!currentWallet) {
       document.getElementById('sssNoWallet').style.display = 'block';
@@ -786,6 +817,7 @@ async function createWallet() {
     localStorage.setItem('bb_wallet', JSON.stringify({
       wallet_id: data.wallet_id,
       address: data.address,
+      username: username,
       share_a: data.share_a,
       share_a_is_encrypted: data.share_a_is_encrypted,
       public_key: data.public_key,
@@ -1134,6 +1166,20 @@ function renderAccounts() {
 async function selectAccount(addr) {
   selectedAccount = addr;
   renderAccounts();
+  // Auto-copy address to clipboard
+  try {
+    await navigator.clipboard.writeText(addr);
+    toast('Address copied: ' + addr.slice(0,8) + '…' + addr.slice(-4), 'success');
+  } catch (e) {
+    // Fallback for non-HTTPS / older browsers
+    const ta = document.createElement('textarea');
+    ta.value = addr;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('Address copied: ' + addr.slice(0,8) + '…' + addr.slice(-4), 'success');
+  }
   await refreshTransactions(addr);
   await showAccountDetail(addr);
 }
@@ -1270,6 +1316,94 @@ async function lookupAddress() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// EXPLORER
+// ══════════════════════════════════════════════════════════════
+let explorerTimer = null;
+async function refreshExplorer() {
+  try {
+    // Fetch health for slot/epoch
+    const health = await fetch(API + '/health').then(r => r.json());
+    const slot = health.blockchain?.block_count || 0;
+    const epoch = health.poh_status?.epoch || 0;
+    document.getElementById('expSlot').textContent = slot;
+    document.getElementById('expEpoch').textContent = epoch;
+
+    // Fetch Tower BFT stats
+    try {
+      const tower = await fetch(API + '/consensus/tower').then(r => r.json());
+      document.getElementById('expTowerRoot').textContent = tower.global_root ?? '—';
+      document.getElementById('expConfirmed').textContent = tower.confirmed_slots ?? '—';
+      document.getElementById('expValidator').textContent = 'genesis_validator (stake: ' + (tower.total_stake ?? 0) + ')';
+    } catch(e) {}
+
+    // Fetch Turbine stats
+    try {
+      const turbine = await fetch(API + '/turbine/status').then(r => r.json());
+      document.getElementById('expDataShreds').textContent = turbine.data_shreds ?? '—';
+      document.getElementById('expFecShreds').textContent = turbine.fec_shreds ?? '—';
+    } catch(e) {}
+
+    // Fetch recent blocks (last 10)
+    const startSlot = Math.max(0, slot - 10);
+    const blocks = [];
+    for (let s = slot; s >= startSlot && s >= 0; s--) {
+      try {
+        const resp = await fetch(API + '/poh/block/' + s);
+        if (resp.ok) {
+          const b = await resp.json();
+          if (b.slot !== undefined) blocks.push(b);
+        }
+      } catch(e) {}
+    }
+
+    // Compute TPS from recent blocks
+    if (blocks.length >= 2) {
+      const totalTx = blocks.reduce((sum, b) => sum + (b.tx_count || 0), 0);
+      const timeSpan = (blocks[0].timestamp - blocks[blocks.length-1].timestamp) || 1;
+      const tps = (totalTx / timeSpan).toFixed(2);
+      document.getElementById('expTps').textContent = tps + '/s';
+      const rate = (blocks.length / timeSpan).toFixed(2);
+      document.getElementById('expBlockRate').textContent = rate + ' blk/s';
+    }
+
+    // Render block list
+    const container = document.getElementById('explorerBlocks');
+    if (blocks.length === 0) {
+      container.innerHTML = '<div class="empty">No blocks yet</div>';
+    } else {
+      container.innerHTML = blocks.map(b => `
+        <div style="padding:8px;border-bottom:1px solid var(--border);font-size:0.8rem">
+          <div style="display:flex;justify-content:space-between">
+            <strong>Slot ${b.slot}</strong>
+            <span style="color:var(--fg3)">${b.tx_count || 0} txs</span>
+          </div>
+          <div style="color:var(--fg3);font-size:0.7rem;margin-top:2px">
+            Hash: ${(b.hash || '').substring(0,24)}…
+          </div>
+          <div style="color:var(--fg3);font-size:0.7rem">
+            PoH: ${(b.poh_hash || '').substring(0,24)}… · ${b.confirmations || 0} confirmations
+          </div>
+          ${(b.transactions || []).length > 0 ? `
+            <div style="margin-top:4px;padding:4px;background:var(--bg3);border-radius:4px;font-size:0.7rem">
+              ${(b.transactions || []).slice(0,5).map(tx => `
+                <div>${tx.from || '?'} → ${tx.data?.TransferBb?.to || '?'}: ${((tx.data?.TransferBb?.amount || 0) / 1000000).toFixed(6)} BB</div>
+              `).join('')}
+              ${(b.transactions||[]).length > 5 ? '<div>… and ' + ((b.transactions||[]).length - 5) + ' more</div>' : ''}
+            </div>
+          ` : ''}
+        </div>
+      `).join('');
+    }
+  } catch(e) {
+    console.error('Explorer refresh error:', e);
+  }
+
+  // Auto-refresh every 3s while on explorer tab
+  if (explorerTimer) clearInterval(explorerTimer);
+  explorerTimer = setInterval(refreshExplorer, 3000);
+}
+
+// ══════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════
 document.getElementById('rpcUrl').textContent = RPC;
@@ -1282,7 +1416,7 @@ document.getElementById('rpcUrl').textContent = RPC;
       const w = JSON.parse(saved);
       currentWallet = w;
       if (!accounts.find(a => a.address === w.address)) {
-        accounts.push({ name: 'My Wallet', address: w.address, role: 'user' });
+        accounts.push({ name: w.username || 'My Wallet', address: w.address, role: 'user' });
       }
       // Pre-fill Send tab Share A
       if (w.share_a) {

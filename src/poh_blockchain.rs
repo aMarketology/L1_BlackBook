@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 use sha2::{Sha256, Digest};
+use tracing::error;
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn};
 
@@ -111,7 +112,7 @@ impl Shred {
     }
     
     /// Verify the shred's integrity
-    pub fn verify(&self, expected_leader: &str) -> bool {
+    pub fn verify(&self, _expected_leader: &str) -> bool {
         // In production, verify Ed25519 signature
         // For now, check signature format
         !self.signature.is_empty() && self.data.len() <= SHRED_SIZE
@@ -583,10 +584,14 @@ pub struct BlockProducer {
     /// Current slot
     current_slot: Arc<AtomicU64>,
     
-    /// Pending transactions for next block
+    /// Pending transactions for next block (from Gulf Stream — will be executed)
     pending_txs: Arc<RwLock<Vec<Transaction>>>,
+
+    /// Pre-executed transactions for next block (from handlers — already executed,
+    /// just need to be recorded in the block for PoH ordering + persistence)
+    executed_txs: Arc<RwLock<Vec<Transaction>>>,
     
-    /// Produced blocks (in-memory cache)
+    /// Produced blocks (in-memory cache, last N blocks)
     blocks: Arc<RwLock<Vec<FinalizedBlock>>>,
     
     /// Latest block hash for chaining
@@ -597,6 +602,9 @@ pub struct BlockProducer {
 
     /// SVM execution engine (Phase 1C: routes TransferBb through native Rust path)
     svm: Arc<std::sync::Mutex<BlackBookSVM>>,
+
+    /// Last slot we produced a block for (prevents double-production)
+    last_produced_slot: Arc<AtomicU64>,
 }
 
 impl BlockProducer {
@@ -629,10 +637,12 @@ impl BlockProducer {
             leader_schedule,
             current_slot,
             pending_txs: Arc::new(RwLock::new(Vec::new())),
+            executed_txs: Arc::new(RwLock::new(Vec::new())),
             blocks: Arc::new(RwLock::new(Vec::new())),
             latest_hash: Arc::new(RwLock::new(genesis_hash)),
             validator_id,
             svm,
+            last_produced_slot: Arc::new(AtomicU64::new(u64::MAX)), // sentinel: no block produced yet
         }
     }
 
@@ -657,6 +667,30 @@ impl BlockProducer {
         Ok(tx_id)
     }
 
+    /// Record an already-executed transaction for inclusion in the next block.
+    ///
+    /// Unlike `submit_transaction()`, this does NOT execute the transaction —
+    /// it only queues it so `produce_block()` packages it into the PoH block.
+    /// Use this for transactions processed by HTTP handlers (SSS transfers,
+    /// faucet mints) that are already committed to ReDB + SVM.
+    pub fn record_executed_transaction(&self, tx: Transaction) {
+        let tx_id = tx.hash.clone();
+
+        // Mix into PoH for cryptographic ordering proof
+        {
+            let mut poh = self.poh.write();
+            poh.queue_transaction(tx_id.clone());
+        }
+
+        // Queue for next block (will NOT be re-executed)
+        {
+            let mut executed = self.executed_txs.write();
+            executed.push(tx);
+        }
+
+        tracing::debug!(tx_id = %tx_id, "Recorded pre-executed tx for next block");
+    }
+
     /// Check if we are the leader for the current slot
     pub fn is_current_leader(&self) -> bool {
         let slot = self.current_slot.load(Ordering::Relaxed);
@@ -668,6 +702,12 @@ impl BlockProducer {
     /// Produce a block for the current slot (if we are leader)
     pub fn produce_block(&self) -> Result<FinalizedBlock, String> {
         let slot = self.current_slot.load(Ordering::Relaxed);
+
+        // Guard: don't double-produce the same slot
+        let last = self.last_produced_slot.load(Ordering::Relaxed);
+        if last == slot {
+            return Err(format!("Already produced block for slot {}", slot));
+        }
         
         // Check leadership
         let leader = {
@@ -679,22 +719,13 @@ impl BlockProducer {
             return Err(format!("Not leader for slot {}. Leader is: {}", slot, leader));
         }
 
-        // Get PoH state
+        // Snapshot PoH state for this slot (PoH clock handles advancement)
         let (poh_hash, poh_sequence, poh_entries, epoch) = {
-            let mut poh = self.poh.write();
-            
-            // Mix any pending transactions
-            poh.mix_pending_transactions();
-            
-            // Get current state
+            let poh = self.poh.read();
             let hash = poh.current_hash.clone();
             let seq = poh.num_hashes;
             let entries = poh.current_entries.clone();
             let epoch = poh.current_epoch;
-            
-            // Advance to next slot
-            poh.advance_slot();
-            
             (hash, seq, entries, epoch)
         };
 
@@ -713,16 +744,36 @@ impl BlockProducer {
             }
         }
 
-        // Collect transactions
-        let transactions: Vec<Transaction> = {
+        // ---- Collect pre-executed transactions (from HTTP handlers) ----
+        let pre_executed: Vec<Transaction> = {
+            let mut executed = self.executed_txs.write();
+            std::mem::take(&mut *executed)
+        };
+
+        // ---- Collect pending transactions (from Gulf Stream — need execution) ----
+        let pending: Vec<Transaction> = {
             let mut pending = self.pending_txs.write();
             std::mem::take(&mut *pending)
         };
 
-        // Execute transactions and build ordered list
+        // Build ordered transaction list
         let mut ordered_txs = Vec::new();
-        for (position, tx) in transactions.into_iter().enumerate() {
-            // Execute the transaction
+        let mut position: u32 = 0;
+
+        // 1) Pre-executed transactions — already committed, just record in block
+        for tx in pre_executed {
+            ordered_txs.push(OrderedTransaction {
+                tx,
+                poh_hash: poh_hash.clone(),
+                poh_sequence,
+                slot,
+                position,
+            });
+            position += 1;
+        }
+
+        // 2) Pending transactions — execute then record
+        for tx in pending {
             match self.execute_transaction(&tx) {
                 Ok(_) => {
                     ordered_txs.push(OrderedTransaction {
@@ -730,8 +781,9 @@ impl BlockProducer {
                         poh_hash: poh_hash.clone(),
                         poh_sequence,
                         slot,
-                        position: position as u32,
+                        position,
                     });
+                    position += 1;
                 }
                 Err(e) => {
                     warn!("Transaction {} failed: {}", tx.hash, e);
@@ -783,7 +835,7 @@ impl BlockProducer {
             *latest = block_hash.clone();
         }
 
-        // Store block
+        // Store block in-memory cache (keep last 1000 blocks)
         {
             let mut blocks = self.blocks.write();
             blocks.push(block.clone());
@@ -793,6 +845,17 @@ impl BlockProducer {
             for i in 0..len.saturating_sub(1) {
                 blocks[len - 1 - i - 1].confirmations += 1;
             }
+
+            // Evict oldest if cache exceeded
+            if blocks.len() > 1000 {
+                let excess = blocks.len() - 1000;
+                blocks.drain(0..excess);
+            }
+        }
+
+        // Persist block to ReDB
+        if let Err(e) = self.blockchain.store_block(slot, &block) {
+            error!("Failed to persist block {} to ReDB: {}", slot, e);
         }
 
         // Update leader schedule
@@ -805,22 +868,24 @@ impl BlockProducer {
         {
             if let Ok(mut svm) = self.svm.lock() {
                 match svm.end_of_block() {
-                    Ok(n) => info!("💾 SVM flush: {} accounts persisted for slot {}", n, slot),
+                    Ok(n) => if n > 0 { info!("💾 SVM flush: {} accounts persisted for slot {}", n, slot) },
                     Err(e) => warn!("SVM flush error at slot {}: {}", slot, e),
                 }
             }
         }
 
-        // Advance slot counter
-        self.current_slot.fetch_add(1, Ordering::Relaxed);
+        // Mark this slot as produced
+        self.last_produced_slot.store(slot, Ordering::Relaxed);
 
-        info!(
-            "📦 Block {} produced: {} txs, state_root: {}..., poh: {}...",
-            slot,
-            block.tx_count,
-            &block.state_root[..16],
-            &block.poh_hash[..16]
-        );
+        if block.tx_count > 0 {
+            info!(
+                "📦 Block {} produced: {} txs, hash: {}…, poh: {}…",
+                slot,
+                block.tx_count,
+                &block.hash[..16],
+                &block.poh_hash[..16]
+            );
+        }
 
         Ok(block)
     }
@@ -925,7 +990,7 @@ impl BlockProducer {
         amount_bb: u64,
     ) -> Result<(), String> {
         use crate::svm::types::LAMPORTS_PER_BB;
-        use solana_sdk::account::{AccountSharedData, ReadableAccount};
+        use solana_sdk::account::AccountSharedData;
 
         let svm_guard = self.svm.lock()
             .map_err(|e| format!("SVM lock poisoned: {e}"))?;
@@ -1015,16 +1080,29 @@ impl BlockProducer {
         BTreeMap::new()
     }
 
-    /// Get a block by slot number
+    /// Get a block by slot number (memory cache → ReDB fallback)
     pub fn get_block(&self, slot: u64) -> Option<FinalizedBlock> {
+        // Check in-memory cache first
         let blocks = self.blocks.read();
-        blocks.iter().find(|b| b.slot == slot).cloned()
+        if let Some(block) = blocks.iter().find(|b| b.slot == slot) {
+            return Some(block.clone());
+        }
+        drop(blocks);
+
+        // Fallback to ReDB
+        self.blockchain.load_block(slot).ok().flatten()
     }
 
     /// Get the latest block
     pub fn get_latest_block(&self) -> Option<FinalizedBlock> {
         let blocks = self.blocks.read();
         blocks.last().cloned()
+    }
+
+    /// Get total blocks produced (including ReDB-persisted)
+    pub fn total_blocks_produced(&self) -> u64 {
+        let last = self.last_produced_slot.load(Ordering::Relaxed);
+        if last == u64::MAX { 0 } else { last + 1 }
     }
 
     /// Get block count

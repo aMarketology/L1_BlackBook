@@ -19,11 +19,10 @@
 //
 // ============================================================================
 
-use borsh::{BorshDeserialize, BorshSerialize};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Sha256, Digest};
 use solana_sdk::{
-    account::{AccountSharedData, Account, ReadableAccount, WritableAccount},
+    account::{AccountSharedData, Account, ReadableAccount},
     pubkey::Pubkey,
 };
 

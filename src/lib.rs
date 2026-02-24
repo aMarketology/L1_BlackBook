@@ -27,45 +27,19 @@ pub mod runtime;
 // ============================================================================
 
 // Storage
-pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, CreditSession, SettlementResult};
+pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, SettlementResult};
 
-// Protocol — Tier 1 Vault (Gatekeeper)
-pub use protocol::blockchain::{
-    // Constants
-    USDT_TO_BB_RATIO, TOKEN_DECIMALS, DEFAULT_BASE_CPI,
-    
-    // Token Ledgers
-    BlackBookLedger, DimeLedger,
-    
-    // Tier 1: USDT → $BB Gateway
-    Tier1Gateway, Tier1Deposit,
-    
-    // Tier 2: $BB → $DIME Vault
-    Tier2Vault, DimeVintage,
-    
-    // Events
-    L1Event,
-    
-    // Transactions
-    Transaction, TxData,
-    
-    // State & Security
-    L1State, AccountSecurity,
-    
-    // Errors
-    ChainError,
-    
-    // Compliance
-    ProofOfReserves,
-};
+// Protocol — Transactions
+pub use protocol::blockchain::{Transaction, TxData};
 
 // Runtime — Solana-style consensus
 pub use runtime::{
-    PoHConfig, PoHService, SharedPoHService, 
+    PoHConfig, SharedPoHService, 
     create_poh_service, run_poh_clock,
     TransactionPipeline, LeaderSchedule,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
+pub use runtime::poh_service::PoHService;
 
 // PoH-Integrated Blockchain
 pub use poh_blockchain::{

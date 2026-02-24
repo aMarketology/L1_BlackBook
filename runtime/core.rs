@@ -10,18 +10,17 @@
 //!   - Circuit breakers (automatic bank-run protection)
 //!   - Stake-weighted throttling (fair resource allocation)
 
-#![allow(dead_code)]
+
 
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use rayon::prelude::*;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 use borsh::{BorshSerialize, BorshDeserialize};
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 
 // ============================================================================
 // SEALEVEL CONSTANTS

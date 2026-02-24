@@ -14,35 +14,27 @@ pub mod poh_service;
 
 // PoH Service
 pub use poh_service::{
-    PoHService, SharedPoHService, create_poh_service, run_poh_clock,
-    TransactionPipeline, SharedPipeline, verify_poh_chain,
+    SharedPoHService, create_poh_service, run_poh_clock,
+    TransactionPipeline,
     PipelinePacket,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
 
 // Consensus — Tower BFT + PoH + Gulf Stream
 pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};
-pub use consensus::{
-    Vote, TowerLockout, VoteTower, TowerSync, ForkInfo,
-    TowerBFT, ConsensusStatus, TowerBFTStats,
-    verify_block_validity, check_vote_threshold,
-    MAX_TOWER_DEPTH, SUPERMAJORITY_THRESHOLD, MIN_FORK_VOTES,
-};
+pub use consensus::TowerBFT;
 
 // Sealevel Parallel Execution
-pub use core::{
-    ParallelScheduler, AccountLockManager,
-    Transaction as RuntimeTransaction,
-};
+pub use core::ParallelScheduler;
 
 // Account System (PDA + Metadata)
 pub use core::{
-    pda_namespace, AccountType, ProgramDerivedAddress, AccountMetadata, PDAInfo,
-    AccountAccess, AccountValidationError, AccountValidator,
+    AccountType, ProgramDerivedAddress, AccountMetadata, PDAInfo,
+    AccountAccess, AccountValidator,
 };
 
 // Security Infrastructure
-pub use core::{NetworkThrottler, RateLimitEntry};
-pub use core::{CircuitBreaker, ValueFlowEntry, SINGLE_BLOCK_VALUE_THRESHOLD, HOURLY_VALUE_THRESHOLD, CIRCUIT_BREAKER_COOLDOWN_SECS};
-pub use core::{LocalizedFeeMarket, FeeMarketEntry};
+pub use core::NetworkThrottler;
+pub use core::CircuitBreaker;
+pub use core::LocalizedFeeMarket;
 

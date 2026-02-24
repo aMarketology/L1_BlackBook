@@ -18,7 +18,6 @@
 //
 // ============================================================================
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error};
 
@@ -182,7 +181,7 @@ pub fn execute_migration(
 fn migrate_single_wallet(
     blockchain: &ConcurrentBlockchain,
     entry: &WalletMigrationEntry,
-    drain_old: bool,
+    _drain_old: bool,
     migrate_shares: bool,
 ) -> WalletMigrationResult {
     let old_balance = blockchain.get_balance(&entry.old_address);

@@ -9,7 +9,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit},
     Aes256Gcm, Nonce
 };
-use rand::RngCore;
+// rand::RngCore reserved for future direct random byte generation
 
 /// Hashes a secret (PIN/Password) using Argon2id. Returns PHC string.
 pub fn hash_secret(secret: &str) -> String {

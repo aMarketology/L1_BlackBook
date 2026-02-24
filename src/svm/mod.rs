@@ -29,42 +29,19 @@ pub mod spl_token;
 
 // Re-export the most-used types at the svm:: level for ergonomic imports.
 pub use types::{
-    StoredAccount,
     StoredTransactionResult,
-    SvmError,
-    TransactionExecutionResult,
     LAMPORTS_PER_BB,
-    RENT_EPOCH_EXEMPT,
-    MAX_COMPUTE_UNITS,
-    MAX_RECENT_BLOCKHASHES,
 };
 
-pub use accounts_db::{
-    SvmAccountsDB,
-    SVM_ACCOUNTS,
-    SVM_PROGRAMS,
-    BLOCKHASH_QUEUE,
-    SVM_SIGNATURES,
-    SVM_TX_LOG,
-    SVM_ADDR_SIGS,
-};
-pub use runtime::{BlackBookSVM, TransferRequest, BlockhashQueue};
+pub use accounts_db::SvmAccountsDB;
+pub use runtime::{BlackBookSVM, TransferRequest};
 
-pub use tx_adapter::{bb_to_lamports, lamports_to_bb};
 
 // Re-export SPL Token types and helpers
 pub use spl_token::{
     SplTokenEngine,
     usdc_mint_address,
     usdc_mint_bytes,
-    derive_ata_address,
     USDC_DECIMALS,
     USDC_UNIT,
-    SPL_TOKEN_PROGRAM_ID,
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-    MintLayout,
-    TokenAccountLayout,
-    MintResult,
-    TransferTokenResult,
-    TokenAccountInfo,
 };

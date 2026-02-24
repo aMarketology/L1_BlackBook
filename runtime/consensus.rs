@@ -18,7 +18,7 @@
 //!   Readers forward incoming transactions to the current Writer
 //!   so the Writer's mempool is pre-filled before its slot arrives.
 
-#![allow(dead_code)]
+
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -29,7 +29,7 @@ use parking_lot::RwLock;
 use borsh::{BorshSerialize, BorshDeserialize};
 use dashmap::DashMap;
 use sha2::{Sha256, Digest};
-use tracing::{info, debug};
+use tracing::info;
 use crate::runtime::core::Transaction;
 
 // ============================================================================

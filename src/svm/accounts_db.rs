@@ -38,7 +38,7 @@
 use std::sync::Arc;
 use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
-use borsh::{BorshSerialize, BorshDeserialize};
+use borsh::BorshDeserialize;
 use tracing::{info, warn, debug};
 
 use crate::svm::types::{StoredAccount, SvmError, RENT_EPOCH_EXEMPT};

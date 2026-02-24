@@ -1,7 +1,7 @@
 use vaultrs::client::{VaultClient, VaultClientSettingsBuilder};
 use std::env;
 use std::collections::HashMap;
-use tracing::{info, error, warn};
+use tracing::{info, error};
 
 pub struct VaultManager {
     client: VaultClient,

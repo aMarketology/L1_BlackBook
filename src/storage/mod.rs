@@ -37,11 +37,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
-use tracing::{info, error, warn};
+use tracing::{info, warn};
 use crate::svm::accounts_db::SvmAccountsDB;
 use crate::svm::types::LAMPORTS_PER_BB;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::account::{AccountSharedData, ReadableAccount};
+use solana_sdk::account::AccountSharedData;
 
 // ============================================================================
 // REDB TABLE DEFINITIONS (Type-Safe!)
@@ -84,24 +84,9 @@ const WALLET_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet
 /// Stores wallet info (created_at, last_accessed, share locations, etc.)
 const WALLET_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_metadata");
 
-// ============================================================================
-// TWO-TIER VAULT TABLES
-// ============================================================================
-
-/// Tier 1 USDT Reserve: "state" → Tier1Gateway serialized state (Vec<u8>)
-const TIER1_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier1_state");
-
-/// Tier 2 Inflation Vault: "state" → Tier2InflationVault serialized state (Vec<u8>)
-const TIER2_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("tier2_state");
-
-/// DIME Vintages: VintageId (String) → DimeVintage serialized (Vec<u8>)
-const DIME_VINTAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("dime_vintages");
-
-/// CPI History: Timestamp (u64) → CPI value as bytes (serialized f64)
-const CPI_HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("cpi_history");
-
-/// DIME Balances: Address (String) → Balance (u64)
-const DIME_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("dime_balances");
+// NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
+// DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
+// feature was designed but never wired up. Recoverable from git history.
 
 // ============================================================================
 // ENHANCED LEDGER ENUMS (Type-Safe Blockchain Integrity)
@@ -134,26 +119,8 @@ impl std::fmt::Display for TxType {
     }
 }
 
-/// Transaction status enum
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TxStatus {
-    Pending,
-    Finalized,
-    Reverted,
-    Failed,
-}
-
-impl std::fmt::Display for TxStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TxStatus::Pending => write!(f, "PENDING"),
-            TxStatus::Finalized => write!(f, "FINALIZED"),
-            TxStatus::Reverted => write!(f, "REVERTED"),
-            TxStatus::Failed => write!(f, "FAILED"),
-        }
-    }
-}
+// NOTE: TxStatus enum removed — tx lifecycle is tracked by
+// FinalityTracker (ConfirmationStatus::Processing → Confirmed → Finalized).
 
 /// Authentication type for ZKP/SSS tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -162,6 +129,7 @@ pub enum AuthType {
     MasterKey,      // Direct password authentication
     SessionKey,     // Scoped session key
     ZkProof,        // Zero-knowledge proof
+    SSS,            // Shamir Secret Sharing 2-of-3 reconstruction
     SystemInternal, // Internal system operation (mints, etc)
 }
 
@@ -171,6 +139,7 @@ impl std::fmt::Display for AuthType {
             AuthType::MasterKey => write!(f, "MASTER_KEY"),
             AuthType::SessionKey => write!(f, "SESSION_KEY"),
             AuthType::ZkProof => write!(f, "ZKP_SESSION"),
+            AuthType::SSS => write!(f, "SSS_2OF3"),
             AuthType::SystemInternal => write!(f, "SYSTEM"),
         }
     }
@@ -608,6 +577,34 @@ impl ConcurrentBlockchain {
             warn!("Failed to log mint transaction: {}", e);
         }
         
+        // ═══ SVM TX RECEIPT: So faucet mints show in explorer ═══
+        {
+            use sha2::{Sha256, Digest};
+            let slot = self.block_height.load(Ordering::Relaxed);
+            let lamport_amount = (amount * LAMPORTS_PER_BB as f64) as i64;
+            // Deterministic signature from mint details
+            let sig_input = format!("MINT:{}:{}:{}", address, amount, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let sig_hash: [u8; 32] = Sha256::digest(sig_input.as_bytes()).into();
+            let sig_b58 = bs58::encode(&sig_hash).into_string();
+            let stored = crate::svm::types::StoredTransactionResult {
+                signature: sig_b58,
+                slot,
+                success: true,
+                error_msg: String::new(),
+                compute_units_consumed: 100,
+                fee: 0,
+                account_keys: vec!["TREASURY".to_string(), address.to_string()],
+                lamport_deltas: vec![
+                    ("TREASURY".to_string(), -lamport_amount),
+                    (address.to_string(), lamport_amount),
+                ],
+                block_time: chrono::Utc::now().timestamp(),
+            };
+            if let Err(e) = self.svm_accounts.store_transaction_result(&stored) {
+                warn!("Failed to store SVM mint receipt: {}", e);
+            }
+        }
+        
         info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens ADDED to wallet");
         Ok(())
     }
@@ -763,8 +760,13 @@ impl ConcurrentBlockchain {
         self.get_transactions(None, limit, 0).unwrap_or_default()
     }
 
-    /// Transfer tokens between addresses (atomic)
+    /// Transfer tokens between addresses (atomic) — legacy API (no SVM receipt).
     pub fn transfer(&self, from: &str, to: &str, amount: f64) -> Result<(), String> {
+        self.transfer_inner(from, to, amount, AuthType::MasterKey)
+    }
+
+    /// Core atomic transfer: ReDB write + DashMap cache + SVM sync + L1 ledger log.
+    fn transfer_inner(&self, from: &str, to: &str, amount: f64, auth_type: AuthType) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
         }
@@ -830,7 +832,7 @@ impl ConcurrentBlockchain {
             from_balance_before,
             from_balance,
             to_balance,
-            AuthType::MasterKey, // Default to master key for simple transfers
+            auth_type,
         );
         
         if let Err(e) = self.log_transaction(tx_record) {
@@ -844,6 +846,48 @@ impl ConcurrentBlockchain {
             "Transfer successful"
         );
         Ok(())
+    }
+
+    /// Transfer tokens with a pre-computed Ed25519 signature and emit an SVM
+    /// transaction receipt so wallets & explorer can look it up via
+    /// `getTransaction` / `getSignaturesForAddress`.
+    pub fn transfer_with_receipt(
+        &self,
+        from: &str,
+        to: &str,
+        amount: f64,
+        signature_hex: &str,
+        auth_type: AuthType,
+    ) -> Result<String, String> {
+        // Execute the core atomic transfer (ReDB + cache + SVM sync)
+        self.transfer_inner(from, to, amount, auth_type)?;
+
+        // Build a Solana-compatible transaction receipt for the SVM layer
+        let slot = self.block_height.load(Ordering::Relaxed);
+        let lamport_amount = (amount * LAMPORTS_PER_BB as f64) as i64;
+
+        let stored = crate::svm::types::StoredTransactionResult {
+            signature: signature_hex.to_string(),
+            slot,
+            success: true,
+            error_msg: String::new(),
+            compute_units_consumed: 150,
+            fee: 0,
+            account_keys: vec![from.to_string(), to.to_string()],
+            lamport_deltas: vec![
+                (from.to_string(), -lamport_amount),
+                (to.to_string(), lamport_amount),
+            ],
+            block_time: chrono::Utc::now().timestamp(),
+        };
+
+        if let Err(e) = self.svm_accounts.store_transaction_result(&stored) {
+            warn!("Failed to store SVM tx receipt: {}", e);
+        } else {
+            info!(sig = %signature_hex, "📜 SVM tx receipt stored");
+        }
+
+        Ok(signature_hex.to_string())
     }
 
     // ========================================================================
@@ -860,6 +904,49 @@ impl ConcurrentBlockchain {
             total_supply: self.total_supply(),
             cache_hit_rate: 0.99, // DashMap is extremely fast
         }
+    }
+
+    // ========================================================================
+    // BLOCK PERSISTENCE (PoH Blocks → ReDB)
+    // ========================================================================
+
+    /// Persist a FinalizedBlock to ReDB (BLOCKS table: slot → bincode)
+    pub fn store_block(&self, slot: u64, block: &crate::poh_blockchain::FinalizedBlock) -> Result<(), String> {
+        let encoded = serde_json::to_vec(block)
+            .map_err(|e| format!("Block serialization failed: {e}"))?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(BLOCKS).map_err(|e| e.to_string())?;
+            table.insert(slot, encoded.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        self.block_height.fetch_max(slot + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Load a FinalizedBlock from ReDB by slot number
+    pub fn load_block(&self, slot: u64) -> Result<Option<crate::poh_blockchain::FinalizedBlock>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(BLOCKS).map_err(|e| e.to_string())?;
+        match table.get(slot).map_err(|e| e.to_string())? {
+            Some(data) => {
+                let block: crate::poh_blockchain::FinalizedBlock = serde_json::from_slice(data.value())
+                    .map_err(|e| format!("Block deserialization failed: {e}"))?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get the highest stored block slot from ReDB
+    pub fn latest_block_slot(&self) -> Result<Option<u64>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(BLOCKS).map_err(|e| e.to_string())?;
+        let result = match table.last().map_err(|e| e.to_string())? {
+            Some((slot, _)) => Ok(Some(slot.value())),
+            None => Ok(None),
+        };
+        result
     }
 
     // ========================================================================
@@ -1104,8 +1191,7 @@ pub struct MarketSession {
     pub expires_at: String,
 }
 
-// Type alias for backwards compatibility
-pub type CreditSession = MarketSession;
+// NOTE: CreditSession type alias removed — use MarketSession directly.
 
 /// Result of settling a credit session
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1135,8 +1221,7 @@ pub struct TokenLock {
     pub l2_tx_hash: Option<String>,
 }
 
-// Type alias for backwards compatibility
-pub type BridgeLock = TokenLock;
+// NOTE: BridgeLock type alias removed — use TokenLock directly.
 
 /// Token lock status
 #[derive(Clone, Debug, serde::Serialize, PartialEq)]

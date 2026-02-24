@@ -21,7 +21,7 @@
 // ============================================================================
 use solana_sdk::{hash::Hash, pubkey::Pubkey};
 
-use crate::svm::types::{SvmError, LAMPORTS_PER_BB};
+use crate::svm::types::LAMPORTS_PER_BB;
 use crate::svm::runtime::TransferRequest;
 
 // ============================================================================

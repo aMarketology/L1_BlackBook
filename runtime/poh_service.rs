@@ -15,7 +15,7 @@
 //! INFRASTRUCTURE NOTE: Pipeline stages are built for high-throughput parallel
 //! transaction processing. Pipeline::submit() will be wired to routes for
 //! direct transaction submission.
-#![allow(dead_code)]
+
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
@@ -143,8 +143,6 @@ pub struct VerifiedPacket {
 pub struct ExecutedPacket {
     pub packet: PipelinePacket,
     pub success: bool,
-    pub error: Option<String>,
-    pub execution_time_us: u64,
 }
 
 /// Result of commit stage
@@ -352,23 +350,12 @@ impl TransactionPipeline {
                     continue;
                 }
                 
-                // Simulate execution
-                let start = Instant::now();
-                
                 // Basic validation (in real system, Sealevel parallel execution)
-                let (success, error) = if verified.packet.amount < 0.0 {
-                    (false, Some("Negative amount".to_string()))
-                } else {
-                    (true, None)
-                };
-                
-                let execution_time_us = start.elapsed().as_micros() as u64;
+                let success = verified.packet.amount >= 0.0;
                 
                 let executed = ExecutedPacket {
                     packet: verified.packet,
                     success,
-                    error,
-                    execution_time_us,
                 };
                 
                 if execute_tx.send(executed).await.is_err() {

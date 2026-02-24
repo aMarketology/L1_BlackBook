@@ -27,8 +27,7 @@
 // Run: cargo run --bin main_v4
 // Test: curl http://localhost:8080/health
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
+
 
 // ============================================================================
 // IMPORTS

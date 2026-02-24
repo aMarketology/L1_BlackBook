@@ -37,6 +37,7 @@ use base64::engine::{Engine, general_purpose::STANDARD as B64};
 
 use crate::svm::{SvmAccountsDB, BlackBookSVM};
 use crate::supabase::SupabaseManager;
+use crate::poh_blockchain::BlockProducer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Solana-compatible response wrappers
@@ -397,6 +398,33 @@ pub trait BlackBookRpc {
     /// Returns true if the address is registered and active in Supabase.
     #[method(name = "blackbook_isRegistered")]
     async fn blackbook_is_registered(&self, pubkey: String) -> RpcResult<bool>;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 5 — Block query methods
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Returns an identity and transaction information about a confirmed block.
+    #[method(name = "getBlock")]
+    async fn get_block(
+        &self,
+        slot: u64,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<Option<serde_json::Value>>;
+
+    /// Returns a list of confirmed blocks between two slots.
+    #[method(name = "getBlocks")]
+    async fn get_blocks(
+        &self,
+        start_slot: u64,
+        end_slot: Option<u64>,
+    ) -> RpcResult<Vec<u64>>;
+
+    /// Returns recent block production information.
+    #[method(name = "getBlockProduction")]
+    async fn get_block_production(
+        &self,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -411,6 +439,8 @@ pub struct BlackBookRpcImpl {
     pub genesis_hash: String,
     /// Supabase client for wallet profile lookups (Backpack identity filter)
     pub supabase:     Arc<SupabaseManager>,
+    /// Block access for getBlock / getBlocks RPC
+    pub block_producer: Option<Arc<BlockProducer>>,
 }
 
 impl BlackBookRpcImpl {
@@ -426,7 +456,7 @@ impl BlackBookRpcImpl {
 
         info!("🔌 BlackBookRpc created  genesis_hash={}", genesis_hash);
 
-        Self { svm_db, svm, current_slot, genesis_hash, supabase }
+        Self { svm_db, svm, current_slot, genesis_hash, supabase, block_producer: None }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -877,7 +907,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     ) -> RpcResult<RpcResponse<Vec<serde_json::Value>>> {
         info!("📡 RPC ← getTokenAccountsByOwner({pubkey})");
 
-        use crate::svm::spl_token::{SplTokenEngine, usdc_mint_bytes, SPL_TOKEN_PROGRAM_ID, USDC_DECIMALS};
+        use crate::svm::spl_token::{SplTokenEngine, usdc_mint_bytes, SPL_TOKEN_PROGRAM_ID};
 
         // Parse the wallet pubkey
         let wallet_bytes = bs58::decode(&pubkey)
@@ -1184,6 +1214,96 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
             Ok(Some(p)) => Ok(p.account_status == "active"),
             _           => Ok(false),
         }
+    }
+
+    // ─── Phase 5: Block query methods ───────────────────────────────────
+
+    async fn get_block(
+        &self,
+        slot: u64,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<Option<serde_json::Value>> {
+        info!("📡 RPC ← getBlock({})", slot);
+        let block = self.block_producer.as_ref()
+            .and_then(|bp| bp.get_block(slot));
+        match block {
+            Some(b) => {
+                let txs: Vec<serde_json::Value> = b.transactions.iter().map(|otx| {
+                    serde_json::json!({
+                        "hash": otx.tx.hash,
+                        "from": otx.tx.from,
+                        "slot": otx.slot,
+                        "position": otx.position,
+                        "poh_hash": otx.poh_hash,
+                    })
+                }).collect();
+                Ok(Some(serde_json::json!({
+                    "blockHeight": b.slot,
+                    "blockTime": b.timestamp,
+                    "blockhash": b.hash,
+                    "parentSlot": b.slot.saturating_sub(1),
+                    "previousBlockhash": b.previous_hash,
+                    "transactions": txs,
+                    "rewards": [],
+                    "leader": b.leader,
+                    "epoch": b.epoch,
+                    "pohHash": b.poh_hash,
+                    "stateRoot": b.state_root,
+                    "txCount": b.tx_count,
+                    "confirmations": b.confirmations,
+                })))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn get_blocks(
+        &self,
+        start_slot: u64,
+        end_slot: Option<u64>,
+    ) -> RpcResult<Vec<u64>> {
+        let end = end_slot.unwrap_or_else(|| self.slot());
+        info!("📡 RPC ← getBlocks({}, {})", start_slot, end);
+        let mut slots = Vec::new();
+        if let Some(bp) = &self.block_producer {
+            for s in start_slot..=end.min(start_slot + 500_000) {
+                if bp.get_block(s).is_some() {
+                    slots.push(s);
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    async fn get_block_production(
+        &self,
+        _config: Option<serde_json::Value>,
+    ) -> RpcResult<RpcResponse<serde_json::Value>> {
+        info!("📡 RPC ← getBlockProduction");
+        let slot = self.slot();
+        // Single-validator: genesis_validator produces all slots
+        let mut leader_slots: Vec<u64> = Vec::new();
+        let mut blocks_produced: Vec<u64> = Vec::new();
+        if let Some(bp) = &self.block_producer {
+            for s in 0..=slot {
+                leader_slots.push(s);
+                if bp.get_block(s).is_some() {
+                    blocks_produced.push(s);
+                }
+            }
+        }
+        Ok(RpcResponse {
+            context: self.ctx(),
+            value: serde_json::json!({
+                "byIdentity": {
+                    "genesis_validator": [leader_slots.len(), blocks_produced.len()]
+                },
+                "range": {
+                    "firstSlot": 0,
+                    "lastSlot": slot,
+                }
+            }),
+        })
     }
 }
 
