@@ -134,6 +134,10 @@ fn account_name(addr: &str) -> Option<&'static str> {
 }
 
 // ============================================================================
+// SVM LIVE-SYNC HELPER
+// ============================================================================
+
+// ============================================================================
 // APPLICATION STATE
 // ============================================================================
 
@@ -326,14 +330,16 @@ async fn signed_transfer_handler(
 
     match state.blockchain.transfer(from, &payload.to, payload.amount) {
         Ok(_) => {
+            let from_bal = state.blockchain.get_balance(from);
+            let to_bal   = state.blockchain.get_balance(&payload.to);
             info!("💸 Transfer: {} → {} : {} BB", from, payload.to, payload.amount);
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "from": from,
                 "to": payload.to,
                 "amount": payload.amount,
-                "from_balance": state.blockchain.get_balance(from),
-                "to_balance": state.blockchain.get_balance(&payload.to),
+                "from_balance": from_bal,
+                "to_balance": to_bal,
             })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
@@ -486,13 +492,14 @@ async fn admin_mint_handler(
 
     match state.blockchain.credit(&req.to, req.amount) {
         Ok(_) => {
-            info!("🪙 MINT: {} BB → {} (receipt: {:?})", 
+            let new_bal = state.blockchain.get_balance(&req.to);
+            info!("🪙 MINT: {} BB → {} (receipt: {:?})",
                 req.amount, req.to, req.l2_receipt_id);
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "minted": req.amount,
                 "to": req.to,
-                "new_balance": state.blockchain.get_balance(&req.to),
+                "new_balance": new_bal,
                 "l2_receipt_id": req.l2_receipt_id,
             })))
         }
@@ -528,12 +535,13 @@ async fn admin_burn_handler(
 
     match state.blockchain.debit(&req.from, req.amount) {
         Ok(_) => {
+            let new_bal = state.blockchain.get_balance(&req.from);
             info!("🔥 BURN: {} BB from {} (receipt: {:?})", req.amount, req.from, req.l2_receipt_id);
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "burned": req.amount,
                 "from": req.from,
-                "new_balance": state.blockchain.get_balance(&req.from),
+                "new_balance": new_bal,
                 "l2_receipt_id": req.l2_receipt_id,
             })))
         }
@@ -542,7 +550,7 @@ async fn admin_burn_handler(
 }
 
 // ============================================================================
-// FAUCET — Public token mint (max 100 BB per address per epoch)
+// FAUCET — Public token mint (max 99,999 BB per address per epoch)
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -551,12 +559,12 @@ struct FaucetRequest {
     amount: f64,
 }
 
-/// POST /faucet — Mint up to 100 BB to any address (rate-limited per epoch)
+/// POST /faucet — Mint up to 99,999 BB to any address (rate-limited per epoch)
 async fn faucet_handler(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> impl IntoResponse {
-    const MAX_FAUCET_BB: f64 = 100.0;
+    const MAX_FAUCET_BB: f64 = 99_999.0;
 
     if req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -566,7 +574,7 @@ async fn faucet_handler(
     let amount = req.amount.min(MAX_FAUCET_BB).max(0.0);
     if amount <= 0.0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Amount must be between 0 and 100 BB"
+            "error": "Amount must be between 0 and 99,999 BB"
         })));
     }
 
@@ -574,7 +582,7 @@ async fn faucet_handler(
     let current_slot = state.current_slot.load(Ordering::Relaxed);
     let current_epoch = current_slot / 432_000;
 
-    // Rate-limit: one faucet per address per epoch, up to 100 BB total
+    // Rate-limit: one faucet per address per epoch, up to 99,999 BB total
     {
         let mut entry = state.faucet_claims.entry(req.to.clone()).or_insert((current_epoch, 0.0));
         let (claimed_epoch, claimed_total) = entry.value_mut();
@@ -588,7 +596,7 @@ async fn faucet_handler(
         let remaining = MAX_FAUCET_BB - *claimed_total;
         if remaining <= 0.0 {
             return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-                "error": "Faucet limit reached for this epoch (100 BB)",
+                "error": "Faucet limit reached for this epoch (99,999 BB)",
                 "epoch": current_epoch,
                 "claimed": *claimed_total,
                 "next_epoch_slot": (current_epoch + 1) * 432_000
@@ -600,12 +608,13 @@ async fn faucet_handler(
         match state.blockchain.credit(&req.to, mint_amount) {
             Ok(_) => {
                 *claimed_total += mint_amount;
+                let new_bal = state.blockchain.get_balance(&req.to);
                 info!("🚰 FAUCET: {} BB → {} (epoch {})", mint_amount, req.to, current_epoch);
                 return (StatusCode::OK, Json(serde_json::json!({
                     "success": true,
                     "minted": mint_amount,
                     "to": req.to,
-                    "new_balance": state.blockchain.get_balance(&req.to),
+                    "new_balance": new_bal,
                     "epoch": current_epoch,
                     "remaining_this_epoch": MAX_FAUCET_BB - *claimed_total
                 })));
@@ -650,11 +659,12 @@ async fn dealer_settle_handler(
         match state.blockchain.credit(&payout.address, payout.amount) {
             Ok(_) => {
                 total_paid += payout.amount;
+                let new_bal = state.blockchain.get_balance(&payout.address);
                 results.push(serde_json::json!({
                     "address": payout.address,
                     "amount": payout.amount,
                     "status": "paid",
-                    "new_balance": state.blockchain.get_balance(&payout.address),
+                    "new_balance": new_bal,
                 }));
             }
             Err(e) => {
@@ -1575,6 +1585,7 @@ async fn main() {
     // Extract Arcs for RPC before state is moved into build_router
     let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
     let rpc_current_slot = Arc::clone(&state.current_slot);
+    let rpc_supabase     = Arc::clone(&state.supabase);
 
     // Bootstrap the USDC SPL Token Mint (idempotent — no-op if already exists)
     {
@@ -1732,7 +1743,7 @@ async fn main() {
         });
         info!("🕐 Slot ticker started (600ms intervals → advancing slot + blockhash)");
 
-        let rpc_impl = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);
+        let rpc_impl = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot, rpc_supabase);
         match start_rpc_server(rpc_impl, "0.0.0.0:8899").await {
             Ok(handle) => {
                 info!("🔌 Solana JSON-RPC on port 8899");

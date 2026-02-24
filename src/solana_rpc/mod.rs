@@ -36,6 +36,7 @@ use tracing::info;
 use base64::engine::{Engine, general_purpose::STANDARD as B64};
 
 use crate::svm::{SvmAccountsDB, BlackBookSVM};
+use crate::supabase::SupabaseManager;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Solana-compatible response wrappers
@@ -382,6 +383,20 @@ pub trait BlackBookRpc {
         signatures: Vec<String>,
         config: Option<serde_json::Value>,
     ) -> RpcResult<RpcResponse<Vec<Option<serde_json::Value>>>>;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // BlackBook extensions — Backpack / custom dApps
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Full wallet profile from Supabase user_vault: username, account_status,
+    /// daily_spending_limit, on-chain balance. Call from Backpack via:
+    ///   connection.request({ method: 'blackbook_getProfile', params: [pubkey] })
+    #[method(name = "blackbook_getProfile")]
+    async fn blackbook_get_profile(&self, pubkey: String) -> RpcResult<serde_json::Value>;
+
+    /// Returns true if the address is registered and active in Supabase.
+    #[method(name = "blackbook_isRegistered")]
+    async fn blackbook_is_registered(&self, pubkey: String) -> RpcResult<bool>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -394,6 +409,8 @@ pub struct BlackBookRpcImpl {
     pub current_slot: Arc<AtomicU64>,
     /// base58-encoded SHA256("BLACKBOOK_L1_GENESIS_2025")
     pub genesis_hash: String,
+    /// Supabase client for wallet profile lookups (Backpack identity filter)
+    pub supabase:     Arc<SupabaseManager>,
 }
 
 impl BlackBookRpcImpl {
@@ -401,6 +418,7 @@ impl BlackBookRpcImpl {
         svm_db:       Arc<SvmAccountsDB>,
         svm:          Arc<Mutex<BlackBookSVM>>,
         current_slot: Arc<AtomicU64>,
+        supabase:     Arc<SupabaseManager>,
     ) -> Self {
         // Compute genesis hash once at startup — BlackBook L1 identity
         let genesis_bytes: [u8; 32] = Sha256::digest(b"BLACKBOOK_L1_GENESIS_2025").into();
@@ -408,7 +426,7 @@ impl BlackBookRpcImpl {
 
         info!("🔌 BlackBookRpc created  genesis_hash={}", genesis_hash);
 
-        Self { svm_db, svm, current_slot, genesis_hash }
+        Self { svm_db, svm, current_slot, genesis_hash, supabase }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -489,7 +507,22 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     async fn get_balance(&self, pubkey: String) -> RpcResult<RpcResponse<u64>> {
         let pk = Self::parse_pubkey(&pubkey)?;
         let lamports = self.svm_db.get_lamports(&pk);
-        info!("📡 RPC ← getBalance({pubkey}) → {lamports} lamports");
+        // Spawn a background Supabase lookup so the balance response isn't delayed.
+        // If the wallet is registered the username appears in the server log.
+        {
+            let sb   = Arc::clone(&self.supabase);
+            let addr = pubkey.clone();
+            let lam  = lamports;
+            tokio::spawn(async move {
+                match sb.fetch_wallet_by_address(&addr).await {
+                    Ok(Some(p)) => info!(
+                        "\u{1f4e1} RPC \u{2190} getBalance({}) \u{2192} {} lamports  [\u{1f464} {} | {}]",
+                        addr, lam, p.username, p.account_status
+                    ),
+                    _ => info!("\u{1f4e1} RPC \u{2190} getBalance({addr}) \u{2192} {lam} lamports"),
+                }
+            });
+        }
         Ok(RpcResponse { context: self.ctx(), value: lamports })
     }
 
@@ -498,8 +531,20 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         pubkey: String,
         _config: Option<RpcAccountInfoConfig>,
     ) -> RpcResult<RpcResponse<Option<UiAccount>>> {
-        info!("📡 RPC ← getAccountInfo({pubkey})");
         let pk = Self::parse_pubkey(&pubkey)?;
+        // Background Supabase lookup — log the registered username if found.
+        {
+            let sb   = Arc::clone(&self.supabase);
+            let addr = pubkey.clone();
+            tokio::spawn(async move {
+                if let Ok(Some(p)) = sb.fetch_wallet_by_address(&addr).await {
+                    info!("\u{1f4e1} RPC \u{2190} getAccountInfo({}) [\u{1f464} {} | {}]",
+                          addr, p.username, p.account_status);
+                } else {
+                    info!("\u{1f4e1} RPC \u{2190} getAccountInfo({addr})");
+                }
+            });
+        }
         let account = self.svm_db.get_account(&pk);
 
         let ui = account.map(|acct| {
@@ -1071,6 +1116,74 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
             statuses.push(status);
         }
         Ok(RpcResponse { context: self.ctx(), value: statuses })
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // BlackBook extensions — Backpack / custom dApps
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn blackbook_get_profile(&self, pubkey: String) -> RpcResult<serde_json::Value> {
+        info!("📡 RPC ← blackbook_getProfile({pubkey})");
+
+        // Validate pubkey format first
+        let pk       = Self::parse_pubkey(&pubkey)?;
+        let lamports = self.svm_db.get_lamports(&pk);
+        let bb       = lamports as f64 / 1_000_000_000.0;
+        let slot     = self.slot();
+
+        match self.supabase.fetch_wallet_by_address(&pubkey).await {
+            Ok(Some(profile)) => Ok(serde_json::json!({
+                "registered":          true,
+                "username":            profile.username,
+                "walletAddress":       profile.wallet_address,
+                "rootPubkey":          profile.root_pubkey,
+                "accountStatus":       profile.account_status,
+                "dailySpendingLimit":  profile.daily_spending_limit,
+                "balance": {
+                    "lamports": lamports,
+                    "bb":       bb,
+                },
+                "network": "BlackBook-L1-mainnet",
+                "slot":    slot,
+            })),
+            Ok(None) => {
+                // On-chain but not in Supabase — still expose balance so
+                // Backpack can display it for unregistered addresses.
+                Ok(serde_json::json!({
+                    "registered":    false,
+                    "walletAddress": pubkey,
+                    "balance": {
+                        "lamports": lamports,
+                        "bb":       bb,
+                    },
+                    "network": "BlackBook-L1-mainnet",
+                    "slot":    slot,
+                }))
+            }
+            Err(e) => {
+                // Supabase unreachable — serve on-chain data with error note
+                Ok(serde_json::json!({
+                    "registered":    null,
+                    "walletAddress": pubkey,
+                    "balance": {
+                        "lamports": lamports,
+                        "bb":       bb,
+                    },
+                    "network":       "BlackBook-L1-mainnet",
+                    "slot":          slot,
+                    "supabaseError": e,
+                }))
+            }
+        }
+    }
+
+    async fn blackbook_is_registered(&self, pubkey: String) -> RpcResult<bool> {
+        info!("📡 RPC ← blackbook_isRegistered({pubkey})");
+        Self::parse_pubkey(&pubkey)?; // validate format
+        match self.supabase.fetch_wallet_by_address(&pubkey).await {
+            Ok(Some(p)) => Ok(p.account_status == "active"),
+            _           => Ok(false),
+        }
     }
 }
 

@@ -1,10 +1,11 @@
 // ============================================================================
-// BLACKBOOK SDK — Production v2.0
+// BLACKBOOK SDK — Production v3.0
 // ============================================================================
 //
 // Complete JavaScript SDK for BlackBook L1 blockchain.
-// Supports: Wallet creation (FROST 2-of-3), SSS signing, transfers,
-//           faucet, balance queries, and WalletConnect v2 session management.
+// Supports: Wallet creation (BIP-39 + Shamir 2-of-3 SSS), SSS signing,
+//           SSS recovery verification, transfers, faucet, balance queries,
+//           wallet session management, and WalletConnect v2 sessions.
 //
 // Browser:
 //   <script src="blackbook_sdk.js"></script>
@@ -20,7 +21,17 @@
 
 const LAMPORTS_PER_BB = 1_000_000_000;
 const CHAIN_ID = 0xBB;
-const MAX_FAUCET_BB = 100;
+const MAX_FAUCET_BB = 99_999;
+
+/**
+ * Valid 2-of-3 SSS shard combinations for wallet recovery/verification.
+ * Each combo specifies which two of the three shards to use.
+ */
+const SSS_COMBOS = {
+  AB: { label: 'A + B', desc: 'User + Server',  shards: ['A', 'B'] },
+  AC: { label: 'A + C', desc: 'User + Cold',    shards: ['A', 'C'] },
+  BC: { label: 'B + C', desc: 'Server + Cold',  shards: ['B', 'C'] },
+};
 
 // ============================================================================
 // SDK CLASS
@@ -232,49 +243,56 @@ class BlackBookSDK {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // 3. WALLET — Create + SSS (FROST 2-of-3)
+  // 3. WALLET — Create + SSS (BIP-39 + Shamir 2-of-3)
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Create a new FROST 2-of-3 wallet on the BlackBook node.
+   * Create a new Shamir 2-of-3 wallet on the BlackBook node.
    *
-   * The server performs FROST Ed25519 key generation producing three shards:
-   *   - Shard A (Active):   Encrypted with user's password (Argon2id + AES-256-GCM).
+   * The server generates a BIP-39 mnemonic → Ed25519 keypair → Shamir splits
+   * the 32-byte seed into three shares (any 2 reconstruct the full keypair):
+   *
+   *   - Shard A (User):     Encrypted with user's password (Argon2id + AES-256-GCM).
    *                         Returned to the client → store in localStorage or Supabase.
-   *   - Shard B (Cloud):    Encrypted with SERVER_MASTER_KEY → stored on node in ReDB.
+   *   - Shard B (Server):   Encrypted with SERVER_MASTER_KEY → stored on node in ReDB.
    *                         Never leaves the server in raw form.
-   *   - Shard C (Recovery): Returned raw in response → user writes it down offline.
+   *   - Shard C (Cold):     Returned raw hex → user writes it down offline.
    *                         Also synced to HashiCorp Vault for emergency recovery.
    *
-   * @param {string} username    - Username (for Supabase account sync)
-   * @param {string} password    - Encrypts Shard A server-side (Argon2id → AES-256-GCM)
-   * @param {string} pin         - PIN hash stored for high-value tx authorization
-   * @param {number} [dailyLimit=500] - BB threshold above which PIN is required
-   * @returns {{ walletId, address, mnemonic, shardA, shardC, publicKey }}
+   * @param {string} username              - Username (for Supabase account sync)
+   * @param {Object} [opts]                - Optional parameters
+   * @param {string} [opts.password]        - Encrypts Shard A (Argon2id → AES-256-GCM). Highly recommended.
+   * @param {string} [opts.pin]            - PIN hash stored for high-value tx authorization
+   * @param {number} [opts.dailyLimit=500] - BB threshold above which PIN is required
+   * @returns {{ walletId, address, mnemonic, shardA, shardAIsEncrypted, shardC, publicKey }}
    */
-  async createWallet(username, password, pin, dailyLimit = 500) {
+  async createWallet(username, opts = {}) {
     const result = await this._api('/wallet/create', {
       username,
-      password,
-      pin,
-      daily_limit: dailyLimit,
+      password:    opts.password || undefined,
+      pin:         opts.pin || undefined,
+      daily_limit: opts.dailyLimit || undefined,
     });
 
-    return {
-      walletId:  result.wallet_id,
-      address:   result.address,
-      mnemonic:  result.mnemonic,   // BIP-39 — user writes this down
-      shardA:    result.share_a,    // Encrypted with password (Argon2id + AES-256-GCM)
-      shardC:    result.share_c,    // Raw hex — show ONCE, user stores offline
-      publicKey: result.public_key,
+    const wallet = {
+      walletId:         result.wallet_id,
+      address:          result.address,
+      mnemonic:         result.mnemonic,           // BIP-39 24-word phrase
+      shardA:           result.share_a,            // Encrypted with password (or raw hex if no password)
+      shardAIsEncrypted: result.share_a_is_encrypted,
+      shardC:           result.share_c,            // Raw hex — show ONCE, user stores offline
+      publicKey:        result.public_key,
     };
+
+    return wallet;
   }
 
   /**
-   * Retrieve Shard B metadata from the node (server-encrypted, never raw).
-   * Used to verify the shard exists; the node decrypts it internally during signing.
+   * Retrieve Shard B from the node (server-encrypted blob).
+   * The server stores this encrypted with SERVER_MASTER_KEY.
+   * During SSS verify or transfer, the server decrypts it internally.
    *
-   * @param {string} walletId
+   * @param {string} walletId - Wallet address / ID
    * @returns {{ shardB: string, status: string }}
    */
   async getShardB(walletId) {
@@ -282,7 +300,7 @@ class BlackBookSDK {
       wallet_id: walletId,
     });
     return {
-      shardB: result.shard_b || result.encrypted_share_b,
+      shardB: result.shard_b,
       status: result.status,
     };
   }
@@ -302,18 +320,116 @@ class BlackBookSDK {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
+  // 3b. SSS VERIFICATION — Test 2-of-3 shard reconstruction
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Verify that two Shamir shards reconstruct the correct wallet.
+   *
+   * Sends two shards to the server, which reconstructs the Ed25519 seed,
+   * derives the public key, and checks it matches the wallet address.
+   *
+   * @param {Object} params
+   * @param {string} params.walletId               - Wallet address to verify against
+   * @param {string} params.shard1                 - First shard (hex or encrypted blob)
+   * @param {string} params.shard2                 - Second shard (hex or encrypted blob)
+   * @param {string} [params.password]             - Password if shard1 is password-encrypted (Share A)
+   * @param {boolean} [params.shard2IsServerEncrypted] - True if shard2 is server-encrypted (Share B)
+   * @returns {{ success, walletId, derivedAddress, matches, message }}
+   */
+  async verifySss({ walletId, shard1, shard2, password, shard2IsServerEncrypted = false }) {
+    const result = await this._api('/wallet/verify-sss', {
+      wallet_id:                walletId,
+      shard_1:                  shard1,
+      shard_2:                  shard2,
+      password:                 password || undefined,
+      shard_2_is_server_encrypted: shard2IsServerEncrypted,
+    });
+    return {
+      success:        result.success,
+      walletId:       result.wallet_id,
+      derivedAddress: result.derived_address,
+      matches:        result.matches,
+      message:        result.message,
+    };
+  }
+
+  /**
+   * High-level SSS verification using a named combo (AB, AC, or BC).
+   *
+   * Automatically handles shard ordering, server-encrypted flags, and
+   * auto-fetches Shard B from the node when needed.
+   *
+   * @param {Object} params
+   * @param {'AB'|'AC'|'BC'} params.combo    - Which two shards to combine
+   * @param {string} params.walletId         - Wallet address to verify against
+   * @param {string} [params.shardA]         - Share A (encrypted with password)
+   * @param {string} [params.shardB]         - Share B (server-encrypted). Auto-fetched if omitted for AB/BC.
+   * @param {string} [params.shardC]         - Share C (raw hex from cold storage)
+   * @param {string} [params.password]       - Password to decrypt Share A (required for AB, AC)
+   * @returns {{ success, walletId, derivedAddress, matches, message }}
+   */
+  async verifySssWithCombo({ combo, walletId, shardA, shardB, shardC, password }) {
+    if (!SSS_COMBOS[combo]) {
+      throw new Error(`Invalid combo "${combo}". Use: ${Object.keys(SSS_COMBOS).join(', ')}`);
+    }
+
+    // Auto-fetch Shard B from node if not provided
+    if ((combo === 'AB' || combo === 'BC') && !shardB) {
+      const bResp = await this.getShardB(walletId);
+      shardB = bResp.shardB;
+    }
+
+    switch (combo) {
+      case 'AB':
+        // shard1 = A (password-encrypted), shard2 = B (server-encrypted)
+        return this.verifySss({
+          walletId,
+          shard1: shardA,
+          shard2: shardB,
+          password,
+          shard2IsServerEncrypted: true,
+        });
+
+      case 'AC':
+        // shard1 = A (password-encrypted), shard2 = C (raw hex)
+        return this.verifySss({
+          walletId,
+          shard1: shardA,
+          shard2: shardC,
+          password,
+          shard2IsServerEncrypted: false,
+        });
+
+      case 'BC':
+        // shard1 = C (raw hex), shard2 = B (server-encrypted)
+        // Note: we pass C as shard_1 (no password) and B as shard_2 (server-encrypted)
+        return this.verifySss({
+          walletId,
+          shard1: shardC,
+          shard2: shardB,
+          password: undefined,
+          shard2IsServerEncrypted: true,
+        });
+
+      default:
+        throw new Error(`Unhandled combo: ${combo}`);
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
   // 4. TRANSFERS — Send BB tokens
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * SSS-authenticated transfer (FROST 2-of-3 signing on the node).
+   * SSS-authenticated transfer (Shamir 2-of-3 signing on the node).
    *
    * Flow:
    *   1. Client sends encrypted Shard A + password
    *   2. Server decrypts Shard A (password) + Shard B (SERVER_MASTER_KEY)
-   *   3. FROST round1 → commitments
-   *   4. FROST round2 → signature shares
-   *   5. Aggregate → valid Ed25519 signature
+   *   3. Shamir reconstruction → 32-byte Ed25519 seed
+   *   4. Derive signing key → verify address matches
+   *   5. Sign transfer message → Ed25519 signature
    *   6. Transfer executed on-chain
    *
    * @param {string} fromWalletId - Sender wallet ID
@@ -380,15 +496,15 @@ class BlackBookSDK {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // 6. FAUCET — Mint tokens (max 100 BB per request, rate-limited)
+  // 6. FAUCET — Mint tokens (max 99,999 BB per address per epoch, rate-limited)
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Request up to 100 BB from the faucet.
+   * Request up to 99,999 BB from the faucet.
    * Available to any address. Rate-limited to one mint per address per epoch.
    *
    * @param {string} toAddress - Recipient address
-   * @param {number} [amountBB=100] - Amount in BB (server caps at 100)
+   * @param {number} [amountBB=100] - Amount in BB (server caps at 99,999 per epoch)
    * @returns {{ success, minted, to, new_balance }}
    */
   async faucet(toAddress, amountBB = 100) {
@@ -475,11 +591,77 @@ class BlackBookSDK {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // 9. SHARD STORAGE HELPERS — Local + Supabase backup
+  // 9. WALLET SESSION — Full wallet persistence (localStorage)
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Save Shard A to browser localStorage.
+   * Save full wallet session to browser localStorage.
+   * Stores: walletId, address, shardA (encrypted), shardAIsEncrypted, publicKey.
+   * NOTE: Mnemonic and Shard C are intentionally NOT stored — show once only.
+   *
+   * @param {Object} wallet - Wallet object from createWallet()
+   */
+  saveWalletLocal(wallet) {
+    if (typeof localStorage === 'undefined') {
+      throw new Error('localStorage not available — use Node.js file storage instead');
+    }
+    const session = {
+      wallet_id:          wallet.walletId,
+      address:            wallet.address,
+      share_a:            wallet.shardA,
+      share_a_is_encrypted: wallet.shardAIsEncrypted,
+      public_key:         wallet.publicKey,
+      created_at:         new Date().toISOString(),
+    };
+    localStorage.setItem('bb_wallet', JSON.stringify(session));
+    // Also save shard A separately for backward compat
+    localStorage.setItem(`bb_shard_a_${wallet.walletId}`, wallet.shardA);
+  }
+
+  /**
+   * Load wallet session from browser localStorage.
+   *
+   * @returns {{ walletId, address, shardA, shardAIsEncrypted, publicKey, createdAt }|null}
+   */
+  loadWalletLocal() {
+    if (typeof localStorage === 'undefined') return null;
+    try {
+      const raw = localStorage.getItem('bb_wallet');
+      if (!raw) return null;
+      const s = JSON.parse(raw);
+      return {
+        walletId:         s.wallet_id,
+        address:          s.address,
+        shardA:           s.share_a,
+        shardAIsEncrypted: s.share_a_is_encrypted,
+        publicKey:        s.public_key,
+        createdAt:        s.created_at,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Delete wallet session from browser localStorage.
+   * Removes both the session and the shard-specific key.
+   *
+   * @param {string} [walletId] - If provided, also removes the shard-specific key
+   */
+  deleteWalletLocal(walletId) {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.removeItem('bb_wallet');
+    if (walletId) {
+      localStorage.removeItem(`bb_shard_a_${walletId}`);
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // 9b. SHARD STORAGE HELPERS — Individual shard + Supabase backup
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Save Shard A to browser localStorage (individual storage).
    * The shard is already encrypted (Argon2id + AES-256-GCM) by the server.
    *
    * @param {string} walletId - Wallet identifier
@@ -595,9 +777,10 @@ class BlackBookSDK {
 // ============================================================================
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { BlackBookSDK, LAMPORTS_PER_BB, CHAIN_ID, MAX_FAUCET_BB };
+  module.exports = { BlackBookSDK, LAMPORTS_PER_BB, CHAIN_ID, MAX_FAUCET_BB, SSS_COMBOS };
 }
 
 if (typeof globalThis !== 'undefined') {
   globalThis.BlackBookSDK = BlackBookSDK;
+  globalThis.SSS_COMBOS = SSS_COMBOS;
 }

@@ -1,4 +1,4 @@
-# Max Production Wallet — Status & Reference
+            # Max Production Wallet — Status & Reference
 
 > **Max's wallet is LIVE on BlackBook L1 v5.0.0 with Shamir SSS 2-of-3.**
 > **Last Updated: February 21, 2026**

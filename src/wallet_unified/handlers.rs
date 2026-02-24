@@ -98,8 +98,8 @@ pub struct SSSTransferRequest {
     pub to_address: String,
     #[zeroize(skip)]
     pub amount: f64,
-    pub share_a: String,            // User provides encrypted Share A
-    pub password: String,           // To decrypt Share A
+    pub share_a: String,            // Encrypted blob OR raw hex
+    pub password: Option<String>,   // Required if share_a is encrypted; omit for raw hex
 }
 
 // ============================================================================
@@ -243,9 +243,16 @@ pub async fn transfer_with_sss(
         return Err(err(format!("Insufficient balance: {} < {}", balance, req.amount)));
     }
 
-    // 1. Decrypt Share A (user provides encrypted blob + password)
-    let mut share_a_bytes = security::decrypt_with_secret(&req.password, &req.share_a)
-        .map_err(|e| err(format!("Failed to decrypt Share A: {}", e)))?;
+    // 1. Decrypt Share A (encrypted blob + password) or decode raw hex
+    let mut share_a_bytes = if let Some(ref password) = req.password {
+        // Encrypted mode: AES-256-GCM blob with Argon2id-derived key
+        security::decrypt_with_secret(password, &req.share_a)
+            .map_err(|e| err(format!("Failed to decrypt Share A: {}", e)))?
+    } else {
+        // Raw hex mode: user pasted unencrypted shard hex directly
+        hex::decode(&req.share_a)
+            .map_err(|e| err(format!("Invalid raw Share A hex: {}", e)))?
+    };
 
     // 2. Fetch + decrypt Share B from ReDB
     let container_bytes = state.blockchain.get_frost_share_b(&req.from_wallet_id)
@@ -381,12 +388,102 @@ pub async fn get_shard_b_handler(
     }))
 }
 
+// ============================================================================
+// SSS 2/3 VERIFY — Test that any 2 of 3 shards reconstruct the wallet
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct SSSVerifyRequest {
+    /// The wallet address (public key) to verify against
+    pub wallet_id: String,
+    /// First shard (hex-encoded raw share bytes)
+    pub shard_1: String,
+    /// Second shard (hex-encoded raw share bytes)
+    pub shard_2: String,
+    /// If shard_1 is password-encrypted (Share A), provide the password
+    pub password: Option<String>,
+    /// If shard_2 is server-encrypted (Share B), set true to auto-decrypt
+    pub shard_2_is_server_encrypted: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct SSSVerifyResponse {
+    pub success: bool,
+    pub wallet_id: String,
+    pub derived_address: String,
+    pub matches: bool,
+    pub message: String,
+}
+
+pub async fn verify_sss_handler(
+    State(state): State<Arc<UnifiedWalletState>>,
+    Json(req): Json<SSSVerifyRequest>,
+) -> Result<Json<SSSVerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // 1. Decode / decrypt shard 1
+    let shard_1_bytes = if let Some(ref password) = req.password {
+        // Shard 1 is password-encrypted (Share A)
+        security::decrypt_with_secret(password, &req.shard_1)
+            .map_err(|e| err(format!("Failed to decrypt Shard 1: {}", e)))?
+    } else {
+        hex::decode(&req.shard_1).map_err(|_| err("Invalid hex for Shard 1"))?
+    };
+
+    // 2. Decode / decrypt shard 2
+    let shard_2_bytes = if req.shard_2_is_server_encrypted.unwrap_or(false) {
+        // Shard 2 is server-encrypted (Share B from storage)
+        let master_key = get_server_master_key()?;
+        security::decrypt_with_secret(&master_key, &req.shard_2)
+            .map_err(|e| err(format!("Failed to decrypt Shard 2: {}", e)))?
+    } else {
+        hex::decode(&req.shard_2).map_err(|_| err("Invalid hex for Shard 2"))?
+    };
+
+    // 3. Reconstruct seed from 2 Shamir shares
+    let shark = Sharks(2u8);
+    let share_a = Share::try_from(shard_1_bytes.as_slice())
+        .map_err(|_| err("Malformed Shard 1"))?;
+    let share_b = Share::try_from(shard_2_bytes.as_slice())
+        .map_err(|_| err("Malformed Shard 2"))?;
+    let seed_bytes = shark
+        .recover(&[share_a, share_b])
+        .map_err(|e| err(format!("SSS reconstruction failed: {}", e)))?;
+
+    if seed_bytes.len() < 32 {
+        return Err(err("Reconstructed seed too short"));
+    }
+
+    // 4. Derive Ed25519 public key from reconstructed seed
+    let seed_32: [u8; 32] = seed_bytes[..32].try_into().unwrap();
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+
+    let matches = derived_address == req.wallet_id;
+
+    info!(
+        "🔍 SSS Verify: wallet={} derived={} match={}",
+        req.wallet_id, derived_address, matches
+    );
+
+    Ok(Json(SSSVerifyResponse {
+        success: true,
+        wallet_id: req.wallet_id.clone(),
+        derived_address: derived_address.clone(),
+        matches,
+        message: if matches {
+            "✅ 2/3 SSS reconstruction successful — wallet access verified!".to_string()
+        } else {
+            "❌ Derived address does not match. Wrong shards or wrong password.".to_string()
+        },
+    }))
+}
+
 pub fn router() -> Router<Arc<UnifiedWalletState>> {
     Router::new()
         .route("/wallet/create", post(create_hybrid_wallet))
         .route("/transfer", post(transfer_with_sss))
         .route("/wallet/secure/shard-b", post(get_shard_b_handler))
         .route("/wallet/secure/recover-shard-c", post(recover_shard_c))
+        .route("/wallet/verify-sss", post(verify_sss_handler))
 }
 
 // Helper

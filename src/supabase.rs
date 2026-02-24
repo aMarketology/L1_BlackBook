@@ -1,6 +1,21 @@
 use supabase_jwt::{Claims, JwksCache};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Resolved wallet profile from Supabase `user_vault` — returned by
+/// `blackbook_getProfile` on the JSON-RPC port and used for Backpack
+/// wallet identity enrichment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletProfile {
+    pub user_id: String,
+    pub username: String,
+    pub wallet_address: String,
+    pub root_pubkey: String,
+    pub account_status: String,
+    pub daily_spending_limit: f64,
+}
 
 #[derive(Clone)]
 pub struct SupabaseManager {
@@ -24,6 +39,75 @@ impl SupabaseManager {
             supabase_url,
             service_role_key,
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // RPC / Backpack connection helpers
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Look up a wallet profile from `user_vault` by its base58 wallet address.
+    /// Used by the Solana JSON-RPC `blackbook_getProfile` method so Backpack
+    /// can display the registered username and account status.
+    pub async fn fetch_wallet_by_address(
+        &self,
+        wallet_address: &str,
+    ) -> Result<Option<WalletProfile>, String> {
+        let url = format!("{}/rest/v1/user_vault", self.supabase_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("apikey", &self.service_role_key)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.service_role_key),
+            )
+            .query(&[
+                (
+                    "wallet_address",
+                    format!("eq.{}", wallet_address),
+                ),
+                (
+                    "select",
+                    "id,username,wallet_address,root_pubkey,account_status,daily_spending_limit"
+                        .to_string(),
+                ),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("Supabase request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Supabase error ({}): {}", status, body));
+        }
+
+        let rows: Vec<Value> = response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {}", e))?;
+
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+
+        Ok(Some(WalletProfile {
+            user_id: row["id"].as_str().unwrap_or("").to_string(),
+            username: row["username"].as_str().unwrap_or("").to_string(),
+            wallet_address: row["wallet_address"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            root_pubkey: row["root_pubkey"].as_str().unwrap_or("").to_string(),
+            account_status: row["account_status"]
+                .as_str()
+                .unwrap_or("active")
+                .to_string(),
+            daily_spending_limit: row["daily_spending_limit"]
+                .as_f64()
+                .unwrap_or(500.0),
+        }))
     }
 
     /// JOB 1: Verify the user is who they say they are

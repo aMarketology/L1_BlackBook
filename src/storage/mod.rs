@@ -39,6 +39,9 @@ use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
 use tracing::{info, error, warn};
 use crate::svm::accounts_db::SvmAccountsDB;
+use crate::svm::types::LAMPORTS_PER_BB;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::account::{AccountSharedData, ReadableAccount};
 
 // ============================================================================
 // REDB TABLE DEFINITIONS (Type-Safe!)
@@ -363,6 +366,29 @@ pub struct ConcurrentBlockchain {
 }
 
 impl ConcurrentBlockchain {
+    /// Try to parse a string address as a Solana Pubkey (32-byte base58)
+    fn try_parse_pubkey(address: &str) -> Option<Pubkey> {
+        if address.starts_with("bb_") { return None; }
+        let bytes = bs58::decode(address).into_vec().ok()?;
+        if bytes.len() != 32 { return None; }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(Pubkey::new_from_array(arr))
+    }
+
+    /// Sync a balance change to the SVM AccountsDB (write-through)
+    fn svm_sync_balance(&self, address: &str, new_balance_bb: f64) {
+        if let Some(pk) = Self::try_parse_pubkey(address) {
+            let lamports = (new_balance_bb * LAMPORTS_PER_BB as f64) as u64;
+            let account = AccountSharedData::new(
+                lamports,
+                0,
+                &solana_sdk::system_program::id(),
+            );
+            self.svm_accounts.store_account(&pk, account);
+        }
+    }
+
     /// Create or open a blockchain database
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!(path = %path, "Opening ReDB database");
@@ -456,10 +482,18 @@ impl ConcurrentBlockchain {
 
     /// Get balance for an address - LOCK FREE
     /// 
-    /// This can be called by 100,000 threads simultaneously with zero contention.
+    /// For SVM-compatible addresses (base58 pubkeys), reads from the SVM AccountsDB
+    /// which is the source of truth for Solana JSON-RPC and wallet extensions.
+    /// For legacy bb_ addresses, falls back to the DashMap cache / ReDB.
     #[inline]
     pub fn get_balance(&self, address: &str) -> f64 {
-        // Fast path: Check RAM cache first
+        // SVM path: base58 pubkey addresses read from SVM AccountsDB
+        if let Some(pk) = Self::try_parse_pubkey(address) {
+            let lamports = self.svm_accounts.get_lamports(&pk);
+            return lamports as f64 / LAMPORTS_PER_BB as f64;
+        }
+
+        // Legacy path: bb_ prefixed addresses use DashMap cache
         if let Some(balance) = self.cache.get(address) {
             return *balance;
         }
@@ -472,7 +506,6 @@ impl ConcurrentBlockchain {
                         match table.get(address) {
                             Ok(Some(access)) => {
                                 let balance = access.value();
-                                // Update cache for next time
                                 self.cache.insert(address.to_string(), balance);
                                 balance
                             }
@@ -488,9 +521,19 @@ impl ConcurrentBlockchain {
     }
 
     /// Get total supply - LOCK FREE
+    /// Reads from SVM AccountsDB (source of truth for all base58 accounts)
     #[inline]
     pub fn total_supply(&self) -> f64 {
-        self.total_supply.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        let svm_lamports = self.svm_accounts.total_lamports();
+        let svm_bb = svm_lamports as f64 / LAMPORTS_PER_BB as f64;
+        
+        // Add legacy bb_ balances that aren't in SVM
+        let legacy_total: f64 = self.cache.iter()
+            .filter(|e| e.key().starts_with("bb_"))
+            .map(|e| *e.value())
+            .sum();
+        
+        svm_bb + legacy_total
     }
 
     /// Get block height - LOCK FREE
@@ -538,6 +581,9 @@ impl ConcurrentBlockchain {
         // Update total supply
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_add(micro_amount, Ordering::Relaxed);
+        
+        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
+        self.svm_sync_balance(address, new_balance);
         
         // Log new wallet creation (anonymously - no address shown)
         if is_new_wallet {
@@ -607,6 +653,9 @@ impl ConcurrentBlockchain {
         // Update total supply
         let micro_amount = (amount * 1_000_000.0) as u64;
         self.total_supply.fetch_sub(micro_amount, Ordering::Relaxed);
+        
+        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
+        self.svm_sync_balance(address, new_balance);
         
         // Get balance_before for logging (was current before debit)
         let balance_before = new_balance + amount;
@@ -763,6 +812,10 @@ impl ConcurrentBlockchain {
         // Update caches AFTER successful commit
         self.cache.insert(from.to_string(), from_balance);
         self.cache.insert(to.to_string(), to_balance);
+        
+        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
+        self.svm_sync_balance(from, from_balance);
+        self.svm_sync_balance(to, to_balance);
         
         // Calculate balance_before for sender
         let from_balance_before = from_balance + amount;

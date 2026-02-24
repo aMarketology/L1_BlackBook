@@ -1,12 +1,12 @@
 {
   "name": "@blackbook/sdk",
-  "version": "2.0.0",
-  "description": "BlackBook L1 SDK — wallet creation, FROST 2-of-3 signing, faucet, WalletConnect v2",
+  "version": "3.0.0",
+  "description": "BlackBook L1 SDK — wallet creation, Shamir 2-of-3 SSS key management, faucet, WalletConnect v2",
   "main": "blackbook_sdk.js",
   "exports": {
     ".": "./blackbook_sdk.js"
   },
-  "keywords": ["blackbook", "blockchain", "l1", "wallet", "frost", "sss", "walletconnect"],
+  "keywords": ["blackbook", "blockchain", "l1", "wallet", "shamir", "sss", "walletconnect"],
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"

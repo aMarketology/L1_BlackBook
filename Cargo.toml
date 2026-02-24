@@ -167,6 +167,7 @@ supabase-jwt = "0.1.1"
 # Testing utilities
 tokio-test = "0.4"
 tempfile = "3.10"
+litesvm = "0.9.1"
 
 [build-dependencies]
 # Protocol Buffer compilation
