@@ -1,11 +1,7 @@
 // ============================================================================
 // BLACKBOOK L1 V4 - MAINNET PRODUCTION SERVER
 // ============================================================================
-//
-// A clean, modular rewrite of the BlackBook L1 blockchain server.
-// Optimized for mainnet deployment with enterprise-grade security.
-//
-// ARCHITECTURE:
+
 // - Framework: Axum 0.7 (async, no recursion limits, fast compile)
 // - Storage: ReDB (ACID, MVCC, zero-copy reads)
 // - Concurrency: DashMap cache (lock-free reads)
@@ -20,18 +16,7 @@
 // - Type-safe PDAs (namespace + owner + bump)
 // - Nonce tracking (replay attack prevention)
 //
-// WALLET TRACKS:
-// 1. S+ Tier (Institutional): FROST TSS + OPAQUE - key NEVER exists in full
-// 2. Consumer: BIP-39 mnemonic with Shamir 2-of-3 backup
-//
-// Run: cargo run --bin main_v4
-// Test: curl http://localhost:8080/health
 
-
-
-// ============================================================================
-// IMPORTS
-// ============================================================================
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,7 +49,6 @@ use serde::{Deserialize, Serialize};
 // MODULES
 // ============================================================================
 
-mod social_mining;
 mod wallet_unified;
 mod consensus;
 mod storage;
@@ -79,8 +63,6 @@ mod poh_blockchain;
 // ============================================================================
 // MODULE IMPORTS
 // ============================================================================
-
-use social_mining::SocialMiningSystem;
 use storage::{ConcurrentBlockchain, AssetManager, TransactionRecord, TxType, AuthType};
 
 // PoH & Consensus Infrastructure
@@ -96,7 +78,6 @@ use runtime::{
     // Tower BFT
     TowerBFT, Vote, TowerLockout,
 };
-
 use protocol::Transaction as ProtocolTransaction;
 
 // Block Production & Finality
@@ -115,7 +96,6 @@ use wallet_unified::handlers::UnifiedWalletState;
 // ============================================================================
 
 /// Data file paths
-const SOCIAL_DATA_FILE: &str = "social_mining_data.json";
 const REDB_DATA_PATH: &str = "./blockchain_data";
 
 /// Security thresholds
@@ -149,9 +129,6 @@ pub struct AppState {
     /// Unified L2 integration (bridge + credit sessions)
     pub assets: AssetManager,
     
-    /// Social mining system
-    pub social: Arc<TokioMutex<SocialMiningSystem>>,
-    
     // =========================================================================
     // POH & CONSENSUS INFRASTRUCTURE
     // =========================================================================
@@ -164,9 +141,6 @@ pub struct AppState {
     
     /// Leader schedule for consensus (engagement-weighted)
     pub leader_schedule: Arc<RwLock<LeaderSchedule>>,
-    
-    /// Transaction pipeline (4-stage async: fetch → verify → execute → commit)
-    pub pipeline: Arc<TransactionPipeline>,
     
     /// Sealevel-style parallel transaction execution
     pub parallel_scheduler: Arc<ParallelScheduler>,
@@ -1332,23 +1306,6 @@ fn load_blockchain() -> ConcurrentBlockchain {
     }
 }
 
-fn load_social_system() -> SocialMiningSystem {
-    if let Ok(data) = fs::read_to_string(SOCIAL_DATA_FILE) {
-        if let Ok(system) = serde_json::from_str(&data) {
-            info!("📂 Loaded social mining from {}", SOCIAL_DATA_FILE);
-            return system;
-        }
-    }
-    info!("🆕 Creating new social mining system");
-    SocialMiningSystem::new()
-}
-
-fn save_social_system(system: &SocialMiningSystem) {
-    if let Ok(data) = serde_json::to_string_pretty(system) {
-        let _ = fs::write(SOCIAL_DATA_FILE, data);
-    }
-}
-
 // ============================================================================
 // GRACEFUL SHUTDOWN
 // ============================================================================
@@ -1453,8 +1410,6 @@ async fn main() {
     gulf_stream.start();
     info!("🌊 GulfStream service started");
 
-    let social_system = Arc::new(TokioMutex::new(load_social_system()));
-
     let block_producer = Arc::new(BlockProducer::new(
         blockchain.clone(),
         poh_service.clone(),
@@ -1556,7 +1511,6 @@ async fn main() {
     let state = AppState {
         blockchain,
         assets,
-        social: social_system.clone(),
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
         leader_schedule: leader_schedule.clone(),
@@ -1598,15 +1552,6 @@ async fn main() {
     // ========================================================================
     // 12. START BACKGROUND TASKS
     // ========================================================================
-    let social_save = social_system.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            let data = social_save.lock().await.clone();
-            save_social_system(&data);
-        }
-    });
-
     // ========================================================================
     // 13. START HTTP SERVER
     // ========================================================================
@@ -1643,8 +1588,5 @@ async fn main() {
         .await
         .unwrap();
     
-    // Final cleanup
-    let social_data = social_system.lock().await.clone();
-    save_social_system(&social_data);
     info!("✅ Server shutdown complete");
 }
