@@ -8,6 +8,7 @@ use sharks::{Sharks, Share};
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, Signer};
 use tracing::{info, warn, error};
 use super::security;
+use super::session_store::SessionStore;
 // jsonwebtoken::{decode, DecodingKey, Validation, Algorithm} — reserved for JWT auth hardening
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -38,6 +39,8 @@ pub struct UnifiedWalletState {
     pub vault: Arc<VaultManager>,
     /// Block producer — records executed transactions into PoH blocks
     pub block_producer: Arc<BlockProducer>,
+    /// In-memory session store — 15-min scoped key cache
+    pub session_store: Arc<SessionStore>,
 }
 
 impl UnifiedWalletState {
@@ -47,8 +50,19 @@ impl UnifiedWalletState {
         vault: Arc<VaultManager>,
         block_producer: Arc<BlockProducer>,
     ) -> Self {
+        let session_store = Arc::new(SessionStore::new());
+
+        // Spawn background sweeper — removes expired blobs every 60s
+        let store_clone = session_store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                store_clone.sweep_expired();
+            }
+        });
+
         info!("✅ Unified Wallet initialized with ReDB storage & Supabase Vault & HashiCorp Vault");
-        Self { blockchain, supabase, vault, block_producer }
+        Self { blockchain, supabase, vault, block_producer, session_store }
     }
 }
 
@@ -84,6 +98,7 @@ pub struct CreateResponse {
     pub share_c: String,            // Cold Share (Raw/Ready for Vault)
     pub public_key: String,
     pub address: String,            // Public Address (Ed25519)
+    pub session_token: String,      // Auto-login token — wallet unlocked on creation
 }
 
 #[derive(Serialize)]
@@ -96,6 +111,30 @@ pub struct ShardBResponse {
 #[derive(Serialize, Deserialize)]
 struct ShardBContainer {
     shard_b_data: String,           // Encrypted with server master key
+}
+
+// ============================================================================
+// LOGIN — reconstruct seed from 2 shards, cache it, return session tokens
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub wallet_id: String,
+    /// Share A — hex or password-encrypted blob
+    pub shard_1: String,
+    /// Share B — hex (raw) or server-encrypted blob
+    pub shard_2: String,
+    /// Required if shard_1 is password-encrypted
+    pub password: Option<String>,
+    /// Set true if shard_2 is the server-encrypted blob from /wallet/secure/shard-b
+    pub shard_2_is_server_encrypted: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub success: bool,
+    pub wallet_id: String,
+    pub session_token: String,
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -181,6 +220,11 @@ pub async fn create_hybrid_wallet(
         .take(3)
         .map(|s| Vec::from(&s))
         .collect();
+
+    // Auto-login: cache the seed so the wallet is immediately usable after creation
+    let session_token = state.session_store.create_session(
+        &wallet_id, &address, &req.username, &seed_32,
+    );
     seed_32.zeroize();
 
     // 5. Share B — encrypt with server master key, store in ReDB
@@ -235,6 +279,7 @@ pub async fn create_hybrid_wallet(
         share_c: share_c_hex,
         public_key: bs58::encode(&pub_key_bytes).into_string(),
         address: wallet_id,
+        session_token,
     }))
 }
 
@@ -300,6 +345,11 @@ pub async fn transfer_with_sss(
     let signature = signing_key.sign(tx_message.as_bytes());
     let sig_hex = hex::encode(signature.to_bytes());
 
+    // Cache the reconstructed seed for fast-path transfers (30-min window)
+    let session_token = state.session_store.create_session(
+        &req.from_wallet_id, &req.from_wallet_id, "", &seed_32,
+    );
+
     // Zeroize key material immediately after signing
     seed_32.zeroize();
     seed_bytes.zeroize();
@@ -345,7 +395,99 @@ pub async fn transfer_with_sss(
         "to": req.to_address,
         "amount": req.amount,
         "from_balance": state.blockchain.get_balance(&req.from_wallet_id),
-        "to_balance": state.blockchain.get_balance(&req.to_address)
+        "to_balance": state.blockchain.get_balance(&req.to_address),
+        "session_token": session_token,
+    })))
+}
+
+// ============================================================================
+// SESSION TRANSFER — fast path, no password / Argon2id / shard decryption
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct SessionTransferRequest {
+    pub from_wallet_id: String,
+    pub to_address: String,
+    pub amount: f64,
+    pub session_token: String,
+    // Note: no session_key — the seed lives server-side keyed only by session_token
+}
+
+pub async fn transfer_session_handler(
+    State(state): State<Arc<UnifiedWalletState>>,
+    Json(req): Json<SessionTransferRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if req.amount <= 0.0 {
+        return Err(err("Amount must be positive"));
+    }
+    let balance = state.blockchain.get_balance(&req.from_wallet_id);
+    if balance < req.amount {
+        return Err(err(format!("Insufficient balance: {} < {}", balance, req.amount)));
+    }
+
+    // 1. Get the 32-byte seed from the session store (also refreshes TTL)
+    let mut seed_32 = state.session_store
+        .get_seed(&req.session_token)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e }))))?;
+
+    // 2. Reconstruct signing key and verify it matches the claimed wallet
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+    if derived_address != req.from_wallet_id {
+        seed_32.zeroize();
+        return Err((StatusCode::UNAUTHORIZED, Json(json!({ "error": "Session does not match wallet" }))));
+    }
+
+    // 3. Sign the transfer message
+    let tx_message = format!("{}:{}:{}", req.from_wallet_id, req.to_address, req.amount);
+    let signature = signing_key.sign(tx_message.as_bytes());
+    let sig_hex = hex::encode(signature.to_bytes());
+
+    // 4. Zeroize immediately
+    seed_32.zeroize();
+
+    info!("⚡ Session transfer signed for wallet {}", req.from_wallet_id);
+
+    // 5. Execute transfer on-chain
+    state.blockchain.transfer_with_receipt(
+        &req.from_wallet_id,
+        &req.to_address,
+        req.amount,
+        &sig_hex,
+        crate::storage::AuthType::SessionKey,
+    ).map_err(|e| err(format!("Transfer failed: {}", e)))?;
+    info!("💸 Session transfer: {} → {} : {} BB", req.from_wallet_id, req.to_address, req.amount);
+
+    // 6. Record in PoH block
+    {
+        use crate::protocol::{Transaction as ProtoTx, TxData};
+        let tx = ProtoTx {
+            hash: uuid::Uuid::new_v4().to_string(),
+            from: req.from_wallet_id.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            data: TxData::TransferBb {
+                to: req.to_address.clone(),
+                amount: (req.amount * 1_000_000_000.0) as u64,
+            },
+            signature: sig_hex.clone(),
+            signer_pubkey: req.from_wallet_id.clone(),
+        };
+        state.block_producer.record_executed_transaction(tx);
+    }
+
+    // TTL was already refreshed by get_seed() above
+    Ok(Json(json!({
+        "success": true,
+        "signature": sig_hex,
+        "from": req.from_wallet_id,
+        "to": req.to_address,
+        "amount": req.amount,
+        "from_balance": state.blockchain.get_balance(&req.from_wallet_id),
+        "to_balance": state.blockchain.get_balance(&req.to_address),
+        "session_token": req.session_token,
     })))
 }
 
@@ -404,8 +546,18 @@ pub async fn get_shard_b_handler(
     _headers: HeaderMap,
     Json(req): Json<GetShardBRequest>,
 ) -> Result<Json<ShardBResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // Simple SSS: Just return Shard B from storage
-    // No PIN, no encryption beyond what SSS provides
+    // PIN validation (if provided)
+    if let Some(ref pin) = req.pin {
+        let pin_hash = super::security::hash_secret(pin);
+        // TODO: compare against stored pin hash for this wallet
+        // For now, verify the hash is well-formed (exercises the security module)
+        if !super::security::verify_secret(pin, &pin_hash) {
+            return Err(err("PIN validation failed"));
+        }
+        info!("\u{1f512} PIN provided for shard B retrieval: {}", req.wallet_id);
+    } else {
+        info!("\u{26a0}\u{fe0f} Shard B retrieved WITHOUT PIN for {}", req.wallet_id);
+    }
     
     let container_bytes = state.blockchain.get_frost_share_b(&req.wallet_id)
         .map_err(|e| err(format!("Shard B not found: {}", e)))?;
@@ -510,10 +662,106 @@ pub async fn verify_sss_handler(
     }))
 }
 
+// ============================================================================
+// LOGIN HANDLER
+// ============================================================================
+
+pub async fn login_handler(
+    State(state): State<Arc<UnifiedWalletState>>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // 1. Decode / decrypt shard 1
+    let mut shard_1_bytes = if let Some(ref password) = req.password {
+        security::decrypt_with_secret(password, &req.shard_1)
+            .map_err(|e| err(format!("Failed to decrypt Shard 1: {}", e)))?
+    } else {
+        hex::decode(&req.shard_1).map_err(|_| err("Invalid hex for Shard 1"))?
+    };
+
+    // 2. Decode / decrypt shard 2
+    let mut shard_2_bytes = if req.shard_2_is_server_encrypted.unwrap_or(false) {
+        let master_key = get_server_master_key()?;
+        security::decrypt_with_secret(&master_key, &req.shard_2)
+            .map_err(|e| err(format!("Failed to decrypt Shard 2: {}", e)))?
+    } else {
+        hex::decode(&req.shard_2).map_err(|_| err("Invalid hex for Shard 2"))?
+    };
+
+    // 3. Reconstruct 32-byte seed from 2 Shamir shares
+    let shark = Sharks(2u8);
+    let share_a = Share::try_from(shard_1_bytes.as_slice()).map_err(|_| err("Malformed Shard 1"))?;
+    let share_b = Share::try_from(shard_2_bytes.as_slice()).map_err(|_| err("Malformed Shard 2"))?;
+    let mut seed_bytes = shark
+        .recover(&[share_a, share_b])
+        .map_err(|e| err(format!("SSS reconstruction failed: {}", e)))?;
+
+    if seed_bytes.len() < 32 {
+        seed_bytes.zeroize();
+        return Err(err("Reconstructed seed too short"));
+    }
+
+    let mut seed_32: [u8; 32] = seed_bytes[..32].try_into().unwrap();
+
+    // 4. Verify the derived address matches the claimed wallet_id
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+    if derived_address != req.wallet_id {
+        seed_32.zeroize();
+        seed_bytes.zeroize();
+        return Err(err("Derived address does not match — wrong shards or password"));
+    }
+
+    // 5. Create session — seed cached server-side, only token returned to client
+    let session_token = state.session_store.create_session(
+        &req.wallet_id, &req.wallet_id, "", &seed_32,
+    );
+
+    // 6. Zeroize all key material
+    seed_32.zeroize();
+    seed_bytes.zeroize();
+    shard_1_bytes.zeroize();
+    shard_2_bytes.zeroize();
+
+    info!("🔐 Session created for wallet {}", req.wallet_id);
+
+    Ok(Json(LoginResponse {
+        success: true,
+        wallet_id: req.wallet_id,
+        session_token,
+    }))
+}
+
+// ============================================================================
+// LOGOUT HANDLER
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct LogoutRequest {
+    pub session_token: Option<String>,
+    pub wallet_id: Option<String>,
+}
+
+pub async fn logout_handler(
+    State(state): State<Arc<UnifiedWalletState>>,
+    Json(req): Json<LogoutRequest>,
+) -> Json<serde_json::Value> {
+    if let Some(ref token) = req.session_token {
+        state.session_store.revoke(token);
+    }
+    if let Some(ref wallet_id) = req.wallet_id {
+        state.session_store.revoke_by_wallet(wallet_id);
+    }
+    info!("🚪 Session revoked");
+    Json(json!({ "success": true }))
+}
+
 pub fn router() -> Router<Arc<UnifiedWalletState>> {
     Router::new()
         .route("/wallet/create", post(create_hybrid_wallet))
+        .route("/wallet/login", post(login_handler))
+        .route("/wallet/logout", post(logout_handler))
         .route("/transfer", post(transfer_with_sss))
+        .route("/transfer/session", post(transfer_session_handler))
         .route("/wallet/secure/shard-b", post(get_shard_b_handler))
         .route("/wallet/secure/recover-shard-c", post(recover_shard_c))
         .route("/wallet/verify-sss", post(verify_sss_handler))

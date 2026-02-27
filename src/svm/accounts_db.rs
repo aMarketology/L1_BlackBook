@@ -118,6 +118,7 @@ impl DirtySet {
         keys
     }
 
+    #[allow(dead_code)] // Used in flush_block diagnostics
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }

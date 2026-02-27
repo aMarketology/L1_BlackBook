@@ -303,6 +303,7 @@ impl Vote {
         h.update(ts.to_le_bytes());
         Self { slot, block_hash, validator, stake_weight: stake, timestamp: ts, signature: format!("{:x}", h.finalize()) }
     }
+    #[allow(dead_code)] // Used by reader nodes validating incoming P2P votes
     pub fn verify(&self) -> bool {
         let mut h = Sha256::new();
         h.update(self.slot.to_le_bytes());
@@ -371,6 +372,7 @@ impl VoteTower {
 
 /// Compact tower sync for P2P gossip
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[allow(dead_code)] // Phase 5+: multi-validator P2P gossip
 pub struct TowerSync {
     pub validator: String,
     pub root: u64,
@@ -491,6 +493,49 @@ impl TowerBFT {
     pub fn global_root(&self) -> u64 { self.global_root.load(Ordering::Relaxed) }
     pub fn is_finalized(&self, slot: u64) -> bool { slot <= self.global_root() }
     pub fn is_confirmed(&self, slot: u64) -> bool { self.confirmed.contains_key(&slot) || self.is_finalized(slot) }
+
+    /// Vote as our own validator (uses `our_validator` identity)
+    pub fn self_vote(&self, slot: u64, block_hash: &str) -> Result<bool, String> {
+        self.vote(&self.our_validator, slot, block_hash)
+    }
+
+    /// Get consensus status for a slot
+    pub fn get_consensus_status(&self, slot: u64) -> ConsensusStatus {
+        if self.is_finalized(slot) {
+            return ConsensusStatus::Rooted;
+        }
+        let total = *self.total_stake.read();
+        let slot_stake: f64 = self.slot_votes.get(&slot)
+            .map(|v| v.iter().map(|x| x.stake_weight).sum())
+            .unwrap_or(0.0);
+        if total > 0.0 && slot_stake / total >= SUPERMAJORITY_THRESHOLD {
+            ConsensusStatus::Confirmed { stake: slot_stake }
+        } else {
+            let vote_count = self.slot_votes.get(&slot).map(|v| v.len()).unwrap_or(0);
+            if vote_count > 0 {
+                ConsensusStatus::Voting { stake: slot_stake, votes: vote_count }
+            } else {
+                ConsensusStatus::Unknown
+            }
+        }
+    }
+
+    /// Verify a proposed block's validity using leader schedule
+    pub fn verify_proposed_block(
+        &self, slot: u64, block_hash: &str, poh_hash: &str,
+        leader: &str, expected_leader: &str, transactions: &[String],
+    ) -> Result<(), String> {
+        verify_block_validity(slot, block_hash, poh_hash, leader, expected_leader, transactions)
+    }
+
+    /// Check if a vote threshold is met for a slot
+    pub fn meets_threshold(&self, slot: u64, threshold: f64) -> bool {
+        let total = *self.total_stake.read();
+        let voted: f64 = self.slot_votes.get(&slot)
+            .map(|v| v.iter().map(|x| x.stake_weight).sum())
+            .unwrap_or(0.0);
+        check_vote_threshold(voted, total, threshold)
+    }
 
     pub fn select_fork(&self) -> Option<(u64, String)> {
         let root = self.global_root();

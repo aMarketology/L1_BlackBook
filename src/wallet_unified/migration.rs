@@ -285,34 +285,6 @@ fn migrate_share_b(
 // BUILT-IN MIGRATION PLANS
 // ============================================================================
 
-/// Build the FROST→Shamir migration plan for all known wallets
-///
-/// Call this with the new v2 addresses after creating replacement wallets.
-/// Old FROST wallets (bb_ prefix) will have their balances swept to new
-/// Shamir wallets (base58 Solana-format addresses).
-pub fn build_frost_to_shamir_plan(
-    mappings: Vec<(&str, &str, &str)>, // (name, old_addr, new_addr)
-) -> MigrationPlan {
-    let entries = mappings
-        .into_iter()
-        .map(|(name, old, new)| WalletMigrationEntry {
-            name: name.to_string(),
-            old_address: old.to_string(),
-            new_address: new.to_string(),
-            old_version: WalletVersion::V1Frost,
-            new_version: WalletVersion::V2Shamir,
-        })
-        .collect();
-
-    MigrationPlan {
-        from_version: WalletVersion::V1Frost,
-        to_version: WalletVersion::V2Shamir,
-        entries,
-        drain_old_wallets: true,    // Zero out old bb_ wallets
-        migrate_share_data: false,  // FROST shares are incompatible with Shamir
-    }
-}
-
 /// Build a generic balance migration plan (same wallet version, address change)
 ///
 /// Use this for future migrations where only the address format changes

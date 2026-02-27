@@ -3,9 +3,8 @@
 // ============================================================================
 //
 // This module implements the Solana Virtual Machine execution layer for
-// BlackBook L1.  All SVM code is behind `#[cfg(feature = "svm")]` at the
-// call sites so that a plain `cargo build` (without --features svm) compiles
-// the existing production code without any regressions.
+// BlackBook L1.  The SVM is always compiled and active — there are no
+// feature gates.  This is the production writer-node execution engine.
 //
 // Module layout:
 //   types.rs      — StoredAccount, SvmError, constants, TransactionExecutionResult
@@ -14,10 +13,9 @@
 //   tx_adapter.rs — Legacy TxData → TransferRequest routing
 //
 // Feature set per phase:
-//   Phase 1A (current): types + accounts_db compile-gated
-//   Phase 1B:           runtime executes system transfers
-//   Phase 1C:           tx_adapter wires into BlockProducer
-//   Phase 2+:           InvokeContext, rBPF, Anchor programs
+//   Phase 1 (live):  types + accounts_db + runtime + tx_adapter (system transfers)
+//   Phase 2:         SPL Token engine (USDC bridge minting)
+//   Phase 3:         InvokeContext, rBPF, Anchor programs
 //
 // ============================================================================
 

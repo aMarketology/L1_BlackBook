@@ -322,6 +322,7 @@ pub struct ConcurrentBlockchain {
     pub cache: Arc<DashMap<String, f64>>,
     
     /// Processed bridge TX cache (for fast replay checks)
+    #[allow(dead_code)] // Loaded from ReDB on startup; will be queried by bridge handler (Phase 7+)
     processed_bridge_txs: Arc<DashMap<String, String>>,
     
     /// Block height counter

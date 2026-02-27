@@ -1,0 +1,117 @@
+syntax = "proto3";
+package validator_relay;
+
+// ============================================================================
+// VALIDATOR RELAY — 1-Writer / N-Reader Block Streaming Protocol
+// ============================================================================
+//
+// The Writer node produces blocks and streams them to Reader nodes via gRPC.
+// Readers verify each block (hash chain, PoH entries, tx count) before storing.
+//
+// Flow:
+//   1. Reader connects → CatchupBlocks (fetch missed slots)
+//   2. Reader subscribes → SubscribeBlocks (live stream)
+//   3. Reader forwards user txs → ForwardTransaction (to writer's mempool)
+
+// ── Messages ──────────────────────────────────────────────────────────────
+
+/// A single transaction as it appears in a block
+message BlockTransaction {
+    string hash = 1;
+    string from = 2;
+    string data_json = 3;        // JSON-encoded TxData variant
+    string signature = 4;
+    string signer_pubkey = 5;
+    uint64 timestamp = 6;
+    string poh_hash = 7;         // PoH hash at time of inclusion
+    uint64 poh_sequence = 8;     // Global PoH ordering number
+    uint32 position = 9;         // Position within the block
+}
+
+/// A PoH entry within a block
+message PoHEntry {
+    string hash = 1;
+    uint64 num_hashes = 2;
+    uint64 slot = 3;
+}
+
+/// Complete block data streamed from Writer → Reader
+message BlockData {
+    // Header
+    uint64 slot = 1;
+    uint64 timestamp = 2;
+    string previous_hash = 3;
+    string hash = 4;
+
+    // State
+    string state_root = 5;
+    string accounts_hash = 6;
+
+    // PoH
+    string poh_hash = 7;
+    uint64 poh_sequence = 8;
+    repeated PoHEntry poh_entries = 9;
+
+    // Transactions
+    repeated BlockTransaction transactions = 10;
+    uint32 tx_count = 11;
+
+    // Consensus
+    string leader = 12;
+    uint64 epoch = 13;
+    uint64 confirmations = 14;
+}
+
+/// Subscribe request from Reader → Writer
+message SubscribeRequest {
+    string reader_id = 1;        // Reader's identity string
+    uint64 start_slot = 2;       // Resume from this slot (0 = latest)
+}
+
+/// Catchup request: fetch a range of historical blocks
+message CatchupRequest {
+    string reader_id = 1;
+    uint64 start_slot = 2;       // First slot to fetch (inclusive)
+    uint64 end_slot = 3;         // Last slot to fetch (inclusive, 0 = latest)
+}
+
+/// Forward a transaction from Reader → Writer for inclusion in next block
+message ForwardTransactionRequest {
+    string tx_json = 1;          // JSON-serialized Transaction
+    string reader_id = 2;        // Which reader forwarded this
+}
+
+message ForwardTransactionResponse {
+    bool success = 1;
+    string error = 2;
+    string tx_id = 3;            // Assigned transaction ID
+}
+
+/// Health / status query
+message StatusRequest {}
+
+message StatusResponse {
+    string node_id = 1;
+    string mode = 2;             // "writer" or "reader"
+    uint64 latest_slot = 3;
+    string latest_hash = 4;
+    uint64 epoch = 5;
+    uint64 uptime_secs = 6;
+    uint32 connected_readers = 7;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────
+
+service ValidatorRelay {
+    // Live block stream: Writer → Reader (server-streaming)
+    rpc SubscribeBlocks(SubscribeRequest) returns (stream BlockData);
+
+    // Historical catchup: Reader requests a range of past blocks
+    rpc CatchupBlocks(CatchupRequest) returns (stream BlockData);
+
+    // Transaction forwarding: Reader → Writer mempool
+    rpc ForwardTransaction(ForwardTransactionRequest) returns (ForwardTransactionResponse);
+
+    // Status query
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
+}

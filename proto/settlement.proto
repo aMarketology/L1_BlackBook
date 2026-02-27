@@ -1,0 +1,147 @@
+syntax = "proto3";
+package blackbook;
+
+// ============================================================================
+// L1 SETTLEMENT SERVICE — L1 (Bank) ↔ L2 (Casino) Communication
+// ============================================================================
+// NOTE: This proto was previously empty and relied on stale build cache.
+// These definitions match the types used in src/grpc/mod.rs.
+
+message BalanceRequest {
+    string address = 1;
+}
+
+message BalanceResponse {
+    bool success = 1;
+    string error = 2;
+    string address = 3;
+    uint64 available = 4;
+    uint64 locked = 5;
+    uint64 total = 6;
+}
+
+message VirtualBalanceRequest {
+    string address = 1;
+    string session_id = 2;
+}
+
+message VirtualBalanceResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 real_balance = 3;
+    uint64 credit_available = 4;
+    uint64 total_available = 5;
+}
+
+message SoftLockRequest {
+    string address = 1;
+    uint64 amount = 2;
+    string bet_id = 3;
+    string l2_signature = 4;
+    uint64 timestamp = 5;
+    string l2_public_key = 6;
+}
+
+message SoftLockResponse {
+    bool success = 1;
+    string error = 2;
+    string lock_id = 3;
+    uint64 remaining_balance = 4;
+}
+
+message ReleaseLockRequest {
+    string lock_id = 1;
+    string l2_signature = 2;
+    uint64 timestamp = 3;
+    string l2_public_key = 4;
+}
+
+message ReleaseLockResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 released_amount = 3;
+}
+
+message SettleBetRequest {
+    string bet_id = 1;
+    string user_address = 2;
+    string outcome = 3;
+    int64 user_pnl = 4;
+    string l2_signature = 5;
+    uint64 timestamp = 6;
+    string l2_public_key = 7;
+}
+
+message SettleBetResponse {
+    bool success = 1;
+    string error = 2;
+    string tx_hash = 3;
+    uint64 new_balance = 4;
+}
+
+message BatchSettleRequest {
+    repeated SettleBetRequest settlements = 1;
+    string l2_signature = 2;
+    uint64 timestamp = 3;
+    string l2_public_key = 4;
+}
+
+message BatchSettleResponse {
+    bool success = 1;
+    uint32 total = 2;
+    uint32 succeeded = 3;
+    uint32 failed = 4;
+    repeated SettleBetResponse results = 5;
+}
+
+message CreateCreditRequest {
+    string user_address = 1;
+    uint64 credit_limit = 2;
+    uint64 expires_at = 3;
+    string l2_signature = 4;
+    uint64 timestamp = 5;
+    string l2_public_key = 6;
+}
+
+message CreateCreditResponse {
+    bool success = 1;
+    string error = 2;
+    string session_id = 3;
+}
+
+message CloseCreditRequest {
+    string session_id = 1;
+    string l2_signature = 2;
+    uint64 timestamp = 3;
+    string l2_public_key = 4;
+}
+
+message CloseCreditResponse {
+    bool success = 1;
+    string error = 2;
+    int64 net_position = 3;
+    string settlement_tx = 4;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+    bool healthy = 1;
+    string version = 2;
+    uint64 uptime_secs = 3;
+    uint64 settled_count = 4;
+    uint64 active_locks = 5;
+    uint64 active_sessions = 6;
+}
+
+service L1Settlement {
+    rpc GetBalance(BalanceRequest) returns (BalanceResponse);
+    rpc GetVirtualBalance(VirtualBalanceRequest) returns (VirtualBalanceResponse);
+    rpc SoftLock(SoftLockRequest) returns (SoftLockResponse);
+    rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
+    rpc SettleBet(SettleBetRequest) returns (SettleBetResponse);
+    rpc BatchSettle(BatchSettleRequest) returns (BatchSettleResponse);
+    rpc CreateCredit(CreateCreditRequest) returns (CreateCreditResponse);
+    rpc CloseCredit(CloseCreditRequest) returns (CloseCreditResponse);
+    rpc CheckHealth(HealthRequest) returns (HealthResponse);
+}

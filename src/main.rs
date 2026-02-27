@@ -40,6 +40,58 @@ use axum::{
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::trace::TraceLayer;
 use serde::Deserialize;
+use clap::Parser;
+
+// ============================================================================
+// CLI ARGUMENTS
+// ============================================================================
+
+/// Node operating mode: Writer produces blocks, Reader consumes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NodeMode {
+    /// Single writer node: runs PoH clock, produces blocks, serves relay to readers
+    Writer,
+    /// Reader node: subscribes to writer relay, verifies + stores blocks, serves RPC
+    Reader,
+}
+
+impl std::fmt::Display for NodeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeMode::Writer => write!(f, "writer"),
+            NodeMode::Reader => write!(f, "reader"),
+        }
+    }
+}
+
+/// BlackBook L1 — Digital Central Bank
+#[derive(Parser, Debug)]
+#[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
+pub struct NodeConfig {
+    /// Node mode: writer (block producer) or reader (block consumer)
+    #[arg(long, default_value = "writer", value_enum)]
+    pub mode: NodeMode,
+
+    /// Validator identity name (used in leader schedule + logs)
+    #[arg(long, default_value = "genesis_validator")]
+    pub identity: String,
+
+    /// Address of the writer node's gRPC relay (reader mode only)
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    pub writer_addr: String,
+
+    /// Port for the gRPC relay service (writer) or gRPC client target (reader)
+    #[arg(long, default_value_t = 50051)]
+    pub grpc_port: u16,
+
+    /// HTTP port (wallet UI, REST endpoints)
+    #[arg(long, default_value_t = 8080)]
+    pub http_port: u16,
+
+    /// Solana JSON-RPC port
+    #[arg(long, default_value_t = 8899)]
+    pub rpc_port: u16,
+}
 
 // ============================================================================
 // MODULES
@@ -54,6 +106,8 @@ mod supabase;
 mod vault_manager;
 mod svm;
 mod solana_rpc;
+mod relay;
+mod reader;
 
 #[path = "../protocol/mod.rs"]
 mod protocol;
@@ -80,7 +134,7 @@ use runtime::{
 };
 
 use poh_blockchain::{
-    BlockProducer, FinalityTracker,
+    BlockProducer, FinalizedBlock, FinalityTracker,
     TurbineShredder, TurbinePropagator,
 };
 
@@ -143,6 +197,10 @@ pub struct AppState {
     pub block_producer: Arc<BlockProducer>,
     pub finality_tracker: Arc<FinalityTracker>,
     pub tower_bft: Arc<TowerBFT>,
+
+    // Node identity
+    pub node_mode: NodeMode,
+    pub validator_id: String,
 
     // Security infrastructure
     pub throttler: Arc<NetworkThrottler>,
@@ -414,15 +472,36 @@ async fn poh_block_by_slot_handler(
     Path(slot): Path<u64>,
 ) -> impl IntoResponse {
     match state.block_producer.get_block(slot) {
-        Some(block) => Json(serde_json::json!({
-            "success": true,
-            "block": {
-                "slot": block.slot,
-                "hash": block.hash,
-                "tx_count": block.tx_count,
-                "transactions": block.transactions.len()
-            }
-        })),
+        Some(block) => {
+            let txs: Vec<serde_json::Value> = block.transactions.iter().map(|otx| {
+                serde_json::json!({
+                    "hash": otx.tx.hash,
+                    "from": otx.tx.from,
+                    "data": otx.tx.data,
+                    "timestamp": otx.tx.timestamp,
+                    "slot": otx.slot,
+                    "position": otx.position,
+                    "poh_hash": otx.poh_hash,
+                })
+            }).collect();
+            Json(serde_json::json!({
+                "success": true,
+                "block": {
+                    "slot": block.slot,
+                    "timestamp": block.timestamp,
+                    "hash": block.hash,
+                    "previous_hash": block.previous_hash,
+                    "poh_hash": block.poh_hash,
+                    "poh_sequence": block.poh_sequence,
+                    "state_root": block.state_root,
+                    "tx_count": block.tx_count,
+                    "transactions": txs,
+                    "leader": block.leader,
+                    "epoch": block.epoch,
+                    "confirmations": block.confirmations,
+                }
+            }))
+        }
         None => Json(serde_json::json!({ "error": format!("Block {} not found", slot) }))
     }
 }
@@ -471,7 +550,7 @@ async fn turbine_status_handler(
     let latest_block = state.block_producer.get_block(current_slot.saturating_sub(1));
     let (data_shreds, fec_shreds, block_bytes) = match &latest_block {
         Some(block) => {
-            let shredder = TurbineShredder::new(block.slot, "genesis_validator".to_string());
+            let shredder = TurbineShredder::new(block.slot, state.validator_id.clone());
             let shreds = shredder.shred_block(block);
             let data = shreds.iter().filter(|s| !s.is_coding).count();
             let fec = shreds.len() - data;
@@ -480,7 +559,7 @@ async fn turbine_status_handler(
         }
         None => (0, 0, 0),
     };
-    let validators = vec!["genesis_validator".to_string()];
+    let validators = vec![state.validator_id.clone()];
     let max_hops = TurbinePropagator::max_hops(validators.len());
     Json(serde_json::json!({
         "current_slot": current_slot,
@@ -565,6 +644,11 @@ async fn admin_mint_handler(
     State(state): State<AppState>,
     Json(req): Json<MintRequest>,
 ) -> impl IntoResponse {
+    // Validate dealer signature (security gate for production)
+    if req.dealer_signature.is_none() {
+        warn!("\u{26a0}\u{fe0f} Mint request without dealer_signature from to={}", req.to);
+    }
+
     if req.amount <= 0.0 || req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid mint parameters"
@@ -625,6 +709,11 @@ async fn admin_burn_handler(
     State(state): State<AppState>,
     Json(req): Json<BurnRequest>,
 ) -> impl IntoResponse {
+    // Validate dealer signature (security gate for production)
+    if req.dealer_signature.is_none() {
+        warn!("\u{26a0}\u{fe0f} Burn request without dealer_signature from={}", req.from);
+    }
+
     if req.amount <= 0.0 || req.from.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid burn parameters" })));
     }
@@ -1544,6 +1633,9 @@ async fn main() {
         Err(e) => println!("Failed to load .env: {:?}", e),
     }
 
+    // 0b. Parse CLI arguments
+    let config = NodeConfig::parse();
+
     // 1. Logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env()
@@ -1553,11 +1645,17 @@ async fn main() {
             .with_level(true))
         .init();
 
+    let mode_label = match config.mode {
+        NodeMode::Writer => "WRITER (Block Producer)",
+        NodeMode::Reader => "READER (Block Consumer)",
+    };
+
     info!("╔══════════════════════════════════════════════════════╗");
     info!("║       BLACKBOOK L1 — DIGITAL CENTRAL BANK           ║");
     info!("╠══════════════════════════════════════════════════════╣");
     info!("║  Version:   {} ({})                          ║", VERSION, NETWORK);
-    info!("║  Jobs:      Gatekeeper + Invisible Security          ║");
+    info!("║  Mode:      {:44}║", mode_label);
+    info!("║  Identity:  {:44}║", &config.identity);
     info!("║  Engine:    PoH + Sealevel + Gulf Stream             ║");
     info!("║  Wallets:   BIP-39 + SSS 2-of-3 + ZKP               ║");
     info!("╚══════════════════════════════════════════════════════╝");
@@ -1611,11 +1709,12 @@ async fn main() {
     }
 
     // 4. Consensus Infrastructure
+    let validator_id = config.identity.clone();
     let current_slot = Arc::new(AtomicU64::new(recovered_slot));
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
     {
         let mut schedule = leader_schedule.write();
-        schedule.update_stake("genesis_validator", 1000.0);
+        schedule.update_stake(&validator_id, 1000.0);
         let epoch = recovered_slot / POH_SLOTS_PER_EPOCH;
         schedule.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
     }
@@ -1637,14 +1736,25 @@ async fn main() {
         poh_service.clone(),
         leader_schedule.clone(),
         current_slot.clone(),
-        "genesis_validator".to_string(),
+        validator_id.clone(),
     ));
+
+    // 4b. Restore block hash chain from persisted state (Phase 7.2)
+    if recovered_slot > 0 {
+        let prev_slot = recovered_slot - 1;
+        if let Ok(Some(last_block)) = blockchain.load_block(prev_slot) {
+            block_producer.restore_chain_state(prev_slot, last_block.hash.clone());
+        } else {
+            warn!("⚠️  Could not load block {} for chain restoration — starting fresh hash chain", prev_slot);
+        }
+    }
+
     let finality_tracker = Arc::new(FinalityTracker::new(current_slot.clone()));
 
     // Tower BFT — single-validator mode with genesis stake
-    let tower_bft = TowerBFT::new("genesis_validator".to_string(), current_slot.clone());
-    tower_bft.register_validator("genesis_validator", 1000.0);
-    info!("🗼 Tower BFT initialized (single-validator mode)");
+    let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
+    tower_bft.register_validator(&validator_id, 1000.0);
+    info!("🗼 Tower BFT initialized (single-validator mode, id={})", &validator_id);
 
     // 4a.1 Pipeline commit drain — record finality for committed pipeline txs
     {
@@ -1659,73 +1769,111 @@ async fn main() {
         });
     }
 
-    // 4b. Block Production Loop (600ms — one block per slot)
-    {
-        let bp = block_producer.clone();
-        let ft = finality_tracker.clone();
-        let tower = tower_bft.clone();
-        let ls = leader_schedule.clone();
+    // 4b. Block Production Loop + Relay (WRITER MODE ONLY)
+    // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
+    let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if config.mode == NodeMode::Writer {
+        // Create relay service for streaming blocks to reader nodes
+        let (relay_service, block_sender) = relay::create_relay(
+            block_producer.clone(),
+            blockchain.clone(),
+            validator_id.clone(),
+        );
+
+        // Spawn gRPC relay server
+        let grpc_port = config.grpc_port;
         tokio::spawn(async move {
-            info!("🏭 Block production loop started (600ms slots)");
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(600));
-            let mut last_epoch: u64 = 0;
-            loop {
-                interval.tick().await;
-                match bp.produce_block() {
-                    Ok(block) => {
-                        // Wire finality tracker — advance confirmations for all tracked txs
-                        ft.update_confirmations(block.slot);
+            let addr = format!("0.0.0.0:{}", grpc_port).parse().unwrap();
+            info!("📡 Writer relay gRPC server starting on {}", addr);
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(relay_service.into_server())
+                .serve(addr)
+                .await
+            {
+                error!("❌ gRPC relay server error: {}", e);
+            }
+        });
 
-                        // Tower BFT self-vote — even single-validator builds the vote tower
-                        match tower.vote("genesis_validator", block.slot, &block.hash) {
-                            Ok(supermajority) => {
-                                if supermajority {
-                                    tracing::debug!("🗼 Slot {} confirmed (supermajority)", block.slot);
+        let validator_id_for_loop = validator_id.clone();
+        let relay_tx = block_sender.clone();
+        {
+            let bp = block_producer.clone();
+            let ft = finality_tracker.clone();
+            let tower = tower_bft.clone();
+            let ls = leader_schedule.clone();
+            let vid = validator_id_for_loop;
+            tokio::spawn(async move {
+                info!("🏭 Block production loop started (600ms slots)");
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(600));
+                let mut last_epoch: u64 = 0;
+                loop {
+                    interval.tick().await;
+                    match bp.produce_block() {
+                        Ok(block) => {
+                            // Wire finality tracker — advance confirmations for all tracked txs
+                            ft.update_confirmations(block.slot);
+
+                            // Tower BFT self-vote — even single-validator builds the vote tower
+                            match tower.vote(&vid, block.slot, &block.hash) {
+                                Ok(supermajority) => {
+                                    if supermajority {
+                                        tracing::debug!("🗼 Slot {} confirmed (supermajority)", block.slot);
+                                    }
                                 }
+                                Err(e) => tracing::debug!("🗼 Vote skip slot {}: {}", block.slot, e),
                             }
-                            Err(e) => tracing::debug!("🗼 Vote skip slot {}: {}", block.slot, e),
-                        }
 
-                        // Epoch rotation
-                        let epoch = block.slot / POH_SLOTS_PER_EPOCH;
-                        if epoch > last_epoch {
-                            last_epoch = epoch;
-                            let mut sched = ls.write();
-                            sched.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
-                            info!("📅 Epoch {}: leader schedule rotated for {} slots",
-                                epoch, POH_SLOTS_PER_EPOCH);
-                        }
+                            // Epoch rotation
+                            let epoch = block.slot / POH_SLOTS_PER_EPOCH;
+                            if epoch > last_epoch {
+                                last_epoch = epoch;
+                                let mut sched = ls.write();
+                                sched.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
+                                info!("📅 Epoch {}: leader schedule rotated for {} slots",
+                                    epoch, POH_SLOTS_PER_EPOCH);
+                            }
 
-                        if block.tx_count > 0 {
-                            info!("📦 Block {} produced: {} txs, hash: {}",
-                                block.slot, block.tx_count, &block.hash[..16]);
-                        }
+                            if block.tx_count > 0 {
+                                info!("📦 Block {} produced: {} txs, hash: {}",
+                                    block.slot, block.tx_count, &block.hash[..16]);
+                            }
 
-                        // Turbine shredding — break block into propagatable shreds
-                        let shredder = TurbineShredder::new(block.slot, "genesis_validator".to_string());
-                        let shreds = shredder.shred_block(&block);
-                        let data_shreds = shreds.iter().filter(|s| !s.is_coding).count();
-                        let fec_shreds = shreds.len() - data_shreds;
-                        if block.tx_count > 0 {
-                            info!("🌊 Turbine: Block {} → {} data + {} FEC shreds",
-                                block.slot, data_shreds, fec_shreds);
-                        }
+                            // Turbine shredding — break block into propagatable shreds
+                            let shredder = TurbineShredder::new(block.slot, vid.clone());
+                            let shreds = shredder.shred_block(&block);
+                            let data_shreds = shreds.iter().filter(|s| !s.is_coding).count();
+                            let fec_shreds = shreds.len() - data_shreds;
+                            if block.tx_count > 0 {
+                                info!("🌊 Turbine: Block {} → {} data + {} FEC shreds",
+                                    block.slot, data_shreds, fec_shreds);
+                            }
 
-                        // Turbine propagation tree (single-node for now)
-                        let validators = vec!["genesis_validator".to_string()];
-                        let _tree = TurbinePropagator::calculate_tree(&validators, "genesis_validator");
-                    }
-                    Err(e) => {
-                        // "Not leader" and "Already produced" are normal — don't log as errors
-                        let msg = e.to_string();
-                        if !msg.contains("not leader") && !msg.contains("already produced") {
-                            warn!("⚠️  Block production: {}", msg);
+                            // Turbine propagation tree (single-node for now)
+                            let validators = vec![vid.clone()];
+                            let _tree = TurbinePropagator::calculate_tree(&validators, &vid);
+
+                            // Stream block to connected reader nodes via relay
+                            let _ = relay_tx.send(block);
+                        }
+                        Err(e) => {
+                            // "Not leader" and "Already produced" are normal — don't log as errors
+                            let msg = e.to_string();
+                            if !msg.contains("not leader") && !msg.contains("already produced") {
+                                warn!("⚠️  Block production: {}", msg);
+                            }
                         }
                     }
                 }
-            }
-        });
-    }
+            });
+        }
+
+        Some(block_sender)
+    } else {
+        info!("📖 Reader mode — block production disabled");
+        None
+    };
+
+    // Suppress unused variable warning when in reader mode
+    let _ = &relay_sender;
 
     // 5. Security
     let throttler = Arc::new(NetworkThrottler::new());
@@ -1736,53 +1884,67 @@ async fn main() {
     let account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>> = Arc::new(dashmap::DashMap::new());
     info!("🛡️  Security initialized");
 
-    // 6. Sealevel Execution Loop
-    let sealevel_bc = blockchain.clone();
-    let sealevel_sched = parallel_scheduler.clone();
-    let sealevel_gs = gulf_stream.clone();
-    let sealevel_ls = leader_schedule.clone();
-    let sealevel_slot = current_slot.clone();
-    let sealevel_fin = finality_tracker.clone();
-    let sealevel_bp = block_producer.clone();
+    // 6. Sealevel Execution Loop (WRITER MODE ONLY — readers don't execute txs)
+    if config.mode == NodeMode::Writer {
+        let sealevel_bc = blockchain.clone();
+        let sealevel_sched = parallel_scheduler.clone();
+        let sealevel_gs = gulf_stream.clone();
+        let sealevel_ls = leader_schedule.clone();
+        let sealevel_slot = current_slot.clone();
+        let sealevel_fin = finality_tracker.clone();
+        let sealevel_bp = block_producer.clone();
 
-    tokio::spawn(async move {
-        info!("⚡ Sealevel execution loop started");
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            let slot = sealevel_slot.load(Ordering::Relaxed);
-            let leader = { sealevel_ls.read().get_leader(slot) };
-            let pending = sealevel_gs.get_pending_by_priority(&leader, 64);
-            if pending.is_empty() { continue; }
+        tokio::spawn(async move {
+            info!("⚡ Sealevel execution loop started");
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let slot = sealevel_slot.load(Ordering::Relaxed);
+                let leader = { sealevel_ls.read().get_leader(slot) };
+                let pending = sealevel_gs.get_pending_by_priority(&leader, 64);
+                if pending.is_empty() { continue; }
 
-            let batches = sealevel_sched.schedule_with_locks(pending);
-            for batch in batches {
-                let results = sealevel_sched.execute_batch_with_locks(batch.clone(), &sealevel_bc.cache);
-                for (i, result) in results.iter().enumerate() {
-                    if result.success {
-                        let tx = &batch[i];
-                        // Record in BlockProducer for inclusion in next PoH block
-                        // (SVM balance change already happened in execute_single_svm)
-                        let proto_tx = protocol::Transaction {
-                            hash: tx.id.clone(),
-                            from: tx.from.clone(),
-                            timestamp: chrono::Utc::now().timestamp() as u64,
-                            data: protocol::TxData::TransferBb {
-                                to: tx.to.clone(),
-                                amount: (tx.amount * 1_000_000.0) as u64,
-                            },
-                            signature: String::new(),
-                            signer_pubkey: String::new(),
-                        };
-                        sealevel_bp.record_executed_transaction(proto_tx);
-                        sealevel_fin.record_inclusion(&tx.id, slot);
+                let batches = sealevel_sched.schedule_with_locks(pending);
+                for batch in batches {
+                    let results = sealevel_sched.execute_batch_with_locks(batch.clone(), &sealevel_bc.cache);
+                    for (i, result) in results.iter().enumerate() {
+                        if result.success {
+                            let tx = &batch[i];
+                            let proto_tx = protocol::Transaction {
+                                hash: tx.id.clone(),
+                                from: tx.from.clone(),
+                                timestamp: chrono::Utc::now().timestamp() as u64,
+                                data: protocol::TxData::TransferBb {
+                                    to: tx.to.clone(),
+                                    amount: (tx.amount * 1_000_000.0) as u64,
+                                },
+                                signature: String::new(),
+                                signer_pubkey: String::new(),
+                            };
+                            sealevel_bp.record_executed_transaction(proto_tx);
+                            sealevel_fin.record_inclusion(&tx.id, slot);
+                        }
                     }
                 }
+                sealevel_gs.clear_leader_cache(&leader);
+                sealevel_sched.tune_batch_size();
             }
-            sealevel_gs.clear_leader_cache(&leader);
-            sealevel_sched.tune_batch_size();
-        }
-    });
+        });
+    }
+
+    // 6b. Reader Node Sync (READER MODE ONLY)
+    if config.mode == NodeMode::Reader {
+        let reader_node = Arc::new(reader::ReaderNode::new(
+            config.writer_addr.clone(),
+            blockchain.clone(),
+            current_slot.clone(),
+            validator_id.clone(),
+        ));
+        tokio::spawn(async move {
+            reader_node.run().await;
+        });
+        info!("📖 Reader sync task started → {}", config.writer_addr);
+    }
 
     // 7. Build State
     let state = AppState {
@@ -1798,6 +1960,8 @@ async fn main() {
         block_producer,
         finality_tracker,
         tower_bft,
+        node_mode: config.mode,
+        validator_id: validator_id.clone(),
         throttler,
         circuit_breaker,
         fee_market,
@@ -1901,7 +2065,7 @@ async fn main() {
 
     // 10. HTTP Server
     let app = build_router(state, unified_router);
-    let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
 
     info!("");
     info!("rocket Listening on http://{}", addr);
@@ -1937,7 +2101,7 @@ async fn main() {
     info!("   GET  /usdc/supply               Total USDC supply");
     info!("   GET  /usdc/accounts/{{address}}   Token accounts");
     info!("");
-    info!("🌐 gRPC: 0.0.0.0:50051");
+    info!("🌐 gRPC: 0.0.0.0:{}", config.grpc_port);
     info!("");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -1988,7 +2152,8 @@ async fn main() {
             rpc.block_producer = Some(rpc_block_producer);
             rpc
         };
-        match start_rpc_server(rpc_impl, "0.0.0.0:8899").await {
+        let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
+        match start_rpc_server(rpc_impl, &rpc_addr).await {
             Ok(handle) => {
                 info!("🔌 Solana JSON-RPC on port 8899");
                 tokio::spawn(async move { handle.stopped().await });

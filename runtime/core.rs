@@ -75,6 +75,7 @@ impl AccountType {
 
 /// PDA derivation — deterministic off-curve address from seeds
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[allow(dead_code)] // Phase 5+: PDA accounts for program-owned state
 pub struct ProgramDerivedAddress {
     pub address: String,
     pub account_type: AccountType,
@@ -84,6 +85,7 @@ pub struct ProgramDerivedAddress {
 }
 
 impl ProgramDerivedAddress {
+    #[allow(dead_code)] // Phase 5+: PDA derivation
     pub fn derive(account_type: AccountType, owner: &str, index: Option<&str>) -> Result<Self, String> {
         let namespace = account_type.namespace();
         let mut seed_data = Vec::new();
@@ -128,6 +130,7 @@ pub struct PDAInfo {
 
 /// Declarative account access (for future validation framework)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // Phase 5+: instruction-level account validation
 pub struct AccountAccess {
     pub address: String,
     pub expected_type: AccountType,
@@ -137,6 +140,7 @@ pub struct AccountAccess {
 
 /// Account validation error types
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase 5+: instruction-level account validation
 pub enum AccountValidationError {
     AccountNotFound(String),
     InvalidType { expected: AccountType, found: AccountType },
@@ -156,11 +160,13 @@ impl std::fmt::Display for AccountValidationError {
 }
 
 /// Account validator stub (validates account accesses before execution)
+#[allow(dead_code)] // Phase 5+: instruction-level account validation
 pub struct AccountValidator {
     accounts: Arc<DashMap<String, AccountMetadata>>,
 }
 
 impl AccountValidator {
+    #[allow(dead_code)]
     pub fn new(accounts: Arc<DashMap<String, AccountMetadata>>) -> Self {
         Self { accounts }
     }

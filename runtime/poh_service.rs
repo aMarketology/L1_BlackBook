@@ -72,10 +72,12 @@ pub enum ConfirmationStatus {
 /// - 300,000 slots = ~3.5 days at 1 second slots
 /// - Enough for dispute resolution and recent queries
 /// - Archive nodes keep everything, pruned nodes discard older data
+#[allow(dead_code)] // Phase 7+: node pruning configuration
 pub const PRUNED_SLOTS_RETENTION: u64 = 300_000;
 
 /// Pruning mode for the node
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 7+: node pruning configuration
 pub enum NodePruningMode {
     /// Archive node - keeps all historical data
     Archive,
@@ -135,6 +137,7 @@ impl PipelinePacket {
 pub struct VerifiedPacket {
     pub packet: PipelinePacket,
     pub signature_valid: bool,
+    #[allow(dead_code)] // Logged in pipeline metrics
     pub verification_time_us: u64,
 }
 
@@ -155,9 +158,6 @@ pub struct CommittedPacket {
     /// Number of confirmations (increases as more blocks are built on top)
     pub confirmations: u64,
 }
-
-/// Shared reference to the transaction pipeline
-pub type SharedPipeline = Arc<TransactionPipeline>;
 
 /// Pipeline statistics for monitoring
 #[derive(Debug, Clone, Serialize)]

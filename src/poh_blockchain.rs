@@ -61,6 +61,7 @@ pub const MAX_TXS_PER_BLOCK: usize = 10_000;
 
 /// Block production interval in milliseconds
 /// TUNED: 600ms for stability (vs Solana's fragile 400ms) = 1.67 blocks/second
+#[allow(dead_code)] // Used by main_v4 and future scheduling
 pub const BLOCK_INTERVAL_MS: u64 = 600;
 
 /// Shred size in bytes (Turbine-style propagation)
@@ -103,6 +104,7 @@ pub struct Shred {
 
 impl Shred {
     /// Compute the hash of this shred's data
+    #[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine)
     pub fn data_hash(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(&self.slot.to_le_bytes());
@@ -112,6 +114,7 @@ impl Shred {
     }
     
     /// Verify the shred's integrity
+    #[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine)
     pub fn verify(&self, _expected_leader: &str) -> bool {
         // In production, verify Ed25519 signature
         // For now, check signature format
@@ -205,6 +208,7 @@ impl TurbineShredder {
     }
     
     /// Reassemble a block from shreds
+    #[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine receiver)
     pub fn reassemble_block(shreds: &[Shred]) -> Result<FinalizedBlock, String> {
         // Filter to data shreds only, sorted by index
         let mut data_shreds: Vec<_> = shreds.iter()
@@ -241,6 +245,7 @@ impl TurbineShredder {
 }
 
 /// Turbine propagation tree - determines who to send shreds to
+#[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine)
 pub struct TurbinePropagator {
     /// Our node's position in the tree (0 = leader)
     pub layer: u32,
@@ -643,6 +648,50 @@ impl BlockProducer {
             validator_id,
             svm,
             last_produced_slot: Arc::new(AtomicU64::new(u64::MAX)), // sentinel: no block produced yet
+        }
+    }
+
+    /// Restore chain state from a previous block after restart.
+    /// Sets the latest hash for block chaining and the last produced slot
+    /// to prevent re-producing already-persisted slots.
+    pub fn restore_chain_state(&self, last_slot: u64, last_hash: String) {
+        {
+            let mut h = self.latest_hash.write();
+            *h = last_hash.clone();
+        }
+        self.last_produced_slot.store(last_slot, Ordering::Relaxed);
+        info!(
+            "🔗 BlockProducer chain restored: slot {}, hash {}…",
+            last_slot,
+            &last_hash[..last_hash.len().min(16)]
+        );
+    }
+
+    /// Flush pending/executed transactions into one final block (for graceful shutdown).
+    /// Returns the number of transactions flushed.
+    pub fn flush_final_block(&self) -> u64 {
+        let pending = self.pending_txs.read().len();
+        let executed = self.executed_txs.read().len();
+        let total = pending + executed;
+        if total == 0 {
+            return 0;
+        }
+        // Advance slot by one to avoid the "already produced" guard
+        let current = self.current_slot.load(Ordering::Relaxed);
+        let next = current + 1;
+        self.current_slot.store(next, Ordering::Relaxed);
+        match self.produce_block() {
+            Ok(block) => {
+                info!(
+                    "📦 Shutdown block {} produced: {} txs flushed",
+                    block.slot, block.tx_count
+                );
+                block.tx_count as u64
+            }
+            Err(e) => {
+                warn!("⚠️  Shutdown block failed: {} — {} txs lost", e, total);
+                0
+            }
         }
     }
 
@@ -1074,10 +1123,32 @@ impl BlockProducer {
     }
 
     /// Get all accounts (for state root computation)
+    /// Merges legacy f64 balances from the DashMap cache AND SVM lamport balances
+    /// into a single BTreeMap for deterministic merkle hashing.
     fn get_all_accounts(&self) -> BTreeMap<String, f64> {
-        // This would need to be implemented in ConcurrentBlockchain
-        // For now, return empty (state root will be computed differently)
-        BTreeMap::new()
+        use solana_sdk::account::ReadableAccount;
+        let mut accounts = BTreeMap::new();
+
+        // 1) Legacy f64 balances from ConcurrentBlockchain DashMap cache
+        for entry in self.blockchain.cache.iter() {
+            let balance = *entry.value();
+            if balance > 0.0 {
+                accounts.insert(entry.key().clone(), balance);
+            }
+        }
+
+        // 2) SVM lamport balances (converted to f64 BB: 1 BB = 1_000_000 lamports)
+        for entry in self.blockchain.svm_accounts.hot_state.iter() {
+            let lamports = entry.value().lamports();
+            if lamports > 0 {
+                let bb_balance = lamports as f64 / 1_000_000.0;
+                let key = entry.key().to_string();
+                // SVM balance takes precedence when both exist
+                accounts.insert(key, bb_balance);
+            }
+        }
+
+        accounts
     }
 
     /// Get a block by slot number (memory cache → ReDB fallback)
@@ -1103,6 +1174,12 @@ impl BlockProducer {
     pub fn total_blocks_produced(&self) -> u64 {
         let last = self.last_produced_slot.load(Ordering::Relaxed);
         if last == u64::MAX { 0 } else { last + 1 }
+    }
+
+    /// Get cumulative transaction count across all in-memory cached blocks.
+    /// O(n) over the cache (max 1000 blocks) — fast enough for RPC use.
+    pub fn total_transaction_count(&self) -> u64 {
+        self.blocks.read().iter().map(|b| b.tx_count as u64).sum()
     }
 
     /// Get block count
@@ -1194,6 +1271,7 @@ impl FinalityTracker {
 // ============================================================================
 
 /// Verify a block's integrity
+#[allow(dead_code)] // Called by reader nodes in multi-validator mode
 pub fn verify_block(block: &FinalizedBlock, expected_previous_hash: &str) -> bool {
     // 1. Verify previous hash linkage
     if block.previous_hash != expected_previous_hash {
@@ -1232,6 +1310,7 @@ pub fn verify_block(block: &FinalizedBlock, expected_previous_hash: &str) -> boo
 }
 
 /// Verify a chain of blocks
+#[allow(dead_code)] // Called by reader nodes in multi-validator mode
 pub fn verify_chain(blocks: &[FinalizedBlock]) -> bool {
     if blocks.is_empty() {
         return true;

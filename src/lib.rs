@@ -15,6 +15,8 @@ pub mod supabase;
 pub mod vault_manager;
 pub mod svm;
 pub mod solana_rpc;
+pub mod relay;
+pub mod reader;
 
 // Infrastructure
 #[path = "../protocol/mod.rs"]

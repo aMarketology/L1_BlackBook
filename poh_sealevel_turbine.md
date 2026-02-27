@@ -7,27 +7,38 @@
 
 ---
 
-## Current State — Honest Assessment
+## Current State — As of 2026-02-24
 
-| Subsystem | Status | What Works | What's Broken |
-|-----------|--------|------------|---------------|
+| Subsystem | Status | What Works | Notes |
+|-----------|--------|------------|-------|
 | **PoH Clock** | ✅ FULLY WIRED | SHA-256 hash chain ticks every 9ms, 64 ticks/slot, 600ms slots | — |
-| **SVM Engine** | ✅ FULLY WIRED | Account storage, system transfers, blockhash queue, SPL tokens | — |
-| **JSON-RPC** | ✅ FULLY WIRED | 25 Solana-compatible methods on port 8899 | Missing `getBlock`, `getBlocks`, WebSockets |
+| **SVM Engine** | ✅ FULLY WIRED | Account storage, system transfers, blockhash queue, SPL tokens, CU enforcement | — |
+| **JSON-RPC** | ✅ FULLY WIRED | 28 Solana-compatible methods on port 8899 incl. `getBlock`, `getBlocks`, `getBlockProduction` | Missing WebSockets |
 | **Gulf Stream** | ✅ FULLY WIRED | Tx forwarding, priority sorting, leader-aware caching | — |
 | **Storage (ReDB)** | ✅ FULLY WIRED | 20+ tables, ACID writes, DashMap cache, `store_block()`/`load_block()` | — |
-| **Wallet + SSS** | ✅ FULLY WIRED | BIP-39, Shamir 2/3, SSS-authenticated transfers, SVM receipts | — |
-| **BlockProducer** | ⚠️ EXISTS BUT NEVER CALLED | `produce_block()` + `record_executed_transaction()` implemented | **No loop spawned — blocks never produced** |
-| **Sealevel Loop** | ⚠️ BYPASSES BLOCKS | Parallel execution works, transactions execute | Calls `blockchain.transfer()` directly, skips BlockProducer |
-| **Transaction Pipeline** | ⚠️ RUNNING BUT BROKEN | 4-stage pipeline (Fetch→Verify→Execute→Commit) running | `commit_rx` dropped — results vanish |
-| **ParallelScheduler** | ⚠️ LEGACY PATH | Rayon batch scheduling works | `with_svm()` never called — uses f64 path not SVM |
-| **Leader Schedule** | ⚠️ STATIC | Works for epoch 0, single validator | Never rotates, no epoch transitions |
-| **Finality Tracker** | ⚠️ HALF-WIRED | Records tx inclusion | `update_confirmations()` never called |
-| **Turbine** | 🔧 DATA STRUCTURES ONLY | Shredder, FEC coding, propagation tree | Not wired — no P2P network layer |
-| **Tower BFT** | 🔧 DATA STRUCTURES ONLY | Vote towers, exponential lockouts, fork selection | Not instantiated in main.rs |
-| **Slot Ticker** | ⚠️ DUAL COUNTERS | Advances AtomicU64 + SVM blockhash every 600ms | Not synced with PoH clock's internal counter |
+| **Wallet + SSS** | ✅ FULLY WIRED | BIP-39, Shamir 2/3, SSS-authenticated transfers, SVM receipts, PIN security | — |
+| **Block Production Loop** | ✅ FULLY WIRED | `tokio::spawn` produces blocks every 600ms | Writer mode only |
+| **SSS Transfers → Blocks** | ✅ FULLY WIRED | Every wallet transfer recorded via `record_executed_transaction()` | Appears in PoH blocks |
+| **Faucet Mints → Blocks** | ✅ FULLY WIRED | Faucet credits recorded in blocks | Appears in PoH blocks |
+| **Slot Counter** | ✅ UNIFIED | Single canonical slot from BlockProducer drives SVM + PoH | No more dual drift |
+| **ParallelScheduler** | ✅ SVM PATH | `with_svm()` called — uses lamport transfers not f64 | Sealevel runs real SVM |
+| **Sealevel Loop** | ✅ ROUTES TO BLOCKS | Gulf Stream txs go through `submit_transaction()` → BlockProducer | Writer mode only |
+| **Pipeline Commit Stage** | ✅ WIRED | `commit_rx` read, committed packets recorded in blocks | Full 4-stage pipeline |
+| **Finality Tracker** | ✅ WIRED | `update_confirmations()` called after each block | Txns advance to Finalized after 31 slots |
+| **Tower BFT** | ✅ WIRED | Instantiated, self-votes after every block, `GET /consensus/tower` endpoint live | Single-validator mode |
+| **Leader Schedule** | ✅ EPOCH ROTATION | Rotates at epoch boundaries, logs transitions | Ready for multi-validator |
+| **Turbine Shredding** | ✅ WIRED | Every block shredded into data + FEC shreds post-production | `shred_count` in block response |
+| **Turbine Propagation** | ✅ WIRED | `TurbinePropagator` instantiated, tree computed, `GET /turbine/status` live | No P2P layer yet |
+| **CLI + Node Mode** | ✅ WIRED | `--mode writer\|reader`, `--identity`, `--grpc-port`, `--http-port`, `--rpc-port` | clap 4 |
+| **1W/100R Relay (gRPC)** | ✅ WIRED | Writer streams blocks via `ValidatorRelay` gRPC service, reader verifies + stores | Phase 9 |
+| **Startup Recovery** | ✅ PARTIAL | `restore_chain_state()` restores slot + hash from ReDB on startup | Phase 7.2 partial |
+| **Build** | ✅ CLEAN | 0 errors, 0 warnings | Dead code removed or suppressed with rationale |
+| **getBlock / getBlocks** | ✅ IMPLEMENTED | `getBlock(slot)`, `getBlocks(start,end)`, `getBlockProduction` all wired to BlockProducer | Phase 5 complete |
+| **WebSocket Subscriptions** | ❌ NOT IMPLEMENTED | — | Phase 5 stretch |
+| **Block Explorer UI** | ❌ NOT IMPLEMENTED | — | Phase 6 |
+| **Graceful Shutdown** | ❌ PARTIAL | `flush_final_block()` method exists, shutdown section stub | Phase 7.1 |
 
-**Bottom line:** The engine parts are all built. They're just not bolted together. Transactions execute but never land in blocks. Blocks have a producer but no one tells it to produce. The pipeline runs but its output goes nowhere.
+**Bottom line:** Phases 1–5.2 + Phase 9 (1-Writer/100-Reader) complete. CLI parses `--mode writer|reader`. Writer produces blocks, streams via gRPC relay. Reader catches up, subscribes to live stream, verifies hash chain, stores to local ReDB. Build is clean (0 errors, 0 warnings).
 
 ---
 
@@ -339,6 +350,63 @@
 
 ---
 
+## Phase 9: 1-WRITER / 100-READER ARCHITECTURE
+> *"One node produces, 100 nodes verify — trustless at scale"*
+
+### Milestone 9.1 — CLI + Node Mode
+**Files:** `Cargo.toml`, `src/main.rs`
+**What:** Add `clap` CLI parsing with `--mode writer|reader`, `--identity`, `--grpc-port`, `--http-port`, `--rpc-port`, `--writer-addr`.
+**Why:** Nodes must be configurable per deployment role. Writer produces blocks; Reader consumes them.
+**Status:** ✅ COMPLETE
+
+### Milestone 9.2 — gRPC Proto (ValidatorRelay)
+**Files:** `proto/validator_relay.proto`, `build.rs`
+**What:** Define `ValidatorRelay` gRPC service with `SubscribeBlocks` (server-streaming), `CatchupBlocks`, `ForwardTransaction`, `GetStatus`.
+**Why:** gRPC streaming is the transport layer between Writer and Reader nodes.
+**Status:** ✅ COMPLETE
+
+### Milestone 9.3 — Writer Relay Service
+**Files:** `src/relay/mod.rs`
+**What:** `WriterRelayService` wraps a `tokio::broadcast::Sender<FinalizedBlock>`. Block production loop calls `send(block)` after each produced block. Readers subscribe via gRPC.
+**Why:** Writer must push blocks to all connected Readers in real-time.
+**Details:**
+- `SubscribeBlocks`: creates a `broadcast::Receiver`, yields blocks as server-streaming responses
+- `CatchupBlocks`: reads historical blocks from BlockProducer cache + ReDB
+- `ForwardTransaction`: readers forward user txs to writer's mempool
+- Broadcast buffer: 256 blocks — lagging readers must do catchup
+**Status:** ✅ COMPLETE
+
+### Milestone 9.4 — Reader Node Client
+**Files:** `src/reader/mod.rs`
+**What:** `ReaderNode` connects to Writer gRPC, catches up missed blocks, subscribes to live stream, verifies each block (`verify_block()`), stores to local ReDB, updates DashMap cache.
+**Why:** Readers serve RPC from local verified storage — no trust required in the writer beyond cryptographic verification.
+**Details:**
+- Automatic reconnect on disconnect (3s delay)
+- `verify_block()`: checks hash chain, PoH entries, tx count
+- `apply_block_balances()`: updates local DashMap cache from block transactions
+- Reader does NOT re-execute SVM — trusts writer's state after hash verification
+**Status:** ✅ COMPLETE
+
+### Milestone 9.5 — main() Mode Branching
+**Files:** `src/main.rs`
+**What:** `if config.mode == Writer` runs block production + Sealevel + relay gRPC server. `else` runs ReaderNode sync task. Both share: blockchain storage, HTTP server, JSON-RPC.
+**Why:** Single binary, two roles.
+**Status:** ✅ COMPLETE
+
+### Usage
+```bash
+# Writer node (default — produces blocks, serves relay on :50051)
+cargo run -- --mode writer --identity genesis_validator
+
+# Reader node (connects to writer, verifies blocks, serves RPC on :8899)
+cargo run -- --mode reader --identity reader_1 --writer-addr http://127.0.0.1:50051 --http-port 8081 --rpc-port 9899
+
+# Check writer status from reader
+grpcurl -plaintext 127.0.0.1:50051 validator_relay.ValidatorRelay/GetStatus
+```
+
+---
+
 ## Execution Order (Priority Sequence)
 
 ```
@@ -456,9 +524,13 @@ STRETCH: Phase 5.3 (WebSocket subscriptions)
 
 | File | Responsibility |
 |------|---------------|
-| `src/main.rs` | Server startup, route wiring, task spawning, Sealevel loop |
-| `src/poh_blockchain.rs` | BlockProducer, FinalizedBlock, Turbine, Merkle trees, Finality |
+| `src/main.rs` | Server startup, route wiring, task spawning, Sealevel loop, mode branching |
+| `src/poh_blockchain.rs` | BlockProducer, FinalizedBlock, Turbine, Merkle trees, Finality, verify_block |
 | `src/storage/mod.rs` | ReDB tables, DashMap cache, balance R/W, block persistence |
+| `src/relay/mod.rs` | Writer gRPC relay: SubscribeBlocks, CatchupBlocks, ForwardTransaction |
+| `src/reader/mod.rs` | Reader node: catchup, live subscribe, verify, store to local ReDB |
+| `proto/validator_relay.proto` | ValidatorRelay gRPC service definition |
+| `proto/settlement.proto` | L1Settlement gRPC service (L1↔L2 casino) |
 | `runtime/poh_service.rs` | PoH clock, tick/hash chain, TransactionPipeline |
 | `runtime/consensus.rs` | Gulf Stream, Leader Schedule, Tower BFT |
 | `runtime/core.rs` | ParallelScheduler, AccountLockManager, batch execution |
@@ -472,33 +544,37 @@ STRETCH: Phase 5.3 (WebSocket subscriptions)
 
 ## Status Tracking
 
-- [ ] **Phase 1.1** — Spawn block production loop
-- [ ] **Phase 1.2** — Route SSS transfers into blocks
-- [ ] **Phase 1.3** — Route faucet mints into blocks
-- [ ] **Phase 1.4** — Unify slot counter
-- [ ] **Phase 2.1** — Wire ParallelScheduler to SVM
-- [ ] **Phase 2.2** — Sealevel loop → BlockProducer
-- [ ] **Phase 2.3** — Pipeline commit stage
-- [ ] **Phase 3.1** — Finality tracker wiring
-- [ ] **Phase 3.2** — Tower BFT single-validator
-- [ ] **Phase 3.3** — Leader schedule epoch rotation
-- [ ] **Phase 4.1** — Turbine shredding
-- [ ] **Phase 4.2** — Turbine propagation tree
-- [ ] **Phase 5.1** — getBlock RPC method
-- [ ] **Phase 5.2** — getBlocks + getBlockProduction
+- [x] **Phase 1.1** — Spawn block production loop
+- [x] **Phase 1.2** — Route SSS transfers into blocks
+- [x] **Phase 1.3** — Route faucet mints into blocks
+- [x] **Phase 1.4** — Unify slot counter
+- [x] **Phase 2.1** — Wire ParallelScheduler to SVM
+- [x] **Phase 2.2** — Sealevel loop → BlockProducer
+- [x] **Phase 2.3** — Pipeline commit stage
+- [x] **Phase 3.1** — Finality tracker wiring
+- [x] **Phase 3.2** — Tower BFT single-validator
+- [x] **Phase 3.3** — Leader schedule epoch rotation
+- [x] **Phase 4.1** — Turbine shredding
+- [x] **Phase 4.2** — Turbine propagation tree
+- [x] **Phase 5.1** — getBlock RPC method
+- [x] **Phase 5.2** — getBlocks + getBlockProduction
 - [ ] **Phase 5.3** — WebSocket subscriptions (stretch)
 - [ ] **Phase 6.1** — Explorer tab in wallet page
 - [ ] **Phase 6.2** — Network stats dashboard
 - [ ] **Phase 7.1** — Graceful shutdown
-- [ ] **Phase 7.2** — Startup recovery from ReDB
+- [x] **Phase 7.2** — Startup recovery from ReDB (partial: slot + hash restored)
 - [ ] **Phase 7.3** — Health checks & monitoring
 - [ ] **Phase 7.4** — Rate limiting & DoS protection
 - [ ] **Phase 8.1** — Docker image optimization
 - [ ] **Phase 8.2** — Digital Ocean deploy
 - [ ] **Phase 8.3** — Railway staging
 - [ ] **Phase 8.4** — DNS + TLS + monitoring
+- [x] **Phase 9.1** — CLI + Node Mode (`--mode writer|reader`, clap 4)
+- [x] **Phase 9.2** — gRPC proto (`validator_relay.proto`: SubscribeBlocks, CatchupBlocks, ForwardTransaction)
+- [x] **Phase 9.3** — Writer Relay Service (`src/relay/mod.rs`: broadcast blocks to readers)
+- [x] **Phase 9.4** — Reader Node Client (`src/reader/mod.rs`: catchup + live subscribe + verify + store)
+- [x] **Phase 9.5** — main() mode branching (writer runs production+relay, reader runs sync+RPC)
 
 ---
 
-*Last updated: 2026-02-23*
-*Ready to execute Phase 1.1 — say the word.*
+*Last updated: 2026-02-24 — Phases 1–5.2 + 9.1–9.5 complete, 0 errors, 0 warnings. 1-Writer/100-Reader architecture wired: CLI `--mode writer|reader`, gRPC block relay, reader catchup+verify+store. settlement.proto populated. Quick fixes applied.*

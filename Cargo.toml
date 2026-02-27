@@ -88,6 +88,9 @@ base64 = "0.21"
 fastrand = "2.0"
 lazy_static = "1.4"
 
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
 # Channels for Gulf Stream transaction forwarding
 flume = "0.11"
 
@@ -159,6 +162,8 @@ void = "1.0"
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"
+async-stream = "0.3"
+tokio-stream = "0.1"
 frost-ed25519 = "2.2.0"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto", "use_pem"] }
 supabase-jwt = "0.1.1"

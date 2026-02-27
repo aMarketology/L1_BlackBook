@@ -94,15 +94,6 @@ impl BlockhashQueue {
         self.index.contains_key(&bytes)
     }
 
-    /// Returns `true` if the hash is in the recent window (raw bytes variant).
-    pub fn is_valid_bytes(&self, bytes: &[u8; 32]) -> bool {
-        self.entries.iter().any(|(_, h)| h == bytes)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Return the most recently recorded hash, or `None` if the queue is empty.
     pub fn latest_hash(&self) -> Option<Hash> {
         self.entries.back().map(|(_, bytes)| Hash::new_from_array(*bytes))
@@ -200,10 +191,6 @@ impl BlackBookSVM {
         debug!(slot = slot, "SVM slot advanced");
     }
 
-    pub fn current_slot(&self) -> u64 {
-        self.current_slot
-    }
-
     // ========================================================================
     // BLOCKHASH VALIDATION
     // ========================================================================
@@ -216,10 +203,6 @@ impl BlackBookSVM {
         self.blockhash_queue
             .latest_hash()
             .unwrap_or_else(Hash::default)
-    }
-
-    pub fn blockhash_queue_len(&self) -> usize {
-        self.blockhash_queue.len()
     }
 
     // ========================================================================
@@ -244,6 +227,14 @@ impl BlackBookSVM {
             return TransactionExecutionResult::err(
                 req.tx_id.clone(),
                 SvmError::InvalidBlockhash,
+            );
+        }
+
+        // 1b. Compute unit budget check
+        if self.max_compute_units == 0 {
+            return TransactionExecutionResult::err(
+                req.tx_id.clone(),
+                SvmError::ComputeBudgetExceeded { used: 0, limit: 0 },
             );
         }
 
@@ -282,6 +273,7 @@ impl BlackBookSVM {
     /// Rayon can call this method on multiple threads simultaneously because
     /// `SvmAccountsDB::system_transfer` uses `DashMap` sharding internally.
     /// Conflicts are resolved upstream by `AccountLockManager`.
+    #[allow(dead_code)] // Called by ParallelScheduler when SVM path is active
     pub fn execute_transfer_batch(
         &self,
         requests: &[TransferRequest],

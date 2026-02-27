@@ -31,6 +31,7 @@ use crate::svm::runtime::TransferRequest;
 /// Routing decision for a single `protocol::Transaction`.
 ///
 /// The block producer inspects this and sends work to the right path.
+#[allow(dead_code)] // Wired when BlockProducer uses SVM routing (Phase 2.2+)
 pub enum TxRoute {
     /// Hand to SVM (Phase 1: transfers only).
     Svm(TransferRequest),
@@ -56,6 +57,7 @@ pub enum TxRoute {
 ///   - `TxRoute::Svm(_)` if the tx can execute through the SVM.
 ///   - `TxRoute::Legacy` if the tx must use the existing execution path.
 ///   - `TxRoute::Reject(_)` if the tx is structurally invalid.
+#[allow(dead_code)] // Wired when BlockProducer uses SVM routing (Phase 2.2+)
 pub fn route_transaction(
     tx_id: &str,
     from_pubkey: &Pubkey,
@@ -125,6 +127,7 @@ pub fn route_transaction(
 }
 
 /// Parse a 64-character hex string into a Pubkey.
+#[allow(dead_code)] // Used by route_transaction
 fn hex_to_pubkey(s: &str) -> Result<Pubkey, String> {
     let bytes = hex::decode(s).map_err(|e| format!("hex decode: {}", e))?;
     if bytes.len() != 32 {
@@ -142,6 +145,7 @@ fn hex_to_pubkey(s: &str) -> Result<Pubkey, String> {
 /// Convert BB (display f64) → lamports (u64).
 /// Clamps to u64::MAX on overflow rather than wrapping.
 /// Use this ONCE at the API boundary; after conversion always work in lamports.
+#[allow(dead_code)] // Display utility for RPC/explorer
 pub fn bb_to_lamports(bb: f64) -> u64 {
     if bb < 0.0 { return 0; }
     let raw = bb * LAMPORTS_PER_BB as f64;
@@ -151,6 +155,7 @@ pub fn bb_to_lamports(bb: f64) -> u64 {
 
 /// Convert lamports (u64) → BB (display f64).
 /// DISPLAY ONLY. Never use the result in arithmetic.
+#[allow(dead_code)] // Display utility for RPC/explorer
 pub fn lamports_to_bb(lamports: u64) -> f64 {
     lamports as f64 / LAMPORTS_PER_BB as f64
 }

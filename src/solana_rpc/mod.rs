@@ -14,7 +14,7 @@
 //  - Return types mirror Solana mainnet-beta JSON-RPC responses exactly.
 //  - No solana-account-decoder dependency; encode manually using base64/base58.
 //  - All methods are async; the server is driven by tokio.
-//  - Entire module is behind `#[cfg(feature = "svm")]`.
+//  - Module is always compiled (no feature gate).
 //
 // Run:  cargo build --features svm
 // Test: cargo test --features svm --test rpc_tests
@@ -114,6 +114,7 @@ pub struct RpcVersionInfo {
 
 /// Config objects (optional params — ignored in Phase 2A, accepted for compatibility)
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)] // Fields deserialized by serde for Solana client compat
 pub struct RpcAccountInfoConfig {
     pub encoding: Option<String>,
     pub commitment: Option<String>,
@@ -127,6 +128,7 @@ pub struct RpcAccountInfoConfig {
 /// sendTransaction config (accepted for compatibility — encoding matters)
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields deserialized by serde for Solana client compat
 pub struct SendTransactionConfig {
     pub encoding: Option<String>,
     pub skip_preflight: Option<bool>,
@@ -204,6 +206,7 @@ pub struct RpcSignatureInfo {
 /// getSignaturesForAddress config
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields deserialized by serde for Solana client compat
 pub struct GetSignaturesConfig {
     pub limit: Option<usize>,
     pub before: Option<String>,
@@ -616,13 +619,17 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         let epoch      = slot / SLOTS_PER_EPOCH;
         let slot_index = slot % SLOTS_PER_EPOCH;
 
+        let transaction_count = self.block_producer.as_ref()
+            .map(|bp| bp.total_transaction_count())
+            .unwrap_or(0);
+
         Ok(RpcEpochInfo {
             epoch,
             slot_index,
             slots_in_epoch: SLOTS_PER_EPOCH,
             absolute_slot: slot,
             block_height: slot,
-            transaction_count: 0, // TODO: add to BlockProducer stats in 2B
+            transaction_count,
         })
     }
 
@@ -1281,22 +1288,16 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     ) -> RpcResult<RpcResponse<serde_json::Value>> {
         info!("📡 RPC ← getBlockProduction");
         let slot = self.slot();
-        // Single-validator: genesis_validator produces all slots
-        let mut leader_slots: Vec<u64> = Vec::new();
-        let mut blocks_produced: Vec<u64> = Vec::new();
-        if let Some(bp) = &self.block_producer {
-            for s in 0..=slot {
-                leader_slots.push(s);
-                if bp.get_block(s).is_some() {
-                    blocks_produced.push(s);
-                }
-            }
-        }
+        // Single-validator: use total_blocks_produced() O(1) instead of scanning every slot
+        let total_leader_slots = slot.saturating_add(1); // slots 0..=slot
+        let total_produced = self.block_producer.as_ref()
+            .map(|bp| bp.total_blocks_produced())
+            .unwrap_or(0);
         Ok(RpcResponse {
             context: self.ctx(),
             value: serde_json::json!({
                 "byIdentity": {
-                    "genesis_validator": [leader_slots.len(), blocks_produced.len()]
+                    "genesis_validator": [total_leader_slots, total_produced]
                 },
                 "range": {
                     "firstSlot": 0,

@@ -195,6 +195,27 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .search-bar{display:flex;gap:8px;margin-bottom:16px}
 .search-bar input{flex:1}
 .lookup-result{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:16px;font-size:0.85rem;word-break:break-all}
+.progress-wrap{background:var(--bg3);border-radius:6px;height:22px;overflow:hidden;position:relative;margin:4px 0 8px}
+.progress-fill{height:100%;border-radius:6px;transition:width .4s ease}
+.progress-fill.slot{background:linear-gradient(90deg,var(--accent2),var(--green))}
+.progress-fill.epoch{background:linear-gradient(90deg,var(--gold),var(--accent2))}
+.progress-label{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:0.65rem;color:var(--fg);font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.5)}
+.poh-viz{font-family:var(--mono);font-size:1.4rem;letter-spacing:2px;color:var(--accent2);text-align:center;padding:10px 0;animation:pulse 1.2s ease-in-out infinite}
+.block-card{padding:10px 12px;border-bottom:1px solid var(--border);font-size:0.8rem;cursor:pointer;transition:background .15s}
+.block-card:hover{background:var(--bg3)}
+.block-card .block-header{display:flex;justify-content:space-between;align-items:center}
+.block-card .block-hash{color:var(--fg3);font-size:0.68rem;font-family:var(--mono);margin-top:2px}
+.block-card .block-meta{display:flex;gap:12px;color:var(--fg3);font-size:0.7rem;margin-top:3px}
+.block-txs{margin-top:6px;padding:6px 8px;background:var(--bg3);border-radius:var(--radius-sm);font-size:0.72rem;display:none}
+.block-txs.open{display:block}
+.tx-row{padding:4px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.tx-row:last-child{border:none}
+.tx-row .tx-arrow{color:var(--accent2);margin:0 4px}
+.tx-row .tx-amount{color:var(--green);font-weight:600;font-family:var(--mono)}
+.finality-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:0.6rem;font-weight:700}
+.finality-badge.finalized{background:var(--green);color:#000}
+.finality-badge.confirming{background:var(--gold);color:#000}
+.finality-badge.pending{background:var(--fg3);color:#000}
 
 /* ── Checklist ─────────────────────────────────────────────── */
 .checklist{list-style:none;padding:0}
@@ -596,20 +617,50 @@ footer{text-align:center;padding:32px 0 16px;color:var(--fg3);font-size:0.72rem;
   <!-- TAB 5: EXPLORER                                             -->
   <!-- ═══════════════════════════════════════════════════════════ -->
   <div class="tab-content" id="tab-explorer">
+    <!-- Search bar -->
+    <div class="search-bar">
+      <input type="text" id="explorerSearch" placeholder="Search by slot number or tx hash…" />
+      <button class="btn btn-primary btn-sm" onclick="explorerLookup()">Search</button>
+    </div>
+    <div id="explorerLookupResult" class="lookup-result" style="display:none;margin-bottom:12px"></div>
+
     <div class="panels">
+      <!-- Left: Blocks -->
       <div class="panel" style="flex:2">
         <h2><span class="icon">🔍</span> Recent Blocks</h2>
-        <div id="explorerBlocks" style="max-height:500px;overflow-y:auto">
+        <!-- Slot progress bar -->
+        <div style="font-size:0.72rem;color:var(--fg3);margin-bottom:2px">Slot Progress</div>
+        <div class="progress-wrap">
+          <div class="progress-fill slot" id="expSlotBar" style="width:0%"></div>
+          <div class="progress-label" id="expSlotLabel">—</div>
+        </div>
+        <!-- Epoch progress bar -->
+        <div style="font-size:0.72rem;color:var(--fg3);margin-bottom:2px">Epoch Progress</div>
+        <div class="progress-wrap">
+          <div class="progress-fill epoch" id="expEpochBar" style="width:0%"></div>
+          <div class="progress-label" id="expEpochLabel">—</div>
+        </div>
+        <!-- PoH hash visualization -->
+        <div style="margin:8px 0 12px">
+          <div style="font-size:0.72rem;color:var(--fg3);text-align:center">Live PoH Hash</div>
+          <div class="poh-viz" id="expPohViz">00000000</div>
+        </div>
+        <!-- Block list -->
+        <div id="explorerBlocks" style="max-height:460px;overflow-y:auto">
           <div class="empty">Loading blocks…</div>
         </div>
       </div>
+
+      <!-- Right: Stats -->
       <div class="panel" style="flex:1">
         <h2><span class="icon">📊</span> Network Stats</h2>
         <div class="stats-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
           <div class="stat-card"><div class="label">Slot</div><div class="value" id="expSlot">—</div></div>
           <div class="stat-card"><div class="label">Epoch</div><div class="value" id="expEpoch">—</div></div>
-          <div class="stat-card"><div class="label">TPS (10 blocks)</div><div class="value" id="expTps">—</div></div>
+          <div class="stat-card"><div class="label">TPS (10 blk)</div><div class="value" id="expTps">—</div></div>
           <div class="stat-card"><div class="label">Block Rate</div><div class="value" id="expBlockRate">—</div></div>
+          <div class="stat-card"><div class="label">Avg Finality</div><div class="value" id="expFinality">—</div></div>
+          <div class="stat-card"><div class="label">Total Txs</div><div class="value" id="expTotalTx">—</div></div>
           <div class="stat-card"><div class="label">Tower Root</div><div class="value" id="expTowerRoot">—</div></div>
           <div class="stat-card"><div class="label">Confirmed Slots</div><div class="value" id="expConfirmed">—</div></div>
           <div class="stat-card"><div class="label">Data Shreds</div><div class="value" id="expDataShreds">—</div></div>
@@ -617,8 +668,10 @@ footer{text-align:center;padding:32px 0 16px;color:var(--fg3);font-size:0.72rem;
         </div>
         <h3 style="margin-top:12px">Validator</h3>
         <div class="stat-card"><div class="label">Identity</div><div class="value" style="font-size:0.7rem" id="expValidator">—</div></div>
+        <div class="stat-card" style="margin-top:6px"><div class="label">Uptime</div><div class="value" id="expUptime">—</div></div>
       </div>
     </div>
+  </div>
   </div>
 
   <footer>
@@ -1319,14 +1372,99 @@ async function lookupAddress() {
 // EXPLORER
 // ══════════════════════════════════════════════════════════════
 let explorerTimer = null;
+const SLOTS_PER_EPOCH = 432000;
+const explorerStartTime = Date.now();
+
+function toggleBlockTxs(slotId) {
+  const el = document.getElementById('block-txs-' + slotId);
+  if (el) el.classList.toggle('open');
+}
+
+function fmtHash(h, n) { return h ? h.substring(0, n || 16) + '…' : '—'; }
+
+function fmtAmount(data) {
+  if (!data) return '';
+  if (data.TransferBb) return (data.TransferBb.amount / 1000000).toFixed(6) + ' BB';
+  if (data.DepositUsdt) return (data.DepositUsdt.usdt_amount / 1000000).toFixed(6) + ' USDT→BB';
+  if (data.TransferDime) return (data.TransferDime.amount / 1000000).toFixed(6) + ' DIME';
+  return JSON.stringify(data).substring(0, 40);
+}
+
+function fmtTo(data) {
+  if (!data) return '?';
+  if (data.TransferBb) return data.TransferBb.to;
+  if (data.TransferDime) return data.TransferDime.to;
+  if (data.DepositUsdt) return 'MINT';
+  if (data.CreateAccount) return data.CreateAccount.root_pubkey;
+  return '—';
+}
+
+function finalityBadge(confirmations) {
+  if (confirmations >= 31) return '<span class="finality-badge finalized">Finalized</span>';
+  if (confirmations > 0) return '<span class="finality-badge confirming">' + confirmations + '/31</span>';
+  return '<span class="finality-badge pending">Pending</span>';
+}
+
+async function explorerLookup() {
+  const q = document.getElementById('explorerSearch').value.trim();
+  const box = document.getElementById('explorerLookupResult');
+  if (!q) { box.style.display = 'none'; return; }
+  box.style.display = 'block';
+  box.innerHTML = '<div class="spinner"></div> Searching…';
+
+  // Try as slot number first
+  if (/^\d+$/.test(q)) {
+    try {
+      const resp = await fetch(API + '/poh/block/' + q);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.success && data.block) {
+          const b = data.block;
+          box.innerHTML = '<strong>Block #' + b.slot + '</strong><br>Hash: <code>' + b.hash + '</code><br>PoH: <code>' + b.poh_hash + '</code><br>Txs: ' + b.tx_count + ' · Leader: ' + b.leader + ' · ' + finalityBadge(b.confirmations);
+          return;
+        }
+      }
+    } catch(e) {}
+  }
+  // Try as tx hash
+  try {
+    const resp = await fetch(API + '/poh/tx/' + encodeURIComponent(q) + '/status');
+    if (resp.ok) {
+      const data = await resp.json();
+      box.innerHTML = '<strong>Tx ' + fmtHash(data.tx_id, 24) + '</strong><br>Status: ' + data.status + '<br>Finalized: ' + (data.is_finalized ? 'Yes ✅' : 'No');
+      return;
+    }
+  } catch(e) {}
+  box.innerHTML = 'Nothing found for "' + q + '"';
+}
+
 async function refreshExplorer() {
   try {
     // Fetch health for slot/epoch
     const health = await fetch(API + '/health').then(r => r.json());
     const slot = health.blockchain?.block_count || 0;
     const epoch = health.poh_status?.epoch || 0;
-    document.getElementById('expSlot').textContent = slot;
+    document.getElementById('expSlot').textContent = slot.toLocaleString();
     document.getElementById('expEpoch').textContent = epoch;
+
+    // Slot progress bar (time within 600ms cycle, estimated)
+    const slotInEpoch = slot % SLOTS_PER_EPOCH;
+    const epochPct = ((slotInEpoch / SLOTS_PER_EPOCH) * 100).toFixed(2);
+    document.getElementById('expEpochBar').style.width = epochPct + '%';
+    document.getElementById('expEpochLabel').textContent = 'Epoch ' + epoch + ' — ' + slotInEpoch.toLocaleString() + ' / ' + SLOTS_PER_EPOCH.toLocaleString() + ' (' + epochPct + '%)';
+
+    // Slot progress (animate ~600ms cycle)
+    const ms = Date.now() % 600;
+    const slotPct = ((ms / 600) * 100).toFixed(0);
+    document.getElementById('expSlotBar').style.width = slotPct + '%';
+    document.getElementById('expSlotLabel').textContent = 'Slot ' + slot.toLocaleString() + ' — ' + ms + 'ms / 600ms';
+
+    // Uptime
+    const uptimeSec = Math.floor((Date.now() - explorerStartTime) / 1000);
+    const hrs = Math.floor(uptimeSec / 3600);
+    const mins = Math.floor((uptimeSec % 3600) / 60);
+    const secs = uptimeSec % 60;
+    document.getElementById('expUptime').textContent = hrs + 'h ' + mins + 'm ' + secs + 's';
 
     // Fetch Tower BFT stats
     try {
@@ -1343,64 +1481,88 @@ async function refreshExplorer() {
       document.getElementById('expFecShreds').textContent = turbine.fec_shreds ?? '—';
     } catch(e) {}
 
-    // Fetch recent blocks (last 10)
+    // Fetch recent blocks (last 10) with full tx data
     const startSlot = Math.max(0, slot - 10);
     const blocks = [];
     for (let s = slot; s >= startSlot && s >= 0; s--) {
       try {
         const resp = await fetch(API + '/poh/block/' + s);
         if (resp.ok) {
-          const b = await resp.json();
-          if (b.slot !== undefined) blocks.push(b);
+          const data = await resp.json();
+          if (data.success && data.block && data.block.slot !== undefined) blocks.push(data.block);
         }
       } catch(e) {}
     }
 
-    // Compute TPS from recent blocks
+    // Compute TPS + block rate
+    let totalTx = 0;
     if (blocks.length >= 2) {
-      const totalTx = blocks.reduce((sum, b) => sum + (b.tx_count || 0), 0);
+      totalTx = blocks.reduce((sum, b) => sum + (b.tx_count || 0), 0);
       const timeSpan = (blocks[0].timestamp - blocks[blocks.length-1].timestamp) || 1;
       const tps = (totalTx / timeSpan).toFixed(2);
       document.getElementById('expTps').textContent = tps + '/s';
       const rate = (blocks.length / timeSpan).toFixed(2);
       document.getElementById('expBlockRate').textContent = rate + ' blk/s';
+    } else {
+      document.getElementById('expTps').textContent = '—';
+      document.getElementById('expBlockRate').textContent = '—';
+    }
+    document.getElementById('expTotalTx').textContent = totalTx.toLocaleString();
+
+    // Compute avg finality (for blocks with confirmations > 0)
+    const confirmedBlocks = blocks.filter(b => b.confirmations > 0);
+    if (confirmedBlocks.length > 0) {
+      const avgConf = confirmedBlocks.reduce((s, b) => s + b.confirmations, 0) / confirmedBlocks.length;
+      const avgTime = (avgConf * 0.6).toFixed(1);
+      document.getElementById('expFinality').textContent = avgTime + 's (' + avgConf.toFixed(0) + ' slots)';
+    } else {
+      document.getElementById('expFinality').textContent = '—';
     }
 
-    // Render block list
+    // PoH hash visualization (last 8 chars of latest block's poh_hash)
+    if (blocks.length > 0 && blocks[0].poh_hash) {
+      const pohSuffix = blocks[0].poh_hash.slice(-8);
+      document.getElementById('expPohViz').textContent = pohSuffix;
+    }
+
+    // Render block list with clickable transactions
     const container = document.getElementById('explorerBlocks');
     if (blocks.length === 0) {
-      container.innerHTML = '<div class="empty">No blocks yet</div>';
+      container.innerHTML = '<div class="empty">No blocks yet — chain starting up…</div>';
     } else {
-      container.innerHTML = blocks.map(b => `
-        <div style="padding:8px;border-bottom:1px solid var(--border);font-size:0.8rem">
-          <div style="display:flex;justify-content:space-between">
-            <strong>Slot ${b.slot}</strong>
-            <span style="color:var(--fg3)">${b.tx_count || 0} txs</span>
-          </div>
-          <div style="color:var(--fg3);font-size:0.7rem;margin-top:2px">
-            Hash: ${(b.hash || '').substring(0,24)}…
-          </div>
-          <div style="color:var(--fg3);font-size:0.7rem">
-            PoH: ${(b.poh_hash || '').substring(0,24)}… · ${b.confirmations || 0} confirmations
-          </div>
-          ${(b.transactions || []).length > 0 ? `
-            <div style="margin-top:4px;padding:4px;background:var(--bg3);border-radius:4px;font-size:0.7rem">
-              ${(b.transactions || []).slice(0,5).map(tx => `
-                <div>${tx.from || '?'} → ${tx.data?.TransferBb?.to || '?'}: ${((tx.data?.TransferBb?.amount || 0) / 1000000).toFixed(6)} BB</div>
-              `).join('')}
-              ${(b.transactions||[]).length > 5 ? '<div>… and ' + ((b.transactions||[]).length - 5) + ' more</div>' : ''}
-            </div>
-          ` : ''}
-        </div>
-      `).join('');
+      container.innerHTML = blocks.map(b => {
+        const txList = (b.transactions || []);
+        const txHtml = txList.length > 0 ? txList.map(tx =>
+          '<div class="tx-row">' +
+            '<span style="font-family:var(--mono);font-size:0.65rem" title="' + (tx.hash||'') + '">' + fmtHash(tx.from, 12) + '</span>' +
+            '<span class="tx-arrow">→</span>' +
+            '<span style="font-family:var(--mono);font-size:0.65rem">' + fmtHash(fmtTo(tx.data), 12) + '</span>' +
+            '<span class="tx-amount">' + fmtAmount(tx.data) + '</span>' +
+          '</div>'
+        ).join('') : '<div style="color:var(--fg3);font-size:0.7rem;padding:4px 0">Empty block (tick only)</div>';
+
+        return '<div class="block-card" onclick="toggleBlockTxs(' + b.slot + ')">' +
+          '<div class="block-header">' +
+            '<strong>Slot ' + b.slot + '</strong>' +
+            '<span>' + (b.tx_count || 0) + ' txs ' + finalityBadge(b.confirmations) + '</span>' +
+          '</div>' +
+          '<div class="block-hash">Hash: ' + fmtHash(b.hash, 24) + ' · PoH: ' + fmtHash(b.poh_hash, 16) + '</div>' +
+          '<div class="block-meta">' +
+            '<span>Leader: ' + (b.leader || '—') + '</span>' +
+            '<span>Epoch ' + (b.epoch || 0) + '</span>' +
+            '<span>' + new Date((b.timestamp || 0) * 1000).toLocaleTimeString() + '</span>' +
+          '</div>' +
+          '<div class="block-txs" id="block-txs-' + b.slot + '">' + txHtml + '</div>' +
+        '</div>';
+      }).join('');
     }
   } catch(e) {
     console.error('Explorer refresh error:', e);
   }
 
-  // Auto-refresh every 3s while on explorer tab
+  // Auto-refresh every 2s while on explorer tab
   if (explorerTimer) clearInterval(explorerTimer);
-  explorerTimer = setInterval(refreshExplorer, 3000);
+  explorerTimer = setInterval(refreshExplorer, 2000);
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -1,0 +1,278 @@
+//! Reader Node — gRPC client that consumes blocks from a Writer node.
+//!
+//! Flow:
+//!   1. Connect to Writer's gRPC relay
+//!   2. Catchup: fetch missed blocks since our last stored slot
+//!   3. Subscribe: receive live blocks as they're produced
+//!   4. Verify: check hash chain + PoH linkage for each block
+//!   5. Store: persist verified blocks to local ReDB + update DashMap cache
+//!   6. Serve: reader's own RPC endpoint answers queries from local storage
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tonic::transport::Channel;
+use tracing::{info, warn, error};
+
+use crate::poh_blockchain::{FinalizedBlock, verify_block};
+use crate::storage::ConcurrentBlockchain;
+use crate::relay::proto_to_block;
+
+// Import generated client
+use crate::relay::proto::validator_relay_client::ValidatorRelayClient;
+use crate::relay::proto::{CatchupRequest, SubscribeRequest, StatusRequest};
+
+// ============================================================================
+// READER NODE
+// ============================================================================
+
+pub struct ReaderNode {
+    /// Writer node gRPC address (e.g., "http://127.0.0.1:50051")
+    writer_addr: String,
+
+    /// Local blockchain storage (ReDB)
+    blockchain: ConcurrentBlockchain,
+
+    /// Current slot (shared with local RPC server)
+    current_slot: Arc<AtomicU64>,
+
+    /// Reader identity
+    reader_id: String,
+
+    /// Last verified block hash (for chain verification)
+    latest_hash: parking_lot::RwLock<String>,
+
+    /// Blocks verified counter
+    blocks_verified: AtomicU64,
+
+    /// Blocks failed counter
+    blocks_failed: AtomicU64,
+}
+
+impl ReaderNode {
+    pub fn new(
+        writer_addr: String,
+        blockchain: ConcurrentBlockchain,
+        current_slot: Arc<AtomicU64>,
+        reader_id: String,
+    ) -> Self {
+        // Initialize latest_hash from storage (for chain continuity)
+        let latest_hash = match blockchain.latest_block_slot() {
+            Ok(Some(slot)) => {
+                blockchain.load_block(slot)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.hash.clone())
+                    .unwrap_or_else(|| "0".repeat(64))
+            }
+            _ => "0".repeat(64),
+        };
+
+        Self {
+            writer_addr,
+            blockchain,
+            current_slot,
+            reader_id,
+            latest_hash: parking_lot::RwLock::new(latest_hash),
+            blocks_verified: AtomicU64::new(0),
+            blocks_failed: AtomicU64::new(0),
+        }
+    }
+
+    /// Connect to the Writer and start consuming blocks.
+    /// This runs forever (reconnects on failure).
+    pub async fn run(self: Arc<Self>) {
+        loop {
+            match self.connect_and_sync().await {
+                Ok(()) => {
+                    warn!("📡 Writer stream ended — reconnecting in 3s…");
+                }
+                Err(e) => {
+                    error!("❌ Reader connection failed: {} — retrying in 5s…", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    /// Single connection cycle: catchup + subscribe
+    async fn connect_and_sync(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("📡 Connecting to writer at {}…", self.writer_addr);
+
+        let channel = Channel::from_shared(self.writer_addr.clone())?
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(300))
+            .connect()
+            .await?;
+
+        let mut client = ValidatorRelayClient::new(channel.clone());
+
+        // 1. Check writer status
+        let status = client.get_status(StatusRequest {}).await?.into_inner();
+        info!(
+            "📡 Connected to writer '{}' — latest slot {}, {} readers connected",
+            status.node_id, status.latest_slot, status.connected_readers
+        );
+
+        // 2. Determine where to start catchup
+        let our_latest = self.current_slot.load(Ordering::Relaxed);
+        let writer_latest = status.latest_slot;
+
+        if our_latest < writer_latest && writer_latest > 0 {
+            info!("📥 Catching up: our slot {} → writer slot {}", our_latest, writer_latest);
+            self.catchup(&mut client, our_latest, writer_latest).await?;
+        }
+
+        // 3. Subscribe to live blocks
+        info!("📡 Subscribing to live block stream…");
+        self.subscribe(&mut client).await?;
+
+        Ok(())
+    }
+
+    /// Catch up on historical blocks
+    async fn catchup(
+        &self,
+        client: &mut ValidatorRelayClient<Channel>,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = CatchupRequest {
+            reader_id: self.reader_id.clone(),
+            start_slot: start,
+            end_slot: end,
+        };
+
+        let mut stream = client.catchup_blocks(request).await?.into_inner();
+        let mut count = 0u64;
+
+        while let Some(block_data) = stream.message().await? {
+            let block = proto_to_block(&block_data);
+            self.process_block(block, "catchup")?;
+            count += 1;
+        }
+
+        info!("📥 Catchup complete: {} blocks verified and stored", count);
+        Ok(())
+    }
+
+    /// Subscribe to live block stream
+    async fn subscribe(
+        &self,
+        client: &mut ValidatorRelayClient<Channel>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let start_slot = self.current_slot.load(Ordering::Relaxed);
+        let request = SubscribeRequest {
+            reader_id: self.reader_id.clone(),
+            start_slot,
+        };
+
+        let mut stream = client.subscribe_blocks(request).await?.into_inner();
+
+        while let Some(block_data) = stream.message().await? {
+            let block = proto_to_block(&block_data);
+            match self.process_block(block, "live") {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("⚠️  Block processing error: {}", e);
+                    // Continue — don't break the stream for one bad block
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify + store a single block
+    fn process_block(&self, block: FinalizedBlock, source: &str) -> Result<(), String> {
+        let slot = block.slot;
+
+        // 1. Verify block integrity (hash chain, PoH entries, tx count)
+        let expected_prev = self.latest_hash.read().clone();
+
+        if !verify_block(&block, &expected_prev) {
+            self.blocks_failed.fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "Block {} failed verification (expected prev_hash: {}…, got: {}…)",
+                slot,
+                &expected_prev[..expected_prev.len().min(16)],
+                &block.previous_hash[..block.previous_hash.len().min(16)]
+            ));
+        }
+
+        // 2. Store to local ReDB
+        if let Err(e) = self.blockchain.store_block(slot, &block) {
+            warn!("⚠️  Failed to store block {}: {}", slot, e);
+            // Don't return error — we still accept the block for chain continuity
+        }
+
+        // 3. Apply balance changes from transactions to DashMap cache
+        // (Reader doesn't re-execute — it trusts the writer's state_root after verification)
+        self.apply_block_balances(&block);
+
+        // 4. Update tracking state
+        {
+            let mut h = self.latest_hash.write();
+            *h = block.hash.clone();
+        }
+        self.current_slot.store(slot + 1, Ordering::Relaxed);
+        self.blocks_verified.fetch_add(1, Ordering::Relaxed);
+
+        if block.tx_count > 0 {
+            info!(
+                "✅ [{source}] Block {slot} verified: {} txs, hash: {}…",
+                block.tx_count,
+                &block.hash[..block.hash.len().min(16)]
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Apply balance changes from block transactions to local DashMap cache.
+    /// Reader nodes don't re-execute SVM — they trust the writer's state after
+    /// verifying the block hash chain. This keeps the DashMap cache warm for
+    /// local RPC queries like getBalance.
+    fn apply_block_balances(&self, block: &FinalizedBlock) {
+        for otx in &block.transactions {
+            match &otx.tx.data {
+                crate::protocol::blockchain::TxData::TransferBb { to, amount } => {
+                    let bb_amount = *amount as f64 / 1_000_000.0;
+                    // Debit sender
+                    if let Some(mut bal) = self.blockchain.cache.get_mut(&otx.tx.from) {
+                        *bal -= bb_amount;
+                        if *bal < 0.0 { *bal = 0.0; }
+                    }
+                    // Credit receiver
+                    self.blockchain.cache
+                        .entry(to.clone())
+                        .and_modify(|b| *b += bb_amount)
+                        .or_insert(bb_amount);
+                }
+                crate::protocol::blockchain::TxData::DepositUsdt { usdt_amount, .. } => {
+                    // Mint: credit recipient at 1:10 ratio
+                    let bb_amount = (*usdt_amount as f64) * 10.0;
+                    self.blockchain.cache
+                        .entry(otx.tx.from.clone())
+                        .and_modify(|b| *b += bb_amount)
+                        .or_insert(bb_amount);
+                }
+                _ => {
+                    // Other transaction types don't affect balances in simple cache
+                }
+            }
+        }
+    }
+
+    /// Get verification stats
+    #[allow(dead_code)]
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.blocks_verified.load(Ordering::Relaxed),
+            self.blocks_failed.load(Ordering::Relaxed),
+        )
+    }
+}
