@@ -98,12 +98,9 @@ pub struct NodeConfig {
 // ============================================================================
 
 mod wallet_unified;
-mod wallet_page;
 mod storage;
 mod consensus;
 mod poh_blockchain;
-mod supabase;
-mod vault_manager;
 mod svm;
 mod solana_rpc;
 mod relay;
@@ -120,8 +117,6 @@ mod runtime;
 
 use storage::{ConcurrentBlockchain, AssetManager};
 use wallet_unified::handlers::UnifiedWalletState;
-use supabase::SupabaseManager;
-use vault_manager::VaultManager;
 
 // Solana-style consensus infrastructure
 use runtime::{
@@ -185,7 +180,6 @@ pub struct AppState {
     // Core blockchain (ReDB + DashMap cache)
     pub blockchain: ConcurrentBlockchain,
     pub assets: AssetManager,
-    pub supabase: Arc<SupabaseManager>,
 
     // Solana-style consensus
     pub poh: SharedPoHService,
@@ -1544,20 +1538,18 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .allow_headers(Any);
 
     let app_routes = Router::new()
-        // Web Wallet UI
-        .route("/wallet", get(wallet_page::wallet_page_handler))
         // Public
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
-        .route("/balance/{address}", get(balance_handler))
+        .route("/balance/:address", get(balance_handler))
         .route("/ledger", get(ledger_handler))
         // Transfers (Submission)
         .route("/transfer/simple", post(signed_transfer_handler))
         // PoH & Consensus
         .route("/poh/status", get(poh_status_handler))
         .route("/poh/block/latest", get(poh_latest_block_handler))
-        .route("/poh/block/{slot}", get(poh_block_by_slot_handler))
-        .route("/poh/tx/{tx_id}/status", get(poh_tx_status_handler))
+        .route("/poh/block/:slot", get(poh_block_by_slot_handler))
+        .route("/poh/tx/:tx_id/status", get(poh_tx_status_handler))
         // Consensus
         .route("/consensus/tower", get(tower_bft_handler))
         // Turbine
@@ -1580,9 +1572,9 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         // USDC SPL Token
         .route("/admin/usdc/mint", post(usdc_mint_handler))
         .route("/usdc/transfer", post(usdc_transfer_handler))
-        .route("/usdc/balance/{address}", get(usdc_balance_handler))
+        .route("/usdc/balance/:address", get(usdc_balance_handler))
         .route("/usdc/supply", get(usdc_supply_handler))
-        .route("/usdc/accounts/{address}", get(usdc_accounts_handler))
+        .route("/usdc/accounts/:address", get(usdc_accounts_handler))
         .with_state(state);
 
     // Merge wallet router (Unified FROST+SSS) with app routes
@@ -1681,8 +1673,6 @@ async fn main() {
         }
     };
     let assets = AssetManager::new();
-    let supabase = Arc::new(SupabaseManager::new());
-    info!("🔐 Supabase Vault initialized");
 
     // 3a. Startup Recovery — resume from persisted state
     let (recovered_slot, _recovered_hash) = match blockchain.latest_block_slot() {
@@ -1950,7 +1940,6 @@ async fn main() {
     let state = AppState {
         blockchain,
         assets,
-        supabase,
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
         leader_schedule,
@@ -1970,13 +1959,9 @@ async fn main() {
         faucet_claims: Arc::new(dashmap::DashMap::new()),
     };
 
-    // 8. Unified Wallet Router (FROST + SSS + Mnemonic)
-    let vault_manager = Arc::new(VaultManager::new().expect("CRITICAL: Vault Connection Required for Production"));
-
+    // 8. Unified Wallet Router (SSS 2-of-3)
     let unified_state = Arc::new(UnifiedWalletState::new(
         Arc::new(state.blockchain.clone()),
-        state.supabase.clone(),
-        vault_manager,
         state.block_producer.clone(),
     ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
@@ -1984,7 +1969,6 @@ async fn main() {
     // Extract Arcs for RPC before state is moved into build_router
     let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
     let rpc_current_slot = Arc::clone(&state.current_slot);
-    let rpc_supabase     = Arc::clone(&state.supabase);
     let rpc_block_producer = Arc::clone(&state.block_producer);
 
     // Bootstrap the USDC SPL Token Mint (idempotent — no-op if already exists)
@@ -2076,12 +2060,12 @@ async fn main() {
     info!("   POST /transfer/simple           Broadcast Signed TX");
     info!("   GET  /ledger                    Transaction history");
     info!("");
-    info!("🔐 UNIFIED WALLET (FROST 2-of-3):");
-    info!("   POST /wallet/create             Create (Triple-Write)");
-    info!("   POST /wallet/sign               Sign (FROST Aggregation)");
-    info!("   POST /wallet/share_b            Get Cloud Shard (ReDB)");
-    info!("   POST /wallet/secure/shard-b     Get Cloud Shard (Supabase)");
-    info!("   POST /wallet/secure/recover-shard-c  Get Vault Shard (Recovery)");
+    info!("🔐 UNIFIED WALLET (SSS 2-of-3):");
+    info!("   POST /wallet/create             Create wallet");
+    info!("   POST /wallet/login              Login (reconstruct seed)");
+    info!("   POST /wallet/logout             Logout (wipe session)");
+    info!("   POST /wallet/secure/shard-b     Get Server Shard (ReDB)");
+    info!("   POST /wallet/verify-sss         Verify shard reconstruction");
     info!("");
     info!("⚡ ENGINE:");
     info!("   GET  /poh/status                PoH clock");
@@ -2148,7 +2132,7 @@ async fn main() {
         info!("🕐 Slot ticker started (600ms intervals → advancing slot + blockhash)");
 
         let rpc_impl = {
-            let mut rpc = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot, rpc_supabase);
+            let mut rpc = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);
             rpc.block_producer = Some(rpc_block_producer);
             rpc
         };

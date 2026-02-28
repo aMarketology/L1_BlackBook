@@ -54,16 +54,13 @@ slip10_ed25519 = "0.1"
 hmac = "0.12"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 
-# Vault encryption - AES-256-GCM + Argon2id KDF
+# Wallet encryption - AES-256-GCM + Argon2id KDF
 aes-gcm = "0.10"
 argon2 = "0.5"
 
 # Async trait support
 async-trait = "0.1"
 zeroize = { version = "1.7", features = ["derive"] }
-
-# HashiCorp Vault integration (production pepper retrieval)
-vaultrs = "0.7"
 
 # Parallel processing - Sealevel-style execution
 rayon = "1.10"
@@ -82,7 +79,6 @@ hex = "0.4"
 lru = "0.12"
 chrono = { version = "0.4.41", features = ["serde"] }
 md5 = "0.7"
-reqwest = { version = "0.11", features = ["json"] }
 dotenv = "0.15"
 base64 = "0.21"
 fastrand = "2.0"
@@ -164,9 +160,6 @@ tonic = { version = "0.12", features = ["transport"] }
 tonic-build = "0.12"
 async-stream = "0.3"
 tokio-stream = "0.1"
-frost-ed25519 = "2.2.0"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto", "use_pem"] }
-supabase-jwt = "0.1.1"
 
 [dev-dependencies]
 # Testing utilities

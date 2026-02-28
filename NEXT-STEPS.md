@@ -1,7 +1,7 @@
 # NEXT-STEPS.md — BlackBook L1 Roadmap
 
 > Where we've been, where we are, what happens next.
-> Last updated: 2025-06-25
+> Last updated: 2026-02-27
 
 ---
 
@@ -27,8 +27,8 @@ Everything below compiles, runs, and is wired end-to-end in `main.rs`:
 | **Faucet** | `/faucet` route, per-epoch rate limiting, recorded in PoH blocks | ✅ Live |
 | **Ed25519 Transfers** | `/transfer/simple` — sig verification, SVM execution, block recording | ✅ Live |
 | **USDC Endpoints** | `/admin/usdc/mint`, `/usdc/transfer`, `/usdc/balance/{addr}`, `/usdc/supply` | ✅ Live |
-| **Supabase** | JWT validation, profile lookup, shard-B cloud storage | ✅ Wired |
-| **HashiCorp Vault** | Shard-C emergency recovery storage via `vaultrs` | ✅ Wired |
+| **Pure SVM Balance Path** | `SvmAccountsDB` is sole source of truth — no dual f64/legacy sync, no external cloud dependencies | ✅ Live |
+| **Unified Wallet (SSS)** | Shard B in ReDB on-chain; Shards A & C returned directly to client — L1 holds zero cloud state | ✅ Live |
 | **JavaScript SDK** | `@blackbook/sdk` v3.0 — createWallet, transfer, faucet, SSS verify, WalletConnect scaffolding | ✅ Published |
 
 ---
@@ -63,7 +63,17 @@ Code that compiles but is not imported or called at runtime:
 | 6 | **Clean dead code** | 2 hours | Remove `main_v4.rs`, empty `consensus/mod.rs`, broken `opaque_impl.rs` |
 | 7 | **Prune unused deps** | 1 hour | `libp2p`, `memmap2`, `frost-ed25519` — add compile time for zero value |
 
-### 3.2 High Value — Unlocks Real Users
+### 3.2 AI-Agent Performance — Critical for Microtransaction Speed
+
+These three items directly unlock the "incredibly fast microtransaction" use case. Without them, AI agents must poll REST endpoints and operate over HTTP/1.1, which adds 10–100 ms of latency per payment.
+
+| # | Feature | Effort | Why |
+|---|---------|--------|-----|
+| A | **`accountSubscribe` WebSocket push** — L1 pushes SVM state change to agent the nanosecond the account is written | 2–3 days | AI agents must not poll `/balance`. They need instant push notification at the moment funds arrive. This is the difference between "fast" and "instant". |
+| B | **QUIC ingestion endpoint** — replace HTTP REST POST for transaction submission with QUIC (UDP + reliability + 0-RTT) | 1–2 weeks | At thousands of AI-agent microtransactions per second, TCP connection setup dominates latency. QUIC opens one persistent session per agent, eliminates per-tx handshakes. Solana's `tpu` port uses this exact model. |
+| C | **Deterministic fee schedule** — flat `0.0001 BB` per tx, encoded in genesis, never dynamic | 4–8 hours | AI agents calculate payment paths mathematically ahead of time. Dynamic gas bidding is incompatible with autonomous agents. A fixed fee means an agent can know the exact cost of 10,000 hops before sending the first one. |
+
+### 3.3 High Value — Unlocks Real Users
 
 | # | Feature | Effort | Why |
 |---|---------|--------|-----|
@@ -74,7 +84,7 @@ Code that compiles but is not imported or called at runtime:
 | 12 | **Deployment scripts** (Docker Compose / Terraform for 5-node cluster) | 1–2 days | Infra automation for the first-100-users plan |
 | 13 | **CI/CD pipeline** (GitHub Actions: build, test, Docker push) | 4 hours | Automated quality gate |
 
-### 3.3 Medium Term — Growth & Decentralization
+### 3.4 Medium Term — Growth & Decentralization
 
 | # | Feature | Effort | Why |
 |---|---------|--------|-----|
@@ -85,7 +95,7 @@ Code that compiles but is not imported or called at runtime:
 | 18 | **USDC on-ramp** (fiat → USDC → BB swap) | 2–3 weeks | Real money on-chain |
 | 19 | **Mobile wallet** (React Native + SDK) | 2–3 weeks | Consumer reach |
 
-### 3.4 Deferred / Nice to Have
+### 3.5 Deferred / Nice to Have
 
 | # | Feature | Notes |
 |---|---------|-------|
@@ -107,13 +117,16 @@ Code that compiles but is not imported or called at runtime:
  ├── 6. Clean dead code
  └── 7. Prune unused deps
 
- WEEK 1 (infrastructure)
- ├── 4. Health monitoring (/metrics)
- ├── 12. Deployment scripts (5-node Docker)
- └── 13. CI/CD pipeline
+ WEEK 1 (AI-agent speed)
+ ├── A. accountSubscribe WebSocket push  ← agents stop polling
+ ├── C. Deterministic flat fee (0.0001 BB) ← agents can pre-calculate cost
+ └── 4. Health monitoring (/metrics)
 
- WEEK 2-3 (user experience)
- ├── 8. WebSocket subscriptions
+ WEEK 2-3 (infrastructure + UX)
+ ├── B. QUIC ingestion endpoint           ← eliminate TCP handshake overhead
+ ├── 8. WebSocket subscriptions (full set)
+ ├── 12. Deployment scripts (5-node Docker)
+ ├── 13. CI/CD pipeline
  ├── 9. Block Explorer
  ├── 10. Proof of Reserves endpoint
  └── 11. Priority fee model
@@ -137,12 +150,13 @@ Code that compiles but is not imported or called at runtime:
 |------|-------|-------|
 | Core blockchain | 9/10 | PoH + SVM + storage all production-wired |
 | Solana compatibility | 8/10 | 28 RPCs, real SPL tokens. Missing: `simulateTransaction`, WebSockets |
-| Wallet system | 8/10 | SSS works. OPAQUE broken (missing dep). Migration partially wired |
+| Wallet system | 9/10 | Pure SSS 2-of-3. Shard B on-chain. A+C to client. No cloud deps. |
 | Multi-node | 7/10 | Writer/Reader gRPC relay complete. No P2P, no leader election |
-| External integrations | 7/10 | Supabase + Vault live. No Prometheus, no CI/CD |
+| External integrations | 10/10 | Zero external deps — no Supabase, no Vault, no JWT. Pure L1. |
+| AI-agent readiness | 4/10 | SVM path clean. Missing: WebSocket push, QUIC, deterministic fees |
 | Test coverage | 3/10 | 1 integration test + 4 inline. 26+ missing from repo |
 | Dead code | ~2,600 lines | `main_v4`, `grpc`, `proof_of_reserves`, `social_mining`, `opaque_impl`, `consensus` stub |
-| Unused deps | 3–4 crates | `libp2p`, `memmap2`, `frost-ed25519` add compile time for zero runtime use |
+| Unused deps | 2–3 crates | `libp2p`, `memmap2` add compile time for zero runtime use |
 
 ---
 

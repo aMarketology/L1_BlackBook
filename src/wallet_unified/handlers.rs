@@ -6,17 +6,13 @@ use bip39::Mnemonic;
 use rand::rngs::OsRng;
 use sharks::{Sharks, Share};
 use ed25519_dalek::{SigningKey as Ed25519SigningKey, Signer};
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use super::security;
 use super::session_store::SessionStore;
-// jsonwebtoken::{decode, DecodingKey, Validation, Algorithm} — reserved for JWT auth hardening
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::storage::ConcurrentBlockchain;
 use crate::poh_blockchain::BlockProducer;
-
-use crate::supabase::SupabaseManager;
-use crate::vault_manager::VaultManager;
 
 // ============================================================================
 // CONSTANTS & CONFIG
@@ -35,19 +31,15 @@ fn get_server_master_key() -> Result<String, (StatusCode, Json<serde_json::Value
 pub struct UnifiedWalletState {
     // ReDB-backed storage (production-grade persistence)
     pub blockchain: Arc<ConcurrentBlockchain>,
-    pub supabase: Arc<SupabaseManager>,
-    pub vault: Arc<VaultManager>,
     /// Block producer — records executed transactions into PoH blocks
     pub block_producer: Arc<BlockProducer>,
-    /// In-memory session store — 15-min scoped key cache
+    /// In-memory session store — 30-min scoped key cache
     pub session_store: Arc<SessionStore>,
 }
 
 impl UnifiedWalletState {
     pub fn new(
         blockchain: Arc<ConcurrentBlockchain>,
-        supabase: Arc<SupabaseManager>,
-        vault: Arc<VaultManager>,
         block_producer: Arc<BlockProducer>,
     ) -> Self {
         let session_store = Arc::new(SessionStore::new());
@@ -61,8 +53,8 @@ impl UnifiedWalletState {
             }
         });
 
-        info!("✅ Unified Wallet initialized with ReDB storage & Supabase Vault & HashiCorp Vault");
-        Self { blockchain, supabase, vault, block_producer, session_store }
+        info!("✅ Unified Wallet initialized with ReDB storage");
+        Self { blockchain, block_producer, session_store }
     }
 }
 
@@ -70,15 +62,9 @@ impl UnifiedWalletState {
 // TYPE DEFS
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-}
-
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop, Clone)]
 pub struct CreateWalletRequest {
-    pub username: String,           // Required for User Vault ID
+    pub username: String,
     pub password: Option<String>,   // Encrypts Share A (User Active)
     pub pin: Option<String>,        // Hashed for Auth. Encrypts Share B with Server Key if PIN present.
     pub daily_limit: Option<u64>,   // Threshold for PIN requirement
@@ -150,47 +136,14 @@ pub struct SSSTransferRequest {
 }
 
 // ============================================================================
-// HELPERS
-// ============================================================================
-
-fn validate_jwt(headers: &HeaderMap) -> Result<Claims, (StatusCode, Json<serde_json::Value>)> {
-    let auth_header = headers.get("Authorization")
-        .ok_or_else(|| err("Missing Authorization header"))?
-        .to_str()
-        .map_err(|_| err("Invalid Authorization header"))?;
-    
-    if !auth_header.starts_with("Bearer ") {
-        return Err(err("Invalid Bearer token format"));
-    }
-    
-    let token = &auth_header[7..];
-    
-    // WARNING: Insecure Decode for Mainnet-Beta (Supabase using ES256, we skip cert verification for now)
-    // TODO: Implement proper JWKS fetching for ES256 verification in Production 1.0
-    let token_data = jsonwebtoken::dangerous::insecure_decode::<Claims>(token)
-        .map_err(|e| {
-            let error_msg = format!("JWT Verification Failed: {}", e);
-            error!("{}", error_msg);
-            err(error_msg)
-        })?;
-
-    Ok(token_data.claims)
-}
-
-// ============================================================================
-// CORE LOGIC: Mnemonic -> FROST 2-of-3
+// CORE LOGIC: Mnemonic -> SSS 2-of-3
 // ============================================================================
 
 pub async fn create_hybrid_wallet(
     State(state): State<Arc<UnifiedWalletState>>,
-    headers: HeaderMap,
     Json(req): Json<CreateWalletRequest>,
 ) -> Result<Json<CreateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    if let Ok(claims) = validate_jwt(&headers) {
-        info!("🔐 Authenticated CreateWallet: {}", claims.sub);
-    } else {
-        warn!("⚠️  Unauthenticated CreateWallet!");
-    }
+    info!("🔐 CreateWallet request for user: {}", req.username);
 
     // 1. BIP-39 mnemonic (24 words — user can import this into any SVM wallet)
     let mut rng = OsRng;
@@ -239,7 +192,8 @@ pub async fn create_hybrid_wallet(
         .map_err(|e| err(format!("Failed to store public key: {}", e)))?;
     info!("✅ Share B stored for wallet {}", wallet_id);
 
-    // 6. Share A — encrypt with user password, return to client for localStorage/Supabase
+    // 6. Share A — encrypt with user password, return to frontend
+    //    Frontend is responsible for storing this in Supabase / localStorage
     let (final_share_a, is_encrypted) = if let Some(password) = &req.password {
         match security::encrypt_with_secret(password, &raw_shares[0]) {
             Ok(ct) => (ct, true),
@@ -249,26 +203,9 @@ pub async fn create_hybrid_wallet(
         warn!("⚠️  No password — Share A returned unencrypted");
         (hex::encode(&raw_shares[0]), false)
     };
-    if let Ok(claims) = validate_jwt(&headers) {
-        if let Err(e) = state.supabase
-            .store_encrypted_shard_a(&claims.sub, &req.username, &wallet_id, &wallet_id, &final_share_a)
-            .await
-        {
-            error!("❌ Failed to sync Share A to Supabase: {}", e);
-        } else {
-            info!("☁️  Share A synced to Supabase");
-        }
-    }
 
-    // 7. Share C — return raw hex (user writes offline / HashiCorp Vault backup)
+    // 7. Share C — return raw hex (user stores offline for recovery)
     let share_c_hex = hex::encode(&raw_shares[2]);
-    if let Ok(claims) = validate_jwt(&headers) {
-        if let Err(e) = state.vault.store_shard_c(&claims.sub, &share_c_hex).await {
-            warn!("⚠️  HashiCorp Vault backup skipped: {}", e);
-        } else {
-            info!("🔒 Share C stored in HashiCorp Vault");
-        }
-    }
 
     info!("✅ BlackBook wallet created: {} (SVM-compatible Ed25519)", wallet_id);
     Ok(Json(CreateResponse {
@@ -497,50 +434,6 @@ pub struct GetShardBRequest {
     pub pin: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct RecoverShardCRequest {
-    // Intentionally empty. Relying on JWT strictly.
-    // Future: Add 2FA token or Email OTP code here?
-}
-
-#[derive(Serialize)]
-pub struct RecoverShardCResponse {
-    pub shard_c: String,
-    pub warning: String,
-}
-
-pub async fn recover_shard_c(
-    State(state): State<Arc<UnifiedWalletState>>,
-    headers: HeaderMap,
-    Json(_req): Json<RecoverShardCRequest>,
-) -> Result<Json<RecoverShardCResponse>, (StatusCode, Json<serde_json::Value>)> {
-    // 1. STRICT AUTH: The Bouncer
-    let auth_header = headers.get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| err("Unauthorized"))?;
-
-    let user_id = state.supabase.verify_user(auth_header).await
-        .map_err(|e| err(format!("Access Denied: {}", e)))?;
-
-    info!("🚨 RECOVERY ALERT: User {} is requesting SHARD C from Vault!", user_id);
-
-    // 2. Retrieve from HashiCorp Vault
-    let shard_c = state.vault.retrieve_shard_c(&user_id).await
-        .map_err(|e| {
-            error!("Vault Retrieval Failed for {}: {}", user_id, e);
-            err("Recovery failed. Contact support if this persists.")
-        })?;
-
-    // 3. Audit Log (Critical)
-    // In a real system, we would fire an event to an Audit log, email the user, etc.
-    info!("✅ Shard C released to {}", user_id);
-
-    Ok(Json(RecoverShardCResponse {
-        shard_c,
-        warning: "This is your Recovery Shard. Combine with Shard B (Cloud) to restore wallet. DO NOT SHARE.".to_string(),
-    }))
-}
-
 pub async fn get_shard_b_handler(
     State(state): State<Arc<UnifiedWalletState>>,
     _headers: HeaderMap,
@@ -763,7 +656,6 @@ pub fn router() -> Router<Arc<UnifiedWalletState>> {
         .route("/transfer", post(transfer_with_sss))
         .route("/transfer/session", post(transfer_session_handler))
         .route("/wallet/secure/shard-b", post(get_shard_b_handler))
-        .route("/wallet/secure/recover-shard-c", post(recover_shard_c))
         .route("/wallet/verify-sss", post(verify_sss_handler))
 }
 
