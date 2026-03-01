@@ -331,7 +331,171 @@ class BlackBookExplorer {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 5. RESERVES — Proof of Reserves
+  // 5. CHAIN STATS — Pipeline / Gulf Stream / Parallel Execution
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get chain performance stats (pipeline, Gulf Stream, Sealevel).
+   * @returns {Promise<{ blockchain, pipeline, gulf_stream, parallel_execution }>}
+   *
+   * @example
+   *   const s = await explorer.getStats();
+   *   console.log(`Block count: ${s.blockchain.block_count}`);
+   *   console.log(`TPS: ${s.pipeline}`);
+   */
+  async getStats() {
+    return this._apiGet('/stats');
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 6. LEDGER — Paginated audit ledger
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get the paginated audit ledger as text.
+   * @param {number} [page=1]   - Page number (1-indexed)
+   * @param {number} [limit=50] - Rows per page (max 100)
+   * @returns {Promise<string>} ASCII ledger text
+   *
+   * @example
+   *   const ledger = await explorer.getLedger(1, 25);
+   *   console.log(ledger); // ═══ BLACKBOOK L1 AUDIT LEDGER ══════
+   */
+  async getLedger(page = 1, limit = 50) {
+    return this._apiGet(`/ledger?page=${page}&limit=${limit}`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 7. POH — Proof of History clock & blocks
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get current PoH clock status.
+   * @returns {Promise<{ current_slot, num_hashes, current_hash, is_running }>}
+   *
+   * @example
+   *   const poh = await explorer.getPohStatus();
+   *   console.log(`Slot ${poh.current_slot}, hash ${poh.current_hash}`);
+   */
+  async getPohStatus() {
+    return this._apiGet('/poh/status');
+  }
+
+  /**
+   * Get the latest finalized block.
+   * @returns {Promise<{ success, block: { slot, timestamp, hash, previous_hash, tx_count, leader, epoch } }>}
+   *
+   * @example
+   *   const { block } = await explorer.getLatestBlock();
+   *   console.log(`Slot ${block.slot} — ${block.tx_count} txs`);
+   */
+  async getLatestBlock() {
+    return this._apiGet('/poh/block/latest');
+  }
+
+  /**
+   * Get a specific block by slot number (includes full transaction list).
+   * @param {number} slot - Slot number
+   * @returns {Promise<{ success, block: { slot, hash, transactions, tx_count, leader, epoch, confirmations, ... } }>}
+   *
+   * @example
+   *   const { block } = await explorer.getBlockBySlot(2117);
+   *   block.transactions.forEach(tx => console.log(tx.hash, tx.from));
+   */
+  async getBlockBySlot(slot) {
+    return this._apiGet(`/poh/block/${slot}`);
+  }
+
+  /**
+   * Get finality status for a transaction.
+   * @param {string} txId - Transaction hash / ID
+   * @returns {Promise<{ tx_id, status, is_finalized }>}
+   *
+   * @example
+   *   const status = await explorer.getTxStatus('3fKx...');
+   *   console.log(status.is_finalized); // true
+   */
+  async getTxStatus(txId) {
+    return this._apiGet(`/poh/tx/${encodeURIComponent(txId)}/status`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 8. CONSENSUS — Tower BFT & Turbine
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get Tower BFT consensus state.
+   * @returns {Promise<{ validator_count, total_stake, global_root, confirmed_slots, active_forks, current_slot, best_fork }>}
+   *
+   * @example
+   *   const tower = await explorer.getTowerBft();
+   *   console.log(`Root: ${tower.global_root}, Forks: ${tower.active_forks}`);
+   */
+  async getTowerBft() {
+    return this._apiGet('/consensus/tower');
+  }
+
+  /**
+   * Get Turbine shred propagation status.
+   * @returns {Promise<{ current_slot, latest_shredded_slot, data_shreds, fec_shreds, max_hops, ... }>}
+   *
+   * @example
+   *   const turbine = await explorer.getTurbineStatus();
+   *   console.log(`${turbine.data_shreds} data shreds, ${turbine.fec_shreds} FEC`);
+   */
+  async getTurbineStatus() {
+    return this._apiGet('/turbine/status');
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 9. USDC — SPL Token (native BlackBook USDC)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get USDC balance for an address.
+   * @param {string} address - Base58 public key
+   * @returns {Promise<{ address, balance_usdc, raw_balance, decimals, mint }>}
+   *
+   * @example
+   *   const usdc = await explorer.getUsdcBalance('4PtfY2qR...');
+   *   console.log(`${usdc.balance_usdc} USDC`);
+   */
+  async getUsdcBalance(address) {
+    return this._apiGet(`/usdc/balance/${address}`);
+  }
+
+  /**
+   * Get total USDC supply on-chain.
+   * @returns {Promise<{ mint, total_supply, raw_supply, decimals }>}
+   *
+   * @example
+   *   const supply = await explorer.getUsdcSupply();
+   *   console.log(`${supply.total_supply} USDC in circulation`);
+   */
+  async getUsdcSupply() {
+    return this._apiGet('/usdc/supply');
+  }
+
+  /**
+   * Get all USDC token accounts (ATAs) owned by a wallet.
+   * @param {string} address - Wallet address (base58)
+   * @returns {Promise<{ owner, token_accounts: Array<{ address, mint, owner, balance_usdc, raw_balance, decimals }> }>}
+   *
+   * @example
+   *   const { token_accounts } = await explorer.getUsdcAccounts('4PtfY2qR...');
+   *   token_accounts.forEach(a => console.log(a.address, a.balance_usdc));
+   */
+  async getUsdcAccounts(address) {
+    return this._apiGet(`/usdc/accounts/${address}`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 10. RESERVES — Proof of Reserves
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -375,7 +539,7 @@ class BlackBookExplorer {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 6. UTILITIES — Formatting helpers for explorer UI
+  // 11. UTILITIES — Formatting helpers for explorer UI
   // ═══════════════════════════════════════════════════════════════════════════
 
   /** Convert BB to lamports */

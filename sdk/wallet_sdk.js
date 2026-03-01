@@ -440,7 +440,7 @@ class BlackBookWalletSDK {
    *   console.log(result.toBalance);   // 50
    */
   async transfer(fromWalletId, toAddress, amountBB, shardA, password) {
-    const result = await this._api('/wallet/transfer', {
+    const result = await this._api('/transfer', {
       from_wallet_id: fromWalletId,
       to_address:     toAddress,
       amount:         amountBB,
@@ -455,6 +455,57 @@ class BlackBookWalletSDK {
       amount:      result.amount,
       fromBalance: result.from_balance,
       toBalance:   result.to_balance,
+    };
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 4b. SESSION TRANSFER — fast path after first login
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // POST /transfer/session
+  //
+  // After a successful login() or transfer(), the server returns a session_token.
+  // Subsequent transfers within 30 minutes can use this token instead of
+  // re-sending shards and re-running Argon2id. ~10x faster per call.
+  //
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Fast-path transfer using a cached session token (no shard decryption).
+   *
+   * Requires a valid session_token from a prior login() or transfer() call.
+   * The server retains the reconstructed seed for 30 minutes.
+   *
+   * @param {string} sessionToken  - Token from login() or transfer() response
+   * @param {string} fromWalletId  - Sender address
+   * @param {string} toAddress     - Recipient address
+   * @param {number} amountBB      - Amount in BB
+   * @returns {Promise<TransferResult>}
+   *
+   * @example
+   *   // First transfer (reconstructs key, returns session_token)
+   *   const r1 = await sdk.transfer(myWalletId, recipient, 10, shardA, 'password');
+   *
+   *   // Fast subsequent transfers using the cached session
+   *   const r2 = await sdk.transferSession(r1.sessionToken, myWalletId, recipient, 5);
+   */
+  async transferSession(sessionToken, fromWalletId, toAddress, amountBB) {
+    const result = await this._api('/transfer/session', {
+      session_token:  sessionToken,
+      from_wallet_id: fromWalletId,
+      to_address:     toAddress,
+      amount:         amountBB,
+    });
+    return {
+      success:      result.success,
+      signature:    result.signature,
+      from:         result.from,
+      to:           result.to,
+      amount:       result.amount,
+      fromBalance:  result.from_balance,
+      toBalance:    result.to_balance,
+      sessionToken: result.session_token,
     };
   }
 
@@ -598,6 +649,34 @@ class BlackBookWalletSDK {
       default:
         throw new Error(`Unhandled combo: ${combo}`);
     }
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 5b. LOGOUT — Revoke server-side session
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Invalidate a session server-side.
+   *
+   * Removes the cached seed from the server's session store before the
+   * 30-minute TTL expires. Best practice: call on page unload / sign-out.
+   *
+   * @param {Object} [opts]
+   * @param {string} [opts.sessionToken] - Specific session to revoke
+   * @param {string} [opts.walletId]     - Revoke ALL sessions for this wallet
+   * @returns {Promise<{ success: boolean }>}
+   *
+   * @example
+   *   await sdk.logout({ sessionToken: mySessionToken });
+   *   // or revoke all sessions for a wallet:
+   *   await sdk.logout({ walletId: myWalletId });
+   */
+  async logout({ sessionToken, walletId } = {}) {
+    return this._api('/wallet/logout', {
+      session_token: sessionToken || undefined,
+      wallet_id:     walletId     || undefined,
+    });
   }
 
 
@@ -841,46 +920,6 @@ class BlackBookWalletSDK {
     }
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // 9c. Supabase Shard A Backup
-  // ───────────────────────────────────────────────────────────────────────────
-
-  /**
-   * Backup Shard A to Supabase (requires JWT).
-   *
-   * @param {string} walletId
-   * @param {string} encryptedShardA
-   * @returns {Promise<Object>}
-   *
-   * @example
-   *   sdk.setJWT(supabaseAccessToken);
-   *   await sdk.backupShardA(myWalletId, myEncryptedShardA);
-   */
-  async backupShardA(walletId, encryptedShardA) {
-    if (!this.jwt) throw new Error('JWT required for Supabase backup');
-    return this._api('/wallet/backup-shard-a', {
-      wallet_id: walletId,
-      encrypted_shard_a: encryptedShardA,
-    });
-  }
-
-  /**
-   * Restore Shard A from Supabase backup (requires JWT).
-   *
-   * @param {string} walletId
-   * @returns {Promise<{ encryptedShardA: string }>}
-   *
-   * @example
-   *   sdk.setJWT(supabaseAccessToken);
-   *   const { encryptedShardA } = await sdk.restoreShardA(myWalletId);
-   */
-  async restoreShardA(walletId) {
-    if (!this.jwt) throw new Error('JWT required for Supabase restore');
-    const result = await this._api('/wallet/restore-shard-a', {
-      wallet_id: walletId,
-    });
-    return { encryptedShardA: result.encrypted_shard_a };
-  }
 
 
   // ═══════════════════════════════════════════════════════════════════════════

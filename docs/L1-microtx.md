@@ -56,7 +56,7 @@ Everything else (tokens, NFTs, DeFi) lives in **programs** (smart contracts), no
 **Current**: Complex engagement scoring, streak tracking, multipliers
 **Problem**: Adds state reads/writes to every transaction path
 **Action**: 
-- [ ] Move to separate Layer 2 or off-chain service
+- [ ] REMOVE COMPLETLTY 
 - [ ] Remove from transaction critical path
 - [ ] Engagement can be calculated from on-chain events externally
 

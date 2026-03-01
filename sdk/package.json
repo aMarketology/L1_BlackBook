@@ -1,10 +1,12 @@
 {
   "name": "@blackbook/sdk",
-  "version": "3.0.0",
-  "description": "BlackBook L1 SDK — wallet creation, Shamir 2-of-3 SSS key management, faucet, WalletConnect v2",
+  "version": "4.0.0",
+  "description": "BlackBook L1 SDK — unified explorer + wallet. Covers all REST/RPC endpoints: chain stats, PoH blocks, USDC, Tower BFT, Turbine, SSS 2-of-3 wallets.",
   "main": "blackbook_sdk.js",
   "exports": {
-    ".": "./blackbook_sdk.js"
+    ".":           "./blackbook_sdk.js",
+    "./wallet":   "./wallet_sdk.js",
+    "./explorer": "./explorer_sdk.js"
   },
   "keywords": ["blackbook", "blockchain", "l1", "wallet", "shamir", "sss", "walletconnect"],
   "license": "MIT",
