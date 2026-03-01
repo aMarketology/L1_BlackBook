@@ -2,7 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Cargo.lock — committed for reproducible Docker builds
 
 # Node.js
 node_modules/
@@ -38,3 +38,7 @@ Thumbs.db
 # Backup files
 *.bak
 *.backup
+
+# Wallet secrets — never commit
+real_wallets/
+*.keypair.json

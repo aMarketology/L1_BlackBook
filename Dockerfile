@@ -40,9 +40,6 @@ WORKDIR /app
 # Copy only the binary from builder
 COPY --from=builder /build/target/release/layer1 /app/layer1
 
-# Copy real_wallets for genesis accounts
-COPY real_wallets/ /app/real_wallets/
-
 # Data directory for ReDB persistence
 RUN mkdir -p /data/blockchain_data && chown -R blackbook:blackbook /data /app
 ENV REDB_PATH=/data/blockchain_data/blockchain.redb

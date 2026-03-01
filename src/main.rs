@@ -99,7 +99,6 @@ pub struct NodeConfig {
 
 mod wallet_unified;
 mod storage;
-mod consensus;
 mod poh_blockchain;
 mod svm;
 mod solana_rpc;
@@ -1516,7 +1515,7 @@ async fn ledger_handler(
     
     // Footer
     output.push_str("\n");
-    output.push_str(" 🛡️  Ed25519 Signatures │ MD5 TX Hashes │ Chain-Linked │ State Validated │ ZKP Auth Ready │ Immutably Stored on BlackBook L1\n");
+    output.push_str(" 🛡️  Ed25519 Signatures │ SHA-256 TX Hashes │ Chain-Linked │ State Validated │ Immutably Stored on BlackBook L1\n");
     output.push_str("\n");
     
     (

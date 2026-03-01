@@ -10,19 +10,17 @@
 //   types.rs      — StoredAccount, SvmError, constants, TransactionExecutionResult
 //   accounts_db.rs — SvmAccountsDB (DashMap hot-state + ReDB flush)
 //   runtime.rs    — BlackBookSVM (execution engine, blockhash queue)
-//   tx_adapter.rs — Legacy TxData → TransferRequest routing
+//   spl_token.rs  — SPL Token engine (USDC bridge minting)
 //
 // Feature set per phase:
-//   Phase 1 (live):  types + accounts_db + runtime + tx_adapter (system transfers)
-//   Phase 2:         SPL Token engine (USDC bridge minting)
-//   Phase 3:         InvokeContext, rBPF, Anchor programs
+//   Phase 1 (live):  types + accounts_db + runtime (system transfers + SPL)
+//   Phase 2:         InvokeContext, rBPF, Anchor programs
 //
 // ============================================================================
 
 pub mod types;
 pub mod accounts_db;
 pub mod runtime;
-pub mod tx_adapter;
 pub mod spl_token;
 
 // Re-export the most-used types at the svm:: level for ergonomic imports.

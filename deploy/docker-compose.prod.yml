@@ -1,0 +1,46 @@
+# ============================================================================
+# BlackBook L1 — Production Docker Compose (Hetzner CX42)
+# ============================================================================
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f blackbook
+# ============================================================================
+
+services:
+  blackbook:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: blackbook-l1
+    restart: unless-stopped
+    ports:
+      - "8080:8080"    # HTTP API + Wallet UI
+      - "8899:8899"    # Solana JSON-RPC (Phantom, OneKey, etc.)
+      - "50051:50051"  # gRPC relay (validator-to-validator)
+    volumes:
+      - blackbook-data:/data
+    environment:
+      - RUST_LOG=info,layer1=info,tower_http=info
+      - REDB_PATH=/data/blockchain_data/blockchain.redb
+      - RUST_BACKTRACE=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+        reservations:
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  blackbook-data:
+    driver: local

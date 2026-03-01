@@ -1,0 +1,13 @@
+# Ignore heavy/unnecessary stuff during Docker build
+target/
+.git/
+.gitignore
+.vscode/
+.idea/
+node_modules/
+sdk/
+docs/
+*.md
+blockchain_data/
+sql/
+deploy/

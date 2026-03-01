@@ -10,7 +10,6 @@
 pub mod storage;
 pub mod poh_blockchain;
 pub mod wallet_unified; // SSS 2-of-3 Shamir wallets
-pub mod consensus;
 pub mod svm;
 pub mod solana_rpc;
 pub mod relay;
