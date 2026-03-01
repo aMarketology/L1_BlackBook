@@ -412,7 +412,7 @@ fn bench_e2e_tps(c: &mut Criterion) {
     
     // Pre-populate 100K accounts
     for i in 0..100_000u64 {
-        balances.insert(format!("BB_{:08x}", i), AtomicU64::new(1_000_000_000));
+        balances.insert(format!("BB_{:08x}", i), AtomicU64::new(1_000_000));
     }
     
     for tx_count in [1_000, 10_000, 50_000] {
@@ -502,7 +502,7 @@ fn find_max_tps() {
     // Pre-populate 1M accounts
     println!("Populating 1,000,000 accounts...");
     for i in 0..1_000_000u64 {
-        balances.insert(format!("BB_{:08x}", i), AtomicU64::new(1_000_000_000));
+        balances.insert(format!("BB_{:08x}", i), AtomicU64::new(1_000_000));
     }
     println!("Done.\n");
     

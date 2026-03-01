@@ -146,7 +146,7 @@ impl SettlementNode for CreditLineService {
             session_id: format!("session_{}", req.nonce),
             credit_limit: req.credit_limit,
             expires_at: req.timestamp + (req.expires_in_hours * 3600),
-            l1_balance: 1000000000, // TODO: Get from blockchain
+            l1_balance: 1000000, // TODO: Get from blockchain
             session: None, // TODO: Build CreditSessionInfo
         };
         
@@ -176,10 +176,10 @@ impl SettlementNode for CreditLineService {
             error_code: 0,
             error_message: String::new(),
             amount_drawn: req.amount,
-            l1_before: 1000000000,
-            l1_after: 1000000000 - req.amount,
+            l1_before: 1000000,
+            l1_after: 1000000 - req.amount,
             l2_balance: req.amount,
-            remaining_credit: 500000000 - req.amount,
+            remaining_credit: 500000 - req.amount,
             draw_count: 1,
         };
         
@@ -238,11 +238,11 @@ impl SettlementNode for CreditLineService {
             error_code: 0,
             error_message: String::new(),
             wallet_address: req.wallet_address,
-            l1_balance: 1000000000,
+            l1_balance: 1000000,
             has_active_credit: true,
             approval: None, // TODO: Build CreditApprovalInfo
             session: None,  // TODO: Build CreditSessionInfo
-            total_credit_extended: 5000000000,
+            total_credit_extended: 5000000,
             total_draws: 100,
             total_settlements: 50,
         };

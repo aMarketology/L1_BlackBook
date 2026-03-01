@@ -926,7 +926,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
                 "account": {
                     "data": [raw_base64, "base64"],
                     "executable": false,
-                    "lamports": 1_000_000_000u64,
+                    "lamports": 100_000u64,
                     "owner": bs58::encode(SPL_TOKEN_PROGRAM_ID).into_string(),
                     "rentEpoch": 18446744073709551615u64,
                     "space": 165,
@@ -1091,7 +1091,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
     ) -> RpcResult<RpcResponse<serde_json::Value>> {
         // Sum actual lamports across all on-chain accounts
         let total = self.svm_db.total_lamports();
-        info!("📡 RPC ← getSupply → {} lamports ({:.2} BB)", total, total as f64 / 1_000_000_000.0);
+        info!("📡 RPC ← getSupply → {} lamports ({:.2} BB)", total, total as f64 / 100_000.0);
         Ok(RpcResponse {
             context: self.ctx(),
             value: serde_json::json!({
@@ -1134,7 +1134,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         // Validate pubkey format first
         let pk       = Self::parse_pubkey(&pubkey)?;
         let lamports = self.svm_db.get_lamports(&pk);
-        let bb       = lamports as f64 / 1_000_000_000.0;
+        let bb       = lamports as f64 / 100_000.0;
         let slot     = self.slot();
 
         Ok(serde_json::json!({

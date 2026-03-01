@@ -142,8 +142,8 @@ const VERSION: &str = "5.0.0";
 const NETWORK: &str = "mainnet-beta";
 const REDB_DATA_PATH: &str = "./blockchain_data";
 
-/// PoH Configuration (600ms slots — stable vs Solana's fragile 400ms)
-const POH_SLOT_DURATION_MS: u64 = 600;
+/// PoH Configuration (400ms slots — matching Solana for max TPS)
+const POH_SLOT_DURATION_MS: u64 = 400;
 const POH_HASHES_PER_TICK: u64 = 12500;
 const POH_TICKS_PER_SLOT: u64 = 64;
 const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
@@ -376,6 +376,37 @@ async fn signed_transfer_handler(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
     }
 
+    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
+    let nonce_key = format!("transfer:{}:{}", req.wallet_address, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Nonce already used — possible replay attack",
+            "nonce": req.nonce
+        })));
+    }
+
+    // Check timestamp freshness (reject transactions older than 60 seconds)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Transaction too old (>60s)",
+            "server_time": now,
+            "tx_time": req.timestamp
+        })));
+    }
+
+    // Record nonce BEFORE executing transfer (fail-safe)
+    state.used_nonces.insert(nonce_key, now);
+
+    // Prune old nonces periodically
+    if state.used_nonces.len() > 100_000 {
+        let cutoff = now.saturating_sub(120);
+        state.used_nonces.retain(|_, &mut ts| ts > cutoff);
+    }
+
     // Execute transfer
     let from = &req.wallet_address;
     let balance = state.blockchain.get_balance(from);
@@ -405,7 +436,7 @@ async fn signed_transfer_handler(
                         .as_secs(),
                     data: TxData::TransferBb {
                         to: payload.to.clone(),
-                        amount: (payload.amount * 1_000_000_000.0) as u64,
+                        amount: (payload.amount * 100_000.0) as u64,
                     },
                     signature: req.signature.clone(),
                     signer_pubkey: req.public_key.clone(),
@@ -736,22 +767,38 @@ async fn admin_burn_handler(
 }
 
 // ============================================================================
-// FAUCET — Public token mint (max 99,999 BB per address per epoch)
+// FAUCET — Public token mint (0.1 BB per request, unlimited for now)
 // ============================================================================
 
 #[derive(Deserialize)]
 struct FaucetRequest {
+    /// Wallet address to receive funds (must be hex-encoded Ed25519 pubkey)
     to: String,
+    /// Amount to request (capped at MAX_FAUCET_BB)
     amount: f64,
+    /// Ed25519 signature proving ownership of `to` address
+    signature: String,
+    /// Timestamp (Unix seconds) for replay protection
+    timestamp: u64,
+    /// Unique nonce for replay protection
+    nonce: String,
 }
 
-/// POST /faucet — Mint up to 99,999 BB to any address (rate-limited per epoch)
+/// POST /faucet — Mint up to 0.1 BB to any address
+///
+/// REQUIRES Ed25519 signature to prove ownership of destination wallet.
+/// Message format: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
+/// 
+/// NOTE: Currently unlimited calls allowed. Future: rate-limited to once per 24h.
 async fn faucet_handler(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> impl IntoResponse {
-    const MAX_FAUCET_BB: f64 = 99_999.0;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+    const MAX_FAUCET_BB: f64 = 0.1;
+
+    // ── VALIDATE INPUTS ────────────────────────────────────────────────────
     if req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Missing 'to' address"
@@ -760,78 +807,132 @@ async fn faucet_handler(
     let amount = req.amount.min(MAX_FAUCET_BB).max(0.0);
     if amount <= 0.0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Amount must be between 0 and 99,999 BB"
+            "error": "Amount must be between 0 and 0.1 BB"
         })));
     }
 
-    // Determine current epoch (432,000 slots per epoch, ~2 days at 400ms)
-    let current_slot = state.current_slot.load(Ordering::Relaxed);
-    let current_epoch = current_slot / 432_000;
-
-    // Rate-limit: one faucet per address per epoch, up to 99,999 BB total
-    {
-        let mut entry = state.faucet_claims.entry(req.to.clone()).or_insert((current_epoch, 0.0));
-        let (claimed_epoch, claimed_total) = entry.value_mut();
-
-        // Reset if new epoch
-        if *claimed_epoch != current_epoch {
-            *claimed_epoch = current_epoch;
-            *claimed_total = 0.0;
+    // ── Ed25519 SIGNATURE VERIFICATION ─────────────────────────────────────
+    // Parse public key from `to` address (hex or base58)
+    let pubkey_bytes: Vec<u8> = if req.to.len() == 64 && req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Hex-encoded pubkey
+        match hex::decode(&req.to) {
+            Ok(b) => b,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Invalid hex public key"
+            }))),
         }
-
-        let remaining = MAX_FAUCET_BB - *claimed_total;
-        if remaining <= 0.0 {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-                "error": "Faucet limit reached for this epoch (99,999 BB)",
-                "epoch": current_epoch,
-                "claimed": *claimed_total,
-                "next_epoch_slot": (current_epoch + 1) * 432_000
-            })));
+    } else {
+        // Base58 pubkey (Solana-style)
+        match bs58::decode(&req.to).into_vec() {
+            Ok(b) if b.len() == 32 => b,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Invalid base58 public key (must be 32 bytes)"
+            }))),
         }
+    };
 
-        let mint_amount = amount.min(remaining);
+    if pubkey_bytes.len() != 32 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Public key must be 32 bytes"
+        })));
+    }
 
-        match state.blockchain.credit(&req.to, mint_amount) {
-            Ok(_) => {
-                *claimed_total += mint_amount;
-                let new_bal = state.blockchain.get_balance(&req.to);
-                info!("🚰 FAUCET: {} BB → {} (epoch {})", mint_amount, req.to, current_epoch);
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid signature (must be 64 bytes hex)"
+        }))),
+    };
 
-                // Record faucet mint into PoH block
-                {
-                    use protocol::Transaction as ProtoTx;
-                    use protocol::TxData;
-                    let tx = ProtoTx {
-                        hash: uuid::Uuid::new_v4().to_string(),
-                        from: "SYSTEM_FAUCET".to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        data: TxData::DepositUsdt {
-                            usdt_amount: (mint_amount / 10.0) as u64, // BB→USDT equivalent
-                            external_tx_hash: Some(format!("faucet_epoch_{}", current_epoch)),
-                        },
-                        signature: "faucet".to_string(),
-                        signer_pubkey: "SYSTEM_FAUCET".to_string(),
-                    };
-                    state.block_producer.record_executed_transaction(tx);
-                }
+    // Build message: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
+    let message = format!("FAUCET:{}:{}:{}:{}", req.to, req.amount, req.timestamp, req.nonce);
 
-                return (StatusCode::OK, Json(serde_json::json!({
-                    "success": true,
-                    "minted": mint_amount,
-                    "to": req.to,
-                    "new_balance": new_bal,
-                    "epoch": current_epoch,
-                    "remaining_this_epoch": MAX_FAUCET_BB - *claimed_total
-                })));
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid Ed25519 public key"
+        }))),
+    };
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Signature verification failed — prove you own this wallet"
+        })));
+    }
+
+    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
+    let nonce_key = format!("faucet:{}:{}", req.to, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Nonce already used — possible replay attack",
+            "nonce": req.nonce
+        })));
+    }
+
+    // Check timestamp freshness (reject requests older than 60 seconds)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Request too old (>60s)",
+            "server_time": now,
+            "request_time": req.timestamp
+        })));
+    }
+
+    // Record nonce BEFORE minting
+    state.used_nonces.insert(nonce_key, now);
+
+    // Prune old nonces periodically
+    if state.used_nonces.len() > 100_000 {
+        let cutoff = now.saturating_sub(120);
+        state.used_nonces.retain(|_, &mut ts| ts > cutoff);
+    }
+
+    // ── MINT TOKENS ────────────────────────────────────────────────────────
+    // No per-epoch rate limiting for now (future: once per 24h)
+    let mint_amount = amount;
+
+    match state.blockchain.credit(&req.to, mint_amount) {
+        Ok(_) => {
+            let new_bal = state.blockchain.get_balance(&req.to);
+            info!("🚰 FAUCET: {} BB → {} (sig verified)", mint_amount, req.to);
+
+            // Record faucet mint into PoH block
+            {
+                use protocol::Transaction as ProtoTx;
+                use protocol::TxData;
+                let tx = ProtoTx {
+                    hash: uuid::Uuid::new_v4().to_string(),
+                    from: "SYSTEM_FAUCET".to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    data: TxData::DepositUsdt {
+                        usdt_amount: (mint_amount / 10.0) as u64,
+                        external_tx_hash: Some(format!("faucet_{}", req.nonce)),
+                    },
+                    signature: req.signature.clone(),
+                    signer_pubkey: req.to.clone(),
+                };
+                state.block_producer.record_executed_transaction(tx);
             }
-            Err(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": format!("Mint failed: {}", e)
-                })));
-            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "minted": mint_amount,
+                "to": req.to,
+                "new_balance": new_bal
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Mint failed: {}", e)
+            })))
         }
     }
 }
@@ -1792,8 +1893,8 @@ async fn main() {
             let ls = leader_schedule.clone();
             let vid = validator_id_for_loop;
             tokio::spawn(async move {
-                info!("🏭 Block production loop started (600ms slots)");
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(600));
+                info!("🏭 Block production loop started (400ms slots)");
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(400));
                 let mut last_epoch: u64 = 0;
                 loop {
                     interval.tick().await;
@@ -1906,7 +2007,7 @@ async fn main() {
                                 timestamp: chrono::Utc::now().timestamp() as u64,
                                 data: protocol::TxData::TransferBb {
                                     to: tx.to.clone(),
-                                    amount: (tx.amount * 1_000_000.0) as u64,
+                                    amount: (tx.amount * 100_000.0) as u64,
                                 },
                                 signature: String::new(),
                                 signer_pubkey: String::new(),
@@ -1988,64 +2089,11 @@ async fn main() {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // 9b. Sync legacy L1 balances → SVM AccountsDB
+    // 9b. SVM is the single source of truth — no legacy sync needed.
     // ═══════════════════════════════════════════════════════════════
-    // Wallet extensions (Backpack, Nightly, Phantom) read balances via
-    // the Solana JSON-RPC `getBalance` which queries the SVM accounts DB.
-    // Legacy L1 balances live in the f64 cache — we seed them into SVM
-    // so wallets show correct balances immediately on connect.
-    {
-        use crate::svm::types::LAMPORTS_PER_BB;
-        use solana_sdk::account::AccountSharedData;
-        use solana_sdk::pubkey::Pubkey;
-
-        let mut synced = 0u32;
-        for entry in state.blockchain.cache.iter() {
-            let addr = entry.key();
-            let bb_balance = *entry.value();
-
-            // Skip legacy bb_ prefixed addresses (v1 wallets aren't base58 pubkeys)
-            if addr.starts_with("bb_") {
-                continue;
-            }
-
-            // Parse as Solana pubkey
-            let pk = match bs58::decode(addr.as_str()).into_vec() {
-                Ok(bytes) if bytes.len() == 32 => {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Pubkey::new_from_array(arr)
-                }
-                _ => continue, // skip non-pubkey addresses
-            };
-
-            // Seed if SVM has no account or has 0 lamports but legacy has balance
-            let lamports = (bb_balance * LAMPORTS_PER_BB as f64) as u64;
-            if lamports > 0 {
-                let existing = rpc_svm_accounts.get_account(&pk);
-                let existing_lamports = existing.as_ref()
-                    .map(|a| {
-                        use solana_sdk::account::ReadableAccount;
-                        a.lamports()
-                    })
-                    .unwrap_or(0);
-
-                if existing_lamports == 0 {
-                    let account = AccountSharedData::new(
-                        lamports,
-                        0,
-                        &solana_sdk::system_program::id(),
-                    );
-                    rpc_svm_accounts.store_account(&pk, account);
-                    synced += 1;
-                    info!("💰 SVM sync: {} → {} lamports ({} BB)", addr, lamports, bb_balance);
-                }
-            }
-        }
-        if synced > 0 {
-            info!("✅ Synced {} legacy accounts → SVM AccountsDB", synced);
-        }
-    }
+    // All balances are stored in svm_accounts (u64 lamports).
+    // The f64 DashMap cache is a read-behind mirror for backward compat.
+    // On fresh start, ReDB→SVM seeding happens in ConcurrentBlockchain::new().
 
     // 10. HTTP Server
     let app = build_router(state, unified_router);
@@ -2106,13 +2154,13 @@ async fn main() {
         ));
 
         // Slot ticker: sync shared slot counter from PoH clock + advance SVM blockhash
-        // every 600ms. The PoH clock is the single authority for slot progression.
+        // every 400ms. The PoH clock is the single authority for slot progression.
         // This keeps OneKey / Phantom from treating the node as stale.
         let ticker_slot = rpc_current_slot.clone();
         let ticker_svm = Arc::clone(&rpc_svm);
         let ticker_poh = poh_service.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(600));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(400));
             loop {
                 interval.tick().await;
                 // Read canonical slot from PoH clock (single source of truth)
@@ -2129,7 +2177,7 @@ async fn main() {
                 }
             }
         });
-        info!("🕐 Slot ticker started (600ms intervals → advancing slot + blockhash)");
+        info!("🕐 Slot ticker started (400ms intervals → advancing slot + blockhash)");
 
         let rpc_impl = {
             let mut rpc = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);

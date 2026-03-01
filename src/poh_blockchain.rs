@@ -52,17 +52,17 @@ use crate::svm::runtime::BlackBookSVM;
 use solana_sdk::{hash::Hash as SvmHash, pubkey::Pubkey};
 
 // ============================================================================
-// CONSTANTS - TUNED FOR HIGH THROUGHPUT
+// CONSTANTS - TUNED FOR HIGH THROUGHPUT (125K TPS TARGET)
 // ============================================================================
 
 /// Maximum transactions per block
-/// TUNED: 10,000 txs/block at 600ms slots = 16,667 TPS theoretical max (stable)
-pub const MAX_TXS_PER_BLOCK: usize = 10_000;
+/// TUNED: 50,000 txs/block at 400ms slots = 125,000 TPS theoretical max
+pub const MAX_TXS_PER_BLOCK: usize = 50_000;
 
 /// Block production interval in milliseconds
-/// TUNED: 600ms for stability (vs Solana's fragile 400ms) = 1.67 blocks/second
+/// TUNED: 400ms (matching Solana) = 2.5 blocks/second
 #[allow(dead_code)] // Used by main_v4 and future scheduling
-pub const BLOCK_INTERVAL_MS: u64 = 600;
+pub const BLOCK_INTERVAL_MS: u64 = 400;
 
 /// Shred size in bytes (Turbine-style propagation)
 /// Optimal for UDP MTU (1232 bytes after headers)
@@ -1025,11 +1025,7 @@ impl BlockProducer {
 
     /// Execute a $BB transfer through the SVM execution engine.
     ///
-    /// **Lazy migration:** If the sender account is not yet in `svm_accounts`
-    /// (i.e. it's a wallet that pre-dates the SVM), we seed it from the legacy
-    /// f64 balance table _once_, on first transfer. After that the SVM is the
-    /// single source of truth for that account.
-    ///
+    /// SVM AccountsDB is the single source of truth — no lazy migration needed.
     /// `amount` is in $BB units (matching the `TransferBb.amount` field).
     /// Conversion to lamports happens here — the only place in the call tree.
     fn execute_transfer_via_svm(
@@ -1039,7 +1035,6 @@ impl BlockProducer {
         amount_bb: u64,
     ) -> Result<(), String> {
         use crate::svm::types::LAMPORTS_PER_BB;
-        use solana_sdk::account::AccountSharedData;
 
         let svm_guard = self.svm.lock()
             .map_err(|e| format!("SVM lock poisoned: {e}"))?;
@@ -1050,27 +1045,10 @@ impl BlockProducer {
         let to_pk = Self::legacy_addr_to_pubkey(to_addr)
             .map_err(|e| format!("Invalid to address: {e}"))?;
 
-        // --- Lamport conversion (f64→u64 boundary — ONCE, here only) ---
+        // --- Lamport conversion (u64 × u64 — no f64 involved) ---
         let lamports = amount_bb
             .checked_mul(LAMPORTS_PER_BB)
             .ok_or("Transfer amount overflows u64 lamports")?;
-
-        // --- Lazy migration: seed sender if not yet in SVM ---
-        if svm_guard.accounts_db.get_account(&from_pk).is_none() {
-            let legacy_bb = self.blockchain.get_balance(from_addr); // f64 in $BB
-            let seed_lamports = (legacy_bb * LAMPORTS_PER_BB as f64) as u64;
-            let seeded = AccountSharedData::new(
-                seed_lamports,
-                0,
-                &solana_sdk::system_program::id(),
-            );
-            svm_guard.accounts_db.store_account(&from_pk, seeded);
-            tracing::info!(
-                address = %from_addr,
-                lamports = seed_lamports,
-                "SVM: lazily migrated legacy account"
-            );
-        }
 
         // --- Build transfer request with the slot's current blockhash ---
         let recent_blockhash = svm_guard.current_blockhash();
@@ -1122,28 +1100,19 @@ impl BlockProducer {
         tree.root_hex()
     }
 
-    /// Get all accounts (for state root computation)
-    /// Merges legacy f64 balances from the DashMap cache AND SVM lamport balances
-    /// into a single BTreeMap for deterministic merkle hashing.
+    /// Get all accounts (for state root computation).
+    /// Reads exclusively from SVM AccountsDB (the single source of truth)
+    /// and converts lamports → f64 BB for deterministic merkle hashing.
     fn get_all_accounts(&self) -> BTreeMap<String, f64> {
+        use crate::svm::types::LAMPORTS_PER_BB;
         use solana_sdk::account::ReadableAccount;
         let mut accounts = BTreeMap::new();
 
-        // 1) Legacy f64 balances from ConcurrentBlockchain DashMap cache
-        for entry in self.blockchain.cache.iter() {
-            let balance = *entry.value();
-            if balance > 0.0 {
-                accounts.insert(entry.key().clone(), balance);
-            }
-        }
-
-        // 2) SVM lamport balances (converted to f64 BB: 1 BB = 1_000_000 lamports)
         for entry in self.blockchain.svm_accounts.hot_state.iter() {
             let lamports = entry.value().lamports();
             if lamports > 0 {
-                let bb_balance = lamports as f64 / 1_000_000.0;
+                let bb_balance = lamports as f64 / LAMPORTS_PER_BB as f64;
                 let key = entry.key().to_string();
-                // SVM balance takes precedence when both exist
                 accounts.insert(key, bb_balance);
             }
         }

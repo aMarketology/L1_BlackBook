@@ -1425,7 +1425,7 @@ curl -X POST https://blackbook.id:8899 \
   "result": {
     "registered": true,
     "walletAddress": "5FHneW46...",
-    "balance": { "lamports": 25000000000, "bb": 25000.0 },
+    "balance": { "lamports": 25000000, "bb": 25.0 },
     "network": "blackbook-mainnet",
     "slot": 98712
   }

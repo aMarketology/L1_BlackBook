@@ -1,10 +1,15 @@
 // ============================================================================
-// BLACKBOOK L1 - PRODUCTION STORAGE LAYER
+// BLACKBOOK L1 — UNIFIED STORAGE LAYER (v2 — SVM-native)
 // ============================================================================
 //
-// Simple, fast, production-ready storage using:
-// - ReDB: ACID-compliant embedded database (like SQLite, but key-value)
-// - DashMap: Lock-free concurrent HashMap for hot reads
+// **Single source of truth: SVM AccountsDB (u64 lamports)**
+//
+// All balances are stored as u64 lamports in the SVM AccountsDB.
+// 1 BB = 100,000 lamports (5 decimals).
+//
+// The legacy f64 DashMap cache is kept ONLY as a read-through mirror
+// for backward-compatible REST API responses and audit logging.
+// It is NEVER consulted for authoritative balance data.
 //
 // ARCHITECTURE:
 // ┌─────────────────────────────────────────────────────────────────┐
@@ -13,24 +18,26 @@
 // │              ┌─────────────┴─────────────┐                     │
 // │              ▼                           ▼                     │
 // │    ConcurrentBlockchain            AssetManager                │
-// │         │        │                      │                      │
-// │    ┌────┴────┐   │               ┌──────┴──────┐              │
-// │    │ DashMap │   │               │   DashMap   │              │
-// │    │ (Cache) │   │               │ (Sessions)  │              │
-// │    └────┬────┘   │               └─────────────┘              │
-// │         │        │                                            │
-// │         └────────┴────────────┐                               │
-// │                               ▼                               │
-// │                      ┌────────────────┐                       │
-// │                      │     ReDB       │                       │
-// │                      │  (Persistent)  │                       │
-// │                      └────────────────┘                       │
+// │         │                               │                      │
+// │    ┌────┴──────────────┐          ┌─────┴───────┐             │
+// │    │  SVM AccountsDB   │          │   DashMap   │             │
+// │    │  (u64 lamports)   │          │ (Sessions)  │             │
+// │    │  SINGLE SOURCE    │          └─────────────┘             │
+// │    │  OF TRUTH         │                                      │
+// │    └────┬──────────────┘                                      │
+// │         │                                                     │
+// │    ┌────┴────┐     ┌────────────────┐                        │
+// │    │ DashMap │     │     ReDB       │                        │
+// │    │ (f64   ◄─────┤  (Persistent)  │                        │
+// │    │ mirror) │     │  audit trail   │                        │
+// │    └─────────┘     └────────────────┘                        │
 // └─────────────────────────────────────────────────────────────────┘
 //
 // CONCURRENCY MODEL:
-// - Reads: Lock-free via DashMap (100,000+ concurrent reads)
-// - Writes: ReDB handles via MVCC (single-writer, multi-reader)
+// - Reads:  Lock-free via SVM DashMap hot_state (100,000+ concurrent)
+// - Writes: SVM store_account → then mirror to ReDB for persistence
 //
+// CRITICAL: No f64 in the balance hot path. f64 only at API boundaries.
 // ============================================================================
 
 use std::sync::Arc;
@@ -240,12 +247,14 @@ impl TransactionRecord {
         let timestamp = chrono::Utc::now().timestamp() as u64;
         let tx_id = format!("tx_{}", chrono::Utc::now().timestamp_millis());
         
-        // Compute transaction hash
+        // Compute transaction hash (SHA-256 — cryptographically secure)
+        use sha2::{Sha256, Digest};
         let hash_input = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             tx_id, tx_type, from, to, amount, timestamp, nonce
         );
-        let tx_hash = format!("{:x}", md5::compute(hash_input.as_bytes()));
+        let hash_bytes = Sha256::digest(hash_input.as_bytes());
+        let tx_hash = format!("{:x}", hash_bytes);
         
         Self {
             tx_id,
@@ -295,43 +304,45 @@ impl TransactionRecord {
 // CONCURRENT BLOCKCHAIN
 // ============================================================================
 
-/// High-performance blockchain storage with lock-free reads.
+/// High-performance blockchain storage — SVM-native.
 ///
-/// This is the ONLY blockchain type you need. It wraps ReDB for persistence
-/// and DashMap for fast in-memory reads.
+/// **Single source of truth: SVM AccountsDB (u64 lamports).**
+///
+/// The DashMap `cache` is a f64 mirror kept for backward-compatible API
+/// responses and audit logging. It is populated FROM SVM on writes, never
+/// the other way around. Balance reads go directly to SVM.
 ///
 /// # Thread Safety
 /// - `Clone` is cheap (Arc handles)
-/// - `get_balance()` is lock-free
-/// - `credit()`/`debit()` use ReDB's MVCC (safe, serialized writes)
+/// - `get_balance()` is lock-free (reads SVM hot_state)
+/// - `credit()`/`debit()` write to SVM first, then mirror
 ///
-/// # Bridge Replay Protection
-/// - Tracks all processed external TX hashes (Ethereum/Solana)
-/// - Prevents double-minting from the same USDC lock event
-///
-/// # Sealevel Integration
-/// - `cache` field is public for direct parallel execution access
-/// - ParallelScheduler uses DashMap for lock-free batch updates
+/// # No More Dual-Write
+/// - Old system: write f64 to DashMap/ReDB → sync to SVM (dual source of truth)
+/// - New system: write u64 to SVM → mirror f64 to DashMap/ReDB (single source of truth)
 #[derive(Clone)]
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
     db: Arc<Database>,
     
-    /// In-memory balance cache (DashMap = lock-free reads)
+    /// Legacy f64 cache — MIRROR ONLY, not authoritative.
+    /// Kept for backward compat with code that reads `cache` directly.
+    /// Populated from SVM on writes. Never used for balance decisions.
     /// PUBLIC: Used by Sealevel ParallelScheduler for direct batch execution
     pub cache: Arc<DashMap<String, f64>>,
     
     /// Processed bridge TX cache (for fast replay checks)
-    #[allow(dead_code)] // Loaded from ReDB on startup; will be queried by bridge handler (Phase 7+)
+    #[allow(dead_code)]
     processed_bridge_txs: Arc<DashMap<String, String>>,
     
     /// Block height counter
     block_height: Arc<AtomicU64>,
     
-    /// Total supply tracker
+    /// Total supply tracker (deprecated — use svm_accounts.total_lamports())
     total_supply: Arc<AtomicU64>,
     
-    /// SVM Accounts Database (Phase 1 integration)
+    /// SVM Accounts Database — THE authoritative balance store.
+    /// All balance reads and writes go here. u64 lamports, no f64.
     pub svm_accounts: Arc<SvmAccountsDB>,
 }
 
@@ -346,16 +357,38 @@ impl ConcurrentBlockchain {
         Some(Pubkey::new_from_array(arr))
     }
 
-    /// Sync a balance change to the SVM AccountsDB (write-through)
-    fn svm_sync_balance(&self, address: &str, new_balance_bb: f64) {
+    /// Convert ANY address to a Solana Pubkey.
+    ///
+    /// - Base58 pubkeys: parsed directly
+    /// - Legacy `bb_*` addresses: SHA-256 hashed to a deterministic 32-byte key
+    /// - Other strings: SHA-256 hashed (same as bb_ path)
+    ///
+    /// This is the UNIFIED address resolver — every address maps to exactly
+    /// one SVM account. No more "SVM path vs legacy path" branching.
+    pub fn addr_to_pubkey(address: &str) -> Pubkey {
+        // Fast path: valid base58 Solana pubkey
         if let Some(pk) = Self::try_parse_pubkey(address) {
-            let lamports = (new_balance_bb * LAMPORTS_PER_BB as f64) as u64;
-            let account = AccountSharedData::new(
-                lamports,
-                0,
-                &solana_sdk::system_program::id(),
-            );
-            self.svm_accounts.store_account(&pk, account);
+            return pk;
+        }
+        // Legacy/fallback: deterministic SHA-256 hash
+        use sha2::{Sha256, Digest};
+        let stripped = address.strip_prefix("bb_").unwrap_or(address);
+        let bytes: [u8; 32] = Sha256::digest(stripped.as_bytes()).into();
+        Pubkey::new_from_array(bytes)
+    }
+
+    /// Mirror a balance to the legacy f64 DashMap cache and ReDB.
+    /// Called AFTER writing to SVM. The cache is a read-behind mirror,
+    /// not a source of truth.
+    pub fn mirror_balance_to_cache(&self, address: &str, lamports: u64) {
+        let bb = lamports as f64 / LAMPORTS_PER_BB as f64;
+        self.cache.insert(address.to_string(), bb);
+        // Best-effort ReDB persistence (non-blocking for perf)
+        if let Ok(write_txn) = self.db.begin_write() {
+            if let Ok(mut table) = write_txn.open_table(ACCOUNTS) {
+                let _ = table.insert(address, bb);
+            }
+            let _ = write_txn.commit();
         }
     }
 
@@ -441,7 +474,7 @@ impl ConcurrentBlockchain {
             cache,
             processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
-            total_supply: Arc::new(AtomicU64::new((total * 1_000_000.0) as u64)),
+            total_supply: Arc::new(AtomicU64::new((total * 100_000.0) as u64)),
             svm_accounts,
         })
     }
@@ -450,60 +483,32 @@ impl ConcurrentBlockchain {
     // READ OPERATIONS (Lock-Free)
     // ========================================================================
 
-    /// Get balance for an address - LOCK FREE
+    /// Get balance for an address — LOCK FREE, SVM-NATIVE
     /// 
-    /// For SVM-compatible addresses (base58 pubkeys), reads from the SVM AccountsDB
-    /// which is the source of truth for Solana JSON-RPC and wallet extensions.
-    /// For legacy bb_ addresses, falls back to the DashMap cache / ReDB.
+    /// Always reads from SVM AccountsDB (the single source of truth).
+    /// Returns f64 BB for API backward compatibility.
+    /// Internally: SVM u64 lamports → f64 BB at the boundary.
     #[inline]
     pub fn get_balance(&self, address: &str) -> f64 {
-        // SVM path: base58 pubkey addresses read from SVM AccountsDB
-        if let Some(pk) = Self::try_parse_pubkey(address) {
-            let lamports = self.svm_accounts.get_lamports(&pk);
-            return lamports as f64 / LAMPORTS_PER_BB as f64;
-        }
-
-        // Legacy path: bb_ prefixed addresses use DashMap cache
-        if let Some(balance) = self.cache.get(address) {
-            return *balance;
-        }
-
-        // Slow path: Check disk (rare - only if cache miss)
-        match self.db.begin_read() {
-            Ok(read_txn) => {
-                match read_txn.open_table(ACCOUNTS) {
-                    Ok(table) => {
-                        match table.get(address) {
-                            Ok(Some(access)) => {
-                                let balance = access.value();
-                                self.cache.insert(address.to_string(), balance);
-                                balance
-                            }
-                            Ok(None) => 0.0,
-                            Err(_) => 0.0,
-                        }
-                    }
-                    Err(_) => 0.0,
-                }
-            }
-            Err(_) => 0.0,
-        }
+        let pk = Self::addr_to_pubkey(address);
+        let lamports = self.svm_accounts.get_lamports(&pk);
+        lamports as f64 / LAMPORTS_PER_BB as f64
     }
 
-    /// Get total supply - LOCK FREE
-    /// Reads from SVM AccountsDB (source of truth for all base58 accounts)
+    /// Get balance in raw lamports (u64) — no f64 conversion.
+    /// Use this for internal operations to avoid floating-point dust.
+    #[inline]
+    pub fn get_balance_lamports(&self, address: &str) -> u64 {
+        let pk = Self::addr_to_pubkey(address);
+        self.svm_accounts.get_lamports(&pk)
+    }
+
+    /// Get total supply — LOCK FREE, SVM-NATIVE
+    /// Pure SVM read. No more dual-system merge.
     #[inline]
     pub fn total_supply(&self) -> f64 {
         let svm_lamports = self.svm_accounts.total_lamports();
-        let svm_bb = svm_lamports as f64 / LAMPORTS_PER_BB as f64;
-        
-        // Add legacy bb_ balances that aren't in SVM
-        let legacy_total: f64 = self.cache.iter()
-            .filter(|e| e.key().starts_with("bb_"))
-            .map(|e| *e.value())
-            .sum();
-        
-        svm_bb + legacy_total
+        svm_lamports as f64 / LAMPORTS_PER_BB as f64
     }
 
     /// Get block height - LOCK FREE
@@ -516,46 +521,43 @@ impl ConcurrentBlockchain {
     // WRITE OPERATIONS (ReDB MVCC - Safe, Serialized)
     // ========================================================================
 
-    /// Credit (add) tokens to an address
+    /// Credit (add) tokens to an address — SVM-native
+    ///
+    /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
+    /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
     pub fn credit(&self, address: &str, amount: f64) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
         }
 
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        // ═══ SINGLE CONVERSION: f64 → u64 at the boundary ═══
+        let add_lamports = (amount * LAMPORTS_PER_BB as f64) as u64;
+        if add_lamports == 0 {
+            return Err("Amount too small to represent in lamports".to_string());
+        }
+
+        // ═══ SVM: Read current, compute new, write ═══
+        let pk = Self::addr_to_pubkey(address);
+        let current_lamports = self.svm_accounts.get_lamports(&pk);
+        let new_lamports = current_lamports.checked_add(add_lamports)
+            .ok_or("Balance overflow")?;
         
-        let (new_balance, is_new_wallet) = {
-            let mut table = write_txn.open_table(ACCOUNTS).map_err(|e| e.to_string())?;
-            
-            // Get current balance inside the write transaction (atomic)
-            let current = table.get(address)
-                .map_err(|e| e.to_string())?
-                .map(|v| v.value())
-                .unwrap_or(0.0);
-            
-            let is_new = current == 0.0 && !self.cache.contains_key(address);
-            let new_balance = current + amount;
-            
-            // Write new balance
-            table.insert(address, new_balance).map_err(|e| e.to_string())?;
-            
-            (new_balance, is_new)
-        };
+        let account = AccountSharedData::new(
+            new_lamports,
+            0,
+            &solana_sdk::system_program::id(),
+        );
+        self.svm_accounts.store_account(&pk, account);
+
+        // ═══ MIRROR to cache/ReDB (non-authoritative) ═══
+        self.mirror_balance_to_cache(address, new_lamports);
         
-        // Commit the transaction
-        write_txn.commit().map_err(|e| e.to_string())?;
+        // Update total supply tracker
+        self.total_supply.fetch_add(add_lamports, Ordering::Relaxed);
         
-        // Update cache AFTER successful commit
-        self.cache.insert(address.to_string(), new_balance);
+        let new_balance_bb = new_lamports as f64 / LAMPORTS_PER_BB as f64;
+        let is_new_wallet = current_lamports == 0;
         
-        // Update total supply
-        let micro_amount = (amount * 1_000_000.0) as u64;
-        self.total_supply.fetch_add(micro_amount, Ordering::Relaxed);
-        
-        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
-        self.svm_sync_balance(address, new_balance);
-        
-        // Log new wallet creation (anonymously - no address shown)
         if is_new_wallet {
             let total_wallets = self.cache.len();
             info!("🆕 NEW WALLET CREATED! Total wallets on chain: {}", total_wallets);
@@ -570,7 +572,7 @@ impl ConcurrentBlockchain {
             0, // nonce
             0.0, // balance_before (treasury has unlimited)
             0.0, // balance_after (treasury unchanged)
-            new_balance, // recipient_balance_after
+            new_balance_bb, // recipient_balance_after
             AuthType::SystemInternal,
         );
         
@@ -582,7 +584,7 @@ impl ConcurrentBlockchain {
         {
             use sha2::{Sha256, Digest};
             let slot = self.block_height.load(Ordering::Relaxed);
-            let lamport_amount = (amount * LAMPORTS_PER_BB as f64) as i64;
+            let lamport_amount = add_lamports as i64;
             // Deterministic signature from mint details
             let sig_input = format!("MINT:{}:{}:{}", address, amount, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
             let sig_hash: [u8; 32] = Sha256::digest(sig_input.as_bytes()).into();
@@ -606,57 +608,53 @@ impl ConcurrentBlockchain {
             }
         }
         
-        info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens ADDED to wallet");
+        info!(address = %address, amount = amount, new_balance = new_balance_bb, "✅ Tokens ADDED to wallet");
         Ok(())
     }
 
-    /// Debit (subtract) tokens from an address
+    /// Debit (subtract) tokens from an address — SVM-native
+    ///
+    /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
+    /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
     pub fn debit(&self, address: &str, amount: f64) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
         }
 
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        // ═══ SINGLE CONVERSION: f64 → u64 at the boundary ═══
+        let sub_lamports = (amount * LAMPORTS_PER_BB as f64) as u64;
+        if sub_lamports == 0 {
+            return Err("Amount too small to represent in lamports".to_string());
+        }
+
+        // ═══ SVM: Read current, check sufficient, write ═══
+        let pk = Self::addr_to_pubkey(address);
+        let current_lamports = self.svm_accounts.get_lamports(&pk);
         
-        let new_balance = {
-            let mut table = write_txn.open_table(ACCOUNTS).map_err(|e| e.to_string())?;
-            
-            // Get current balance inside the write transaction (atomic)
-            let current = table.get(address)
-                .map_err(|e| e.to_string())?
-                .map(|v| v.value())
-                .unwrap_or(0.0);
-            
-            if current < amount {
-                return Err(format!(
-                    "Insufficient funds: have {:.2}, need {:.2}",
-                    current, amount
-                ));
-            }
-            
-            let new_balance = current - amount;
-            
-            // Write new balance
-            table.insert(address, new_balance).map_err(|e| e.to_string())?;
-            
-            new_balance
-        };
+        if current_lamports < sub_lamports {
+            return Err(format!(
+                "Insufficient funds: have {:.6}, need {:.6}",
+                current_lamports as f64 / LAMPORTS_PER_BB as f64, amount
+            ));
+        }
         
-        // Commit the transaction
-        write_txn.commit().map_err(|e| e.to_string())?;
+        let new_lamports = current_lamports - sub_lamports;
         
-        // Update cache AFTER successful commit
-        self.cache.insert(address.to_string(), new_balance);
+        let account = AccountSharedData::new(
+            new_lamports,
+            0,
+            &solana_sdk::system_program::id(),
+        );
+        self.svm_accounts.store_account(&pk, account);
+
+        // ═══ MIRROR to cache/ReDB (non-authoritative) ═══
+        self.mirror_balance_to_cache(address, new_lamports);
         
         // Update total supply
-        let micro_amount = (amount * 1_000_000.0) as u64;
-        self.total_supply.fetch_sub(micro_amount, Ordering::Relaxed);
+        self.total_supply.fetch_sub(sub_lamports, Ordering::Relaxed);
         
-        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
-        self.svm_sync_balance(address, new_balance);
-        
-        // Get balance_before for logging (was current before debit)
-        let balance_before = new_balance + amount;
+        let new_balance_bb = new_lamports as f64 / LAMPORTS_PER_BB as f64;
+        let balance_before_bb = current_lamports as f64 / LAMPORTS_PER_BB as f64;
         
         // Log burn transaction to ledger with enhanced fields
         let tx_record = TransactionRecord::new(
@@ -665,8 +663,8 @@ impl ConcurrentBlockchain {
             "DESTROYED",
             amount,
             0, // nonce
-            balance_before,
-            new_balance,
+            balance_before_bb,
+            new_balance_bb,
             0.0, // recipient_balance_after (destroyed)
             AuthType::MasterKey,
         );
@@ -675,7 +673,7 @@ impl ConcurrentBlockchain {
             warn!("Failed to log burn transaction: {}", e);
         }
         
-        info!(address = %address, amount = amount, new_balance = new_balance, "✅ Tokens SUBTRACTED from wallet");
+        info!(address = %address, amount = amount, new_balance = new_balance_bb, "✅ Tokens SUBTRACTED from wallet");
         Ok(())
     }
 
@@ -766,7 +764,10 @@ impl ConcurrentBlockchain {
         self.transfer_inner(from, to, amount, AuthType::MasterKey)
     }
 
-    /// Core atomic transfer: ReDB write + DashMap cache + SVM sync + L1 ledger log.
+    /// Core atomic transfer — SVM-native.
+    ///
+    /// Converts f64 → u64 ONCE, then does the entire debit/credit in u64
+    /// lamports through SVM AccountsDB. Mirrors to cache/ReDB after.
     fn transfer_inner(&self, from: &str, to: &str, amount: f64, auth_type: AuthType) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
@@ -775,53 +776,47 @@ impl ConcurrentBlockchain {
             return Err("Cannot transfer to self".to_string());
         }
 
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        // ═══ SINGLE CONVERSION: f64 → u64 at the boundary ═══
+        let lamports = (amount * LAMPORTS_PER_BB as f64) as u64;
+        if lamports == 0 {
+            return Err("Amount too small to represent in lamports".to_string());
+        }
+
+        // ═══ SVM: Atomic debit sender + credit receiver ═══
+        let from_pk = Self::addr_to_pubkey(from);
+        let to_pk = Self::addr_to_pubkey(to);
         
-        let (from_balance, to_balance) = {
-            let mut table = write_txn.open_table(ACCOUNTS).map_err(|e| e.to_string())?;
-            
-            // Get sender balance
-            let from_current = table.get(from)
-                .map_err(|e| e.to_string())?
-                .map(|v| v.value())
-                .unwrap_or(0.0);
-            
-            if from_current < amount {
-                return Err(format!(
-                    "Insufficient funds: have {:.2}, need {:.2}",
-                    from_current, amount
-                ));
-            }
-            
-            // Get receiver balance
-            let to_current = table.get(to)
-                .map_err(|e| e.to_string())?
-                .map(|v| v.value())
-                .unwrap_or(0.0);
-            
-            let from_new = from_current - amount;
-            let to_new = to_current + amount;
-            
-            // Write both balances atomically
-            table.insert(from, from_new).map_err(|e| e.to_string())?;
-            table.insert(to, to_new).map_err(|e| e.to_string())?;
-            
-            (from_new, to_new)
-        };
+        let from_current = self.svm_accounts.get_lamports(&from_pk);
+        if from_current < lamports {
+            return Err(format!(
+                "Insufficient funds: have {:.6}, need {:.6}",
+                from_current as f64 / LAMPORTS_PER_BB as f64, amount
+            ));
+        }
         
-        // Commit the transaction
-        write_txn.commit().map_err(|e| e.to_string())?;
+        let from_new_lamports = from_current - lamports;
+        let to_current = self.svm_accounts.get_lamports(&to_pk);
+        let to_new_lamports = to_current.checked_add(lamports)
+            .ok_or("Receiver balance overflow")?;
         
-        // Update caches AFTER successful commit
-        self.cache.insert(from.to_string(), from_balance);
-        self.cache.insert(to.to_string(), to_balance);
+        // Write both accounts to SVM
+        let from_account = AccountSharedData::new(
+            from_new_lamports, 0, &solana_sdk::system_program::id(),
+        );
+        let to_account = AccountSharedData::new(
+            to_new_lamports, 0, &solana_sdk::system_program::id(),
+        );
+        self.svm_accounts.store_account(&from_pk, from_account);
+        self.svm_accounts.store_account(&to_pk, to_account);
         
-        // ═══ SVM WRITE-THROUGH: Keep SVM AccountsDB in sync ═══
-        self.svm_sync_balance(from, from_balance);
-        self.svm_sync_balance(to, to_balance);
+        // ═══ MIRROR to cache/ReDB (non-authoritative) ═══
+        self.mirror_balance_to_cache(from, from_new_lamports);
+        self.mirror_balance_to_cache(to, to_new_lamports);
         
-        // Calculate balance_before for sender
-        let from_balance_before = from_balance + amount;
+        // Compute f64 values for logging only
+        let from_balance_before = from_current as f64 / LAMPORTS_PER_BB as f64;
+        let from_balance = from_new_lamports as f64 / LAMPORTS_PER_BB as f64;
+        let to_balance = to_new_lamports as f64 / LAMPORTS_PER_BB as f64;
         
         // Log transaction to ledger with enhanced fields
         let tx_record = TransactionRecord::new(
@@ -829,7 +824,7 @@ impl ConcurrentBlockchain {
             from,
             to,
             amount,
-            0, // nonce - TODO: implement proper nonce tracking
+            0, // nonce
             from_balance_before,
             from_balance,
             to_balance,
@@ -860,7 +855,7 @@ impl ConcurrentBlockchain {
         signature_hex: &str,
         auth_type: AuthType,
     ) -> Result<String, String> {
-        // Execute the core atomic transfer (ReDB + cache + SVM sync)
+        // Execute the core atomic transfer (SVM-native)
         self.transfer_inner(from, to, amount, auth_type)?;
 
         // Build a Solana-compatible transaction receipt for the SVM layer

@@ -77,7 +77,7 @@
 //
 // ============================================================================
 
-const LAMPORTS_PER_BB = 1_000_000_000;
+const LAMPORTS_PER_BB = 100_000;
 const CHAIN_ID = 0xBB;
 const MAX_FAUCET_BB = 99_999;
 
@@ -350,7 +350,7 @@ class BlackBookWalletSDK {
    * @returns {Promise<BalanceResult>}
    *
    * @typedef {Object} BalanceResult
-   * @property {number} lamports - Balance in lamports (1 BB = 1,000,000,000 lamports)
+   * @property {number} lamports - Balance in lamports (1 BB = 100,000 lamports)
    * @property {number} bb       - Balance in BB
    *
    * @example

@@ -300,7 +300,7 @@ impl SplTokenEngine {
         };
 
         let mint_account = AccountSharedData::from(Account {
-            lamports: 1_000_000_000, // rent-exempt minimum (not spent, just SOL-compat marker)
+            lamports: 1_000_000, // rent-exempt minimum (not spent, just SOL-compat marker)
             data: mint_layout.to_bytes(),
             owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
             executable: false,
@@ -386,7 +386,7 @@ impl SplTokenEngine {
             };
 
             AccountSharedData::from(Account {
-                lamports: 1_000_000_000, // rent-exempt
+                lamports: 1_000_000, // rent-exempt
                 data: token_account.to_bytes(),
                 owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
                 executable: false,
@@ -474,7 +474,7 @@ impl SplTokenEngine {
                 close_authority: [0u8; 32],
             };
             AccountSharedData::from(Account {
-                lamports: 1_000_000_000,
+                lamports: 1_000_000,
                 data: new_token_account.to_bytes(),
                 owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
                 executable: false,

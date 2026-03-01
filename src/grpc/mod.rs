@@ -236,16 +236,16 @@ impl L1Settlement for L1SettlementService {
         let req = request.into_inner();
         info!("gRPC GetBalance: {}", req.address);
 
-        let balance = self.blockchain.get_balance(&req.address);
-        let locked = self.asset_manager.get_soft_locked_amount(&req.address);
+        let balance = self.blockchain.get_balance_lamports(&req.address);
+        let locked = (self.asset_manager.get_soft_locked_amount(&req.address) * crate::svm::types::LAMPORTS_PER_BB as f64) as u64;
 
         Ok(Response::new(BalanceResponse {
             success: true,
             error: String::new(),
             address: req.address,
-            available: balance as u64,
-            locked: locked as u64,
-            total: (balance + locked) as u64,
+            available: balance,
+            locked,
+            total: balance + locked,
         }))
     }
 
@@ -257,16 +257,16 @@ impl L1Settlement for L1SettlementService {
         let req = request.into_inner();
         info!("gRPC GetVirtualBalance: L1={}, L2={}", req.l1_address, req.l2_address);
 
-        let l1_available = self.blockchain.get_balance(&req.l1_address);
-        let l1_locked = self.asset_manager.get_soft_locked_amount(&req.l1_address);
+        let l1_available = self.blockchain.get_balance_lamports(&req.l1_address);
+        let l1_locked = (self.asset_manager.get_soft_locked_amount(&req.l1_address) * crate::svm::types::LAMPORTS_PER_BB as f64) as u64;
 
         Ok(Response::new(VirtualBalanceResponse {
             success: true,
             error: String::new(),
-            l1_available: l1_available as u64,
-            l1_locked: l1_locked as u64,
-            l2_in_positions: l1_locked as u64,
-            virtual_available: l1_available as u64,
+            l1_available,
+            l1_locked,
+            l2_in_positions: l1_locked,
+            virtual_available: l1_available,
         }))
     }
 

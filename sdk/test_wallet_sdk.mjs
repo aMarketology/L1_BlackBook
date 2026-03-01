@@ -386,15 +386,15 @@ async function run() {
   // ── 21-22. Static Utilities ────────────────────────────────────
   console.log('\n─── Static Utilities ───');
   try {
-    assert(BlackBookWalletSDK.toLamports(1) === 1_000_000_000, 'toLamports(1)');
-    assert(BlackBookWalletSDK.toLamports(0.5) === 500_000_000, 'toLamports(0.5)');
-    assert(BlackBookWalletSDK.toBB(1_000_000_000) === 1, 'toBB(1e9)');
+    assert(BlackBookWalletSDK.toLamports(1) === 100_000, 'toLamports(1)');
+    assert(BlackBookWalletSDK.toLamports(0.5) === 500_000, 'toLamports(0.5)');
+    assert(BlackBookWalletSDK.toBB(100_000) === 1, 'toBB(1e5)');
     assert(BlackBookWalletSDK.toBB(0) === 0, 'toBB(0)');
     ok('toLamports / toBB', 'round-trip correct');
   } catch (e) { fail('toLamports / toBB', e.message); }
 
   try {
-    const formatted = BlackBookWalletSDK.formatBB(2500000000000, 2);
+    const formatted = BlackBookWalletSDK.formatBB(2500000000, 2);
     assert(typeof formatted === 'string', 'formatBB not string');
     assert(formatted.includes('2,500') || formatted.includes('2500'), `unexpected: ${formatted}`);
 
@@ -458,7 +458,7 @@ async function run() {
   console.log('\n─── Exports ───');
   try {
     assert(typeof BlackBookWalletSDK === 'function', 'BlackBookWalletSDK not a function');
-    assert(LAMPORTS_PER_BB === 1_000_000_000, 'LAMPORTS wrong');
+    assert(LAMPORTS_PER_BB === 100_000, 'LAMPORTS wrong');
     assert(CHAIN_ID === 0xBB, 'CHAIN_ID wrong');
     assert(MAX_FAUCET_BB === 99_999, 'MAX_FAUCET_BB wrong');
     ok('Module exports', 'BlackBookWalletSDK, LAMPORTS_PER_BB, CHAIN_ID, MAX_FAUCET_BB, SSS_COMBOS');

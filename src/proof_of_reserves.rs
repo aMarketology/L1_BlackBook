@@ -64,7 +64,7 @@ use tracing::{info, debug, warn};
 pub struct AccountLeaf {
     /// Account address (wallet public key)
     pub address: String,
-    /// Balance in $BB (6 decimals: 1000000 = 1 BB)
+    /// Balance in $BB (5 decimals: 100000 = 1 BB)
     pub balance: u64,
     /// Optional: Salt for privacy (hash includes this to hide balance)
     pub salt: Option<String>,
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_account_leaf_hashing() {
-        let leaf = AccountLeaf::new("addr1".to_string(), 1000000);
+        let leaf = AccountLeaf::new("addr1".to_string(), 100000);
         let hash1 = leaf.hash();
         let hash2 = leaf.hash();
         assert_eq!(hash1, hash2, "Hashing should be deterministic");
@@ -494,10 +494,10 @@ mod tests {
 
     #[test]
     fn test_merkle_tree_single_leaf() {
-        let leaves = vec![AccountLeaf::new("addr1".to_string(), 1000000)];
+        let leaves = vec![AccountLeaf::new("addr1".to_string(), 100000)];
         let tree = MerkleTree::new(leaves);
         assert_eq!(tree.total_accounts(), 1);
-        assert_eq!(tree.total_reserves(), 1000000);
+        assert_eq!(tree.total_reserves(), 100000);
         assert!(!tree.root().is_empty());
     }
 

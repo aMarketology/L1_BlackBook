@@ -51,7 +51,7 @@
 //
 // ============================================================================
 
-const LAMPORTS_PER_BB = 1_000_000_000;
+const LAMPORTS_PER_BB = 100_000;
 const CHAIN_ID        = 0xBB;
 const MAX_FAUCET_BB   = 99_999;
 

@@ -317,7 +317,7 @@ pub async fn transfer_with_sss(
                 .as_secs(),
             data: TxData::TransferBb {
                 to: req.to_address.clone(),
-                amount: (req.amount * 1_000_000_000.0) as u64,
+                amount: (req.amount * 100_000.0) as u64,
             },
             signature: sig_hex.clone(),
             signer_pubkey: req.from_wallet_id.clone(),
@@ -407,7 +407,7 @@ pub async fn transfer_session_handler(
                 .as_secs(),
             data: TxData::TransferBb {
                 to: req.to_address.clone(),
-                amount: (req.amount * 1_000_000_000.0) as u64,
+                amount: (req.amount * 100_000.0) as u64,
             },
             signature: sig_hex.clone(),
             signer_pubkey: req.from_wallet_id.clone(),

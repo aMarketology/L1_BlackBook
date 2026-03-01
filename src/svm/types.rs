@@ -34,12 +34,14 @@ use solana_sdk::pubkey::Pubkey;
 // CONSTANTS
 // ============================================================================
 
-/// 1 BB token = 1,000,000,000 lamports.
+/// 1 BB token = 100,000 lamports (5 decimals).
 ///
-/// Mirrors SOL's denomination so existing Solana tooling stays compatible.
+/// At $0.10/BB the smallest unit (1 lamport) = $0.000001 — practical for
+/// micro-transactions without sub-cent precision bloat.
+///
 /// NEVER divide to get a fractional BB — always work in lamports and convert
 /// to human-readable BB only at display time.
-pub const LAMPORTS_PER_BB: u64 = 1_000_000_000;
+pub const LAMPORTS_PER_BB: u64 = 100_000;
 
 /// Maximum u64 used as the rent_epoch sentinel that means "rent-exempt forever".
 ///

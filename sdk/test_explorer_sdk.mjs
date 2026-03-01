@@ -270,7 +270,7 @@ async function run() {
   try {
     const bb = 123.456;
     const lamports = BlackBookExplorer.toLamports(bb);
-    assert(lamports === 123456000000, `toLamports(${bb}) = ${lamports}, expected 123456000000`);
+    assert(lamports === 123456000, `toLamports(${bb}) = ${lamports}, expected 123456000`);
     const backBB = BlackBookExplorer.toBB(lamports);
     assert(backBB === 123.456, `toBB(${lamports}) = ${backBB}, expected 123.456`);
     ok('toLamports / toBB', `${bb} BB ↔ ${lamports} lamports`);
@@ -278,7 +278,7 @@ async function run() {
 
   // 18. formatBB
   try {
-    const formatted = BlackBookExplorer.formatBB(1000000000000, 2); // 1000 BB
+    const formatted = BlackBookExplorer.formatBB(100000000, 2); // 1000 BB
     assert(typeof formatted === 'string', 'formatBB not a string');
     assert(formatted.includes('1,000') || formatted.includes('1000'), `unexpected format: ${formatted}`);
     ok('formatBB()', `1000 BB → "${formatted}"`);
@@ -323,7 +323,7 @@ async function run() {
 
   // 22. formatWithUnit
   try {
-    const out = BlackBookExplorer.formatWithUnit(5000000000);
+    const out = BlackBookExplorer.formatWithUnit(5000000);
     assert(out.includes('BB'), 'formatWithUnit missing BB suffix');
     assert(out.includes('5'), 'formatWithUnit missing amount');
     ok('formatWithUnit()', `5 BB → "${out}"`);
@@ -354,7 +354,7 @@ async function run() {
   console.log('\n─── Exports ───');
   try {
     assert(typeof BlackBookExplorer === 'function', 'BlackBookExplorer not exported');
-    assert(LAMPORTS_PER_BB === 1_000_000_000, 'LAMPORTS_PER_BB wrong');
+    assert(LAMPORTS_PER_BB === 100_000, 'LAMPORTS_PER_BB wrong');
     assert(CHAIN_ID === 0xBB, 'CHAIN_ID wrong');
     ok('Module exports', 'BlackBookExplorer, LAMPORTS_PER_BB, CHAIN_ID');
   } catch (e) { fail('Module exports', e.message); }

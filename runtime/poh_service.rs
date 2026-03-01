@@ -301,11 +301,29 @@ impl TransactionPipeline {
             println!("📥 Fetch stage started");
             
             while let Some(packet) = rx.recv().await {
-                // Simulate signature verification (in real system, this is GPU-parallel)
                 let start = Instant::now();
                 
-                // Fast signature check simulation
-                let signature_valid = !packet.from.is_empty() && packet.amount >= 0.0;
+                // Real Ed25519 signature verification
+                let signature_valid = if packet.signature.is_empty() || packet.from.is_empty() {
+                    false
+                } else {
+                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                    (|| -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+                        // Parse pubkey from hex (32 bytes)
+                        let pubkey_bytes = hex::decode(&packet.from)?;
+                        if pubkey_bytes.len() != 32 { return Ok(false); }
+                        
+                        // Parse signature (64 bytes)
+                        if packet.signature.len() != 64 { return Ok(false); }
+                        
+                        let vk = VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into()?)?;
+                        let sig = Signature::from_bytes(packet.signature.as_slice().try_into()?);
+                        
+                        // Message format: "from:to:amount"
+                        let msg = format!("{}:{}:{}", packet.from, packet.to, packet.amount);
+                        Ok(vk.verify(msg.as_bytes(), &sig).is_ok())
+                    })().unwrap_or(false)
+                };
                 
                 let verification_time_us = start.elapsed().as_micros() as u64;
                 

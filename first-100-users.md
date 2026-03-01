@@ -223,7 +223,7 @@ curl -s https://rpc-au.blackbook.io:8899 \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk"]}' \
   | jq .result.value
-# → 500000000000  (500 BB in lamports)
+# → 500000000  (500 BB in lamports)
 ```
 
 ---

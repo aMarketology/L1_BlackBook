@@ -232,36 +232,65 @@ impl ReaderNode {
         Ok(())
     }
 
-    /// Apply balance changes from block transactions to local DashMap cache.
+    /// Apply balance changes from block transactions to the SVM AccountsDB.
     /// Reader nodes don't re-execute SVM — they trust the writer's state after
-    /// verifying the block hash chain. This keeps the DashMap cache warm for
-    /// local RPC queries like getBalance.
+    /// verifying the block hash chain. We apply deltas directly to the SVM
+    /// (the single source of truth) and mirror to the f64 DashMap cache.
     fn apply_block_balances(&self, block: &FinalizedBlock) {
+        use crate::svm::types::LAMPORTS_PER_BB;
+        use solana_sdk::account::AccountSharedData;
+        use solana_sdk::account::ReadableAccount;
+
         for otx in &block.transactions {
             match &otx.tx.data {
                 crate::protocol::blockchain::TxData::TransferBb { to, amount } => {
-                    let bb_amount = *amount as f64 / 1_000_000.0;
-                    // Debit sender
-                    if let Some(mut bal) = self.blockchain.cache.get_mut(&otx.tx.from) {
-                        *bal -= bb_amount;
-                        if *bal < 0.0 { *bal = 0.0; }
-                    }
-                    // Credit receiver
-                    self.blockchain.cache
-                        .entry(to.clone())
-                        .and_modify(|b| *b += bb_amount)
-                        .or_insert(bb_amount);
+                    let lamports = *amount * LAMPORTS_PER_BB;
+
+                    // Debit sender via SVM
+                    let from_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&otx.tx.from);
+                    let from_cur = self.blockchain.svm_accounts
+                        .get_account(&from_pk)
+                        .map(|a| a.lamports())
+                        .unwrap_or(0);
+                    let from_new = from_cur.saturating_sub(lamports);
+                    let from_acct = AccountSharedData::new(
+                        from_new, 0, &solana_sdk::system_program::id(),
+                    );
+                    self.blockchain.svm_accounts.store_account(&from_pk, from_acct);
+                    self.blockchain.mirror_balance_to_cache(&otx.tx.from, from_new);
+
+                    // Credit receiver via SVM
+                    let to_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(to);
+                    let to_cur = self.blockchain.svm_accounts
+                        .get_account(&to_pk)
+                        .map(|a| a.lamports())
+                        .unwrap_or(0);
+                    let to_new = to_cur + lamports;
+                    let to_acct = AccountSharedData::new(
+                        to_new, 0, &solana_sdk::system_program::id(),
+                    );
+                    self.blockchain.svm_accounts.store_account(&to_pk, to_acct);
+                    self.blockchain.mirror_balance_to_cache(to, to_new);
                 }
                 crate::protocol::blockchain::TxData::DepositUsdt { usdt_amount, .. } => {
                     // Mint: credit recipient at 1:10 ratio
-                    let bb_amount = (*usdt_amount as f64) * 10.0;
-                    self.blockchain.cache
-                        .entry(otx.tx.from.clone())
-                        .and_modify(|b| *b += bb_amount)
-                        .or_insert(bb_amount);
+                    let bb_amount = (*usdt_amount as u64) * 10;
+                    let add_lamports = bb_amount * LAMPORTS_PER_BB;
+
+                    let pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&otx.tx.from);
+                    let cur = self.blockchain.svm_accounts
+                        .get_account(&pk)
+                        .map(|a| a.lamports())
+                        .unwrap_or(0);
+                    let new_lam = cur + add_lamports;
+                    let acct = AccountSharedData::new(
+                        new_lam, 0, &solana_sdk::system_program::id(),
+                    );
+                    self.blockchain.svm_accounts.store_account(&pk, acct);
+                    self.blockchain.mirror_balance_to_cache(&otx.tx.from, new_lam);
                 }
                 _ => {
-                    // Other transaction types don't affect balances in simple cache
+                    // Other transaction types don't affect balances
                 }
             }
         }

@@ -78,14 +78,14 @@ cargo run            # starts server on ports 8080 (HTTP) + 8899 (JSON-RPC)
 | File | Responsibility |
 |------|----------------|
 | mod.rs | Module root, re-exports all SVM types |
-| types.rs | `StoredAccount`, `SvmError`, `LAMPORTS_PER_BB` (1e9), constants |
+| types.rs | `StoredAccount`, `SvmError`, `LAMPORTS_PER_BB` (1e6), constants |
 | accounts_db.rs | `SvmAccountsDB` — DashMap hot-state + ReDB ACID persistence |
 | runtime.rs | `BlackBookSVM` — execution engine, blockhash queue, transfer execution |
 | spl_token.rs | **USDC SPL Token** — `SplTokenEngine`, mint/transfer/balance ops, ATA derivation |
 | tx_adapter.rs | Legacy `TxData` → SVM `TransferRequest` routing |
 
 **Key Constants:**
-- `LAMPORTS_PER_BB = 1_000_000_000` (9 decimals)
+- `LAMPORTS_PER_BB = 1_000_000` (6 decimals)
 - `USDC_DECIMALS = 6` / `USDC_UNIT = 1_000_000`
 - `SPL_TOKEN_PROGRAM_ID` = `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`
 - USDC Mint Authority = Dealer v2 wallet (`3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp`)
