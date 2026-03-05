@@ -476,8 +476,9 @@ pub struct PoHService {
     pub current_hash: String,
     /// Total hashes since genesis
     pub num_hashes: u64,
-    /// Current slot number
-    pub current_slot: u64,
+    /// Current slot number — shared Arc<AtomicU64> so BlockProducer,
+    /// GulfStream, Sealevel, and Pipeline all read the same slot.
+    pub current_slot: Arc<AtomicU64>,
     /// Current epoch
     pub current_epoch: u64,
     /// Configuration
@@ -499,6 +500,13 @@ pub struct PoHService {
 impl PoHService {
     /// Create a new PoH service with genesis hash
     pub fn new(config: PoHConfig) -> Self {
+        Self::with_slot(config, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Create a PoH service that shares a slot counter with the rest of the system.
+    /// This is the preferred constructor — ensures BlockProducer, GulfStream,
+    /// Pipeline, FinalityTracker, and Tower BFT all see the same slot.
+    pub fn with_slot(config: PoHConfig, current_slot: Arc<AtomicU64>) -> Self {
         let genesis_hash = Self::compute_genesis_hash();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         
@@ -507,7 +515,7 @@ impl PoHService {
         Self {
             current_hash: genesis_hash,
             num_hashes: 0,
-            current_slot: 0,
+            current_slot,
             current_epoch: 0,
             config,
             last_tick: Instant::now(),
@@ -583,18 +591,18 @@ impl PoHService {
     
     /// Advance to next slot
     pub fn advance_slot(&mut self) -> u64 {
-        self.current_slot += 1;
+        let new_slot = self.current_slot.fetch_add(1, Ordering::Relaxed) + 1;
         self.total_slots_produced += 1;
         self.current_entries.clear();
         
         // Check epoch transition
-        if self.current_slot % self.config.slots_per_epoch == 0 {
+        if new_slot % self.config.slots_per_epoch == 0 {
             self.current_epoch += 1;
             println!("📅 Epoch transition: now in epoch {} (slot {})", 
-                     self.current_epoch, self.current_slot);
+                     self.current_epoch, new_slot);
         }
         
-        self.current_slot
+        new_slot
     }
     
     /// Get current slot info as JSON
@@ -605,7 +613,7 @@ impl PoHService {
         
         serde_json::json!({
             "running": self.is_running,
-            "current_slot": self.current_slot,
+            "current_slot": self.current_slot.load(Ordering::Relaxed),
             "current_epoch": self.current_epoch,
             "num_hashes": self.num_hashes,
             "hashes_per_second": self.calculate_hash_rate(),
@@ -679,6 +687,13 @@ pub fn create_poh_service(config: PoHConfig) -> SharedPoHService {
     Arc::new(RwLock::new(PoHService::new(config)))
 }
 
+/// Create a PoH service that shares a slot counter with the rest of the system.
+/// The PoH clock, BlockProducer, GulfStream, Pipeline, etc. all read/write
+/// the same `Arc<AtomicU64>` — one clock, one truth.
+pub fn create_poh_service_with_slot(config: PoHConfig, slot: Arc<AtomicU64>) -> SharedPoHService {
+    Arc::new(RwLock::new(PoHService::with_slot(config, slot)))
+}
+
 /// Run the PoH clock continuously (call this in a tokio::spawn)
 pub async fn run_poh_clock(poh_service: SharedPoHService) {
     println!("🚀 Starting continuous PoH clock...");
@@ -715,7 +730,7 @@ pub async fn run_poh_clock(poh_service: SharedPoHService) {
             // Check if we should advance to next slot
             let should_advance = tick_count % poh.config.ticks_per_slot == 0;
             
-            (poh.current_slot, should_advance)
+            (poh.current_slot.load(Ordering::Relaxed), should_advance)
         };
         
         if should_advance {
@@ -778,7 +793,7 @@ mod tests {
         let config = PoHConfig::default();
         let service = PoHService::new(config);
         
-        assert_eq!(service.current_slot, 0);
+        assert_eq!(service.current_slot.load(Ordering::Relaxed), 0);
         assert_eq!(service.current_epoch, 0);
         assert_eq!(service.num_hashes, 0);
         assert!(!service.current_hash.is_empty());
@@ -804,9 +819,9 @@ mod tests {
         let config = PoHConfig::default();
         let mut service = PoHService::new(config);
         
-        assert_eq!(service.current_slot, 0);
+        assert_eq!(service.current_slot.load(Ordering::Relaxed), 0);
         service.advance_slot();
-        assert_eq!(service.current_slot, 1);
+        assert_eq!(service.current_slot.load(Ordering::Relaxed), 1);
     }
     
     #[test]

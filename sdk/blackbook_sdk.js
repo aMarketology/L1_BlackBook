@@ -1,90 +1,213 @@
 // ============================================================================
-// BLACKBOOK SDK — v4.0 — Unified Explorer + Wallet
+// BLACKBOOK AGENT SDK — v5.0 — AI Agent Microtransactions
 // ============================================================================
 //
-// Single-file SDK covering every BlackBook L1 HTTP and JSON-RPC endpoint.
-// Import this file for both the block explorer UI and the wallet UI.
+// Purpose-built SDK for AI agents running on Node.js (18+).
+// Uses native WebCrypto Ed25519 for key generation, signing, and verification.
+// No browser dependencies, no SSS, no localStorage — raw keypairs only.
 //
-// PUBLIC ENDPOINTS (no auth)          WALLET ENDPOINTS (SSS 2-of-3)
-// ─────────────────────────────────   ─────────────────────────────────────
-// getHealth()                         createWallet(username, opts)
-// getVersion()                        login({ walletId, shard1, ... })
-// getGenesisHash()                    logout({ sessionToken?, walletId? })
-// getSlot()                           transfer(from, to, bb, shardA, pass)
-// getEpochInfo()                      transferSession(token, from, to, bb)
-// getLatestBlockhash()                verifySss({ walletId, shard1, ... })
-// getSupply()                         verifySssCombo({ combo, ... })
-// getBalance(address)                 getShardB(walletId)
-// getBalances(addresses[])            faucet(address, bb)
-// getAccountInfo(address)             saveWalletLocal(wallet)
-// getSignaturesForAddress(addr, n)    loadWalletLocal()
-// getTransaction(sig)                 deleteWalletLocal(walletId)
-// getStats()
-// getLedger(page, limit)
-// getPohStatus()
-// getLatestBlock()
-// getBlockBySlot(slot)
-// getTxStatus(txId)
-// getTowerBft()
-// getTurbineStatus()
-// getUsdcBalance(address)
-// getUsdcSupply()
-// getUsdcAccounts(address)
-// getReserves()
+// ┌──────────────────────────────────────────────────────────────────────┐
+// │  AI AGENT LIFECYCLE                                                 │
+// │                                                                     │
+// │  1. const agent = await BlackBookAgent.create(API_URL)              │
+// │     → generates Ed25519 keypair in memory                           │
+// │                                                                     │
+// │  2. await agent.fundMe(1000)                                        │
+// │     → faucet with auto-signed Ed25519 auth                          │
+// │                                                                     │
+// │  3. await agent.send(recipientAddr, 0.5)                            │
+// │     → signed transfer via /transfer/simple                          │
+// │                                                                     │
+// │  4. await agent.submitSealevel(recipientAddr, 0.1)                  │
+// │     → parallel execution via Gulf Stream                            │
+// │                                                                     │
+// │  5. await agent.sendUsdc(recipientAddr, 10.0)                       │
+// │     → USDC transfer with Ed25519 auth                               │
+// │                                                                     │
+// │  Every write is Ed25519-signed client-side, verified server-side.   │
+// │  Replay protection: nonce + timestamp (60s window).                 │
+// └──────────────────────────────────────────────────────────────────────┘
 //
+// ENDPOINTS COVERED
 // ─────────────────────────────────────────────────────────────────────────────
-// Quick start:
+// WRITE (Ed25519 signed)              READ (no auth)
+// ─────────────────────────────────   ─────────────────────────────────────
+// send(to, amount)                    getHealth()
+// submitSealevel(to, amount, opts)    getVersion()
+// fundMe(amount)                      getSlot()
+// sendUsdc(to, amount)                getEpochInfo()
+//                                     getLatestBlockhash()
+// ADMIN / DEALER                      getGenesisHash()
+// ─────────────────────────────────   getBalance(addr)
+// adminMint(to, amount, opts)         getBalances(addrs[])
+// adminBurn(from, amount, opts)       getAccountInfo(addr)
+// adminAccounts()                     getSignaturesForAddress(addr, n)
+// adminUsdcMint(to, amount)           getTransaction(sig)
+//                                     getStats()
+// KEYPAIR                             getNodeHealth()
+// ─────────────────────────────────   getLedger(page, limit)
+// BlackBookAgent.create(url)          getPohStatus()
+// BlackBookAgent.fromHex(url, hex)    getLatestBlock()
+// agent.exportKeypair()               getBlockBySlot(slot)
+// agent.address                       getTxStatus(txId)
+// agent.publicKeyHex                  getTowerBft()
+//                                     getTurbineStatus()
+//                                     getUsdcBalance(addr)
+//                                     getUsdcSupply()
+//                                     getUsdcAccounts(addr)
+//                                     getSupply()
+// ─────────────────────────────────────────────────────────────────────────────
 //
-//   <script src="blackbook_sdk.js"></script>
-//   const bb = new BlackBook('https://rpc.blackbook.finance:8899');
+// Quick start (Node.js 18+ with --experimental-vm-modules or .mjs):
 //
-//   // Explorer
-//   const { block } = await bb.getLatestBlock();
-//   console.log(`Slot ${block.slot}`);
+//   import { BlackBookAgent } from './blackbook_sdk.js';
 //
-//   // Wallet
-//   const wallet = await bb.createWallet('alice', { password: 'hunter2' });
-//   const result = await bb.transfer(wallet.address, recipientAddr, 10, wallet.shardA, 'hunter2');
+//   const agent = await BlackBookAgent.create('http://localhost:8080');
+//   await agent.fundMe(100);
+//   const bal = await agent.myBalance();
+//   console.log(`Agent ${agent.address} has ${bal.bb} BB`);
 //
-// Node.js:
-//   const { BlackBook } = require('./blackbook_sdk');
+//   const result = await agent.send(recipientAddr, 5.0);
+//   console.log(`Sent! sig: ${result.signature}`);
 //
 // ============================================================================
+
+import { webcrypto } from 'node:crypto';
 
 const LAMPORTS_PER_BB = 100_000;
 const CHAIN_ID        = 0xBB;
-const MAX_FAUCET_BB   = 99_999;
-
-const SSS_COMBOS = {
-  AB: { label: 'A + B', desc: 'User + Server', shards: ['A', 'B'] },
-  AC: { label: 'A + C', desc: 'User + Cold',   shards: ['A', 'C'] },
-  BC: { label: 'B + C', desc: 'Server + Cold', shards: ['B', 'C'] },
-};
 
 // ============================================================================
-// BLACKBOOK — Unified SDK class
+// BLACKBOOK AGENT — Ed25519 AI Agent SDK
 // ============================================================================
 
-class BlackBook {
+class BlackBookAgent {
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CONSTRUCTION — use static factories, not `new`
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
-   * @param {string} rpcUrl   - JSON-RPC endpoint, e.g. 'http://localhost:8899'
-   * @param {string} [apiUrl] - HTTP API endpoint, e.g. 'http://localhost:8080'
-   *                            Defaults to rpcUrl with port swapped to 8080.
-   * @param {Object} [opts]
-   * @param {number} [opts.timeout=30000] - Request timeout in ms
+   * @private — use BlackBookAgent.create() or BlackBookAgent.fromHex()
    */
-  constructor(rpcUrl, apiUrl, opts = {}) {
-    this.rpcUrl  = rpcUrl.replace(/\/+$/, '');
-    this.apiUrl  = (apiUrl || rpcUrl.replace(':8899', ':8080')).replace(/\/+$/, '');
-    this.timeout = opts.timeout || 30_000;
-    this._rpcId  = 0;
+  constructor(apiUrl, rpcUrl, keyPair, publicKeyHex, address) {
+    /** @type {string} HTTP API base (port 8080) */
+    this.apiUrl = apiUrl.replace(/\/+$/, '');
+
+    /** @type {string} JSON-RPC base (port 8899) */
+    this.rpcUrl = (rpcUrl || apiUrl.replace(':8080', ':8899')).replace(/\/+$/, '');
+
+    /** @type {CryptoKeyPair} WebCrypto Ed25519 key pair */
+    this._keyPair = keyPair;
+
+    /** @type {string} 64-char hex public key */
+    this.publicKeyHex = publicKeyHex;
+
+    /** @type {string} Wallet address (= hex pubkey) */
+    this.address = address;
+
+    /** @type {number} Request timeout in ms */
+    this.timeout = 30_000;
+
+    /** @private JSON-RPC ID counter */
+    this._rpcId = 0;
   }
 
+  /**
+   * Create a new agent with a fresh Ed25519 keypair.
+   *
+   * @param {string} apiUrl - HTTP API endpoint (port 8080)
+   * @param {string} [rpcUrl] - JSON-RPC endpoint (port 8899), auto-derived if omitted
+   * @returns {Promise<BlackBookAgent>}
+   *
+   * @example
+   *   const agent = await BlackBookAgent.create('http://localhost:8080');
+   *   console.log(agent.address); // 64-char hex public key
+   */
+  static async create(apiUrl, rpcUrl) {
+    const keyPair = await webcrypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
+    const rawPub  = new Uint8Array(await webcrypto.subtle.exportKey('raw', keyPair.publicKey));
+    const pubHex  = Buffer.from(rawPub).toString('hex');
+    return new BlackBookAgent(apiUrl, rpcUrl, keyPair, pubHex, pubHex);
+  }
+
+  /**
+   * Restore an agent from a hex-encoded 64-byte Ed25519 keypair (seed + pubkey).
+   *
+   * @param {string} apiUrl
+   * @param {string} keypairHex - 128-char hex string (32-byte seed + 32-byte pubkey)
+   * @param {string} [rpcUrl]
+   * @returns {Promise<BlackBookAgent>}
+   *
+   * @example
+   *   const saved = await agent.exportKeypair();   // 128 hex chars
+   *   const agent2 = await BlackBookAgent.fromHex('http://localhost:8080', saved);
+   *   console.log(agent2.address === agent.address); // true
+   */
+  static async fromHex(apiUrl, keypairHex, rpcUrl) {
+    const raw    = Buffer.from(keypairHex, 'hex');
+    const seed   = raw.slice(0, 32);
+    const pubRaw = raw.slice(32, 64);
+    const pubHex = Buffer.from(pubRaw).toString('hex');
+
+    const privKey = await webcrypto.subtle.importKey(
+      'pkcs8', _ed25519Pkcs8(seed), 'Ed25519', true, ['sign']
+    );
+    const pubKey = await webcrypto.subtle.importKey(
+      'raw', pubRaw, 'Ed25519', true, ['verify']
+    );
+    const keyPair = { privateKey: privKey, publicKey: pubKey };
+    return new BlackBookAgent(apiUrl, rpcUrl, keyPair, pubHex, pubHex);
+  }
+
+  /**
+   * Export the keypair as a 128-char hex string (seed + pubkey).
+   * Store this securely — it IS the private key.
+   *
+   * @returns {Promise<string>} 128-char hex (32-byte seed + 32-byte pubkey)
+   */
+  async exportKeypair() {
+    const pkcs8  = new Uint8Array(await webcrypto.subtle.exportKey('pkcs8', this._keyPair.privateKey));
+    const seed   = pkcs8.slice(pkcs8.length - 32);
+    const rawPub = new Uint8Array(await webcrypto.subtle.exportKey('raw', this._keyPair.publicKey));
+    return Buffer.from(seed).toString('hex') + Buffer.from(rawPub).toString('hex');
+  }
+
+
   // ═══════════════════════════════════════════════════════════════════════════
-  // INTERNAL TRANSPORT
+  // INTERNAL — Transport
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /** @private */
+  /** @private HTTP GET */
+  async _get(path) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), this.timeout);
+    try {
+      const res  = await fetch(`${this.apiUrl}${path}`, { method: 'GET', signal: ctrl.signal });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    } finally { clearTimeout(t); }
+  }
+
+  /** @private HTTP POST */
+  async _post(path, body = {}) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), this.timeout);
+    try {
+      const res = await fetch(`${this.apiUrl}${path}`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+        signal:  ctrl.signal,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    } finally { clearTimeout(t); }
+  }
+
+  /** @private JSON-RPC 2.0 */
   async _rpc(method, params = []) {
     const id   = ++this._rpcId;
     const ctrl = new AbortController();
@@ -123,41 +246,239 @@ class BlackBook {
     } finally { clearTimeout(t); }
   }
 
-  /** @private HTTP GET */
-  async _get(path) {
-    const ctrl = new AbortController();
-    const t    = setTimeout(() => ctrl.abort(), this.timeout);
-    try {
-      const res  = await fetch(`${this.apiUrl}${path}`, { method: 'GET', signal: ctrl.signal });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      return data;
-    } finally { clearTimeout(t); }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INTERNAL — Ed25519 Signing
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** @private Sign arbitrary bytes → hex signature (128 chars) */
+  async _sign(message) {
+    const msgBytes = typeof message === 'string' ? new TextEncoder().encode(message) : message;
+    const sigBytes = new Uint8Array(await webcrypto.subtle.sign('Ed25519', this._keyPair.privateKey, msgBytes));
+    return Buffer.from(sigBytes).toString('hex');
   }
 
-  /** @private HTTP POST (JSON body) */
-  async _post(path, body = {}) {
-    const ctrl = new AbortController();
-    const t    = setTimeout(() => ctrl.abort(), this.timeout);
-    try {
-      const res = await fetch(`${this.apiUrl}${path}`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(body),
-        signal:  ctrl.signal,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      return data;
-    } finally { clearTimeout(t); }
+  /** @private Generate nonce + timestamp for replay protection */
+  _replayFields() {
+    return {
+      timestamp: Math.floor(Date.now() / 1000),
+      nonce:     _uuid(),
+    };
   }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // NETWORK
+  // WRITE — BB Transfers (Ed25519 signed)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /** Check node health. Returns "ok" or throws. */
+  /**
+   * Send BB tokens to another address.
+   *
+   * Constructs the signed payload, signs with Ed25519, submits to
+   * `/transfer/simple`. Replay-protected with nonce + timestamp.
+   *
+   * @param {string} to       - Recipient address (hex pubkey)
+   * @param {number} amount   - Amount in BB (e.g. 0.5)
+   * @returns {Promise<{ success, signature, from, to, amount, from_balance, to_balance }>}
+   *
+   * @example
+   *   const r = await agent.send(recipientAddr, 5.0);
+   *   console.log(`Sent ${r.amount} BB — sig: ${r.signature}`);
+   */
+  async send(to, amount) {
+    const { timestamp, nonce } = this._replayFields();
+    const payload = JSON.stringify({ to, amount });
+
+    // Build message: chain_id byte + payload + \n + timestamp + \n + nonce
+    const msgParts = [
+      new Uint8Array([CHAIN_ID]),
+      new TextEncoder().encode(payload),
+      new TextEncoder().encode('\n'),
+      new TextEncoder().encode(timestamp.toString()),
+      new TextEncoder().encode('\n'),
+      new TextEncoder().encode(nonce),
+    ];
+    const msg = _concat(msgParts);
+    const signature = await this._sign(msg);
+
+    return this._post('/transfer/simple', {
+      public_key:     this.publicKeyHex,
+      wallet_address: this.address,
+      payload,
+      timestamp,
+      nonce,
+      chain_id:       CHAIN_ID,
+      signature,
+    });
+  }
+
+  /**
+   * Submit a transaction to the Sealevel parallel execution engine.
+   *
+   * Uses Gulf Stream (`/sealevel/submit`) for parallel execution.
+   * Ed25519 message format: "SEALEVEL:{from}:{to}:{amount}:{timestamp}:{nonce}"
+   *
+   * @param {string} to           - Recipient address
+   * @param {number} amount       - Amount in BB
+   * @param {Object} [opts]
+   * @param {number} [opts.priority] - Priority hint (higher = faster)
+   * @returns {Promise<{ success, tx_id, status }>}
+   *
+   * @example
+   *   const r = await agent.submitSealevel(recipientAddr, 0.01, { priority: 10 });
+   *   console.log(`TX pending: ${r.tx_id}`);
+   */
+  async submitSealevel(to, amount, opts = {}) {
+    const { timestamp, nonce } = this._replayFields();
+    const message = `SEALEVEL:${this.address}:${to}:${amount}:${timestamp}:${nonce}`;
+    const signature = await this._sign(message);
+
+    return this._post('/sealevel/submit', {
+      from:      this.address,
+      to,
+      amount,
+      priority:  opts.priority ?? undefined,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WRITE — Faucet (Ed25519 signed)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Request BB from the faucet (self-signed).
+   *
+   * Ed25519 message format: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
+   *
+   * @param {number} [amount=0.1] - Amount in BB
+   * @returns {Promise<{ success, minted, to, new_balance, auth_method }>}
+   *
+   * @example
+   *   await agent.fundMe(1000);
+   *   const bal = await agent.myBalance();
+   *   console.log(`Funded: ${bal.bb} BB`);
+   */
+  async fundMe(amount = 0.1) {
+    if (amount <= 0) throw new Error('Amount must be positive');
+    const { timestamp, nonce } = this._replayFields();
+    const message = `FAUCET:${this.address}:${amount}:${timestamp}:${nonce}`;
+    const signature = await this._sign(message);
+
+    return this._post('/faucet', {
+      to: this.address,
+      amount,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WRITE — USDC (Ed25519 signed)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Transfer USDC tokens to another address.
+   *
+   * Ed25519 message format: "USDC_TRANSFER:{from}:{to}:{amount}:{timestamp}:{nonce}"
+   *
+   * @param {string} to     - Recipient address (base58)
+   * @param {number} amount - Amount in human USDC (e.g. 10.50)
+   * @returns {Promise<{ success, amount_usdc, raw_amount, from, to, from_ata, to_ata, from_balance, to_balance }>}
+   *
+   * @example
+   *   const r = await agent.sendUsdc(recipientAddr, 25.0);
+   *   console.log(`Sent ${r.amount_usdc} USDC`);
+   */
+  async sendUsdc(to, amount) {
+    if (amount <= 0) throw new Error('Amount must be positive');
+    const { timestamp, nonce } = this._replayFields();
+    const message = `USDC_TRANSFER:${this.address}:${to}:${amount}:${timestamp}:${nonce}`;
+    const signature = await this._sign(message);
+
+    return this._post('/usdc/transfer', {
+      from: this.address,
+      to,
+      amount,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ADMIN — Dealer mint / burn (L2 settlement)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Mint BB tokens (Dealer / L2 settlement).
+   *
+   * @param {string} to          - Recipient address
+   * @param {number} amount      - Amount in BB
+   * @param {Object} [opts]
+   * @param {string} [opts.dealerSignature] - Dealer auth sig
+   * @param {string} [opts.l2ReceiptId]     - L2 receipt ID for audit trail
+   * @returns {Promise<{ success, minted, to, new_balance, l2_receipt_id }>}
+   */
+  async adminMint(to, amount, opts = {}) {
+    return this._post('/admin/mint', {
+      to,
+      amount,
+      dealer_signature: opts.dealerSignature ?? undefined,
+      l2_receipt_id:    opts.l2ReceiptId ?? undefined,
+    });
+  }
+
+  /**
+   * Burn BB tokens (Dealer / L2 settlement).
+   *
+   * @param {string} from   - Address to burn from
+   * @param {number} amount - Amount in BB
+   * @param {Object} [opts]
+   * @param {string} [opts.dealerSignature]
+   * @param {string} [opts.l2ReceiptId]
+   * @returns {Promise<{ success, burned, from, new_balance, l2_receipt_id }>}
+   */
+  async adminBurn(from, amount, opts = {}) {
+    return this._post('/admin/burn', {
+      from,
+      amount,
+      dealer_signature: opts.dealerSignature ?? undefined,
+      l2_receipt_id:    opts.l2ReceiptId ?? undefined,
+    });
+  }
+
+  /**
+   * List all accounts with non-zero balances.
+   * @returns {Promise<{ accounts: Array<{ address, balance, lamports }>, total_accounts, total_supply }>}
+   */
+  async adminAccounts() {
+    return this._get('/admin/accounts');
+  }
+
+  /**
+   * Mint USDC tokens (admin / Dealer).
+   *
+   * @param {string} to     - Recipient wallet address (base58)
+   * @param {number} amount - Amount in human USDC
+   * @returns {Promise<{ success, minted_usdc, raw_amount, to, ata, mint, new_total_supply }>}
+   */
+  async adminUsdcMint(to, amount) {
+    return this._post('/admin/usdc/mint', { to, amount });
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // READ — Network & Node
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** Check node health via JSON-RPC. Returns "ok" or throws. */
   async getHealth() { return this._rpc('getHealth'); }
 
   /** Node version: `{ 'solana-core': string, 'feature-set': number }` */
@@ -189,39 +510,41 @@ class BlackBook {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // SUPPLY
+  // READ — Supply
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * Total + circulating BB supply.
-   * @returns {Promise<{ totalLamports, totalBB, circulating }>}
+   * @returns {Promise<{ totalLamports: number, totalBB: number, circulating: number }>}
    */
   async getSupply() {
-    const result = await this._rpc('getSupply');
+    const r = await this._rpc('getSupply');
     return {
-      totalLamports: result.value.total,
-      totalBB:       result.value.total / LAMPORTS_PER_BB,
-      circulating:   result.value.circulating / LAMPORTS_PER_BB,
+      totalLamports: r.value.total,
+      totalBB:       r.value.total / LAMPORTS_PER_BB,
+      circulating:   r.value.circulating / LAMPORTS_PER_BB,
     };
   }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ACCOUNTS & BALANCES
+  // READ — Accounts & Balances
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * BB balance for one address.
-   * @returns {Promise<{ lamports, bb }>}
+   * @param {string} address
+   * @returns {Promise<{ lamports: number, bb: number }>}
    */
   async getBalance(address) {
-    const result = await this._rpc('getBalance', [address]);
-    return { lamports: result.value, bb: result.value / LAMPORTS_PER_BB };
+    const r = await this._rpc('getBalance', [address]);
+    return { lamports: r.value, bb: r.value / LAMPORTS_PER_BB };
   }
 
   /**
-   * BB balance via REST (returns address, balance in BB, name, unit).
-   * @returns {Promise<{ address, balance, name, unit }>}
+   * BB balance via REST (address, balance in BB, unit).
+   * @param {string} address
+   * @returns {Promise<{ address: string, balance: number, unit: string }>}
    */
   async getBalanceREST(address) {
     return this._get(`/balance/${address}`);
@@ -230,6 +553,7 @@ class BlackBook {
   /**
    * Batch balance lookup. Returns `{ [address]: { lamports, bb } }`.
    * @param {string[]} addresses
+   * @returns {Promise<Object.<string, { lamports: number, bb: number }>>}
    */
   async getBalances(addresses) {
     const calls   = addresses.map(a => ({ method: 'getBalance', params: [a] }));
@@ -246,15 +570,25 @@ class BlackBook {
 
   /**
    * Full account info (lamports, owner, data, executable) or null.
+   * @param {string} address
+   * @returns {Promise<Object|null>}
    */
   async getAccountInfo(address) {
-    const result = await this._rpc('getAccountInfo', [address, { encoding: 'base64' }]);
-    return result.value;
+    const r = await this._rpc('getAccountInfo', [address, { encoding: 'base64' }]);
+    return r.value;
+  }
+
+  /**
+   * Shortcut: get this agent's own balance.
+   * @returns {Promise<{ lamports: number, bb: number }>}
+   */
+  async myBalance() {
+    return this.getBalance(this.address);
   }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // TRANSACTIONS
+  // READ — Transactions
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -269,6 +603,8 @@ class BlackBook {
 
   /**
    * Full transaction detail by signature, or null.
+   * @param {string} signature
+   * @returns {Promise<Object|null>}
    */
   async getTransaction(signature) {
     return this._rpc('getTransaction', [signature, { encoding: 'json' }]);
@@ -276,506 +612,132 @@ class BlackBook {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // LEDGER
+  // READ — Ledger
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Paginated ASCII audit ledger.
-   * @param {number} [page=1]   - Page number (1-indexed)
-   * @param {number} [limit=50] - Rows per page (max 100)
+   * Paginated audit ledger (JSON format).
+   * @param {number} [page=1]
+   * @param {number} [limit=50]
    */
   async getLedger(page = 1, limit = 50) {
-    return this._get(`/ledger?page=${page}&limit=${limit}`);
+    return this._get(`/ledger?page=${page}&limit=${limit}&format=json`);
   }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // POH — Proof of History clock & blocks
+  // READ — PoH / Blocks
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * Current PoH clock: `{ current_slot, num_hashes, current_hash, is_running }`.
-   */
+  /** Current PoH clock: `{ current_slot, num_hashes, current_hash, is_running }` */
   async getPohStatus() { return this._get('/poh/status'); }
 
-  /**
-   * Latest finalized block: `{ success, block: { slot, hash, tx_count, leader, epoch, ... } }`.
-   */
+  /** Latest finalized block with header + tx list. */
   async getLatestBlock() { return this._get('/poh/block/latest'); }
 
   /**
    * Block by slot (includes full transaction list).
    * @param {number} slot
-   * @returns {Promise<{ success, block: { slot, hash, transactions[], tx_count, confirmations, ... } }>}
    */
   async getBlockBySlot(slot) { return this._get(`/poh/block/${slot}`); }
 
   /**
    * Finality status for a transaction.
-   * @param {string} txId - Transaction hash / ID
+   * @param {string} txId
    * @returns {Promise<{ tx_id, status, is_finalized }>}
    */
   async getTxStatus(txId) { return this._get(`/poh/tx/${encodeURIComponent(txId)}/status`); }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // CONSENSUS & PROPAGATION
+  // READ — Consensus & Propagation
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * Tower BFT state: `{ validator_count, global_root, confirmed_slots, active_forks, best_fork, ... }`.
-   */
+  /** Tower BFT consensus state. */
   async getTowerBft() { return this._get('/consensus/tower'); }
 
-  /**
-   * Turbine shred propagation status: `{ data_shreds, fec_shreds, max_hops, ... }`.
-   */
+  /** Turbine shred propagation status. */
   async getTurbineStatus() { return this._get('/turbine/status'); }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // USDC (SPL Token)
+  // READ — USDC (SPL Token)
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * USDC balance for an address.
+   * @param {string} address
    * @returns {Promise<{ address, balance_usdc, raw_balance, decimals, mint }>}
    */
   async getUsdcBalance(address) { return this._get(`/usdc/balance/${address}`); }
 
-  /**
-   * Total USDC supply on-chain.
-   * @returns {Promise<{ mint, total_supply, raw_supply, decimals }>}
-   */
+  /** Total USDC supply on-chain. */
   async getUsdcSupply() { return this._get('/usdc/supply'); }
 
   /**
    * All USDC token accounts (ATAs) for a wallet.
-   * @returns {Promise<{ owner, token_accounts: Array<{ address, mint, owner, balance_usdc, ... }> }>}
+   * @param {string} address
    */
   async getUsdcAccounts(address) { return this._get(`/usdc/accounts/${address}`); }
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // PROOF OF RESERVES
+  // UTILITIES
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * Proof-of-reserves data (BB supply vs USDC backing).
-   * @returns {Promise<{ bbSupply, usdcHeld, ratio, fullyBacked, merkleRoot, lastVerified }>}
-   */
-  async getReserves() {
-    const d = await this._get('/reserves');
-    return {
-      bbSupply:          d.bb_supply_bb ?? d.bb_supply,
-      bbSupplyLamports:  d.bb_supply,
-      usdcHeld:          d.usdc_held,
-      usdcReserveWallet: d.usdc_reserve_wallet,
-      ratio:             d.ratio,
-      fullyBacked:       d.fully_backed,
-      merkleRoot:        d.merkle_root,
-      lastVerified:      d.last_verified,
-      solanaExplorerUrl: d.solana_explorer_url,
-    };
-  }
+  static toLamports(bb)   { return Math.floor(bb * LAMPORTS_PER_BB); }
+  static toBB(lamports)   { return lamports / LAMPORTS_PER_BB; }
 
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WALLET — Create / Login / Logout
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Create a new Shamir 2-of-3 wallet (BIP-39 → Ed25519 → SSS split).
-   *
-   * @param {string} username              - Username
-   * @param {Object} [opts]
-   * @param {string} [opts.password]       - Encrypts Shard A (strongly recommended)
-   * @param {string} [opts.pin]            - PIN for high-value tx confirmation
-   * @param {number} [opts.dailyLimit]     - BB threshold requiring PIN
-   * @returns {Promise<{ walletId, address, mnemonic, shardA, shardAIsEncrypted, shardC, publicKey, sessionToken }>}
-   *
-   * @example
-   *   const w = await bb.createWallet('alice', { password: 'hunter2' });
-   *   // ⚠ Show w.mnemonic and w.shardC to user ONCE, then discard
-   *   bb.saveWalletLocal(w);
-   */
-  async createWallet(username, opts = {}) {
-    const r = await this._post('/wallet/create', {
-      username,
-      password:    opts.password   || undefined,
-      pin:         opts.pin        || undefined,
-      daily_limit: opts.dailyLimit || undefined,
-    });
-    return {
-      walletId:          r.wallet_id,
-      address:           r.address,
-      mnemonic:          r.mnemonic,
-      shardA:            r.share_a,
-      shardAIsEncrypted: r.share_a_is_encrypted,
-      shardC:            r.share_c,
-      publicKey:         r.public_key,
-      sessionToken:      r.session_token,
-    };
-  }
-
-  /**
-   * Login: reconstruct wallet from 2 Shamir shards → session token.
-   *
-   * @param {Object} params
-   * @param {string} params.walletId
-   * @param {string} params.shard1   - Encrypted Shard A blob (from localStorage)
-   * @param {string} [params.shard2] - Omit to have server auto-fetch Shard B
-   * @param {string} [params.password] - Required if shard1 is encrypted
-   * @param {boolean} [params.shard2IsServerEncrypted=true]
-   * @returns {Promise<{ success, walletId, sessionToken }>}
-   *
-   * @example
-   *   const { sessionToken } = await bb.login({
-   *     walletId: saved.walletId,
-   *     shard1:   saved.shardA,
-   *     password: 'hunter2',
-   *   });
-   */
-  async login({ walletId, shard1, shard2 = '', password, shard2IsServerEncrypted = true }) {
-    const r = await this._post('/wallet/login', {
-      wallet_id:                   walletId,
-      shard_1:                     shard1,
-      shard_2:                     shard2,
-      password:                    password || undefined,
-      shard_2_is_server_encrypted: shard2IsServerEncrypted,
-    });
-    return { success: r.success, walletId: r.wallet_id, sessionToken: r.session_token };
-  }
-
-  /**
-   * Revoke a session server-side (delete cached Ed25519 seed).
-   *
-   * @param {Object} [opts]
-   * @param {string} [opts.sessionToken] - Specific session to revoke
-   * @param {string} [opts.walletId]     - Revoke all sessions for this wallet
-   * @returns {Promise<{ success: boolean }>}
-   *
-   * @example
-   *   await bb.logout({ sessionToken });
-   */
-  async logout({ sessionToken, walletId } = {}) {
-    return this._post('/wallet/logout', {
-      session_token: sessionToken || undefined,
-      wallet_id:     walletId     || undefined,
-    });
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WALLET — Transfers
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Transfer BB using SSS 2-of-3 authentication.
-   *
-   * The server decrypts Shard A (Argon2id + AES-GCM), fetches + decrypts
-   * Shard B, reconstructs the Ed25519 key, signs, executes, and zeroizes.
-   *
-   * @param {string} fromWalletId
-   * @param {string} toAddress
-   * @param {number} amountBB      - Amount in BB (e.g. 50 for 50 BB)
-   * @param {string} shardA        - Encrypted blob (salt:nonce:ciphertext)
-   * @param {string} password      - Password used to encrypt Shard A
-   * @returns {Promise<{ success, signature, from, to, amount, fromBalance, toBalance, sessionToken }>}
-   *
-   * @example
-   *   const r = await bb.transfer(myAddr, recipientAddr, 50, shardA, 'hunter2');
-   *   console.log(`Sent — sig: ${r.signature}`);
-   *   // r.sessionToken is valid for 30 min — pass to transferSession() for fast-path
-   */
-  async transfer(fromWalletId, toAddress, amountBB, shardA, password) {
-    const r = await this._post('/transfer', {
-      from_wallet_id: fromWalletId,
-      to_address:     toAddress,
-      amount:         amountBB,
-      share_a:        shardA,
-      password,
-    });
-    return {
-      success:      r.success,
-      signature:    r.signature,
-      from:         r.from,
-      to:           r.to,
-      amount:       r.amount,
-      fromBalance:  r.from_balance,
-      toBalance:    r.to_balance,
-      sessionToken: r.session_token,
-    };
-  }
-
-  /**
-   * Fast-path transfer using a cached session token (no Argon2id / shard I/O).
-   *
-   * Requires a `sessionToken` from a prior `login()` or `transfer()` call.
-   * Valid for 30 minutes; TTL refreshed on each use.
-   *
-   * @param {string} sessionToken
-   * @param {string} fromWalletId
-   * @param {string} toAddress
-   * @param {number} amountBB
-   * @returns {Promise<{ success, signature, from, to, amount, fromBalance, toBalance, sessionToken }>}
-   *
-   * @example
-   *   // First call (full SSS)
-   *   const r1 = await bb.transfer(myAddr, recipient, 10, shardA, 'hunter2');
-   *   // Subsequent calls (fast-path, same session)
-   *   const r2 = await bb.transferSession(r1.sessionToken, myAddr, recipient, 5);
-   */
-  async transferSession(sessionToken, fromWalletId, toAddress, amountBB) {
-    const r = await this._post('/transfer/session', {
-      session_token:  sessionToken,
-      from_wallet_id: fromWalletId,
-      to_address:     toAddress,
-      amount:         amountBB,
-    });
-    return {
-      success:      r.success,
-      signature:    r.signature,
-      from:         r.from,
-      to:           r.to,
-      amount:       r.amount,
-      fromBalance:  r.from_balance,
-      toBalance:    r.to_balance,
-      sessionToken: r.session_token,
-    };
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WALLET — SSS Verification
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Verify two shards reconstruct the correct wallet (non-destructive).
-   *
-   * @param {Object} params
-   * @param {string} params.walletId
-   * @param {string} params.shard1
-   * @param {string} params.shard2
-   * @param {string} [params.password]
-   * @param {boolean} [params.shard2IsServerEncrypted=false]
-   * @returns {Promise<{ success, walletId, derivedAddress, matches, message }>}
-   */
-  async verifySss({ walletId, shard1, shard2, password, shard2IsServerEncrypted = false }) {
-    const r = await this._post('/wallet/verify-sss', {
-      wallet_id:                   walletId,
-      shard_1:                     shard1,
-      shard_2:                     shard2,
-      password:                    password || undefined,
-      shard_2_is_server_encrypted: shard2IsServerEncrypted,
-    });
-    return {
-      success:        r.success,
-      walletId:       r.wallet_id,
-      derivedAddress: r.derived_address,
-      matches:        r.matches,
-      message:        r.message,
-    };
-  }
-
-  /**
-   * High-level SSS verification using a named combo (`'AB'`, `'AC'`, `'BC'`).
-   * Auto-fetches Shard B when needed.
-   *
-   * @param {Object} params
-   * @param {'AB'|'AC'|'BC'} params.combo
-   * @param {string} params.walletId
-   * @param {string} [params.shardA] - Required for AB / AC
-   * @param {string} [params.shardB] - Auto-fetched if omitted (AB / BC)
-   * @param {string} [params.shardC] - Required for AC / BC
-   * @param {string} [params.password] - Required for AB / AC
-   * @returns {Promise<VerifyResult>}
-   *
-   * @example
-   *   await bb.verifySssCombo({ combo: 'AB', walletId, shardA, password: 'hunter2' });
-   */
-  async verifySssCombo({ combo, walletId, shardA, shardB, shardC, password }) {
-    if (!SSS_COMBOS[combo]) {
-      throw new Error(`Invalid combo "${combo}". Use: ${Object.keys(SSS_COMBOS).join(', ')}`);
-    }
-    if ((combo === 'AB' || combo === 'BC') && !shardB) {
-      const b = await this.getShardB(walletId);
-      shardB  = b.shardB;
-    }
-    switch (combo) {
-      case 'AB':
-        return this.verifySss({ walletId, shard1: shardA, shard2: shardB, password, shard2IsServerEncrypted: true });
-      case 'AC':
-        return this.verifySss({ walletId, shard1: shardA, shard2: shardC, password, shard2IsServerEncrypted: false });
-      case 'BC':
-        return this.verifySss({ walletId, shard1: shardC, shard2: shardB, shard2IsServerEncrypted: true });
-      default:
-        throw new Error(`Unhandled combo: ${combo}`);
-    }
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WALLET — Shard B retrieval
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Retrieve Shard B (server-encrypted) from ReDB.
-   * @param {string} walletId
-   * @returns {Promise<{ shardB, status }>}
-   */
-  async getShardB(walletId) {
-    const r = await this._post('/wallet/secure/shard-b', { wallet_id: walletId });
-    return { shardB: r.shard_b, status: r.status };
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // WALLET — Faucet
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Request BB from the testnet faucet (rate-limited: max 99,999 BB/epoch).
-   * @param {string} toAddress
-   * @param {number} [amountBB=100]
-   * @returns {Promise<{ success, minted, to, new_balance }>}
-   */
-  async faucet(toAddress, amountBB = 100) {
-    if (amountBB > MAX_FAUCET_BB) amountBB = MAX_FAUCET_BB;
-    if (amountBB <= 0) throw new Error('Amount must be positive');
-    return this._post('/faucet', { to: toAddress, amount: amountBB });
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // LOCAL SESSION MANAGEMENT (Browser localStorage)
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /**
-   * Save wallet session to browser localStorage.
-   * Stores: walletId, address, encrypted shardA, publicKey.
-   * Does NOT store mnemonic, shardC, or any plaintext secret.
-   * @param {Object} wallet - Result of createWallet()
-   */
-  saveWalletLocal(wallet) {
-    if (typeof localStorage === 'undefined') {
-      throw new Error('localStorage not available — use Node.js file storage instead');
-    }
-    const s = {
-      wallet_id:            wallet.walletId,
-      address:              wallet.address,
-      share_a:              wallet.shardA,
-      share_a_is_encrypted: wallet.shardAIsEncrypted,
-      public_key:           wallet.publicKey,
-      created_at:           new Date().toISOString(),
-    };
-    localStorage.setItem('bb_wallet', JSON.stringify(s));
-    localStorage.setItem(`bb_shard_a_${wallet.walletId}`, wallet.shardA);
-  }
-
-  /**
-   * Load wallet session from browser localStorage.
-   * @returns {{ walletId, address, shardA, shardAIsEncrypted, publicKey, createdAt } | null}
-   */
-  loadWalletLocal() {
-    if (typeof localStorage === 'undefined') return null;
-    try {
-      const raw = localStorage.getItem('bb_wallet');
-      if (!raw) return null;
-      const s = JSON.parse(raw);
-      return {
-        walletId:          s.wallet_id,
-        address:           s.address,
-        shardA:            s.share_a,
-        shardAIsEncrypted: s.share_a_is_encrypted,
-        publicKey:         s.public_key,
-        createdAt:         s.created_at,
-      };
-    } catch (_) { return null; }
-  }
-
-  /**
-   * Remove wallet session from localStorage (client-side logout).
-   * @param {string} [walletId]
-   */
-  deleteWalletLocal(walletId) {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.removeItem('bb_wallet');
-    if (walletId) localStorage.removeItem(`bb_shard_a_${walletId}`);
-  }
-
-  /** Save encrypted Shard A to localStorage. */
-  saveShardALocal(walletId, encryptedShardA) {
-    if (typeof localStorage === 'undefined') throw new Error('localStorage not available');
-    localStorage.setItem(`bb_shard_a_${walletId}`, encryptedShardA);
-  }
-
-  /** Load encrypted Shard A from localStorage. */
-  loadShardALocal(walletId) {
-    if (typeof localStorage === 'undefined') return null;
-    return localStorage.getItem(`bb_shard_a_${walletId}`);
-  }
-
-  /** Delete Shard A from localStorage. */
-  deleteShardALocal(walletId) {
-    if (typeof localStorage !== 'undefined') localStorage.removeItem(`bb_shard_a_${walletId}`);
-  }
-
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STATIC UTILITIES
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  static toLamports(bb)       { return Math.floor(bb * LAMPORTS_PER_BB); }
-  static toBB(lamports)       { return lamports / LAMPORTS_PER_BB; }
-
-  /**
-   * Format lamports as "1,000.00"
-   * @param {number} lamports
-   * @param {number} [decimals=2]
-   */
+  /** Format lamports as "1,000.00 BB" */
   static formatBB(lamports, decimals = 2) {
     return (lamports / LAMPORTS_PER_BB).toLocaleString('en-US', {
       minimumFractionDigits: decimals,
       maximumFractionDigits: Math.max(decimals, 4),
-    });
+    }) + ' BB';
   }
 
-  /** Format lamports as "1,000.00 BB" */
-  static formatWithUnit(lamports, decimals = 2) {
-    return `${BlackBook.formatBB(lamports, decimals)} BB`;
-  }
-
-  /**
-   * Shorten address for UI: "4PtfY2…2oby"
-   * @param {string} address
-   * @param {number} [chars=6]
-   */
+  /** Shorten address for logs: "a1b2c3…f4e5" */
   static shortAddr(address, chars = 6) {
     if (!address || address.length <= chars * 2) return address;
     return `${address.slice(0, chars)}…${address.slice(-4)}`;
   }
+}
 
-  /**
-   * Human-readable time since Unix timestamp: "5m ago", "2h ago", "3d ago"
-   * @param {number} unixSeconds
-   */
-  static timeAgo(unixSeconds) {
-    const diff = Math.floor(Date.now() / 1000) - unixSeconds;
-    if (diff < 5)     return 'just now';
-    if (diff < 60)    return `${diff}s ago`;
-    if (diff < 3600)  return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-    return `${Math.floor(diff / 86400)}d ago`;
-  }
 
-  /**
-   * Format Unix timestamp as locale date string.
-   * @param {number} unixSeconds
-   */
-  static formatDate(unixSeconds) {
-    return new Date(unixSeconds * 1000).toLocaleString();
-  }
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+/** Generate a UUID v4 nonce */
+function _uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+/** Concatenate Uint8Arrays */
+function _concat(arrays) {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out   = new Uint8Array(total);
+  let offset  = 0;
+  for (const a of arrays) { out.set(a, offset); offset += a.length; }
+  return out;
+}
+
+/**
+ * Wrap a raw 32-byte Ed25519 seed in PKCS#8 DER for WebCrypto import.
+ * Ed25519 PKCS#8 = fixed 16-byte prefix + 32-byte seed.
+ */
+function _ed25519Pkcs8(seed) {
+  const prefix = new Uint8Array([
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+    0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+  ]);
+  const pkcs8 = new Uint8Array(prefix.length + seed.length);
+  pkcs8.set(prefix);
+  pkcs8.set(seed, prefix.length);
+  return pkcs8.buffer;
 }
 
 
@@ -783,18 +745,9 @@ class BlackBook {
 // EXPORTS
 // ============================================================================
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = {
-    BlackBook,
-    LAMPORTS_PER_BB,
-    CHAIN_ID,
-    MAX_FAUCET_BB,
-    SSS_COMBOS,
-  };
-}
+export { BlackBookAgent, LAMPORTS_PER_BB, CHAIN_ID };
 
-if (typeof globalThis !== 'undefined') {
-  globalThis.BlackBook     = BlackBook;
-  globalThis.SSS_COMBOS    = SSS_COMBOS;
-  globalThis.LAMPORTS_PER_BB = LAMPORTS_PER_BB;
+// CommonJS fallback
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { BlackBookAgent, LAMPORTS_PER_BB, CHAIN_ID };
 }

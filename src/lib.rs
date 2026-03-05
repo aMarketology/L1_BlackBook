@@ -26,7 +26,7 @@ pub mod runtime;
 // ============================================================================
 
 // Storage
-pub use storage::{ConcurrentBlockchain, BlockchainStats, AssetManager, SettlementResult};
+pub use storage::{ConcurrentBlockchain, BlockchainStats};
 
 // Protocol — Transactions
 pub use protocol::blockchain::{Transaction, TxData};

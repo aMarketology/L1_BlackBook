@@ -943,25 +943,6 @@ impl BlockProducer {
     /// Note: Amounts are in u64 (6 decimals), converted to f64 for storage
     fn execute_transaction(&self, tx: &Transaction) -> Result<(), String> {
         match &tx.data {
-            TxData::CreateAccount { root_pubkey, initial_op_pubkey, kdf_params_hash } => {
-                // New account creation with dual-key architecture
-                info!("Create account: {} (root: {}..., op: {}..., kdf: {}...)",
-                    tx.from,
-                    &root_pubkey[..16.min(root_pubkey.len())],
-                    &initial_op_pubkey[..16.min(initial_op_pubkey.len())],
-                    &kdf_params_hash[..16.min(kdf_params_hash.len())]);
-                Ok(())
-            }
-
-            TxData::RotateOpKey { new_op_pubkey, kdf_params_hash } => {
-                // Operational key rotation (must be signed by root key)
-                info!("Rotate op key: {} -> {}... (kdf: {}...)",
-                    tx.from,
-                    &new_op_pubkey[..16.min(new_op_pubkey.len())],
-                    &kdf_params_hash[..16.min(kdf_params_hash.len())]);
-                Ok(())
-            }
-            
             // ========== Tier 1: USDT → $BB Gateway ==========
             
             TxData::DepositUsdt { usdt_amount, external_tx_hash } => {
@@ -971,30 +952,6 @@ impl BlockProducer {
                 // Credit $BB to user (at 1:10 ratio)
                 let bb_amount = usdt_amount * 10;
                 self.blockchain.credit(&tx.from, bb_amount as f64)
-            }
-            
-            TxData::RedeemBbForUsdt { bb_amount } => {
-                info!("Tier1 redeem: {} redeems {} $BB for USDT", tx.from, bb_amount);
-                self.blockchain.debit(&tx.from, *bb_amount as f64)
-            }
-            
-            // ========== Tier 2: $BB → $DIME Vault ==========
-            
-            TxData::LockBbForDime { bb_amount } => {
-                info!("Tier2 lock: {} locks {} $BB for $DIME", tx.from, bb_amount);
-                // Debit $BB (locked in vault), credit handled separately for $DIME
-                self.blockchain.debit(&tx.from, *bb_amount as f64)
-            }
-            
-            TxData::RedeemDimeVintage { vintage_id } => {
-                info!("Tier2 redeem: {} redeems vintage {}", tx.from, vintage_id);
-                // Balance changes handled in L1State
-                Ok(())
-            }
-            
-            TxData::UpdateCpi { new_cpi_index } => {
-                info!("CPI update: new index {:.4} by {}", new_cpi_index, tx.from);
-                Ok(())
             }
             
             // ========== Token Transfers ==========
@@ -1007,14 +964,6 @@ impl BlockProducer {
                     }
                     return Ok(());
                 }
-
-
-            }
-            
-            TxData::TransferDime { to, amount } => {
-                info!("Transfer: {} -> {} ({} $DIME)", tx.from, to, amount);
-                // $DIME balances tracked separately in L1State
-                Ok(())
             }
         }
     }

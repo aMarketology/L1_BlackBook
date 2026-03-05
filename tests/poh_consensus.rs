@@ -108,11 +108,11 @@ fn test_poh_slot_advance() {
     let config = PoHConfig::default();
     let mut poh = PoHService::new(config);
 
-    assert_eq!(poh.current_slot, 0, "Should start at slot 0");
+    assert_eq!(poh.current_slot.load(std::sync::atomic::Ordering::Relaxed), 0, "Should start at slot 0");
 
     let new_slot = poh.advance_slot();
     assert_eq!(new_slot, 1, "advance_slot must return slot 1");
-    assert_eq!(poh.current_slot, 1);
+    assert_eq!(poh.current_slot.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 #[test]

@@ -114,17 +114,16 @@ mod runtime;
 // MODULE IMPORTS
 // ============================================================================
 
-use storage::{ConcurrentBlockchain, AssetManager};
+use storage::ConcurrentBlockchain;
 use wallet_unified::handlers::UnifiedWalletState;
+use wallet_unified::session_store::SessionStore;
 
 // Solana-style consensus infrastructure
 use runtime::{
-    PoHConfig, SharedPoHService, create_poh_service, run_poh_clock,
+    PoHConfig, SharedPoHService, create_poh_service_with_slot, run_poh_clock,
     TransactionPipeline, LeaderSchedule, GulfStreamService,
     ParallelScheduler, PipelinePacket,
     TowerBFT,
-    // Security infrastructure
-    NetworkThrottler, CircuitBreaker, LocalizedFeeMarket, AccountMetadata,
 };
 
 use poh_blockchain::{
@@ -147,28 +146,8 @@ const POH_HASHES_PER_TICK: u64 = 12500;
 const POH_TICKS_PER_SLOT: u64 = 64;
 const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
 
-/// Known test accounts (for display names in ledger)
-fn account_name(addr: &str) -> Option<&'static str> {
-    match addr {
-        // v2 Shamir wallets (current)
-        "GWj5GobRe4ir2sJ8ag9F7NaZKd8BhbWDcMCQAnpCPozV" => Some("Max"),
-        "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk" => Some("Alice"),
-        "mmyQSriTrPjrLfquDYZYgAJEAYAoiiDT8srCoLGSdZd"  => Some("Bob"),
-        "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb" => Some("Apollo"),
-        "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp" => Some("Dealer"),
-        // v1 FROST wallets (legacy)
-        "bb_7707fe614ad679b84a6cbc128999c1b5" => Some("Alice (v1)"),
-        "bb_2123862491cdd1865e06cc684f57e7cb" => Some("Bob (v1)"),
-        "bb_54c74820ffa82db9dca554329e521f98" => Some("Max (v1)"),
-        "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6" => Some("Apollo (v1)"),
-        "bb_6a2944608156ffc470bdaea36018a3e9" => Some("Dealer (v1)"),
-        _ => None,
-    }
-}
-
-// ============================================================================
-// SVM LIVE-SYNC HELPER
-// ============================================================================
+// No hardcoded test accounts — this is a zero-sum stablecoin.
+// All accounts are created at runtime via wallet creation endpoints.
 
 // ============================================================================
 // APPLICATION STATE
@@ -178,7 +157,6 @@ fn account_name(addr: &str) -> Option<&'static str> {
 pub struct AppState {
     // Core blockchain (ReDB + DashMap cache)
     pub blockchain: ConcurrentBlockchain,
-    pub assets: AssetManager,
 
     // Solana-style consensus
     pub poh: SharedPoHService,
@@ -195,15 +173,11 @@ pub struct AppState {
     pub node_mode: NodeMode,
     pub validator_id: String,
 
-    // Security infrastructure
-    pub throttler: Arc<NetworkThrottler>,
-    pub circuit_breaker: Arc<CircuitBreaker>,
-    pub fee_market: Arc<LocalizedFeeMarket>,
-    pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
+    // Replay protection
     pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
 
-    // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
-    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, f64)>>,
+    // Shared session store (SSS wallet sessions — used for dual-auth)
+    pub session_store: Arc<SessionStore>,
 }
 
 // ============================================================================
@@ -296,7 +270,7 @@ async fn balance_handler(
     let balance = state.blockchain.get_balance(&address);
     Json(serde_json::json!({
         "address": address,
-        "name": account_name(&address),
+        "name": serde_json::Value::Null,
         "balance": balance,
         "unit": "BB"
     }))
@@ -464,7 +438,7 @@ async fn signed_transfer_handler(
 async fn poh_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let poh = state.poh.read();
     Json(serde_json::json!({
-        "current_slot": poh.current_slot,
+        "current_slot": poh.current_slot.load(Ordering::Relaxed),
         "num_hashes": poh.num_hashes,
         "current_hash": poh.current_hash,
         "is_running": true
@@ -608,9 +582,20 @@ struct GulfStreamSubmitRequest {
     amount: f64,
     #[serde(default)]
     priority: Option<u64>,
+
+    // ── Auth Path 1: Ed25519 signature (microtx wallets) ──────────────
+    /// Ed25519 signature over "SEALEVEL:{from}:{to}:{amount}:{timestamp}:{nonce}"
+    signature: Option<String>,
+    timestamp: Option<u64>,
+    nonce: Option<String>,
+
+    // ── Auth Path 2: SSS session token ────────────────────────────────
+    session_token: Option<String>,
 }
 
 /// POST /sealevel/submit — Submit to Gulf Stream for parallel execution
+///
+/// DUAL AUTH: Ed25519 signature OR session token (SSS wallet)
 async fn gulf_stream_submit_handler(
     State(state): State<AppState>,
     Json(req): Json<GulfStreamSubmitRequest>,
@@ -619,6 +604,62 @@ async fn gulf_stream_submit_handler(
 
     if req.from.is_empty() || req.to.is_empty() || req.amount <= 0.0 {
         return Json(serde_json::json!({ "error": "Invalid parameters" }));
+    }
+
+    // ── DUAL AUTH ───────────────────────────────────────────────────────
+    if let Some(ref session_token) = req.session_token {
+        // SSS session auth
+        let seed = match state.session_store.get_seed(session_token) {
+            Ok(s) => s,
+            Err(e) => return Json(serde_json::json!({ "error": format!("Session auth failed: {}", e) })),
+        };
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let derived = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+        if derived != req.from {
+            return Json(serde_json::json!({ "error": "Session does not match 'from' address" }));
+        }
+    } else if let (Some(ref sig_hex), Some(timestamp), Some(ref nonce)) = (&req.signature, req.timestamp, &req.nonce) {
+        // Ed25519 signature auth
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let pubkey_bytes: Vec<u8> = if req.from.len() == 64 && req.from.chars().all(|c| c.is_ascii_hexdigit()) {
+            hex::decode(&req.from).unwrap_or_default()
+        } else {
+            bs58::decode(&req.from).into_vec().unwrap_or_default()
+        };
+        if pubkey_bytes.len() != 32 {
+            return Json(serde_json::json!({ "error": "Invalid public key" }));
+        }
+
+        let sig_bytes = match hex::decode(sig_hex) {
+            Ok(b) if b.len() == 64 => b,
+            _ => return Json(serde_json::json!({ "error": "Invalid signature" })),
+        };
+
+        let message = format!("SEALEVEL:{}:{}:{}:{}:{}", req.from, req.to, req.amount, timestamp, nonce);
+        let vk = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+            Ok(k) => k,
+            Err(_) => return Json(serde_json::json!({ "error": "Invalid Ed25519 key" })),
+        };
+        let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+        if vk.verify(message.as_bytes(), &sig).is_err() {
+            return Json(serde_json::json!({ "error": "Signature verification failed" }));
+        }
+
+        // Replay protection
+        let nonce_key = format!("sealevel:{}:{}", req.from, nonce);
+        if state.used_nonces.contains_key(&nonce_key) {
+            return Json(serde_json::json!({ "error": "Nonce already used" }));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if now.saturating_sub(timestamp) > 60 {
+            return Json(serde_json::json!({ "error": "Request too old (>60s)" }));
+        }
+        state.used_nonces.insert(nonce_key, now);
+    } else {
+        return Json(serde_json::json!({
+            "error": "Authentication required. Provide EITHER: signature + timestamp + nonce (Ed25519), OR session_token (SSS wallet)"
+        }));
     }
 
     let balance = state.blockchain.get_balance(&req.from);
@@ -775,26 +816,34 @@ struct FaucetRequest {
     to: String,
     /// Amount to request (capped at MAX_FAUCET_BB)
     amount: f64,
+
+    // ── Auth Path 1: Ed25519 signature (microtransaction wallets) ────────
     /// Ed25519 signature proving ownership of `to` address
-    signature: String,
+    signature: Option<String>,
     /// Timestamp (Unix seconds) for replay protection
-    timestamp: u64,
+    timestamp: Option<u64>,
     /// Unique nonce for replay protection
-    nonce: String,
+    nonce: Option<String>,
+
+    // ── Auth Path 2: SSS session token (BlackBook native wallets) ───────
+    /// Session token from /wallet/login — proves wallet ownership server-side
+    session_token: Option<String>,
 }
 
 /// POST /faucet — Mint up to 0.1 BB to any address
 ///
-/// REQUIRES Ed25519 signature to prove ownership of destination wallet.
-/// Message format: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
-/// 
+/// DUAL AUTH: accepts EITHER:
+///   1. Ed25519 signature (microtransaction wallets with raw keypairs)
+///   2. Session token (SSS 2-of-3 BlackBook wallets — login first)
+///
+/// Ed25519 message format: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
+/// Session: just provide session_token from /wallet/login
+///
 /// NOTE: Currently unlimited calls allowed. Future: rate-limited to once per 24h.
 async fn faucet_handler(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> impl IntoResponse {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
     const MAX_FAUCET_BB: f64 = 0.1;
 
     // ── VALIDATE INPUTS ────────────────────────────────────────────────────
@@ -810,85 +859,122 @@ async fn faucet_handler(
         })));
     }
 
-    // ── Ed25519 SIGNATURE VERIFICATION ─────────────────────────────────────
-    // Parse public key from `to` address (hex or base58)
-    let pubkey_bytes: Vec<u8> = if req.to.len() == 64 && req.to.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Hex-encoded pubkey
-        match hex::decode(&req.to) {
-            Ok(b) => b,
-            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid hex public key"
+    // ── DUAL AUTH: Choose path based on what's provided ────────────────────
+    let auth_method: &str;
+    let replay_nonce: String;
+
+    if let Some(ref session_token) = req.session_token {
+        // ── AUTH PATH 2: SSS Session Token ─────────────────────────────────
+        auth_method = "session";
+        let seed = match state.session_store.get_seed(session_token) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": format!("Session auth failed: {}", e),
+                "hint": "Login first via POST /wallet/login to get a session_token"
             }))),
+        };
+        // Verify the session belongs to the requested `to` address
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+        if derived_address != req.to {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": "Session does not match 'to' address — you can only faucet to your own wallet",
+                "session_wallet": derived_address,
+                "requested_to": req.to
+            })));
         }
-    } else {
-        // Base58 pubkey (Solana-style)
-        match bs58::decode(&req.to).into_vec() {
-            Ok(b) if b.len() == 32 => b,
+        // Session token IS the replay nonce (each use refreshes TTL)
+        replay_nonce = format!("session_faucet:{}:{}", req.to, uuid::Uuid::new_v4());
+
+    } else if let (Some(ref sig_hex), Some(timestamp), Some(ref nonce)) = (&req.signature, req.timestamp, &req.nonce) {
+        // ── AUTH PATH 1: Ed25519 Signature ─────────────────────────────────
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        auth_method = "ed25519";
+
+        // Parse public key from `to` address (hex or base58)
+        let pubkey_bytes: Vec<u8> = if req.to.len() == 64 && req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+            match hex::decode(&req.to) {
+                Ok(b) => b,
+                Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "Invalid hex public key"
+                }))),
+            }
+        } else {
+            match bs58::decode(&req.to).into_vec() {
+                Ok(b) if b.len() == 32 => b,
+                _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "Invalid base58 public key (must be 32 bytes)"
+                }))),
+            }
+        };
+
+        if pubkey_bytes.len() != 32 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Public key must be 32 bytes"
+            })));
+        }
+
+        let sig_bytes = match hex::decode(sig_hex) {
+            Ok(b) if b.len() == 64 => b,
             _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid base58 public key (must be 32 bytes)"
+                "error": "Invalid signature (must be 64 bytes hex)"
             }))),
+        };
+
+        // Build message: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
+        let message = format!("FAUCET:{}:{}:{}:{}", req.to, req.amount, timestamp, nonce);
+
+        let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+            Ok(k) => k,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Invalid Ed25519 public key"
+            }))),
+        };
+        let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+        if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": "Signature verification failed — prove you own this wallet"
+            })));
         }
-    };
 
-    if pubkey_bytes.len() != 32 {
+        // Replay protection for Ed25519 path
+        let nonce_key = format!("faucet:{}:{}", req.to, nonce);
+        if state.used_nonces.contains_key(&nonce_key) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": nonce
+            })));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.saturating_sub(timestamp) > 60 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Request too old (>60s)",
+                "server_time": now,
+                "request_time": timestamp
+            })));
+        }
+
+        state.used_nonces.insert(nonce_key.clone(), now);
+        replay_nonce = nonce.clone();
+
+        if state.used_nonces.len() > 100_000 {
+            let cutoff = now.saturating_sub(120);
+            state.used_nonces.retain(|_, &mut ts| ts > cutoff);
+        }
+
+    } else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Public key must be 32 bytes"
+            "error": "Authentication required. Provide EITHER: (1) signature + timestamp + nonce (Ed25519), OR (2) session_token (SSS wallet)",
+            "auth_paths": {
+                "ed25519": { "requires": ["signature", "timestamp", "nonce"] },
+                "session": { "requires": ["session_token"], "hint": "Login first via POST /wallet/login" }
+            }
         })));
-    }
-
-    let sig_bytes = match hex::decode(&req.signature) {
-        Ok(b) if b.len() == 64 => b,
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid signature (must be 64 bytes hex)"
-        }))),
-    };
-
-    // Build message: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
-    let message = format!("FAUCET:{}:{}:{}:{}", req.to, req.amount, req.timestamp, req.nonce);
-
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
-        Ok(k) => k,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid Ed25519 public key"
-        }))),
-    };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
-
-    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Signature verification failed — prove you own this wallet"
-        })));
-    }
-
-    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
-    let nonce_key = format!("faucet:{}:{}", req.to, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
-
-    // Check timestamp freshness (reject requests older than 60 seconds)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now.saturating_sub(req.timestamp) > 60 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Request too old (>60s)",
-            "server_time": now,
-            "request_time": req.timestamp
-        })));
-    }
-
-    // Record nonce BEFORE minting
-    state.used_nonces.insert(nonce_key, now);
-
-    // Prune old nonces periodically
-    if state.used_nonces.len() > 100_000 {
-        let cutoff = now.saturating_sub(120);
-        state.used_nonces.retain(|_, &mut ts| ts > cutoff);
     }
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
@@ -898,7 +984,7 @@ async fn faucet_handler(
     match state.blockchain.credit(&req.to, mint_amount) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.to);
-            info!("🚰 FAUCET: {} BB → {} (sig verified)", mint_amount, req.to);
+            info!("🚰 FAUCET: {} BB → {} (auth: {})", mint_amount, req.to, auth_method);
 
             // Record faucet mint into PoH block
             {
@@ -913,9 +999,9 @@ async fn faucet_handler(
                         .as_secs(),
                     data: TxData::DepositUsdt {
                         usdt_amount: (mint_amount / 10.0) as u64,
-                        external_tx_hash: Some(format!("faucet_{}", req.nonce)),
+                        external_tx_hash: Some(format!("faucet_{}", replay_nonce)),
                     },
-                    signature: req.signature.clone(),
+                    signature: req.signature.clone().unwrap_or_default(),
                     signer_pubkey: req.to.clone(),
                 };
                 state.block_producer.record_executed_transaction(tx);
@@ -925,7 +1011,8 @@ async fn faucet_handler(
                 "success": true,
                 "minted": mint_amount,
                 "to": req.to,
-                "new_balance": new_bal
+                "new_balance": new_bal,
+                "auth_method": auth_method
             })))
         }
         Err(e) => {
@@ -936,202 +1023,42 @@ async fn faucet_handler(
     }
 }
 
-/// POST /admin/dealer/settle — Dealer settles L2 receipts in batch
-///
-/// Flow: L2 sends receipts of losing bets → Dealer mints to self → pays winners
-#[derive(Deserialize)]
-struct DealerSettlementRequest {
-    /// List of payouts: (address, amount) pairs
-    payouts: Vec<PayoutEntry>,
-    /// L2 batch receipt ID
-    batch_receipt_id: String,
-}
-
-#[derive(Deserialize)]
-struct PayoutEntry {
-    address: String,
-    amount: f64,
-}
-
-async fn dealer_settle_handler(
-    State(state): State<AppState>,
-    Json(req): Json<DealerSettlementRequest>,
-) -> impl IntoResponse {
-    let mut results = Vec::new();
-    let mut total_paid = 0.0;
-
-    for payout in &req.payouts {
-        if payout.amount <= 0.0 { continue; }
-
-        // Mint to recipient directly
-        match state.blockchain.credit(&payout.address, payout.amount) {
-            Ok(_) => {
-                total_paid += payout.amount;
-                let new_bal = state.blockchain.get_balance(&payout.address);
-                results.push(serde_json::json!({
-                    "address": payout.address,
-                    "amount": payout.amount,
-                    "status": "paid",
-                    "new_balance": new_bal,
-                }));
-            }
-            Err(e) => {
-                results.push(serde_json::json!({
-                    "address": payout.address,
-                    "amount": payout.amount,
-                    "status": "failed",
-                    "error": e,
-                }));
-            }
-        }
-    }
-
-    info!("🎰 DEALER SETTLEMENT: {} BB across {} payouts (batch: {})", 
-        total_paid, req.payouts.len(), req.batch_receipt_id);
-
-    Json(serde_json::json!({
-        "success": true,
-        "batch_receipt_id": req.batch_receipt_id,
-        "total_paid": total_paid,
-        "payout_count": req.payouts.len(),
-        "results": results,
-    }))
-}
-
 // ============================================================================
-// ADMIN — Wallet Hot Upgrade Migration
+// USDC SPL TOKEN ENDPOINTS
 // ============================================================================
-
-/// Request body for POST /admin/wallet/migrate
-#[derive(Deserialize)]
-struct MigrateWalletsRequest {
-    /// List of (name, old_address, new_address) mappings
-    mappings: Vec<MigrateMapping>,
-    /// Whether to drain old wallets to zero after migration (default: true)
-    #[serde(default = "default_true")]
-    drain_old: bool,
-    /// Whether to copy Share B data (only for same-format migrations)
-    #[serde(default)]
-    migrate_shares: bool,
-}
-
-#[derive(Deserialize)]
-struct MigrateMapping {
-    name: String,
-    old_address: String,
-    new_address: String,
-}
-
-fn default_true() -> bool { true }
-
-/// POST /admin/wallet/migrate — Execute a wallet balance migration
-///
-/// Atomically transfers all balances from old addresses to new addresses.
-/// Used when wallet structure changes (e.g. FROST v1 → Shamir v2).
-///
-/// This is safe to run while the server is live. Each wallet transfer is
-/// atomic via ReDB MVCC. The endpoint is idempotent — running it again
-/// on already-migrated (zero balance) wallets is a no-op.
-async fn wallet_migrate_handler(
-    State(state): State<AppState>,
-    Json(req): Json<MigrateWalletsRequest>,
-) -> impl IntoResponse {
-    use wallet_unified::migration::*;
-
-    let mappings: Vec<(&str, &str, &str)> = req.mappings.iter()
-        .map(|m| (m.name.as_str(), m.old_address.as_str(), m.new_address.as_str()))
-        .collect();
-
-    let plan = build_balance_migration_plan(
-        WalletVersion::V1Frost,
-        WalletVersion::V2Shamir,
-        mappings,
-        req.migrate_shares,
-    );
-
-    // Override drain setting from request
-    let plan = MigrationPlan {
-        drain_old_wallets: req.drain_old,
-        ..plan
-    };
-
-    let report = execute_migration(&state.blockchain, &plan);
-
-    let status = if report.failed == 0 {
-        StatusCode::OK
-    } else {
-        StatusCode::PARTIAL_CONTENT
-    };
-
-    (status, Json(serde_json::json!(report)))
-}
-
-/// GET /admin/accounts — View all known account balances
 async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // v1 FROST wallets (legacy — may have zero balance after migration)
-    let v1_wallets = vec![
-        ("Alice (v1)",  "bb_7707fe614ad679b84a6cbc128999c1b5"),
-        ("Bob (v1)",    "bb_2123862491cdd1865e06cc684f57e7cb"),
-        ("Max (v1)",    "bb_54c74820ffa82db9dca554329e521f98"),
-        ("Apollo (v1)", "bb_d49a03bf45f92bb9d9f9d0a85b4af5e6"),
-        ("Dealer (v1)", "bb_6a2944608156ffc470bdaea36018a3e9"),
-    ];
-
-    // v2 Shamir wallets (current — SVM-compatible Ed25519)
-    let v2_wallets = vec![
-        ("Max",    "GWj5GobRe4ir2sJ8ag9F7NaZKd8BhbWDcMCQAnpCPozV"),
-        ("Alice",  "EnrFA23SmrsUhbQ2z5GjZNafnyyz7qQtsVspgDGkBNQk"),
-        ("Bob",    "mmyQSriTrPjrLfquDYZYgAJEAYAoiiDT8srCoLGSdZd"),
-        ("Apollo", "EfpwG4yyikxU91zAdJiSd9DpGKAQWPGPyH7xDQSQDyQb"),
-        ("Dealer", "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp"),
-    ];
-
     let mut accounts: Vec<serde_json::Value> = Vec::new();
 
-    // Add v2 wallets first (active)
-    for (name, addr) in &v2_wallets {
-        let balance = state.blockchain.get_balance(addr);
-        accounts.push(serde_json::json!({
-            "name": name,
-            "address": addr,
-            "balance": balance,
-            "version": "v2-shamir",
-            "role": if *name == "Dealer" { "admin" } else { "user" },
-            "active": true,
-        }));
-    }
-
-    // Add v1 wallets (legacy — only if they still have balance)
-    for (name, addr) in &v1_wallets {
-        let balance = state.blockchain.get_balance(addr);
-        if balance > 0.0 {
+    // Enumerate all accounts from SVM hot state (DashMap)
+    for entry in state.blockchain.svm_accounts.hot_state.iter() {
+        let address = bs58::encode(entry.key().to_bytes()).into_string();
+        let lamports = {
+            use solana_sdk::account::ReadableAccount;
+            entry.value().lamports()
+        };
+        if lamports > 0 {
+            let balance = lamports as f64 / 100_000.0;
             accounts.push(serde_json::json!({
-                "name": name,
-                "address": addr,
+                "address": address,
                 "balance": balance,
-                "version": "v1-frost",
-                "role": "legacy",
-                "active": false,
+                "lamports": lamports,
             }));
         }
     }
+
+    // Sort by balance descending
+    accounts.sort_by(|a, b| {
+        let ba = a["balance"].as_f64().unwrap_or(0.0);
+        let bb = b["balance"].as_f64().unwrap_or(0.0);
+        bb.partial_cmp(&ba).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let total_supply = state.blockchain.total_supply();
 
     Json(serde_json::json!({
         "accounts": accounts,
+        "total_accounts": accounts.len(),
         "total_supply": total_supply,
-        "dealer_address": "3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp",
-        "wallet_version": "v2-shamir",
-    }))
-}
-
-/// GET /admin/security/stats
-async fn security_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "throttler": state.throttler.get_stats(),
-        "circuit_breaker": state.circuit_breaker.get_stats(),
-        "fee_market": state.fee_market.get_stats(),
     }))
 }
 
@@ -1155,6 +1082,15 @@ struct UsdcTransferRequest {
     to: String,
     /// Amount in human USDC
     amount: f64,
+
+    // ── Auth Path 1: Ed25519 signature (microtx wallets) ──────────────
+    /// Ed25519 signature over "USDC_TRANSFER:{from}:{to}:{amount}:{timestamp}:{nonce}"
+    signature: Option<String>,
+    timestamp: Option<u64>,
+    nonce: Option<String>,
+
+    // ── Auth Path 2: SSS session token ────────────────────────────────
+    session_token: Option<String>,
 }
 
 /// POST /admin/usdc/mint — Mint USDC tokens to a wallet's ATA
@@ -1209,6 +1145,8 @@ async fn usdc_mint_handler(
 }
 
 /// POST /usdc/transfer — Transfer USDC between wallets
+///
+/// DUAL AUTH: Ed25519 signature OR session token (SSS wallet)
 async fn usdc_transfer_handler(
     State(state): State<AppState>,
     Json(req): Json<UsdcTransferRequest>,
@@ -1218,6 +1156,56 @@ async fn usdc_transfer_handler(
     if req.amount <= 0.0 || req.from.is_empty() || req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid transfer parameters"
+        })));
+    }
+
+    // ── DUAL AUTH ───────────────────────────────────────────────────────
+    if let Some(ref session_token) = req.session_token {
+        let seed = match state.session_store.get_seed(session_token) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": format!("Session auth failed: {}", e)
+            }))),
+        };
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let derived = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+        if derived != req.from {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": "Session does not match 'from' address"
+            })));
+        }
+    } else if let (Some(ref sig_hex), Some(timestamp), Some(ref nonce)) = (&req.signature, req.timestamp, &req.nonce) {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let pubkey_bytes: Vec<u8> = bs58::decode(&req.from).into_vec().unwrap_or_default();
+        if pubkey_bytes.len() != 32 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid public key" })));
+        }
+        let sig_bytes = match hex::decode(sig_hex) {
+            Ok(b) if b.len() == 64 => b,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature" }))),
+        };
+        let message = format!("USDC_TRANSFER:{}:{}:{}:{}:{}", req.from, req.to, req.amount, timestamp, nonce);
+        let vk = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+            Ok(k) => k,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid Ed25519 key" }))),
+        };
+        let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+        if vk.verify(message.as_bytes(), &sig).is_err() {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
+        }
+        let nonce_key = format!("usdc_transfer:{}:{}", req.from, nonce);
+        if state.used_nonces.contains_key(&nonce_key) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "Nonce already used" })));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if now.saturating_sub(timestamp) > 60 {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Request too old (>60s)" })));
+        }
+        state.used_nonces.insert(nonce_key, now);
+    } else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Authentication required. Provide EITHER: signature + timestamp + nonce (Ed25519), OR session_token (SSS wallet)"
         })));
     }
 
@@ -1367,11 +1355,15 @@ struct LedgerQuery {
     page: usize,
     #[serde(default = "default_limit")]
     limit: usize,
+    /// Set format=json for JSON response (default: text/ascii)
+    #[serde(default)]
+    format: Option<String>,
 }
 fn default_page() -> usize { 1 }
 fn default_limit() -> usize { 50 }
 
 /// GET /ledger - ASCII art visualization of all ledger entries
+/// Use ?format=json for JSON response
 async fn ledger_handler(
     State(state): State<AppState>,
     Query(query): Query<LedgerQuery>
@@ -1381,8 +1373,53 @@ async fn ledger_handler(
     transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     let stats = state.blockchain.stats();
     let total_supply = state.blockchain.total_supply();
+
+    // ── JSON MODE ────────────────────────────────────────────────
+    if query.format.as_deref() == Some("json") {
+        let limit = query.limit.min(100).max(1);
+        let page = query.page.max(1);
+        let total_pages = (transactions.len() + limit - 1) / limit;
+        let start_idx = (page - 1) * limit;
+        let end_idx = (start_idx + limit).min(transactions.len());
+        let page_txs: Vec<serde_json::Value> = if start_idx < transactions.len() {
+            transactions[start_idx..end_idx].iter().map(|tx| {
+                serde_json::json!({
+                    "tx_hash": tx.tx_hash,
+                    "prev_tx_hash": tx.prev_tx_hash,
+                    "tx_type": tx.tx_type,
+                    "from_address": tx.from_address,
+                    "to_address": tx.to_address,
+                    "amount": tx.amount,
+                    "balance_before": tx.balance_before,
+                    "balance_after": tx.balance_after,
+                    "recipient_balance_after": tx.recipient_balance_after,
+                    "timestamp": tx.timestamp,
+                    "block_height": tx.block_height,
+                    "status": tx.status,
+                    "auth_type": tx.auth_type,
+                    "from_username": tx.from_username,
+                    "to_username": tx.to_username,
+                })
+            }).collect()
+        } else {
+            vec![]
+        };
+        return (
+            StatusCode::OK,
+            [("Content-Type", "application/json")],
+            serde_json::json!({
+                "transactions": page_txs,
+                "total": transactions.len(),
+                "page": page,
+                "total_pages": total_pages,
+                "block_count": stats.block_count,
+                "total_supply": total_supply,
+                "total_accounts": stats.total_accounts,
+            }).to_string()
+        );
+    }
     
-    // Pagination
+    // ── ASCII ART MODE (default) ─────────────────────────────────
     let limit = query.limit.min(100).max(1); // Max 100, min 1
     let page = query.page.max(1); // Min page 1
     let total_pages = (transactions.len() + limit - 1) / limit;
@@ -1526,7 +1563,6 @@ async fn ledger_handler(
 }
 
 /// Helper to format addresses WITH USERNAME for ledger display
-/// Format: "username (bb_1234...abcd)" or just "bb_1234...abcd" if no username
 fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
     let addr_short = if addr.starts_with("bb_") {
         format!("bb_{}..{}", &addr[3..].chars().take(4).collect::<String>(), &addr[addr.len()-4..])
@@ -1546,86 +1582,6 @@ fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
     }
 }
 
-// ============================================================================
-// CREDIT SESSIONS (L2 Bridge Support)
-// ============================================================================
-
-#[derive(Deserialize)]
-struct CreditOpenRequest {
-    wallet: String,
-    amount: f64,
-    session_id: Option<String>,
-}
-
-/// POST /credit/open — Lock tokens for L2 session
-async fn credit_open_handler(
-    State(state): State<AppState>,
-    Json(req): Json<CreditOpenRequest>,
-) -> impl IntoResponse {
-    let balance = state.blockchain.get_balance(&req.wallet);
-    if balance < req.amount {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Insufficient balance",
-            "available": balance,
-        })));
-    }
-
-    if let Err(e) = state.blockchain.debit(&req.wallet, req.amount) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })));
-    }
-
-    let session_id = req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    match state.assets.open_market_session(&req.wallet, req.amount, &session_id) {
-        Ok(session) => {
-            info!("🔒 Lock: {} BB from {} (session: {})", req.amount, req.wallet, session.id);
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "session_id": session.id,
-                "locked_amount": req.amount,
-            })))
-        }
-        Err(e) => {
-            let _ = state.blockchain.credit(&req.wallet, req.amount);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct CreditSettleRequest {
-    session_id: String,
-    net_pnl: f64,
-}
-
-/// POST /credit/settle — Settle L2 session, return tokens ± PnL
-async fn credit_settle_handler(
-    State(state): State<AppState>,
-    Json(req): Json<CreditSettleRequest>,
-) -> impl IntoResponse {
-    match state.assets.settle_market_session(&req.session_id, req.net_pnl) {
-        Ok(result) => {
-            if let Some(wallet) = &result.wallet {
-                let final_amount = result.locked_amount + req.net_pnl;
-                if final_amount > 0.0 {
-                    if let Err(e) = state.blockchain.credit(wallet, final_amount) {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })));
-                    }
-                }
-                info!("🔓 Settle: {} BB to {} (pnl: {:+})", final_amount.max(0.0), wallet, req.net_pnl);
-                (StatusCode::OK, Json(serde_json::json!({
-                    "success": true,
-                    "session_id": req.session_id,
-                    "net_pnl": req.net_pnl,
-                    "returned": final_amount.max(0.0),
-                    "new_balance": state.blockchain.get_balance(wallet),
-                })))
-            } else {
-                (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "No wallet for session" })))
-            }
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
-    }
-}
 
 // ============================================================================
 // ROUTER
@@ -1656,19 +1612,12 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .route("/turbine/status", get(turbine_status_handler))
         // Sealevel
         .route("/sealevel/submit", post(gulf_stream_submit_handler))
-        // Credit/Bridge (L2 sessions)
-        .route("/credit/open", post(credit_open_handler))
-        .route("/credit/settle", post(credit_settle_handler))
-        // Admin (Dealer)
-        // Faucet (public)
+        // Faucet (public, rate-limited)
         .route("/faucet", post(faucet_handler))
         // Admin (Dealer)
         .route("/admin/mint", post(admin_mint_handler))
         .route("/admin/burn", post(admin_burn_handler))
-        .route("/admin/dealer/settle", post(dealer_settle_handler))
-        .route("/admin/wallet/migrate", post(wallet_migrate_handler))
         .route("/admin/accounts", get(admin_accounts_handler))
-        .route("/admin/security/stats", get(security_stats_handler))
         // USDC SPL Token
         .route("/admin/usdc/mint", post(usdc_mint_handler))
         .route("/usdc/transfer", post(usdc_transfer_handler))
@@ -1752,14 +1701,15 @@ async fn main() {
     info!("║  Wallets:   BIP-39 + SSS 2-of-3 + ZKP               ║");
     info!("╚══════════════════════════════════════════════════════╝");
 
-    // 2. PoH Clock
+    // 2. PoH Clock — shares current_slot with BlockProducer, GulfStream, etc.
     let poh_config = PoHConfig {
         slot_duration_ms: POH_SLOT_DURATION_MS,
         hashes_per_tick: POH_HASHES_PER_TICK,
         ticks_per_slot: POH_TICKS_PER_SLOT,
         slots_per_epoch: POH_SLOTS_PER_EPOCH,
     };
-    let poh_service: SharedPoHService = create_poh_service(poh_config);
+    let current_slot = Arc::new(AtomicU64::new(0));
+    let poh_service: SharedPoHService = create_poh_service_with_slot(poh_config, current_slot.clone());
     let poh_runner = poh_service.clone();
     tokio::spawn(async move { run_poh_clock(poh_runner).await; });
     info!("🕐 PoH clock started ({}ms slots)", POH_SLOT_DURATION_MS);
@@ -1772,8 +1722,6 @@ async fn main() {
             Err(e) => { error!("❌ FATAL: {}", e); panic!("Storage init failed: {:?}", e); }
         }
     };
-    let assets = AssetManager::new();
-
     // 3a. Startup Recovery — resume from persisted state
     let (recovered_slot, _recovered_hash) = match blockchain.latest_block_slot() {
         Ok(Some(slot)) => {
@@ -1791,16 +1739,14 @@ async fn main() {
         }
     };
 
-    // Sync PoH clock to recovered slot
+    // Sync PoH clock to recovered slot (shared AtomicU64 — all subsystems see this)
     if recovered_slot > 0 {
-        let mut poh = poh_service.write();
-        poh.current_slot = recovered_slot;
+        current_slot.store(recovered_slot, Ordering::Relaxed);
         info!("🕐 PoH clock → slot {}", recovered_slot);
     }
 
     // 4. Consensus Infrastructure
     let validator_id = config.identity.clone();
-    let current_slot = Arc::new(AtomicU64::new(recovered_slot));
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
     {
         let mut schedule = leader_schedule.write();
@@ -1965,14 +1911,7 @@ async fn main() {
     // Suppress unused variable warning when in reader mode
     let _ = &relay_sender;
 
-    // 5. Security
-    let throttler = Arc::new(NetworkThrottler::new());
-    let circuit_breaker = Arc::new(CircuitBreaker::new());
-    circuit_breaker.add_exemption("genesis");
-    circuit_breaker.add_exemption("system");
-    let fee_market = Arc::new(LocalizedFeeMarket::new());
-    let account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>> = Arc::new(dashmap::DashMap::new());
-    info!("🛡️  Security initialized");
+    // 5. (Security scaffolding removed — moved to network layer per L1-microtx manifesto)
 
     // 6. Sealevel Execution Loop (WRITER MODE ONLY — readers don't execute txs)
     if config.mode == NodeMode::Writer {
@@ -2036,10 +1975,24 @@ async fn main() {
         info!("📖 Reader sync task started → {}", config.writer_addr);
     }
 
-    // 7. Build State
+    // 7. Shared Session Store (used by both AppState and UnifiedWalletState)
+    let session_store = Arc::new(SessionStore::new());
+    {
+        let sweeper = session_store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let removed = sweeper.sweep_expired();
+                if removed > 0 {
+                    tracing::info!("🧹 Swept {} expired wallet sessions", removed);
+                }
+            }
+        });
+    }
+
+    // 7b. Build State
     let state = AppState {
         blockchain,
-        assets,
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
         leader_schedule,
@@ -2051,18 +2004,15 @@ async fn main() {
         tower_bft,
         node_mode: config.mode,
         validator_id: validator_id.clone(),
-        throttler,
-        circuit_breaker,
-        fee_market,
-        account_metadata,
         used_nonces: Arc::new(dashmap::DashMap::new()),
-        faucet_claims: Arc::new(dashmap::DashMap::new()),
+        session_store: session_store.clone(),
     };
 
-    // 8. Unified Wallet Router (SSS 2-of-3)
-    let unified_state = Arc::new(UnifiedWalletState::new(
+    // 8. Unified Wallet Router (SSS 2-of-3) — shares the same session store
+    let unified_state = Arc::new(UnifiedWalletState::new_with_session_store(
         Arc::new(state.blockchain.clone()),
         state.block_producer.clone(),
+        session_store,
     ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
@@ -2074,16 +2024,28 @@ async fn main() {
     // Bootstrap the USDC SPL Token Mint (idempotent — no-op if already exists)
     {
         use svm::SplTokenEngine;
-        // Dealer v2 wallet is the mint authority for USDC on BlackBook L1
-        let dealer_v2_bytes = bs58::decode("3CTtQicXmRZv7Dhnq8TfipfHVAiYFagBiLXBeRQdpFEp")
-            .into_vec().unwrap();
-        let mut dealer_key = [0u8; 32];
-        dealer_key.copy_from_slice(&dealer_v2_bytes);
-        let mint_authority = solana_sdk::pubkey::Pubkey::new_from_array(dealer_key);
+        // Mint authority is set via USDC_MINT_AUTHORITY env var (base58 pubkey).
+        // On first launch, create a wallet via /wallet/create, then set that
+        // address as USDC_MINT_AUTHORITY before restarting.
+        let mint_authority_addr = std::env::var("USDC_MINT_AUTHORITY")
+            .unwrap_or_else(|_| {
+                warn!("⚠️ USDC_MINT_AUTHORITY not set — USDC mint bootstrap skipped");
+                String::new()
+            });
 
-        match SplTokenEngine::bootstrap_usdc_mint(&rpc_svm_accounts, &mint_authority) {
-            Ok(mint_addr) => info!("💵 USDC Mint: {}", mint_addr),
-            Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
+        if !mint_authority_addr.is_empty() {
+            match bs58::decode(&mint_authority_addr).into_vec() {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    let mint_authority = solana_sdk::pubkey::Pubkey::new_from_array(key);
+                    match SplTokenEngine::bootstrap_usdc_mint(&rpc_svm_accounts, &mint_authority) {
+                        Ok(mint_addr) => info!("💵 USDC Mint: {} (authority: {})", mint_addr, mint_authority_addr),
+                        Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
+                    }
+                }
+                _ => error!("❌ Invalid USDC_MINT_AUTHORITY: '{}' — must be 32-byte base58 pubkey", mint_authority_addr),
+            }
         }
     }
 
@@ -2119,7 +2081,7 @@ async fn main() {
     info!("   GET  /poh/block/latest          Latest block");
     info!("   POST /sealevel/submit           Parallel execution");
     info!("");
-    info!("🎰 ADMIN (Dealer):");
+    info!("🔐 ADMIN:");
     info!("   POST /admin/mint                Mint $BB");
     info!("   POST /admin/burn                Burn $BB");
     info!("   POST /admin/dealer/settle       Batch L2 settlement");
@@ -2163,7 +2125,7 @@ async fn main() {
             loop {
                 interval.tick().await;
                 // Read canonical slot from PoH clock (single source of truth)
-                let poh_slot = { ticker_poh.read().current_slot };
+                let poh_slot = { ticker_poh.read().current_slot.load(Ordering::Relaxed) };
                 // Sync shared AtomicU64 from PoH clock
                 ticker_slot.store(poh_slot, Ordering::Relaxed);
                 // Advance the SVM blockhash queue so getLatestBlockhash always returns
@@ -2179,8 +2141,8 @@ async fn main() {
         info!("🕐 Slot ticker started (400ms intervals → advancing slot + blockhash)");
 
         let rpc_impl = {
-            let mut rpc = BlackBookRpcImpl::new(rpc_svm_accounts, rpc_svm, rpc_current_slot);
-            rpc.block_producer = Some(rpc_block_producer);
+            let mut rpc = BlackBookRpcImpl::new(rpc_svm_accounts.clone(), rpc_svm, rpc_current_slot);
+            rpc.block_producer = Some(rpc_block_producer.clone());
             rpc
         };
         let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
@@ -2205,10 +2167,21 @@ async fn main() {
     // ═══════════════════════════════════════════════════════════════
     warn!("🛑 Shutting down — flushing state…");
 
-    // Produce one final block with any remaining pending transactions
-    // (block_producer is already cloned into AppState, but we captured it earlier)
-    // The block production loop will stop when the runtime shuts down,
-    // so we do one last produce_block here for safety.
+    // 1. Flush dirty SVM accounts to ReDB (ACID commit)
+    match rpc_svm_accounts.flush_block() {
+        Ok(n) => info!("✅ SVM accounts flushed to ReDB ({} accounts)", n),
+        Err(e) => error!("❌ SVM flush failed: {:?}", e),
+    }
 
-    info!("✅ Clean shutdown complete");
+    // 2. Produce final PoH block to seal the chain
+    let flushed_txs = rpc_block_producer.flush_final_block();
+    info!("✅ Final block produced ({} txs flushed)", flushed_txs);
+
+    // 3. Flush again after final block (catches any new dirty accounts)
+    match rpc_svm_accounts.flush_block() {
+        Ok(n) if n > 0 => info!("✅ Post-block flush: {} additional accounts", n),
+        _ => {}
+    }
+
+    info!("👋 BlackBook L1 shutdown complete");
 }

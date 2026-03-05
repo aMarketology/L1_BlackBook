@@ -58,8 +58,6 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60); // 30 minutes
 pub struct WalletSessionEntry {
     seed: [u8; 32],              // The raw Ed25519 seed — ready to sign
     pub wallet_id: String,       // Which wallet this session belongs to
-    pub address: String,         // The on-chain address (for quick lookup)
-    pub username: String,        // For display / audit
     last_active: Instant,        // Reset on every successful operation
     ttl: Duration,               // How long until idle-expiry
 }
@@ -92,8 +90,6 @@ impl SessionStore {
     pub fn create_session(
         &self,
         wallet_id: &str,
-        address: &str,
-        username: &str,
         seed: &[u8; 32],
     ) -> String {
         // One session per wallet — revoke any prior session
@@ -104,8 +100,6 @@ impl SessionStore {
         self.sessions.insert(session_token.clone(), WalletSessionEntry {
             seed: *seed,
             wallet_id: wallet_id.to_string(),
-            address: address.to_string(),
-            username: username.to_string(),
             last_active: Instant::now(),
             ttl: SESSION_TTL,
         });
@@ -138,19 +132,6 @@ impl SessionStore {
         Ok(entry.seed)
     }
 
-    /// Check if a session is valid (exists and not expired).
-    pub fn is_valid(&self, session_token: &str) -> bool {
-        match self.sessions.get(session_token) {
-            Some(entry) => entry.last_active.elapsed() <= entry.ttl,
-            None => false,
-        }
-    }
-
-    /// Get the wallet_id for a session (for verification).
-    pub fn get_wallet_id(&self, session_token: &str) -> Option<String> {
-        self.sessions.get(session_token).map(|e| e.wallet_id.clone())
-    }
-
     // ─────────────────────────────────────────────────────────────────────
     // REVOKE
     // ─────────────────────────────────────────────────────────────────────
@@ -178,10 +159,6 @@ impl SessionStore {
         before - self.sessions.len()
     }
 
-    /// How many active sessions exist (for health/debug endpoints).
-    pub fn active_count(&self) -> usize {
-        self.sessions.len()
-    }
 }
 
 // ============================================================================

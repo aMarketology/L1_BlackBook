@@ -56,6 +56,16 @@ impl UnifiedWalletState {
         info!("✅ Unified Wallet initialized with ReDB storage");
         Self { blockchain, block_producer, session_store }
     }
+
+    /// Create with a shared session store (used when AppState needs access too)
+    pub fn new_with_session_store(
+        blockchain: Arc<ConcurrentBlockchain>,
+        block_producer: Arc<BlockProducer>,
+        session_store: Arc<SessionStore>,
+    ) -> Self {
+        info!("✅ Unified Wallet initialized with shared session store");
+        Self { blockchain, block_producer, session_store }
+    }
 }
 
 // ============================================================================
@@ -176,7 +186,7 @@ pub async fn create_hybrid_wallet(
 
     // Auto-login: cache the seed so the wallet is immediately usable after creation
     let session_token = state.session_store.create_session(
-        &wallet_id, &address, &req.username, &seed_32,
+        &wallet_id, &seed_32,
     );
     seed_32.zeroize();
 
@@ -284,7 +294,7 @@ pub async fn transfer_with_sss(
 
     // Cache the reconstructed seed for fast-path transfers (30-min window)
     let session_token = state.session_store.create_session(
-        &req.from_wallet_id, &req.from_wallet_id, "", &seed_32,
+        &req.from_wallet_id, &seed_32,
     );
 
     // Zeroize key material immediately after signing
@@ -606,7 +616,7 @@ pub async fn login_handler(
 
     // 5. Create session — seed cached server-side, only token returned to client
     let session_token = state.session_store.create_session(
-        &req.wallet_id, &req.wallet_id, "", &seed_32,
+        &req.wallet_id, &seed_32,
     );
 
     // 6. Zeroize all key material

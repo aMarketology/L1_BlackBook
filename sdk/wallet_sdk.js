@@ -10,9 +10,9 @@
 //   3. BALANCE  — Check BB balance for any address
 //   4. TRANSFER — SSS-authenticated send (server-side reconstruction)
 //   5. VERIFY   — Test that 2 shards reconstruct the correct wallet
-//   6. RECOVER  — Shard B (server), Shard C (Vault), Shard A (Supabase)
+//   6. RECOVER  — Shard B (server), Shard C (cold storage), Shard A (Supabase)
 //   7. SESSION  — localStorage persistence + Supabase backup
-//   8. FAUCET   — Dev/testnet token minting
+//   8. FAUCET   — Dev/testnet token minting (session-token auth)
 //
 // ============================================================================
 //
@@ -709,25 +709,6 @@ class BlackBookWalletSDK {
     };
   }
 
-  /**
-   * Emergency recovery: retrieve Shard C from HashiCorp Vault.
-   * Requires JWT with aal2 (2FA) authentication.
-   *
-   * @returns {Promise<{ shardC: string, warning: string }>}
-   *
-   * @example
-   *   sdk.setJWT(supabaseJwt);
-   *   const { shardC, warning } = await sdk.recoverShardC();
-   *   console.log(warning); // "This is a one-time recovery..."
-   */
-  async recoverShardC() {
-    const result = await this._api('/wallet/secure/recover-shard-c', {});
-    return {
-      shardC:  result.shard_c,
-      warning: result.warning,
-    };
-  }
-
 
   // ═══════════════════════════════════════════════════════════════════════════
   // 7. FAUCET (Dev/Testnet Token Minting)
@@ -735,26 +716,34 @@ class BlackBookWalletSDK {
   //
   // POST /faucet
   //
-  // Mints BB tokens to any address. Rate-limited: max 99,999 BB per address
-  // per epoch. No authentication required.
+  // Auth: Session token (SSS 2-of-3 wallets — login first).
+  // For Ed25519/microtx faucet, use BlackBookAgent SDK (blackbook_sdk.js).
   //
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Request BB tokens from the faucet.
+   * Request BB tokens from the faucet using a session token (SSS wallet).
    *
-   * @param {string} toAddress     - Recipient address
-   * @param {number} [amountBB=100] - Amount in BB (max 99,999 per epoch)
-   * @returns {Promise<{ success: boolean, minted: number, to: string, new_balance: number }>}
+   * @param {string} toAddress      - Recipient address (must match session wallet)
+   * @param {number} [amountBB=0.1] - Amount in BB (max 0.1 per request)
+   * @param {string} sessionToken   - Session token from login()
+   * @returns {Promise<{ success: boolean, minted: number, to: string, new_balance: number, auth_method: string }>}
    *
    * @example
-   *   const result = await sdk.faucet('4PtfY2qR...', 1000);
-   *   console.log(result.new_balance); // 1000
+   *   const session = await sdk.login({ ... });
+   *   const result = await sdk.faucet(wallet.address, 0.1, session.sessionToken);
    */
-  async faucet(toAddress, amountBB = 100) {
+  async faucet(toAddress, amountBB = 0.1, sessionToken = null) {
     if (amountBB > MAX_FAUCET_BB) amountBB = MAX_FAUCET_BB;
     if (amountBB <= 0) throw new Error('Amount must be positive');
-    return this._api('/faucet', { to: toAddress, amount: amountBB });
+
+    const body = { to: toAddress, amount: amountBB };
+
+    if (sessionToken) {
+      body.session_token = sessionToken;
+    }
+
+    return this._api('/faucet', body);
   }
 
 
@@ -1072,9 +1061,6 @@ class BlackBookWalletSDK {
 //     shardC: 'your-cold-shard-hex...',
 //   });
 //
-//   // Option C: Emergency Vault recovery
-//   sdk.setJWT(aal2Token); // Requires 2FA
-//   const { shardC } = await sdk.recoverShardC();
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 9: Logout

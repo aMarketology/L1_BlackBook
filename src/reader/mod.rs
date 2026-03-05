@@ -289,9 +289,6 @@ impl ReaderNode {
                     self.blockchain.svm_accounts.store_account(&pk, acct);
                     self.blockchain.mirror_balance_to_cache(&otx.tx.from, new_lam);
                 }
-                _ => {
-                    // Other transaction types don't affect balances
-                }
             }
         }
     }
