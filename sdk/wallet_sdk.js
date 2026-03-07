@@ -1,5 +1,5 @@
 // ============================================================================
-// BLACKBOOK WALLET SDK — v1.0
+// BLACKBOOK WALLET SDK — v2.0
 // ============================================================================
 //
 // Dedicated wallet module for BlackBook L1 blockchain.
@@ -11,8 +11,10 @@
 //   4. TRANSFER — SSS-authenticated send (server-side reconstruction)
 //   5. VERIFY   — Test that 2 shards reconstruct the correct wallet
 //   6. RECOVER  — Shard B (server), Shard C (cold storage), Shard A (Supabase)
-//   7. SESSION  — localStorage persistence + Supabase backup
-//   8. FAUCET   — Dev/testnet token minting (session-token auth)
+//   7. FAUCET   — Dev/testnet token minting
+//   8. ESCROW   — Deposit, withdraw (Merkle proof), vault status, market lookup
+//   9. HISTORY  — Transaction history by address
+//   10. SESSION — localStorage persistence + Supabase backup
 //
 // ============================================================================
 //
@@ -748,7 +750,155 @@ class BlackBookWalletSDK {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 8. TRANSACTION HISTORY
+  // 8. GLOBAL ESCROW
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // The escrow write calls (deposit, withdraw) require an Ed25519 signature
+  // produced by the user's private key BEFORE calling these methods.
+  //
+  // Signing convention (plain UTF-8 string, signed with the wallet's Ed25519 key):
+  //   Deposit:  "ESCROW_DEPOSIT:{wallet_address}:{amount}:{timestamp}:{nonce}"
+  //   Withdraw: "ESCROW_WITHDRAW:{market_id}:{wallet_address}:{amount}:{timestamp}:{nonce}"
+  //
+  // Use a nonce (UUID v4 recommended) and a fresh Unix timestamp (seconds).
+  // The L1 rejects requests older than 60 seconds and any repeated nonce.
+  //
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Lock BB tokens into the global escrow vault.
+   *
+   * The caller must pre-sign the message:
+   *   `${"ESCROW_DEPOSIT"}:${walletAddress}:${amount}:${timestamp}:${nonce}`
+   *
+   * @param {Object} params
+   * @param {string} params.walletAddress - Sending wallet address
+   * @param {number} params.amount        - Amount in BB (e.g. 500.0)
+   * @param {string} params.publicKey     - Ed25519 public key hex (64 chars)
+   * @param {string} params.signature     - Ed25519 signature hex (128 chars)
+   * @param {number} params.timestamp     - Unix seconds (must be within 60s of server)
+   * @param {string} params.nonce         - Unique string (UUID v4 recommended)
+   * @returns {Promise<{ success, deposited, wallet_address, escrow_address, user_balance, escrow_balance }>}
+   *
+   * @example
+   *   const ts    = Math.floor(Date.now() / 1000);
+   *   const nonce = crypto.randomUUID();
+   *   const msg   = `ESCROW_DEPOSIT:${addr}:${amount}:${ts}:${nonce}`;
+   *   const sig   = await myEd25519Sign(msg);   // your signing helper
+   *
+   *   const r = await sdk.escrowDeposit({
+   *     walletAddress: addr,
+   *     amount:    500.0,
+   *     publicKey: pubkeyHex,
+   *     signature: sig,
+   *     timestamp: ts,
+   *     nonce,
+   *   });
+   *   console.log(`Locked ${r.deposited} BB — escrow balance: ${r.escrow_balance} BB`);
+   */
+  async escrowDeposit({ walletAddress, amount, publicKey, signature, timestamp, nonce }) {
+    if (!walletAddress || amount <= 0) throw new Error('walletAddress and positive amount required');
+    return this._api('/escrow/deposit', {
+      wallet_address: walletAddress,
+      amount,
+      public_key:  publicKey,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+  /**
+   * Withdraw from escrow using a Merkle proof.
+   *
+   * The caller must pre-sign the message:
+   *   `${"ESCROW_WITHDRAW"}:${marketId}:${walletAddress}:${amount}:${timestamp}:${nonce}`
+   *
+   * The Merkle proof is an array of sibling-hash hex strings (no direction flag).
+   * Request the proof from the L2 API before calling this method.
+   *
+   * @param {Object} params
+   * @param {string}   params.marketId      - Market identifier
+   * @param {string}   params.walletAddress - Recipient wallet address
+   * @param {number}   params.amount        - Amount in BB entitled by the Merkle leaf
+   * @param {string[]} params.merkleProof   - Sibling hashes leaf→root (64-char hex each)
+   * @param {string}   params.publicKey     - Ed25519 public key hex (64 chars)
+   * @param {string}   params.signature     - Ed25519 signature hex (128 chars)
+   * @param {number}   params.timestamp     - Unix seconds (must be within 60s of server)
+   * @param {string}   params.nonce         - Unique string (UUID v4 recommended)
+   * @returns {Promise<{ success, withdrawn, market_id, wallet_address, new_balance }>}
+   *
+   * @example
+   *   // 1. Fetch proof from L2
+   *   const { amount, merkle_proof } = await l2Api.getProof(marketId, myAddr);
+   *
+   *   // 2. Sign the withdrawal message
+   *   const ts    = Math.floor(Date.now() / 1000);
+   *   const nonce = crypto.randomUUID();
+   *   const msg   = `ESCROW_WITHDRAW:${marketId}:${myAddr}:${amount}:${ts}:${nonce}`;
+   *   const sig   = await myEd25519Sign(msg);
+   *
+   *   // 3. Submit to L1
+   *   const r = await sdk.escrowWithdraw({
+   *     marketId:    'super_bowl_2026',
+   *     walletAddress: myAddr,
+   *     amount,
+   *     merkleProof: merkle_proof,
+   *     publicKey:   pubkeyHex,
+   *     signature:   sig,
+   *     timestamp:   ts,
+   *     nonce,
+   *   });
+   *   console.log(`Withdrew ${r.withdrawn} BB — new balance: ${r.new_balance} BB`);
+   */
+  async escrowWithdraw({ marketId, walletAddress, amount, merkleProof, publicKey, signature, timestamp, nonce }) {
+    if (!marketId || !walletAddress || amount <= 0) throw new Error('marketId, walletAddress, and positive amount required');
+    if (!Array.isArray(merkleProof)) throw new Error('merkleProof must be an array of hex strings');
+    return this._api('/escrow/withdraw', {
+      market_id:      marketId,
+      wallet_address: walletAddress,
+      amount,
+      merkle_proof:   merkleProof,
+      public_key:     publicKey,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+  /**
+   * Get current escrow vault status (PDA balance + total settled markets).
+   * Does NOT return the full market list — use getEscrowMarket() for per-market lookup.
+   *
+   * @returns {Promise<{ escrow_address, escrow_balance_lamports, total_markets_settled, l2_sequencer_configured }>}
+   *
+   * @example
+   *   const s = await sdk.getEscrowStatus();
+   *   console.log(`Vault: ${BlackBookWalletSDK.toBB(s.escrow_balance_lamports)} BB`);
+   *   console.log(`Markets settled: ${s.total_markets_settled}`);
+   */
+  async getEscrowStatus() {
+    return this._apiGet('/escrow/status');
+  }
+
+  /**
+   * Look up the 32-byte Merkle root permanently stored for a single market.
+   *
+   * @param {string} marketId - Market identifier (e.g. "super_bowl_2026")
+   * @returns {Promise<{ success, market_id, merkle_root }|{ success, error }>}
+   *
+   * @example
+   *   const m = await sdk.getEscrowMarket('super_bowl_2026');
+   *   if (m.success) console.log(`Root: ${m.merkle_root}`);
+   *   else console.log('Not settled yet');
+   */
+  async getEscrowMarket(marketId) {
+    return this._apiGet(`/escrow/market/${encodeURIComponent(marketId)}`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 9. TRANSACTION HISTORY
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -782,7 +932,7 @@ class BlackBookWalletSDK {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 9. LOCAL SESSION MANAGEMENT (Browser localStorage)
+  // 10. LOCAL SESSION MANAGEMENT (Browser localStorage)
   // ═══════════════════════════════════════════════════════════════════════════
   //
   // These methods persist the wallet session in the browser. Only the
@@ -912,7 +1062,7 @@ class BlackBookWalletSDK {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 10. UTILITIES
+  // 11. UTILITIES
   // ═══════════════════════════════════════════════════════════════════════════
 
   /** Convert BB to lamports */

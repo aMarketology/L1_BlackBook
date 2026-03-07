@@ -50,5 +50,26 @@ pub enum TxData {
         to: String,
         amount: u64,
     },
+
+    // ========== Global Escrow Smart Contract ==========
+
+    /// User deposits tokens into the global escrow vault
+    EscrowDeposit {
+        amount: u64,
+        escrow_address: String,
+    },
+
+    /// L2 sequencer submits a per-market merkle root for settlement
+    EscrowStateRoot {
+        market_id: String,
+        merkle_root: String,
+    },
+
+    /// User withdraws from escrow using a merkle proof against a settled market
+    EscrowWithdraw {
+        market_id: String,
+        amount: u64,
+        escrow_address: String,
+    },
 }
 

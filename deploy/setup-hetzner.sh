@@ -16,6 +16,12 @@ REPO_URL="https://github.com/aMarketology/L1_BlackBook.git"
 BRANCH="master"
 APP_DIR="/opt/blackbook"
 
+# ── Pre-flight: require .env to be present (scp'd before running this script)
+# Run on your LOCAL machine first:
+#   scp .env root@<SERVER_IP>:/opt/blackbook-env.tmp
+# Then this script moves it into place after cloning.
+PRE_ENV="/opt/blackbook-env.tmp"
+
 echo "╔═══════════════════════════════════════════════════════╗"
 echo "║    BlackBook L1 — Hetzner Server Setup               ║"
 echo "╚═══════════════════════════════════════════════════════╝"
@@ -74,8 +80,27 @@ else
     git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 
-# Copy real_wallets if they exist locally (you'll scp them separately)
-mkdir -p "$APP_DIR/deploy/real_wallets"
+# Move pre-loaded .env into place (if it was scp'd before this script ran)
+if [ -f "$PRE_ENV" ]; then
+    mv "$PRE_ENV" "$APP_DIR/.env"
+    chmod 600 "$APP_DIR/.env"
+    echo "✅ .env installed from $PRE_ENV"
+elif [ ! -f "$APP_DIR/.env" ]; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  ⚠️  NO .env FILE FOUND — NODE REQUIRES SECRETS TO START    ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    echo "║  On your LOCAL machine, run:                                 ║"
+    echo "║    cp .env.template .env                                     ║"
+    echo "║    # Fill in SERVER_MASTER_KEY and L2_SEQUENCER_PUBKEY       ║"
+    echo "║    scp .env root@<SERVER_IP>:$APP_DIR/.env                   ║"
+    echo "║  Then re-run step 7 manually:                                ║"
+    echo "║    cd $APP_DIR && docker compose -f deploy/docker-compose.prod.yml up -d --build ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Bootstrap complete — START SKIPPED until .env is provided."
+    exit 0
+fi
 
 # ── 7. Build and launch ──────────────────────────────────────
 echo "[7/7] Building and launching BlackBook L1..."

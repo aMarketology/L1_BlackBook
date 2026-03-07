@@ -17,13 +17,13 @@
 // │                            │                                    │
 // │              ┌─────────────┴─────────────┐                     │
 // │              ▼                           ▼                     │
-// │    ConcurrentBlockchain            AssetManager                │
+// │    ConcurrentBlockchain           Global Escrow                │
 // │         │                               │                      │
 // │    ┌────┴──────────────┐          ┌─────┴───────┐             │
-// │    │  SVM AccountsDB   │          │   DashMap   │             │
-// │    │  (u64 lamports)   │          │ (Sessions)  │             │
-// │    │  SINGLE SOURCE    │          └─────────────┘             │
-// │    │  OF TRUTH         │                                      │
+// │    │  SVM AccountsDB   │          │  DashMap    │             │
+// │    │  (u64 lamports)   │          │ (market     │             │
+// │    │  SINGLE SOURCE    │          │  roots)     │             │
+// │    │  OF TRUTH         │          └─────────────┘             │
 // │    └────┬──────────────┘                                      │
 // │         │                                                     │
 // │    ┌────┴────┐     ┌────────────────┐                        │
@@ -54,9 +54,6 @@ use solana_sdk::account::AccountSharedData;
 // REDB TABLE DEFINITIONS (Type-Safe!)
 // ============================================================================
 
-/// Account balances: Address (String) → Balance (f64)
-const ACCOUNTS: TableDefinition<&str, f64> = TableDefinition::new("accounts");
-
 /// Committed blocks: BlockHeight (u64) → BlockData (Vec<u8>)
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
@@ -70,26 +67,22 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
-/// FROST Wallet Share B storage: WalletID (String) → SecretShare (Vec<u8>)
-/// Share B is stored in ReDB for server-side custody (2-of-3 threshold)
-const FROST_SHARE_B: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_share_b");
+/// SSS Shard B storage: WalletID (String) → EncryptedShare (Vec<u8>)
+/// Share B is stored in ReDB for server-side custody (2-of-3 Shamir threshold)
+const WALLET_SHARD_B: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_shard_b");
 
-/// FROST PublicKeyPackage storage: WalletID (String) → PublicKeyPackage (Vec<u8>)
-/// Needed for signature aggregation and verification
-const FROST_PUB_KEY_PKG: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_pub_key_pkg");
+/// Ed25519 Public Key storage: WalletID (String) → PublicKey (Vec<u8>)
+/// Maps wallet_id to the Ed25519 public key bytes
+const WALLET_ED25519_PUBKEY: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_ed25519_pubkey");
 
-/// FROST Public Key storage: WalletID (String) → PublicKey (Vec<u8>)
-/// Maps wallet_id (derived from group public key) to the actual key bytes
-const FROST_PUB_KEY: TableDefinition<&str, &[u8]> = TableDefinition::new("frost_pub_key");
+/// Escrow market roots: MarketID (String) → MerkleRoot (32 bytes, SHA-256)
+/// Stores ONLY the raw 32-byte merkle root per market. No metadata.
+/// L1 is a vault — it stores the math, not the floor plan.
+pub const ESCROW_MARKET_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_market_roots");
 
-/// Wallet Share B storage: WalletAddress (String) → EncryptedShare (Vec<u8>)
-/// Share B is stored on-chain for institutional-grade custody recovery
-/// The share is encrypted with the user's password-derived key
-const WALLET_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_shares");
-
-/// Wallet metadata: WalletAddress (String) → WalletMetadata (Vec<u8>)
-/// Stores wallet info (created_at, last_accessed, share locations, etc.)
-const WALLET_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_metadata");
+/// Escrow withdrawal claims: "{market_id}:{address}" (String) → ClaimTimestamp (u64)
+/// Prevents double-withdrawal per market — durable across restarts
+pub const ESCROW_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("escrow_claims");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -380,19 +373,12 @@ impl ConcurrentBlockchain {
         Pubkey::new_from_array(bytes)
     }
 
-    /// Mirror a balance to the legacy f64 DashMap cache and ReDB.
+    /// Mirror a balance to the legacy f64 DashMap cache.
     /// Called AFTER writing to SVM. The cache is a read-behind mirror,
-    /// not a source of truth.
+    /// not a source of truth. SVM AccountsDB is the single authoritative store.
     pub fn mirror_balance_to_cache(&self, address: &str, lamports: u64) {
         let bb = lamports as f64 / LAMPORTS_PER_BB as f64;
         self.cache.insert(address.to_string(), bb);
-        // Best-effort ReDB persistence (non-blocking for perf)
-        if let Ok(write_txn) = self.db.begin_write() {
-            if let Ok(mut table) = write_txn.open_table(ACCOUNTS) {
-                let _ = table.insert(address, bb);
-            }
-            let _ = write_txn.commit();
-        }
     }
 
     /// Create or open a blockchain database
@@ -409,17 +395,16 @@ impl ConcurrentBlockchain {
         // Initialize tables
         let write_txn = db.begin_write()?;
         {
-            let _ = write_txn.open_table(ACCOUNTS)?;
             let _ = write_txn.open_table(BLOCKS)?;
             let _ = write_txn.open_table(METADATA)?;
             let _ = write_txn.open_table(TRANSACTIONS)?;
             let _ = write_txn.open_table(PROCESSED_BRIDGE_TXS)?;
-            let _ = write_txn.open_table(WALLET_SHARES)?;
-            let _ = write_txn.open_table(WALLET_METADATA)?;
-            // FROST wallet tables
-            let _ = write_txn.open_table(FROST_SHARE_B)?;
-            let _ = write_txn.open_table(FROST_PUB_KEY_PKG)?;
-            let _ = write_txn.open_table(FROST_PUB_KEY)?;
+            // Escrow tables
+            let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
+            let _ = write_txn.open_table(ESCROW_CLAIMS)?;
+            // SSS wallet tables
+            let _ = write_txn.open_table(WALLET_SHARD_B)?;
+            let _ = write_txn.open_table(WALLET_ED25519_PUBKEY)?;
             
             // SVM tables (behind feature flag)
             {
@@ -437,21 +422,9 @@ impl ConcurrentBlockchain {
         // Load existing data into cache
         let cache = Arc::new(DashMap::new());
         let processed_bridge_txs = Arc::new(DashMap::new());
-        let mut total = 0.0f64;
         
         {
             let read_txn = db.begin_read()?;
-            let table = read_txn.open_table(ACCOUNTS)?;
-            
-            // Iterate all accounts and populate cache
-            let mut iter = table.iter()?;
-            while let Some(result) = iter.next() {
-                let (key, value) = result?;
-                let address = key.value().to_string();
-                let balance = value.value();
-                cache.insert(address, balance);
-                total += balance;
-            }
             
             // Load processed bridge TXs into cache
             if let Ok(bridge_table) = read_txn.open_table(PROCESSED_BRIDGE_TXS) {
@@ -465,9 +438,8 @@ impl ConcurrentBlockchain {
             }
         }
 
-        let account_count = cache.len();
         let bridge_tx_count = processed_bridge_txs.len();
-        info!(accounts = account_count, total_supply = total, processed_bridge_txs = bridge_tx_count, "Database loaded");
+        info!(processed_bridge_txs = bridge_tx_count, "Database loaded (balances in SVM AccountsDB)");
 
         let db_arc = Arc::new(db);
         let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e| e.to_string())?);
@@ -477,7 +449,7 @@ impl ConcurrentBlockchain {
             cache,
             processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
-            total_supply: Arc::new(AtomicU64::new((total * 100_000.0) as u64)),
+            total_supply: Arc::new(AtomicU64::new(0)),
             svm_accounts,
             account_nonces: Arc::new(DashMap::new()),
         })
@@ -954,195 +926,125 @@ impl ConcurrentBlockchain {
     }
 
     // ========================================================================
-    // WALLET SHARE STORAGE (For Hybrid Custody)
-    // ========================================================================
-
-    /// Store an encrypted wallet share (Share B) on-chain
-    /// 
-    /// Share B is stored in the L1 blockchain for institutional-grade custody.
-    /// The share is encrypted with the user's password-derived key before storage.
-    pub fn store_wallet_share(&self, wallet_address: &str, encrypted_share: &[u8]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
-            table.insert(wallet_address, encrypted_share).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        
-        info!(wallet = %wallet_address, size = encrypted_share.len(), "Stored wallet share on-chain");
-        Ok(())
-    }
-
-    /// Retrieve an encrypted wallet share (Share B) from on-chain storage
-    /// 
-    /// Returns None if no share exists for this wallet address.
-    pub fn get_wallet_share(&self, wallet_address: &str) -> Result<Option<Vec<u8>>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
-        
-        match table.get(wallet_address).map_err(|e| e.to_string())? {
-            Some(access) => Ok(Some(access.value().to_vec())),
-            None => Ok(None),
-        }
-    }
-
-    /// Check if a wallet share exists on-chain
-    pub fn has_wallet_share(&self, wallet_address: &str) -> bool {
-        match self.get_wallet_share(wallet_address) {
-            Ok(Some(_)) => true,
-            _ => false,
-        }
-    }
-
-    /// Delete a wallet share from on-chain storage (for wallet deletion)
-    /// 
-    /// CAUTION: This is destructive. Only call when user explicitly deletes wallet.
-    pub fn delete_wallet_share(&self, wallet_address: &str) -> Result<bool, String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        let removed = {
-            let mut table = write_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
-            let result = table.remove(wallet_address).map_err(|e| e.to_string())?;
-            result.is_some()
-        };
-        write_txn.commit().map_err(|e| e.to_string())?;
-        
-        if removed {
-            info!(wallet = %wallet_address, "Deleted wallet share from on-chain storage");
-        }
-        Ok(removed)
-    }
-
-    /// Store wallet metadata (creation date, share locations, security settings)
-    pub fn store_wallet_metadata(&self, wallet_address: &str, metadata: &[u8]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(WALLET_METADATA).map_err(|e| e.to_string())?;
-            table.insert(wallet_address, metadata).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        
-        info!(wallet = %wallet_address, "Stored wallet metadata");
-        Ok(())
-    }
-
-    /// Retrieve wallet metadata
-    pub fn get_wallet_metadata(&self, wallet_address: &str) -> Result<Option<Vec<u8>>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(WALLET_METADATA).map_err(|e| e.to_string())?;
-        
-        match table.get(wallet_address).map_err(|e| e.to_string())? {
-            Some(access) => Ok(Some(access.value().to_vec())),
-            None => Ok(None),
-        }
-    }
-
-    /// Get username from wallet metadata (if set)
-    /// 
-    /// Returns the username/alias associated with a wallet address,
-    /// useful for human-readable ledger display
-    pub fn get_username(&self, wallet_address: &str) -> Option<String> {
-        if let Ok(Some(metadata_bytes)) = self.get_wallet_metadata(wallet_address) {
-            // Try to deserialize as WalletMetadata
-            if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&metadata_bytes) {
-                if let Some(username) = metadata.get("username").and_then(|u| u.as_str()) {
-                    if !username.is_empty() {
-                        return Some(username.to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Get all wallet addresses that have shares stored on-chain
-    /// 
-    /// Useful for admin/recovery operations
-    pub fn list_wallet_addresses(&self) -> Result<Vec<String>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(WALLET_SHARES).map_err(|e| e.to_string())?;
-        
-        let mut addresses = Vec::new();
-        let mut iter = table.iter().map_err(|e| e.to_string())?;
-        while let Some(result) = iter.next() {
-            let (key, _) = result.map_err(|e| e.to_string())?;
-            addresses.push(key.value().to_string());
-        }
-        
-        Ok(addresses)
-    }
-    
-    // ========================================================================
-    // FROST WALLET STORAGE (ReDB-backed)
+    // SSS WALLET STORAGE (ReDB-backed)
     // ========================================================================
     
-    /// Store FROST Share B (server-side custody share)
-    pub fn store_frost_share_b(&self, wallet_id: &str, share_data: &[u8]) -> Result<(), String> {
+    /// Store SSS Shard B (server-side custody share)
+    pub fn store_shard_b(&self, wallet_id: &str, share_data: &[u8]) -> Result<(), String> {
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
-            let mut table = write_txn.open_table(FROST_SHARE_B).map_err(|e| e.to_string())?;
+            let mut table = write_txn.open_table(WALLET_SHARD_B).map_err(|e| e.to_string())?;
             table.insert(wallet_id, share_data).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
-        info!(wallet_id = %wallet_id, "Stored FROST Share B in ReDB");
+        info!(wallet_id = %wallet_id, "Stored SSS Shard B in ReDB");
         Ok(())
     }
     
-    /// Retrieve FROST Share B
-    pub fn get_frost_share_b(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
+    /// Retrieve SSS Shard B
+    pub fn get_shard_b(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(FROST_SHARE_B).map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WALLET_SHARD_B).map_err(|e| e.to_string())?;
         
         match table.get(wallet_id) {
             Ok(Some(data)) => Ok(data.value().to_vec()),
-            Ok(None) => Err(format!("Share B not found for wallet: {}", wallet_id)),
+            Ok(None) => Err(format!("Shard B not found for wallet: {}", wallet_id)),
             Err(e) => Err(e.to_string()),
         }
     }
     
-    /// Store FROST PublicKeyPackage (needed for aggregation)
-    pub fn store_frost_pub_key_package(&self, wallet_id: &str, pkg_data: &[u8]) -> Result<(), String> {
+    /// Store Ed25519 Public Key
+    pub fn store_ed25519_pubkey(&self, wallet_id: &str, pub_key_data: &[u8]) -> Result<(), String> {
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
-            let mut table = write_txn.open_table(FROST_PUB_KEY_PKG).map_err(|e| e.to_string())?;
-            table.insert(wallet_id, pkg_data).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    
-    /// Retrieve FROST PublicKeyPackage
-    pub fn get_frost_pub_key_package(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(FROST_PUB_KEY_PKG).map_err(|e| e.to_string())?;
-        
-        match table.get(wallet_id) {
-            Ok(Some(data)) => Ok(data.value().to_vec()),
-            Ok(None) => Err(format!("PublicKeyPackage not found for wallet: {}", wallet_id)),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-    
-    /// Store FROST Public Key
-    pub fn store_frost_pub_key(&self, wallet_id: &str, pub_key_data: &[u8]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(FROST_PUB_KEY).map_err(|e| e.to_string())?;
+            let mut table = write_txn.open_table(WALLET_ED25519_PUBKEY).map_err(|e| e.to_string())?;
             table.insert(wallet_id, pub_key_data).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
     
-    /// Retrieve FROST Public Key
-    pub fn get_frost_pub_key(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
+    /// Retrieve Ed25519 Public Key
+    pub fn get_ed25519_pubkey(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(FROST_PUB_KEY).map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WALLET_ED25519_PUBKEY).map_err(|e| e.to_string())?;
         
         match table.get(wallet_id) {
             Ok(Some(data)) => Ok(data.value().to_vec()),
-            Ok(None) => Err(format!("Public key not found for wallet: {}", wallet_id)),
+            Ok(None) => Err(format!("Ed25519 public key not found for wallet: {}", wallet_id)),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    // ========================================================================
+    // ESCROW STORAGE (ReDB-backed)
+    // ========================================================================
+
+    /// Store a merkle root for a market settlement (strictly 32 bytes — SHA-256)
+    pub fn store_escrow_market_root(&self, market_id: &str, data: &[u8; 32]) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
+            table.insert(market_id, data.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        info!(market_id = %market_id, "Stored escrow market root in ReDB");
+        Ok(())
+    }
+
+    /// Fetch a single market root (used when verifying a user's Merkle proof)
+    pub fn get_escrow_market_root(&self, market_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
+        let result = table.get(market_id).map_err(|e| e.to_string())?;
+        Ok(result.map(|guard| guard.value().to_vec()))
+    }
+
+    /// Record that a user has claimed their withdrawal for a market
+    /// claim_key MUST be formatted as "{market_id}:{user_pubkey}"
+    pub fn store_escrow_claim(&self, claim_key: &str, timestamp: u64) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+            table.insert(claim_key, timestamp).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        info!(claim_key = %claim_key, "Stored escrow claim in ReDB");
+        Ok(())
+    }
+
+    /// Check if a user has already claimed their payout
+    pub fn has_escrow_claim(&self, claim_key: &str) -> Result<bool, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+        let result = table.get(claim_key).map_err(|e| e.to_string())?;
+        Ok(result.is_some())
+    }
+
+    /// Load all market roots from ReDB (startup recovery)
+    pub fn load_all_escrow_market_roots(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            results.push((key.value().to_string(), value.value().to_vec()));
+        }
+        Ok(results)
+    }
+
+    /// Load all claims from ReDB (startup recovery)
+    pub fn load_all_escrow_claims(&self) -> Result<Vec<(String, u64)>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            results.push((key.value().to_string(), value.value()));
+        }
+        Ok(results)
     }
 }
 

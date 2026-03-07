@@ -42,3 +42,6 @@ Thumbs.db
 # Wallet secrets — never commit
 real_wallets/
 *.keypair.json
+
+# Live chain database — binary, too large for git, regenerated on node start
+blockchain_data/

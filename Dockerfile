@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock* build.rs ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 COPY runtime/ runtime/
 COPY protocol/ protocol/
@@ -22,8 +22,9 @@ COPY benchmarks/ benchmarks/
 COPY tests/ tests/
 COPY examples/ examples/
 
-# Build release binary with all optimizations
-RUN cargo build --release --bin layer1
+# Build release binary with all optimizations.
+# --locked: fail if Cargo.lock is out of sync (reproducible builds).
+RUN cargo build --release --locked --bin layer1
 
 # ── Stage 2: Runtime ──────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -46,8 +47,8 @@ ENV REDB_PATH=/data/blockchain_data/blockchain.redb
 
 USER blackbook
 
-# Expose HTTP (8080) + JSON-RPC (8899)
-EXPOSE 8080 8899
+# Expose HTTP (8080) + JSON-RPC (8899) + gRPC relay (50051)
+EXPOSE 8080 8899 50051
 
 # Health check — block production staleness < 10s
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \

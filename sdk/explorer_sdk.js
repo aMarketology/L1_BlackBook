@@ -1,5 +1,5 @@
 // ============================================================================
-// BLACKBOOK EXPLORER SDK — v1.0
+// BLACKBOOK EXPLORER SDK — v2.0
 // ============================================================================
 //
 // Read-only SDK for the BlackBook L1 block explorer frontend.
@@ -9,11 +9,15 @@
 //   1. NETWORK     — Health, version, genesis hash, slot, epoch info
 //   2. SUPPLY      — Total supply, circulating, lamport conversion
 //   3. ACCOUNTS    — Balance lookups (single + batch), account info
-//   4. BLOCKS      — Block data, latest blockhash
-//   5. TRANSACTIONS — History by address, detail by signature
-//   6. RESERVES    — Proof-of-reserves (BB supply vs USDC backing)
-//   7. VALIDATORS  — Leader schedule, cluster info (future)
-//   8. UTILITIES   — Formatting, address shortening, time display
+//   4. TRANSACTIONS — History by address, detail by signature
+//   5. CHAIN STATS — Pipeline, Gulf Stream, Sealevel
+//   6. LEDGER      — Paginated audit ledger
+//   7. POH         — Proof of History clock & blocks
+//   8. CONSENSUS   — Tower BFT & Turbine
+//   9. USDC        — SPL Token balances & accounts
+//   10. ESCROW     — Global escrow vault status & per-market root lookup
+//   11. RESERVES   — Proof-of-reserves (BB supply vs USDC backing)
+//   12. UTILITIES  — Formatting, address shortening, time display
 //
 // Usage:
 //   <script src="explorer_sdk.js"></script>
@@ -495,7 +499,47 @@ class BlackBookExplorer {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 10. RESERVES — Proof of Reserves
+  // 10. ESCROW — Global escrow smart contract
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get current escrow vault status.
+   * Returns PDA balance and total settled market count only.
+   * The full market list lives in the L2 database.
+   *
+   * @returns {Promise<{ escrow_address, escrow_balance_lamports, total_markets_settled, l2_sequencer_configured }>}
+   *
+   * @example
+   *   const s = await explorer.getEscrowStatus();
+   *   console.log(`Vault: ${BlackBookExplorer.toBB(s.escrow_balance_lamports)} BB`);
+   *   console.log(`Markets settled: ${s.total_markets_settled}`);
+   */
+  async getEscrowStatus() {
+    return this._apiGet('/escrow/status');
+  }
+
+  /**
+   * Look up the Merkle root permanently stored on L1 for a single market.
+   * Returns the 32-byte root as a 64-char hex string.
+   *
+   * @param {string} marketId - Market identifier (e.g. "super_bowl_2026")
+   * @returns {Promise<{ success, market_id, merkle_root }|{ success, error }>}
+   *
+   * @example
+   *   const m = await explorer.getEscrowMarket('super_bowl_2026');
+   *   if (m.success) {
+   *     console.log(`Settled: ${m.merkle_root}`);
+   *   } else {
+   *     console.log('Market not yet settled on L1');
+   *   }
+   */
+  async getEscrowMarket(marketId) {
+    return this._apiGet(`/escrow/market/${encodeURIComponent(marketId)}`);
+  }
+
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 11. RESERVES — Proof of Reserves
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**

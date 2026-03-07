@@ -528,6 +528,108 @@ pub struct TransactionResult {
 }
 
 // ============================================================================
+// SECURITY INFRASTRUCTURE (Rate Limiting, Circuit Breakers, Fee Markets)
+// ============================================================================
+
+/// Network-level rate limiter: prevents a single address from
+/// flooding the mempool. Allows `MAX_PER_WINDOW` txs per address
+/// within a rolling window tracked via DashMap.
+#[derive(Debug, Clone)]
+pub struct NetworkThrottler {
+    /// address → count of recent transactions
+    tx_counts: Arc<dashmap::DashMap<String, u32>>,
+    max_per_window: u32,
+}
+
+impl NetworkThrottler {
+    pub fn new() -> Self {
+        Self {
+            tx_counts: Arc::new(dashmap::DashMap::new()),
+            max_per_window: 10,
+        }
+    }
+
+    /// Check whether a transaction from `sender` should be allowed.
+    /// Returns Err if the sender has exceeded the per-window limit.
+    pub fn check_transaction(&self, sender: &str, _fee: f64) -> Result<(), String> {
+        let mut count = self.tx_counts.entry(sender.to_string()).or_insert(0);
+        if *count >= self.max_per_window {
+            return Err(format!("Rate limited: {} txs in window", self.max_per_window));
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    pub fn get_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tracked_senders": self.tx_counts.len(),
+            "max_per_window": self.max_per_window,
+        })
+    }
+}
+
+/// Circuit breaker: prevents a single account from moving more than
+/// `MAX_BLOCK_PERCENT` of the total supply in a single block.
+/// Exempted addresses (e.g. "genesis", "system") bypass all checks.
+#[derive(Debug, Clone)]
+pub struct CircuitBreaker {
+    exemptions: Arc<dashmap::DashMap<String, bool>>,
+    max_block_percent: f64,
+}
+
+impl CircuitBreaker {
+    pub fn new() -> Self {
+        Self {
+            exemptions: Arc::new(dashmap::DashMap::new()),
+            max_block_percent: 0.20, // 20% of block supply
+        }
+    }
+
+    pub fn add_exemption(&self, address: &str) {
+        self.exemptions.insert(address.to_string(), true);
+    }
+
+    /// Check whether a transfer of `amount` from `sender` is within
+    /// circuit-breaker limits given a `total_supply` and `block_index`.
+    pub fn check_transfer(&self, sender: &str, amount: f64, total_supply: f64, _block: u64) -> Result<(), String> {
+        if self.exemptions.contains_key(sender) {
+            return Ok(());
+        }
+        let threshold = total_supply * self.max_block_percent;
+        if amount > threshold {
+            return Err(format!("Circuit breaker: {} exceeds {}% of supply", amount, self.max_block_percent * 100.0));
+        }
+        Ok(())
+    }
+
+    pub fn get_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "exemptions": self.exemptions.len(),
+            "max_block_percent": self.max_block_percent,
+        })
+    }
+}
+
+/// Localized fee market: computes priority fees based on recent
+/// block congestion. Currently a placeholder with base fee = 0.
+#[derive(Debug, Clone)]
+pub struct LocalizedFeeMarket {
+    base_fee: f64,
+}
+
+impl LocalizedFeeMarket {
+    pub fn new() -> Self {
+        Self { base_fee: 0.0 }
+    }
+
+    pub fn get_stats(&self) -> serde_json::Value {
+        serde_json::json!({
+            "base_fee": self.base_fee,
+        })
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 

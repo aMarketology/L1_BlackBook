@@ -320,6 +320,22 @@ impl TurbinePropagator {
 // MERKLE TREE FOR STATE ROOT
 // ============================================================================
 
+/// Sorted-hash combiner — always places the lexicographically smaller
+/// hash first so the result is position-independent.
+/// Both the tree builder AND the proof verifier must use this same function.
+/// The L2 must implement the identical convention (min-first SHA-256 pairing).
+fn combine_hashes(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if a <= b {
+        hasher.update(a);
+        hasher.update(b);
+    } else {
+        hasher.update(b);
+        hasher.update(a);
+    }
+    hasher.finalize().into()
+}
+
 /// Simple merkle tree implementation for account state proofs
 pub struct MerkleTree {
     leaves: Vec<[u8; 32]>,
@@ -354,7 +370,9 @@ impl MerkleTree {
         Self { leaves, root }
     }
 
-    /// Compute merkle root from leaves
+    /// Compute merkle root from leaves using sorted hashing.
+    /// Each pair is combined via `combine_hashes` (smaller hash first),
+    /// so the root is independent of insertion order.
     fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
             return [0u8; 32];
@@ -369,15 +387,9 @@ impl MerkleTree {
             let mut next_level = Vec::new();
 
             for chunk in current_level.chunks(2) {
-                let mut hasher = Sha256::new();
-                hasher.update(&chunk[0]);
-                if chunk.len() > 1 {
-                    hasher.update(&chunk[1]);
-                } else {
-                    // Odd number of nodes: duplicate the last one
-                    hasher.update(&chunk[0]);
-                }
-                next_level.push(hasher.finalize().into());
+                // Odd node: pair with itself (standard duplicate-last convention)
+                let right = if chunk.len() > 1 { &chunk[1] } else { &chunk[0] };
+                next_level.push(combine_hashes(&chunk[0], right));
             }
 
             current_level = next_level;
@@ -419,17 +431,11 @@ impl MerkleTree {
                 is_left: current_index % 2 == 1,
             });
 
-            // Move to next level
+            // Move to next level — must use the same combine_hashes as compute_root
             let mut next_level = Vec::new();
             for chunk in current_level.chunks(2) {
-                let mut hasher = Sha256::new();
-                hasher.update(&chunk[0]);
-                if chunk.len() > 1 {
-                    hasher.update(&chunk[1]);
-                } else {
-                    hasher.update(&chunk[0]);
-                }
-                next_level.push(hasher.finalize().into());
+                let right = if chunk.len() > 1 { &chunk[1] } else { &chunk[0] };
+                next_level.push(combine_hashes(&chunk[0], right));
             }
 
             current_level = next_level;
@@ -468,22 +474,16 @@ impl MerkleProof {
         hasher.update(balance.to_le_bytes());
         let mut current: [u8; 32] = hasher.finalize().into();
 
-        // Walk up the tree
+        // Walk up the tree using sorted hashing — is_left is ignored;
+        // direction is determined by lexicographic comparison, not position.
         for node in &self.proof {
-            let sibling = hex::decode(&node.hash).unwrap_or_default();
-            if sibling.len() != 32 {
+            let sibling_vec = hex::decode(&node.hash).unwrap_or_default();
+            if sibling_vec.len() != 32 {
                 return false;
             }
-
-            let mut hasher = Sha256::new();
-            if node.is_left {
-                hasher.update(&sibling);
-                hasher.update(&current);
-            } else {
-                hasher.update(&current);
-                hasher.update(&sibling);
-            }
-            current = hasher.finalize().into();
+            let mut sibling = [0u8; 32];
+            sibling.copy_from_slice(&sibling_vec);
+            current = combine_hashes(&current, &sibling);
         }
 
         hex::encode(current) == self.root
@@ -964,6 +964,26 @@ impl BlockProducer {
                     }
                     return Ok(());
                 }
+            }
+
+            // ========== Global Escrow Smart Contract ==========
+
+            TxData::EscrowDeposit { amount, escrow_address } => {
+                info!("Escrow deposit: {} locked {} BB → escrow {}", tx.from, amount, &escrow_address[..16.min(escrow_address.len())]);
+                // Already executed by the handler (debit user + credit escrow)
+                Ok(())
+            }
+
+            TxData::EscrowStateRoot { market_id, merkle_root } => {
+                info!("Escrow state root: market={} root={}…", market_id, &merkle_root[..16.min(merkle_root.len())]);
+                // State root submission — no balance changes, just recorded in PoH
+                Ok(())
+            }
+
+            TxData::EscrowWithdraw { market_id, amount, escrow_address } => {
+                info!("Escrow withdraw: {} claimed {} BB from market {} (escrow {})", tx.from, amount, market_id, &escrow_address[..16.min(escrow_address.len())]);
+                // Already executed by the handler (debit escrow + credit user)
+                Ok(())
             }
         }
     }

@@ -255,14 +255,14 @@ fn migrate_share_b(
     // and new Share B is already stored during wallet creation.
     // This function is useful for same-format migrations (e.g. v2→v3)
     // where the share data format stays the same but the address changes.
-    match blockchain.get_frost_share_b(old_wallet_id) {
+    match blockchain.get_shard_b(old_wallet_id) {
         Ok(old_share_data) => {
             // Only copy if new wallet doesn't already have share data
-            if blockchain.get_frost_share_b(new_wallet_id).is_ok() {
-                info!("  ↳ Share B already exists for new wallet, skipping copy");
+            if blockchain.get_shard_b(new_wallet_id).is_ok() {
+                info!("  ↳ Shard B already exists for new wallet, skipping copy");
                 return true;
             }
-            match blockchain.store_frost_share_b(new_wallet_id, &old_share_data) {
+            match blockchain.store_shard_b(new_wallet_id, &old_share_data) {
                 Ok(_) => {
                     info!("  ↳ Share B migrated: {} → {}", old_wallet_id, new_wallet_id);
                     true

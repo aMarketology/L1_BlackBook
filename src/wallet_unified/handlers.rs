@@ -196,9 +196,9 @@ pub async fn create_hybrid_wallet(
         .map_err(|e| err(format!("Failed to encrypt Share B: {}", e)))?;
     let container = ShardBContainer { shard_b_data: encrypted_share_b };
     let container_bytes = serde_json::to_vec(&container).unwrap();
-    state.blockchain.store_frost_share_b(&wallet_id, &container_bytes)
-        .map_err(|e| err(format!("Failed to store Share B: {}", e)))?;
-    state.blockchain.store_frost_pub_key(&wallet_id, &pub_key_bytes)
+    state.blockchain.store_shard_b(&wallet_id, &container_bytes)
+        .map_err(|e| err(format!("Failed to store Shard B: {}", e)))?;
+    state.blockchain.store_ed25519_pubkey(&wallet_id, &pub_key_bytes)
         .map_err(|e| err(format!("Failed to store public key: {}", e)))?;
     info!("✅ Share B stored for wallet {}", wallet_id);
 
@@ -255,8 +255,8 @@ pub async fn transfer_with_sss(
     };
 
     // 2. Fetch + decrypt Share B from ReDB
-    let container_bytes = state.blockchain.get_frost_share_b(&req.from_wallet_id)
-        .map_err(|e| err(format!("Share B not found: {}", e)))?;
+    let container_bytes = state.blockchain.get_shard_b(&req.from_wallet_id)
+        .map_err(|e| err(format!("Shard B not found: {}", e)))?;
     let container: ShardBContainer = serde_json::from_slice(&container_bytes)
         .map_err(|_| err("Shard B corrupted"))?;
     let master_key = get_server_master_key()?;
@@ -462,7 +462,7 @@ pub async fn get_shard_b_handler(
         info!("\u{26a0}\u{fe0f} Shard B retrieved WITHOUT PIN for {}", req.wallet_id);
     }
     
-    let container_bytes = state.blockchain.get_frost_share_b(&req.wallet_id)
+    let container_bytes = state.blockchain.get_shard_b(&req.wallet_id)
         .map_err(|e| err(format!("Shard B not found: {}", e)))?;
     
     let container: ShardBContainer = serde_json::from_slice(&container_bytes)
