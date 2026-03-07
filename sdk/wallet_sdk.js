@@ -713,39 +713,42 @@ class BlackBookWalletSDK {
 
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 7. FAUCET (Dev/Testnet Token Minting)
+  // 7. FAUCET (SSS-Only Token Minting)
   // ═══════════════════════════════════════════════════════════════════════════
   //
   // POST /faucet
   //
   // Auth: Session token (SSS 2-of-3 wallets — login first).
-  // For Ed25519/microtx faucet, use BlackBookAgent SDK (blackbook_sdk.js).
+  // AI agents with raw Ed25519 keys CANNOT use this endpoint.
+  // Only Shamir wallet users who have logged in get a session_token.
   //
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Request BB tokens from the faucet using a session token (SSS wallet).
+   * Request BB tokens from the faucet using a session token (SSS wallet only).
+   *
+   * You must log in first to get a session_token. AI agents with raw
+   * Ed25519 keypairs cannot claim faucet — only SSS wallets.
    *
    * @param {string} toAddress      - Recipient address (must match session wallet)
    * @param {number} [amountBB=0.1] - Amount in BB (max 0.1 per request)
-   * @param {string} sessionToken   - Session token from login()
+   * @param {string} sessionToken   - Session token from login() — REQUIRED
    * @returns {Promise<{ success: boolean, minted: number, to: string, new_balance: number, auth_method: string }>}
    *
    * @example
    *   const session = await sdk.login({ ... });
    *   const result = await sdk.faucet(wallet.address, 0.1, session.sessionToken);
    */
-  async faucet(toAddress, amountBB = 0.1, sessionToken = null) {
+  async faucet(toAddress, amountBB = 0.1, sessionToken) {
+    if (!sessionToken) throw new Error('session_token is required — log in with your SSS wallet first');
     if (amountBB > MAX_FAUCET_BB) amountBB = MAX_FAUCET_BB;
     if (amountBB <= 0) throw new Error('Amount must be positive');
 
-    const body = { to: toAddress, amount: amountBB };
-
-    if (sessionToken) {
-      body.session_token = sessionToken;
-    }
-
-    return this._api('/faucet', body);
+    return this._api('/faucet', {
+      to: toAddress,
+      amount: amountBB,
+      session_token: sessionToken,
+    });
   }
 
 

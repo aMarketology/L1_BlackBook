@@ -116,6 +116,7 @@ mod runtime;
 
 use storage::ConcurrentBlockchain;
 use wallet_unified::handlers::UnifiedWalletState;
+use wallet_unified::session_store::SessionStore;
 
 // Solana-style consensus infrastructure
 use runtime::{
@@ -188,6 +189,9 @@ pub struct AppState {
 
     // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
     pub faucet_claims: Arc<dashmap::DashMap<String, (u64, f64)>>,
+
+    // SSS session store — shared with UnifiedWalletState
+    pub session_store: Arc<SessionStore>,
 
     // ===== Global Escrow Smart Contract =====
     /// Single global escrow PDA address (derived at startup)
@@ -762,34 +766,34 @@ async fn admin_burn_handler(
 }
 
 // ============================================================================
-// FAUCET — Public token mint (0.1 BB per request, unlimited for now)
+// FAUCET — SSS-only token mint (0.1 BB per request)
+// Only Shamir 2-of-3 wallets can claim — AI agents with raw Ed25519 keys cannot.
 // ============================================================================
 
 #[derive(Deserialize)]
 struct FaucetRequest {
-    /// Wallet address to receive funds (must be hex-encoded Ed25519 pubkey)
+    /// Wallet address to receive funds
     to: String,
     /// Amount to request (capped at MAX_FAUCET_BB)
     amount: f64,
-    /// Ed25519 signature proving ownership of `to` address
-    signature: String,
-    /// Timestamp (Unix seconds) for replay protection
-    timestamp: u64,
-    /// Unique nonce for replay protection
-    nonce: String,
+    /// SSS session token from login() — proves ownership of a Shamir wallet
+    session_token: String,
 }
 
-/// POST /faucet — Mint up to 0.1 BB to any address
+/// POST /faucet — Mint up to 0.1 BB to an SSS wallet
 ///
-/// REQUIRES Ed25519 signature to prove ownership of destination wallet.
-/// Message format: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
-/// 
+/// REQUIRES a valid session_token from a prior /wallet/login or /wallet/create.
+/// Only Shamir 2-of-3 wallets can claim — this prevents AI agents from draining
+/// the faucet with raw Ed25519 keypairs.
+///
 /// NOTE: Currently unlimited calls allowed. Future: rate-limited to once per 24h.
 async fn faucet_handler(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> impl IntoResponse {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+    use ed25519_dalek::Signer;
+    use zeroize::Zeroize;
 
     const MAX_FAUCET_BB: f64 = 0.1;
 
@@ -806,95 +810,46 @@ async fn faucet_handler(
         })));
     }
 
-    // ── Ed25519 SIGNATURE VERIFICATION ─────────────────────────────────────
-    // Parse public key from `to` address (hex or base58)
-    let pubkey_bytes: Vec<u8> = if req.to.len() == 64 && req.to.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Hex-encoded pubkey
-        match hex::decode(&req.to) {
-            Ok(b) => b,
-            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid hex public key"
-            }))),
-        }
-    } else {
-        // Base58 pubkey (Solana-style)
-        match bs58::decode(&req.to).into_vec() {
-            Ok(b) if b.len() == 32 => b,
-            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid base58 public key (must be 32 bytes)"
-            }))),
-        }
-    };
-
-    if pubkey_bytes.len() != 32 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Public key must be 32 bytes"
-        })));
-    }
-
-    let sig_bytes = match hex::decode(&req.signature) {
-        Ok(b) if b.len() == 64 => b,
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid signature (must be 64 bytes hex)"
+    // ── SSS SESSION VERIFICATION ───────────────────────────────────────────
+    // Look up the session — this proves the user logged in with a Shamir wallet.
+    // AI agents don't have SSS wallets, so they can't get a session_token.
+    let mut seed_32 = match state.session_store.get_seed(&req.session_token) {
+        Ok(seed) => seed,
+        Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": format!("Invalid session — log in with your SSS wallet first: {}", e),
+            "auth_method": "sss_session_required"
         }))),
     };
 
-    // Build message: "FAUCET:{to}:{amount}:{timestamp}:{nonce}"
-    let message = format!("FAUCET:{}:{}:{}:{}", req.to, req.amount, req.timestamp, req.nonce);
+    // Derive the wallet address from the session seed and verify it matches `to`
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
+    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
-        Ok(k) => k,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid Ed25519 public key"
-        }))),
-    };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
-
-    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+    if derived_address != req.to {
+        seed_32.zeroize();
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Signature verification failed — prove you own this wallet"
+            "error": "Session does not match the 'to' address — you can only claim faucet for your own wallet",
+            "expected": derived_address,
+            "got": req.to
         })));
     }
 
-    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
-    let nonce_key = format!("faucet:{}:{}", req.to, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
+    // Server-side sign for PoH block recording
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let faucet_message = format!("FAUCET:{}:{}:{}", req.to, amount, nonce);
+    let signature = signing_key.sign(faucet_message.as_bytes());
+    let sig_hex = hex::encode(signature.to_bytes());
 
-    // Check timestamp freshness (reject requests older than 60 seconds)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now.saturating_sub(req.timestamp) > 60 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Request too old (>60s)",
-            "server_time": now,
-            "request_time": req.timestamp
-        })));
-    }
-
-    // Record nonce BEFORE minting
-    state.used_nonces.insert(nonce_key, now);
-
-    // Prune old nonces periodically
-    if state.used_nonces.len() > 100_000 {
-        let cutoff = now.saturating_sub(120);
-        state.used_nonces.retain(|_, &mut ts| ts > cutoff);
-    }
+    // Zeroize seed immediately
+    seed_32.zeroize();
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
-    // No per-epoch rate limiting for now (future: once per 24h)
     let mint_amount = amount;
 
     match state.blockchain.credit(&req.to, mint_amount) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.to);
-            info!("🚰 FAUCET: {} BB → {} (sig verified)", mint_amount, req.to);
+            info!("🚰 FAUCET: {} BB → {} (SSS session verified)", mint_amount, req.to);
 
             // Record faucet mint into PoH block
             {
@@ -909,9 +864,9 @@ async fn faucet_handler(
                         .as_secs(),
                     data: TxData::DepositUsdt {
                         usdt_amount: (mint_amount / 10.0) as u64,
-                        external_tx_hash: Some(format!("faucet_{}", req.nonce)),
+                        external_tx_hash: Some(format!("faucet_{}", nonce)),
                     },
-                    signature: req.signature.clone(),
+                    signature: sig_hex.clone(),
                     signer_pubkey: req.to.clone(),
                 };
                 state.block_producer.record_executed_transaction(tx);
@@ -921,7 +876,8 @@ async fn faucet_handler(
                 "success": true,
                 "minted": mint_amount,
                 "to": req.to,
-                "new_balance": new_bal
+                "new_balance": new_bal,
+                "auth_method": "sss_session"
             })))
         }
         Err(e) => {
@@ -2468,6 +2424,20 @@ async fn main() {
     }
 
     // 7. Build State
+    // Create a shared session store so both AppState (faucet) and
+    // UnifiedWalletState (wallet handlers) share the same login sessions.
+    let shared_session_store = Arc::new(SessionStore::new());
+    // Spawn background sweeper — removes expired sessions every 60s
+    {
+        let sweeper = shared_session_store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                sweeper.sweep_expired();
+            }
+        });
+    }
+
     let state = AppState {
         blockchain,
         poh: poh_service.clone(),
@@ -2487,16 +2457,18 @@ async fn main() {
         account_metadata,
         used_nonces: Arc::new(dashmap::DashMap::new()),
         faucet_claims: Arc::new(dashmap::DashMap::new()),
+        session_store: shared_session_store.clone(),
         escrow_address,
         l2_sequencer_pubkey,
         market_roots,
         withdrawal_claims,
     };
 
-    // 8. Unified Wallet Router (SSS 2-of-3)
-    let unified_state = Arc::new(UnifiedWalletState::new(
+    // 8. Unified Wallet Router (SSS 2-of-3) — shares the same session store
+    let unified_state = Arc::new(UnifiedWalletState::new_with_session_store(
         Arc::new(state.blockchain.clone()),
         state.block_producer.clone(),
+        shared_session_store,
     ));
     let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
