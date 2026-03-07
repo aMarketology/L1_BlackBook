@@ -140,7 +140,7 @@ use poh_blockchain::{
 
 const VERSION: &str = "5.0.0";
 const NETWORK: &str = "mainnet-beta";
-const REDB_DATA_PATH: &str = "./blockchain_data";
+const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
 
 /// PoH Configuration (400ms slots — matching Solana for max TPS)
 const POH_SLOT_DURATION_MS: u64 = 400;
@@ -2149,8 +2149,12 @@ async fn main() {
 
     // 3. Blockchain (ReDB)
     let blockchain = {
-        info!("🗄️  Initializing ReDB at {}", REDB_DATA_PATH);
-        match ConcurrentBlockchain::new(REDB_DATA_PATH) {
+        // REDB_PATH env var: used in Docker (set to /data/blockchain_data/blockchain.redb)
+        // Falls back to ./blockchain_data for local dev
+        let redb_path = std::env::var("REDB_PATH")
+            .unwrap_or_else(|_| REDB_DATA_PATH_DEFAULT.to_string());
+        info!("🗄️  Initializing ReDB at {}", redb_path);
+        match ConcurrentBlockchain::new(&redb_path) {
             Ok(bc) => { info!("✅ Blockchain initialized"); bc }
             Err(e) => { error!("❌ FATAL: {}", e); panic!("Storage init failed: {:?}", e); }
         }

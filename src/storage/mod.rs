@@ -381,16 +381,24 @@ impl ConcurrentBlockchain {
         self.cache.insert(address.to_string(), bb);
     }
 
-    /// Create or open a blockchain database
+    /// Create or open a blockchain database.
+    /// Accepts either:
+    ///   - A full file path ending in .redb (e.g. "/data/blockchain_data/blockchain.redb")
+    ///   - A directory path (e.g. "./blockchain_data") — appends "/blockchain.redb"
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        info!(path = %path, "Opening ReDB database");
-        
+        let db_file = if path.ends_with(".redb") {
+            path.to_string()
+        } else {
+            format!("{}/blockchain.redb", path)
+        };
+        info!(path = %db_file, "Opening ReDB database");
+
         // Create database directory if needed
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = std::path::Path::new(&db_file).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
-        let db = Database::create(format!("{}/blockchain.redb", path))?;
+
+        let db = Database::create(&db_file)?;
         
         // Initialize tables
         let write_txn = db.begin_write()?;
