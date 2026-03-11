@@ -67,14 +67,6 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
-/// SSS Shard B storage: WalletID (String) → EncryptedShare (Vec<u8>)
-/// Share B is stored in ReDB for server-side custody (2-of-3 Shamir threshold)
-const WALLET_SHARD_B: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_shard_b");
-
-/// Ed25519 Public Key storage: WalletID (String) → PublicKey (Vec<u8>)
-/// Maps wallet_id to the Ed25519 public key bytes
-const WALLET_ED25519_PUBKEY: TableDefinition<&str, &[u8]> = TableDefinition::new("wallet_ed25519_pubkey");
-
 /// Escrow market roots: MarketID (String) → MerkleRoot (32 bytes, SHA-256)
 /// Stores ONLY the raw 32-byte merkle root per market. No metadata.
 /// L1 is a vault — it stores the math, not the floor plan.
@@ -126,21 +118,15 @@ impl std::fmt::Display for TxType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthType {
-    MasterKey,      // Direct password authentication
-    SessionKey,     // Scoped session key
-    ZkProof,        // Zero-knowledge proof
-    SSS,            // Shamir Secret Sharing 2-of-3 reconstruction
     SystemInternal, // Internal system operation (mints, etc)
+    Ed25519,        // Ed25519 Signature Authentication
 }
 
 impl std::fmt::Display for AuthType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AuthType::MasterKey => write!(f, "MASTER_KEY"),
-            AuthType::SessionKey => write!(f, "SESSION_KEY"),
-            AuthType::ZkProof => write!(f, "ZKP_SESSION"),
-            AuthType::SSS => write!(f, "SSS_2OF3"),
             AuthType::SystemInternal => write!(f, "SYSTEM"),
+            AuthType::Ed25519 => write!(f, "ED25519"),
         }
     }
 }
@@ -410,9 +396,6 @@ impl ConcurrentBlockchain {
             // Escrow tables
             let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
             let _ = write_txn.open_table(ESCROW_CLAIMS)?;
-            // SSS wallet tables
-            let _ = write_txn.open_table(WALLET_SHARD_B)?;
-            let _ = write_txn.open_table(WALLET_ED25519_PUBKEY)?;
             
             // SVM tables (behind feature flag)
             {
@@ -436,8 +419,8 @@ impl ConcurrentBlockchain {
             
             // Load processed bridge TXs into cache
             if let Ok(bridge_table) = read_txn.open_table(PROCESSED_BRIDGE_TXS) {
-                let mut iter = bridge_table.iter()?;
-                while let Some(result) = iter.next() {
+                let iter = bridge_table.iter()?;
+                for result in iter {
                     let (key, value) = result?;
                     let tx_hash = key.value().to_string();
                     let status = value.value().to_string();
@@ -650,7 +633,7 @@ impl ConcurrentBlockchain {
             balance_before_bb,
             new_balance_bb,
             0.0, // recipient_balance_after (destroyed)
-            AuthType::MasterKey,
+            AuthType::SystemInternal,
         );
         
         if let Err(e) = self.log_transaction(tx_record) {
@@ -692,14 +675,12 @@ impl ConcurrentBlockchain {
         let table = read_txn.open_table(TRANSACTIONS).ok()?;
         
         let mut latest_tx: Option<TransactionRecord> = None;
-        let mut iter = table.iter().ok()?;
+        let iter = table.iter().ok()?;
         
-        while let Some(result) = iter.next() {
-            if let Ok((_, value)) = result {
-                if let Ok(tx) = serde_json::from_slice::<TransactionRecord>(value.value()) {
-                    if latest_tx.is_none() || tx.timestamp > latest_tx.as_ref().unwrap().timestamp {
-                        latest_tx = Some(tx);
-                    }
+        for (_, value) in iter.flatten() {
+            if let Ok(tx) = serde_json::from_slice::<TransactionRecord>(value.value()) {
+                if latest_tx.is_none() || tx.timestamp > latest_tx.as_ref().unwrap().timestamp {
+                    latest_tx = Some(tx);
                 }
             }
         }
@@ -713,9 +694,9 @@ impl ConcurrentBlockchain {
         let table = read_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
         
         let mut transactions = Vec::new();
-        let mut iter = table.iter().map_err(|e| e.to_string())?;
+        let iter = table.iter().map_err(|e| e.to_string())?;
         
-        while let Some(result) = iter.next() {
+        for result in iter {
             let (_, value) = result.map_err(|e| e.to_string())?;
             let tx_data = value.value();
             
@@ -745,7 +726,7 @@ impl ConcurrentBlockchain {
 
     /// Transfer tokens between addresses (atomic) — legacy API (no SVM receipt).
     pub fn transfer(&self, from: &str, to: &str, amount: f64) -> Result<(), String> {
-        self.transfer_inner(from, to, amount, AuthType::MasterKey)
+        self.transfer_inner(from, to, amount, AuthType::SystemInternal)
     }
 
     /// Core atomic transfer — SVM-native.
@@ -832,48 +813,6 @@ impl ConcurrentBlockchain {
         Ok(())
     }
 
-    /// Transfer tokens with a pre-computed Ed25519 signature and emit an SVM
-    /// transaction receipt so wallets & explorer can look it up via
-    /// `getTransaction` / `getSignaturesForAddress`.
-    pub fn transfer_with_receipt(
-        &self,
-        from: &str,
-        to: &str,
-        amount: f64,
-        signature_hex: &str,
-        auth_type: AuthType,
-    ) -> Result<String, String> {
-        // Execute the core atomic transfer (SVM-native)
-        self.transfer_inner(from, to, amount, auth_type)?;
-
-        // Build a Solana-compatible transaction receipt for the SVM layer
-        let slot = self.block_height.load(Ordering::Relaxed);
-        let lamport_amount = (amount * LAMPORTS_PER_BB as f64) as i64;
-
-        let stored = crate::svm::types::StoredTransactionResult {
-            signature: signature_hex.to_string(),
-            slot,
-            success: true,
-            error_msg: String::new(),
-            compute_units_consumed: 150,
-            fee: 0,
-            account_keys: vec![from.to_string(), to.to_string()],
-            lamport_deltas: vec![
-                (from.to_string(), -lamport_amount),
-                (to.to_string(), lamport_amount),
-            ],
-            block_time: chrono::Utc::now().timestamp(),
-        };
-
-        if let Err(e) = self.svm_accounts.store_transaction_result(&stored) {
-            warn!("Failed to store SVM tx receipt: {}", e);
-        } else {
-            info!(sig = %signature_hex, "📜 SVM tx receipt stored");
-        }
-
-        Ok(signature_hex.to_string())
-    }
-
     // ========================================================================
     // STATISTICS
     // ========================================================================
@@ -931,57 +870,6 @@ impl ConcurrentBlockchain {
             None => Ok(None),
         };
         result
-    }
-
-    // ========================================================================
-    // SSS WALLET STORAGE (ReDB-backed)
-    // ========================================================================
-    
-    /// Store SSS Shard B (server-side custody share)
-    pub fn store_shard_b(&self, wallet_id: &str, share_data: &[u8]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(WALLET_SHARD_B).map_err(|e| e.to_string())?;
-            table.insert(wallet_id, share_data).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        info!(wallet_id = %wallet_id, "Stored SSS Shard B in ReDB");
-        Ok(())
-    }
-    
-    /// Retrieve SSS Shard B
-    pub fn get_shard_b(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(WALLET_SHARD_B).map_err(|e| e.to_string())?;
-        
-        match table.get(wallet_id) {
-            Ok(Some(data)) => Ok(data.value().to_vec()),
-            Ok(None) => Err(format!("Shard B not found for wallet: {}", wallet_id)),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-    
-    /// Store Ed25519 Public Key
-    pub fn store_ed25519_pubkey(&self, wallet_id: &str, pub_key_data: &[u8]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(WALLET_ED25519_PUBKEY).map_err(|e| e.to_string())?;
-            table.insert(wallet_id, pub_key_data).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    
-    /// Retrieve Ed25519 Public Key
-    pub fn get_ed25519_pubkey(&self, wallet_id: &str) -> Result<Vec<u8>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(WALLET_ED25519_PUBKEY).map_err(|e| e.to_string())?;
-        
-        match table.get(wallet_id) {
-            Ok(Some(data)) => Ok(data.value().to_vec()),
-            Ok(None) => Err(format!("Ed25519 public key not found for wallet: {}", wallet_id)),
-            Err(e) => Err(e.to_string()),
-        }
     }
 
     // ========================================================================

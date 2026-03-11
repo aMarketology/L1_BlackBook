@@ -22,6 +22,7 @@ pub mod types;
 pub mod accounts_db;
 pub mod runtime;
 pub mod spl_token;
+pub mod sigverify;
 
 // Re-export the most-used types at the svm:: level for ergonomic imports.
 pub use types::{

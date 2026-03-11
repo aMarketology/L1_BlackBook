@@ -107,8 +107,8 @@ impl Shred {
     #[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine)
     pub fn data_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(&self.slot.to_le_bytes());
-        hasher.update(&self.index.to_le_bytes());
+        hasher.update(self.slot.to_le_bytes());
+        hasher.update(self.index.to_le_bytes());
         hasher.update(&self.data);
         format!("{:x}", hasher.finalize())
     }
@@ -414,7 +414,7 @@ impl MerkleTree {
         let mut current_level = self.leaves.clone();
 
         while current_level.len() > 1 {
-            let sibling_index = if current_index % 2 == 0 {
+            let sibling_index = if current_index.is_multiple_of(2) {
                 current_index + 1
             } else {
                 current_index - 1
@@ -784,7 +784,7 @@ impl BlockProducer {
                 use sha2::{Sha256, Digest};
                 let mut h = Sha256::new();
                 h.update(poh_hash.as_bytes());
-                h.update(&slot.to_le_bytes());
+                h.update(slot.to_le_bytes());
                 h.finalize().into()
             };
             let slot_hash = SvmHash::new_from_array(slot_bytes);
@@ -959,10 +959,8 @@ impl BlockProducer {
             TxData::TransferBb { to, amount } => {
                 info!("Transfer: {} -> {} ({} $BB)", tx.from, to, amount);
                 {
-                    if let Err(e) = self.execute_transfer_via_svm(&tx.from, to, *amount) {
-                        return Err(e);
-                    }
-                    return Ok(());
+                    self.execute_transfer_via_svm(&tx.from, to, *amount)?;
+                    Ok(())
                 }
             }
 

@@ -274,7 +274,7 @@ impl ReaderNode {
                 }
                 crate::protocol::blockchain::TxData::DepositUsdt { usdt_amount, .. } => {
                     // Mint: credit recipient at 1:10 ratio
-                    let bb_amount = (*usdt_amount as u64) * 10;
+                    let bb_amount = *usdt_amount * 10;
                     let add_lamports = bb_amount * LAMPORTS_PER_BB;
 
                     let pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&otx.tx.from);

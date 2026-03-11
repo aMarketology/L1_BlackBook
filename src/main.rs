@@ -1,14 +1,16 @@
 // ============================================================================
-// BLACKBOOK L1 — DIGITAL CENTRAL BANK
+// BLACKBOOK L1 — PURE SIGNATURE-VERIFYING BLOCKCHAIN
 // ============================================================================
 //
-// Two Core Jobs (see MANIFESTO.md):
-//   1. GATEKEEPER:          USDT → $BB at 1:10 ratio (vault solvency)
-//   2. INVISIBLE SECURITY:  SSS 2-of-3 Shamir wallets (key never whole)
+// L1 is a pure blockchain node. It does NOT sign transactions — it only
+// VERIFIES Ed25519 signatures submitted by wallets (local or server-side).
 //
 // Engine: Solana-style PoH + Sealevel parallel execution
 // Storage: ReDB (ACID, MVCC, zero-copy reads)
-// Auth: Ed25519 signatures + SSS 2-of-3 reconstruction
+// Auth: Ed25519 signature verification only
+//
+// Wallet services (SSS, FROST, session management) live in /wallet — a
+// separate service that signs transactions and submits them to L1.
 //
 // Run:  cargo run
 // Test: curl http://localhost:8080/health
@@ -97,7 +99,6 @@ pub struct NodeConfig {
 // MODULES
 // ============================================================================
 
-mod wallet_unified;
 mod storage;
 mod poh_blockchain;
 mod svm;
@@ -115,8 +116,6 @@ mod runtime;
 // ============================================================================
 
 use storage::ConcurrentBlockchain;
-use wallet_unified::handlers::UnifiedWalletState;
-use wallet_unified::session_store::SessionStore;
 
 // Solana-style consensus infrastructure
 use runtime::{
@@ -189,9 +188,6 @@ pub struct AppState {
 
     // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
     pub faucet_claims: Arc<dashmap::DashMap<String, (u64, f64)>>,
-
-    // SSS session store — shared with UnifiedWalletState
-    pub session_store: Arc<SessionStore>,
 
     // ===== Global Escrow Smart Contract =====
     /// Single global escrow PDA address (derived at startup)
@@ -300,12 +296,6 @@ async fn balance_handler(
         "unit": "BB"
     }))
 }
-
-// ============================================================================
-// TRANSFER — SSS 2-of-3 Authenticated
-// ============================================================================
-
-// [REMOVED] Legacy SSS Transfer Handler - Use Unified Wallet API
 
 
 // ============================================================================
@@ -583,7 +573,7 @@ async fn turbine_status_handler(
         }
         None => (0, 0, 0),
     };
-    let validators = vec![state.validator_id.clone()];
+    let validators = [state.validator_id.clone()];
     let max_hops = TurbinePropagator::max_hops(validators.len());
     Json(serde_json::json!({
         "current_slot": current_slot,
@@ -766,41 +756,42 @@ async fn admin_burn_handler(
 }
 
 // ============================================================================
-// FAUCET — SSS-only token mint (0.1 BB per request)
-// Only Shamir 2-of-3 wallets can claim — AI agents with raw Ed25519 keys cannot.
+// FAUCET — Ed25519 Signature-Verified Token Mint (0.1 BB per request)
 // ============================================================================
 
 #[derive(Deserialize)]
 struct FaucetRequest {
     /// Wallet address to receive funds
-    to: String,
+    wallet_address: String,
     /// Amount to request (capped at MAX_FAUCET_BB)
     amount: f64,
-    /// SSS session token from login() — proves ownership of a Shamir wallet
-    session_token: String,
+    /// Ed25519 public key (hex, 32 bytes)
+    public_key: String,
+    /// Ed25519 signature (hex, 64 bytes)
+    signature: String,
+    /// Unix timestamp for replay protection
+    timestamp: u64,
+    /// Unique nonce for replay protection
+    nonce: String,
 }
 
-/// POST /faucet — Mint up to 0.1 BB to an SSS wallet
+/// POST /faucet — Mint up to 0.1 BB to any wallet with Ed25519 proof-of-ownership
 ///
-/// REQUIRES a valid session_token from a prior /wallet/login or /wallet/create.
-/// Only Shamir 2-of-3 wallets can claim — this prevents AI agents from draining
-/// the faucet with raw Ed25519 keypairs.
-///
-/// NOTE: Currently unlimited calls allowed. Future: rate-limited to once per 24h.
+/// User signs: "FAUCET:{wallet_address}:{amount}:{timestamp}:{nonce}"
+/// L1 verifies the signature, then mints tokens to the wallet.
+/// Rate-limited: once per epoch per address.
 async fn faucet_handler(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> impl IntoResponse {
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use ed25519_dalek::Signer;
-    use zeroize::Zeroize;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     const MAX_FAUCET_BB: f64 = 0.1;
 
     // ── VALIDATE INPUTS ────────────────────────────────────────────────────
-    if req.to.is_empty() {
+    if req.wallet_address.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Missing 'to' address"
+            "error": "Missing 'wallet_address'"
         })));
     }
     let amount = req.amount.min(MAX_FAUCET_BB).max(0.0);
@@ -810,46 +801,65 @@ async fn faucet_handler(
         })));
     }
 
-    // ── SSS SESSION VERIFICATION ───────────────────────────────────────────
-    // Look up the session — this proves the user logged in with a Shamir wallet.
-    // AI agents don't have SSS wallets, so they can't get a session_token.
-    let mut seed_32 = match state.session_store.get_seed(&req.session_token) {
-        Ok(seed) => seed,
-        Err(e) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": format!("Invalid session — log in with your SSS wallet first: {}", e),
-            "auth_method": "sss_session_required"
-        }))),
+    // ── Ed25519 SIGNATURE VERIFICATION ─────────────────────────────────────
+    let message = format!("FAUCET:{}:{}:{}:{}", req.wallet_address, amount, req.timestamp, req.nonce);
+
+    let pubkey_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid public key (must be 32 bytes hex)" }))),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
 
-    // Derive the wallet address from the session seed and verify it matches `to`
-    let signing_key = Ed25519SigningKey::from_bytes(&seed_32);
-    let derived_address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
+    };
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
 
-    if derived_address != req.to {
-        seed_32.zeroize();
+    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
+    }
+
+    // Verify the public key matches the claimed wallet address
+    let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived_address != req.wallet_address {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Session does not match the 'to' address — you can only claim faucet for your own wallet",
-            "expected": derived_address,
-            "got": req.to
+            "error": "Public key does not match wallet_address",
+            "derived": derived_address,
+            "claimed": req.wallet_address
         })));
     }
 
-    // Server-side sign for PoH block recording
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let faucet_message = format!("FAUCET:{}:{}:{}", req.to, amount, nonce);
-    let signature = signing_key.sign(faucet_message.as_bytes());
-    let sig_hex = hex::encode(signature.to_bytes());
+    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
+    let nonce_key = format!("faucet:{}:{}", req.wallet_address, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Nonce already used — possible replay attack",
+            "nonce": req.nonce
+        })));
+    }
 
-    // Zeroize seed immediately
-    seed_32.zeroize();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Request too old (>60s)",
+            "server_time": now,
+            "request_time": req.timestamp
+        })));
+    }
+    state.used_nonces.insert(nonce_key, now);
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
-    let mint_amount = amount;
-
-    match state.blockchain.credit(&req.to, mint_amount) {
+    match state.blockchain.credit(&req.wallet_address, amount) {
         Ok(_) => {
-            let new_bal = state.blockchain.get_balance(&req.to);
-            info!("🚰 FAUCET: {} BB → {} (SSS session verified)", mint_amount, req.to);
+            let new_bal = state.blockchain.get_balance(&req.wallet_address);
+            info!("🚰 FAUCET: {} BB → {} (Ed25519 verified)", amount, req.wallet_address);
 
             // Record faucet mint into PoH block
             {
@@ -858,26 +868,23 @@ async fn faucet_handler(
                 let tx = ProtoTx {
                     hash: uuid::Uuid::new_v4().to_string(),
                     from: "SYSTEM_FAUCET".to_string(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: now,
                     data: TxData::DepositUsdt {
-                        usdt_amount: (mint_amount / 10.0) as u64,
-                        external_tx_hash: Some(format!("faucet_{}", nonce)),
+                        usdt_amount: (amount / 10.0) as u64,
+                        external_tx_hash: Some(format!("faucet_{}", req.nonce)),
                     },
-                    signature: sig_hex.clone(),
-                    signer_pubkey: req.to.clone(),
+                    signature: req.signature.clone(),
+                    signer_pubkey: req.public_key.clone(),
                 };
                 state.block_producer.record_executed_transaction(tx);
             }
 
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
-                "minted": mint_amount,
-                "to": req.to,
+                "minted": amount,
+                "to": req.wallet_address,
                 "new_balance": new_bal,
-                "auth_method": "sss_session"
+                "auth_method": "ed25519_signature"
             })))
         }
         Err(e) => {
@@ -951,72 +958,8 @@ async fn dealer_settle_handler(
 }
 
 // ============================================================================
-// ADMIN — Wallet Hot Upgrade Migration
+// ADMIN — Operations
 // ============================================================================
-
-/// Request body for POST /admin/wallet/migrate
-#[derive(Deserialize)]
-struct MigrateWalletsRequest {
-    /// List of (name, old_address, new_address) mappings
-    mappings: Vec<MigrateMapping>,
-    /// Whether to drain old wallets to zero after migration (default: true)
-    #[serde(default = "default_true")]
-    drain_old: bool,
-    /// Whether to copy Share B data (only for same-format migrations)
-    #[serde(default)]
-    migrate_shares: bool,
-}
-
-#[derive(Deserialize)]
-struct MigrateMapping {
-    name: String,
-    old_address: String,
-    new_address: String,
-}
-
-fn default_true() -> bool { true }
-
-/// POST /admin/wallet/migrate — Execute a wallet balance migration
-///
-/// Atomically transfers all balances from old addresses to new addresses.
-/// Used when wallet structure changes (e.g. FROST v1 → Shamir v2).
-///
-/// This is safe to run while the server is live. Each wallet transfer is
-/// atomic via ReDB MVCC. The endpoint is idempotent — running it again
-/// on already-migrated (zero balance) wallets is a no-op.
-async fn wallet_migrate_handler(
-    State(state): State<AppState>,
-    Json(req): Json<MigrateWalletsRequest>,
-) -> impl IntoResponse {
-    use wallet_unified::migration::*;
-
-    let mappings: Vec<(&str, &str, &str)> = req.mappings.iter()
-        .map(|m| (m.name.as_str(), m.old_address.as_str(), m.new_address.as_str()))
-        .collect();
-
-    let plan = build_balance_migration_plan(
-        WalletVersion::V1Frost,
-        WalletVersion::V2Shamir,
-        mappings,
-        req.migrate_shares,
-    );
-
-    // Override drain setting from request
-    let plan = MigrationPlan {
-        drain_old_wallets: req.drain_old,
-        ..plan
-    };
-
-    let report = execute_migration(&state.blockchain, &plan);
-
-    let status = if report.failed == 0 {
-        StatusCode::OK
-    } else {
-        StatusCode::PARTIAL_CONTENT
-    };
-
-    (status, Json(serde_json::json!(report)))
-}
 
 /// GET /admin/accounts — View all on-chain account balances (dynamic)
 async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1315,7 +1258,7 @@ async fn ledger_handler(
     // Pagination
     let limit = query.limit.min(100).max(1); // Max 100, min 1
     let page = query.page.max(1); // Min page 1
-    let total_pages = (transactions.len() + limit - 1) / limit;
+    let total_pages = transactions.len().div_ceil(limit);
     let start_idx = (page - 1) * limit;
     let end_idx = (start_idx + limit).min(transactions.len());
     
@@ -1330,13 +1273,13 @@ async fn ledger_handler(
     // ═══════════════════════════════════════════════════════════════════════════
     // HEADER - Chain Summary
     // ═══════════════════════════════════════════════════════════════════════════
-    output.push_str("\n");
+    output.push('\n');
     output.push_str(" ═══ BLACKBOOK L1 AUDIT LEDGER ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     output.push_str(&format!("  BLOCK HEIGHT : {:>12}                     NETWORK : [ MAINNET-ZK ]           VERSION : 5.0.0-mainnet-beta\n", stats.block_count));
     output.push_str(&format!("  TOTAL SUPPLY : {:>12.2} BB              WALLETS : {:>6}                    STATUS  : [ FINALIZED ]\n", total_supply, stats.total_accounts));
     output.push_str(&format!("  TRANSACTIONS : {:>12}                     PAGE    : {:>4} of {:>4}                SHOWING : {} - {}\n", transactions.len(), page, total_pages, start_idx + 1, end_idx));
     output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    output.push_str("\n");
+    output.push('\n');
     
     // ═══════════════════════════════════════════════════════════════════════════
     // TRANSACTION TABLE - Compact but Complete
@@ -1416,7 +1359,7 @@ async fn ledger_handler(
     
     // Close table
     output.push_str(" └─────┴─────────────────────┴──────────────┴──────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────┘\n");
-    output.push_str("\n");
+    output.push('\n');
     
     // ═══════════════════════════════════════════════════════════════════════════
     // LEGEND
@@ -1427,7 +1370,7 @@ async fn ledger_handler(
     output.push_str("  STATUS:  ✅ Finalized │ ⏳ Pending │ ↩️ Reverted │ ❌ Failed      RECONCILED: [✓] Valid │ [✗] Mismatch\n");
     output.push_str("  COLUMNS: BLK=Block Height │ TX HASH=Transaction Hash │ PREV HASH=Chain Link │ Bal=Balance Before→After │ Recv=Recipient Balance\n");
     output.push_str(" ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    output.push_str("\n");
+    output.push('\n');
     
     // ═══════════════════════════════════════════════════════════════════════════
     // PAGINATION
@@ -1440,13 +1383,13 @@ async fn ledger_handler(
         if page < total_pages {
             output.push_str(&format!("Next: /ledger?page={}&limit={}", page + 1, limit));
         }
-        output.push_str("\n");
+        output.push('\n');
     }
     
     // Footer
-    output.push_str("\n");
+    output.push('\n');
     output.push_str(" 🛡️  Ed25519 Signatures │ SHA-256 TX Hashes │ Chain-Linked │ State Validated │ Immutably Stored on BlackBook L1\n");
-    output.push_str("\n");
+    output.push('\n');
     
     (
         StatusCode::OK,
@@ -1858,11 +1801,11 @@ async fn escrow_withdraw_handler(
 
         let mut hasher = Sha256::new();
         if current <= sibling {
-            hasher.update(&current);
-            hasher.update(&sibling);
+            hasher.update(current);
+            hasher.update(sibling);
         } else {
-            hasher.update(&sibling);
-            hasher.update(&current);
+            hasher.update(sibling);
+            hasher.update(current);
         }
         current = hasher.finalize().into();
     }
@@ -1968,13 +1911,13 @@ async fn escrow_market_handler(
 // ROUTER
 // ============================================================================
 
-fn build_router(state: AppState, wallet_router: Router) -> Router {
+fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app_routes = Router::new()
+    Router::new()
         // Public
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
@@ -1999,13 +1942,12 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .route("/escrow/withdraw", post(escrow_withdraw_handler))
         .route("/escrow/status", get(escrow_status_handler))
         .route("/escrow/market/:market_id", get(escrow_market_handler))
-        // Faucet (public, rate-limited)
+        // Faucet (public, rate-limited, Ed25519 verified)
         .route("/faucet", post(faucet_handler))
         // Admin (Dealer)
         .route("/admin/mint", post(admin_mint_handler))
         .route("/admin/burn", post(admin_burn_handler))
         .route("/admin/dealer/settle", post(dealer_settle_handler))
-        .route("/admin/wallet/migrate", post(wallet_migrate_handler))
         .route("/admin/accounts", get(admin_accounts_handler))
         .route("/admin/security/stats", get(security_stats_handler))
         // USDC SPL Token
@@ -2014,11 +1956,7 @@ fn build_router(state: AppState, wallet_router: Router) -> Router {
         .route("/usdc/balance/:address", get(usdc_balance_handler))
         .route("/usdc/supply", get(usdc_supply_handler))
         .route("/usdc/accounts/:address", get(usdc_accounts_handler))
-        .with_state(state);
-
-    // Merge wallet router (Unified SSS 2-of-3) with app routes
-    app_routes
-        .merge(wallet_router)
+        .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }
@@ -2088,7 +2026,7 @@ async fn main() {
     info!("║  Mode:      {:44}║", mode_label);
     info!("║  Identity:  {:44}║", &config.identity);
     info!("║  Engine:    PoH + Sealevel + Gulf Stream             ║");
-    info!("║  Wallets:   BIP-39 + SSS 2-of-3 + ZKP               ║");
+    info!("║  Auth:      Ed25519 Signature Verification           ║");
     info!("╚══════════════════════════════════════════════════════╝");
 
     // 2. PoH Clock
@@ -2180,7 +2118,7 @@ async fn main() {
 
     // Sync PoH clock to recovered slot
     if recovered_slot > 0 {
-        let mut poh = poh_service.write();
+        let poh = poh_service.write();
         poh.current_slot.store(recovered_slot, Ordering::Relaxed);
         info!("🕐 PoH clock → slot {}", recovered_slot);
     }
@@ -2424,20 +2362,6 @@ async fn main() {
     }
 
     // 7. Build State
-    // Create a shared session store so both AppState (faucet) and
-    // UnifiedWalletState (wallet handlers) share the same login sessions.
-    let shared_session_store = Arc::new(SessionStore::new());
-    // Spawn background sweeper — removes expired sessions every 60s
-    {
-        let sweeper = shared_session_store.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                sweeper.sweep_expired();
-            }
-        });
-    }
-
     let state = AppState {
         blockchain,
         poh: poh_service.clone(),
@@ -2457,20 +2381,11 @@ async fn main() {
         account_metadata,
         used_nonces: Arc::new(dashmap::DashMap::new()),
         faucet_claims: Arc::new(dashmap::DashMap::new()),
-        session_store: shared_session_store.clone(),
         escrow_address,
         l2_sequencer_pubkey,
         market_roots,
         withdrawal_claims,
     };
-
-    // 8. Unified Wallet Router (SSS 2-of-3) — shares the same session store
-    let unified_state = Arc::new(UnifiedWalletState::new_with_session_store(
-        Arc::new(state.blockchain.clone()),
-        state.block_producer.clone(),
-        shared_session_store,
-    ));
-    let unified_router = wallet_unified::handlers::router().with_state(unified_state);
 
     // Extract Arcs for RPC before state is moved into build_router
     let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
@@ -2513,7 +2428,7 @@ async fn main() {
     // On fresh start, ReDB→SVM seeding happens in ConcurrentBlockchain::new().
 
     // 10. HTTP Server
-    let app = build_router(state, unified_router);
+    let app = build_router(state);
     let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
 
     info!("");
@@ -2523,14 +2438,8 @@ async fn main() {
     info!("   GET  /health                    Health check");
     info!("   GET  /balance/{{address}}         Balance lookup");
     info!("   POST /transfer/simple           Broadcast Signed TX");
+    info!("   POST /faucet                    Faucet (Ed25519 verified)");
     info!("   GET  /ledger                    Transaction history");
-    info!("");
-    info!("🔐 UNIFIED WALLET (SSS 2-of-3):");
-    info!("   POST /wallet/create             Create wallet");
-    info!("   POST /wallet/login              Login (reconstruct seed)");
-    info!("   POST /wallet/logout             Logout (wipe session)");
-    info!("   POST /wallet/secure/shard-b     Get Server Shard (ReDB)");
-    info!("   POST /wallet/verify-sss         Verify shard reconstruction");
     info!("");
     info!("⚡ ENGINE:");
     info!("   GET  /poh/status                PoH clock");

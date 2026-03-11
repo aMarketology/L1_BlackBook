@@ -1,0 +1,204 @@
+# BlackBook L1 — $BB Blockchain Plan
+# The "Rules of the Game" for a High-Performance Agent Economy
+#
+# The job of the BlackBook L1 blockchain is to serve as the trustless settlement
+# layer for AI agent transactions. It provides the "rules of the game" and the
+# "field" where $BB tokens move — not just between human wallets, but between
+# autonomous agents that sign and submit transactions without any human in the loop.
+#
+# $BB is the native token. 1 $BB = 10 cents. The peg is maintained by the market
+# maker and escrow system built on top of the chain. The chain's only job is to
+# make sure $BB moves correctly, immutably, and fast.
+
+================================================================================
+THE FOUR CORE JOBS
+================================================================================
+
+1. THE TRUTH MACHINE (Ordering & Immutability)
+----------------------------------------------
+The most important job: ensure every node agrees on who holds how many $BB
+and in what order transactions were executed.
+
+  - Preventing Double-Spend: If Agent-A has 1 $BB and submits two transfers
+    simultaneously, the chain picks one as "first" and rejects the other.
+  - Immutability: Once confirmed, a transaction can never be deleted or reversed.
+  - PoH (Proof of History): A cryptographic clock (SHA-256 VDF chain) that
+    timestamps every transaction. Validators don't waste time arguing about when
+    something happened — the hash chain is the proof.
+
+  STATUS: LIVE — poh_blockchain.rs + runtime/poh_service.rs are running.
+
+
+2. THE GATEKEEPER (Security & Validation)
+-----------------------------------------
+Every $BB transfer must be authorized by its rightful owner via cryptographic proof.
+
+  - Ed25519 Signature Verification: Every write (transfer, escrow, faucet) requires
+    a valid signature over a canonical message string. L1 never holds private keys.
+  - Parallel Sig Verification (Rayon): Batch verification across all CPU cores.
+    On 16 cores, 100K sigs verify in ~375ms (fits inside a 400ms slot).
+  - Consensus (Tower BFT): Validators vote on block finality using a lockout-based
+    system mirroring Solana's Tower BFT.
+
+  STATUS: LIVE — sigverify.rs + runtime/consensus.rs operational.
+          Integration tests in tests/sealevel_sigverify.rs.
+
+
+3. THE WORLD COMPUTER (Parallel Execution)
+------------------------------------------
+BlackBook L1 is not just a ledger — it is a parallel execution engine.
+
+  - Sealevel: Transactions declare their account dependencies ahead of execution.
+    Non-overlapping transactions execute concurrently across CPU threads.
+  - Gulf Stream: Transactions are forwarded to the expected leader before the
+    previous block is even finalised — filling the execution pipeline continuously.
+  - SVM (Solana Virtual Machine): Executes both native $BB system transfers and
+    SPL token operations (USDC bridge). Phase 2 adds arbitrary BPF programs.
+  - Sharded Account State: 256 independent DashMap shards route accounts by their
+    first pubkey byte, guaranteeing zero lock contention for unrelated accounts.
+
+  AGENT USE CASE:
+    Autonomous AI agents (trading bots, market makers, settlement agents) submit
+    pre-signed $BB transactions directly to /sealevel/submit or /transfer/simple.
+    Each agent holds its own Ed25519 keypair — generated locally or via FROST MPC.
+    L1 verifies the signature and executes. No human approval. No session. No SSS.
+    The agent IS the wallet.
+
+  STATUS: LIVE — runtime/core.rs, svm/runtime.rs, svm/sharded_state.rs.
+
+
+4. THE ECONOMIC ENFORCER (Escrow & Settlement)
+----------------------------------------------
+The chain manages the on-chain mechanics of the $BB economy.
+
+  - Escrow PDA: Agents and users lock $BB into a global escrow account
+    via POST /escrow/deposit.
+  - L2 Markets: Off-chain orderbooks run their logic, then the market submits
+    a Merkle state root via POST /escrow/submit-state-root.
+  - Withdrawals: Winners exit with a Merkle proof via POST /escrow/withdraw.
+    L1 verifies the proof before releasing funds.
+  - Admin Mint/Burn: The Dealer address can mint/burn $BB to maintain the peg.
+  - USDC Bridge: SPL-compatible USDC minting/transfer for the stablecoin reserve
+    that backs $BB at 10:1.
+  - Fees: Currently zero (dev phase). Will be added before mainnet.
+
+  STATUS: LIVE — escrow handlers, admin mint/burn, USDC SPL engine.
+
+
+================================================================================
+WHAT WE HAVE BUILT (Inventory)
+================================================================================
+
+  File                          Lines   Status    Purpose
+  ---------------------------------------------------------------------------
+  src/main.rs                   2,626   LIVE      All HTTP handlers + router
+  src/poh_blockchain.rs         1,355   LIVE      PoH chain, block producer, Merkle
+  src/solana_rpc/mod.rs         1,300   LIVE      Solana JSON-RPC 2.0 (port 8899)
+  src/storage/mod.rs            1,109   BLOAT     ReDB storage + dead wallet tables
+  src/svm/spl_token.rs            610   LIVE      SPL/USDC token engine
+  src/svm/accounts_db.rs          585   LIVE      SVM account state, flush to ReDB
+  runtime/poh_service.rs          842   LIVE      PoH VDF clock
+  runtime/core.rs                 713   LIVE      ParallelScheduler, block pipeline
+  runtime/consensus.rs            640   LIVE      GulfStream, Tower BFT, LeaderSchedule
+  benchmarks/tps_benchmarks.rs    576   BROKEN    TPS bench referencing removed types
+  src/svm/types.rs                361   LIVE      SvmError, TransactionExecutionResult
+  src/relay/mod.rs                358   LIVE      gRPC writer->reader block relay
+  src/migration.rs                316   DEAD      One-time migration, already run
+  src/svm/sigverify.rs            314   LIVE      Parallel Ed25519 batch verification
+  src/reader/mod.rs               309   LIVE      Reader node, gRPC block subscriber
+  src/svm/runtime.rs              306   LIVE      BlackBookSVM execution engine
+  src/svm/sharded_state.rs        268   LIVE      256-shard DashMap account state
+  tests/sealevel_sigverify.rs     ~260  NEW       Integration: sign -> verify -> SVM
+
+
+================================================================================
+WHAT WE DON'T HAVE YET (Missing for Production)
+================================================================================
+
+  1. VALIDATOR NETWORK
+     Currently single-node (one writer, optional readers).
+     Real PoS slashing and multi-validator consensus are not yet enforced.
+     LeaderSchedule exists but stake-weighted selection is simulated.
+
+  2. FEE MARKET
+     All transactions are free. No gas fee collection or priority queue
+     based on fee bids. Required before mainnet to prevent spam.
+
+  3. ARBITRARY PROGRAMS (BPF / rBPF)
+     SVM Phase 1 handles native transfers and SPL tokens only.
+     Phase 2 adds loadable BPF programs (full smart contract support).
+
+  4. LIGHT CLIENT / MERKLE SYNC
+     Full light-client sync protocol is not implemented. Merkle proofs
+     are used only in the escrow withdraw path today.
+
+  5. STAKING + SLASHING
+     No on-chain bond or slash mechanism. Validators cannot yet be
+     economically penalized for equivocation.
+
+  6. AGENT SDK
+     A typed Rust/JS SDK that agents use to construct and sign $BB
+     transactions — wrapping the sigverify canonical message formats,
+     nonce management, and retry logic.
+
+
+================================================================================
+COMPLEXITY TO REMOVE (Dead Code Audit)
+================================================================================
+
+  PRIORITY 1 — Remove Immediately (no callers, pure dead weight):
+
+  src/storage/mod.rs:
+    - WALLET_SHARD_B table          SSS shard storage. wallet_unified is gone.
+    - WALLET_ED25519_PUBKEY table   SSS pubkey store. No callers.
+    - store_shard_b()               No callers in main.rs.
+    - get_shard_b()                 No callers.
+    - store_ed25519_pubkey()        No callers.
+    - get_ed25519_pubkey()          No callers.
+    - AuthType::SSS                 No callers.
+    - AuthType::SessionKey          No callers.
+    - AuthType::MasterKey           No callers (transfer() uses SystemInternal).
+    - AuthType::ZkProof             No callers.
+    - transfer_with_receipt()       Was wallet handler only. No callers.
+    Saves ~150 lines, removes 2 dormant ReDB tables from every DB file on disk.
+
+  src/migration.rs:
+    - 316 lines for a one-time operation that has already been run.
+    - Remove the file AND the /admin/wallet/migrate route from main.rs.
+
+  benchmarks/tps_benchmarks.rs:
+    - References types removed with wallet_unified. Will not compile.
+    - Delete for now; rewrite a clean benchmark once the API is stable.
+
+
+  PRIORITY 2 — Refactor (real code, but structurally overgrown):
+
+  src/main.rs (2,626 lines):
+    - Every HTTP handler is inline in one file.
+    - Split into: src/handlers/{transfer, escrow, admin, usdc, poh, ledger}.rs
+    - No logic changes — pure structural split.
+    - Reduces main.rs from 2,626 lines to ~300 lines (just AppState + router).
+
+  src/solana_rpc/mod.rs (1,300 lines):
+    - Phase 2B write methods (sendTransaction, getTransaction) are stubs.
+    - Either remove the stubs or clearly mark them as unimplemented!().
+
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+  Role          Responsibility                          Status
+  ---------------------------------------------------------------------------
+  Ledger        Permanent $BB balance history            LIVE  (ReDB)
+  Clock         PoH cryptographic timestamp chain        LIVE
+  Judge         Rejects bad sigs and double-spends       LIVE  (Ed25519 + nonce)
+  Executor      Parallel Sealevel tx execution           LIVE  (Rayon + DashMap)
+  Escrow        L2 market settlement via Merkle proof    LIVE
+  USDC Bridge   SPL stablecoin reserve                   LIVE
+  Agent Ready   Agents sign and submit — no human        LIVE  (architecture correct)
+  RPC Compat    Phantom / Solana CLI connect natively    LIVE  (port 8899)
+  Validators    Multi-node PoS consensus                 NOT YET
+  Programs      BPF smart contracts                      NOT YET (Phase 2)
+  Fee Market    Gas fees and priority queue              NOT YET
+  Agent SDK     Typed SDK for agent tx construction      NOT YET

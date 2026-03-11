@@ -103,6 +103,12 @@ pub struct DirtySet {
     inner: DashMap<[u8; 32], ()>,
 }
 
+impl Default for DirtySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirtySet {
     pub fn new() -> Self {
         Self { inner: DashMap::new() }

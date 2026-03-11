@@ -122,7 +122,7 @@ impl StoredAccount {
         self.lamports = self
             .lamports
             .checked_sub(amount)
-            .ok_or_else(|| SvmError::InsufficientFunds {
+            .ok_or(SvmError::InsufficientFunds {
                 available: self.lamports,
                 required: amount,
             })?;

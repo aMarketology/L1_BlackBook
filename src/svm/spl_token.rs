@@ -197,9 +197,9 @@ pub fn derive_mint_address(seed: &str) -> [u8; 32] {
 pub fn derive_ata_address(wallet: &[u8; 32], mint: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(wallet);
-    hasher.update(&SPL_TOKEN_PROGRAM_ID);
+    hasher.update(SPL_TOKEN_PROGRAM_ID);
     hasher.update(mint);
-    hasher.update(&ASSOCIATED_TOKEN_PROGRAM_ID);
+    hasher.update(ASSOCIATED_TOKEN_PROGRAM_ID);
     let result = hasher.finalize();
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&result[..32]);
@@ -347,7 +347,7 @@ impl SplTokenEngine {
             .ok_or_else(|| SvmError::AccountNotFound(format!("Mint {} not found", bs58::encode(mint_bytes).into_string())))?;
 
         let mut mint_layout = MintLayout::from_bytes(mint_account.data())
-            .map_err(|e| SvmError::SerializationError(e))?;
+            .map_err(SvmError::SerializationError)?;
 
         if !mint_layout.is_initialized {
             return Err(SvmError::InvalidTransaction("Mint not initialized".into()));
@@ -396,7 +396,7 @@ impl SplTokenEngine {
 
         // 4. Credit the ATA
         let mut token_layout = TokenAccountLayout::from_bytes(ata_account.data())
-            .map_err(|e| SvmError::SerializationError(e))?;
+            .map_err(SvmError::SerializationError)?;
 
         token_layout.amount = token_layout.amount
             .checked_add(amount)
@@ -444,7 +444,7 @@ impl SplTokenEngine {
             ))?;
 
         let mut from_layout = TokenAccountLayout::from_bytes(from_account.data())
-            .map_err(|e| SvmError::SerializationError(e))?;
+            .map_err(SvmError::SerializationError)?;
 
         if from_layout.amount < amount {
             return Err(SvmError::InsufficientFunds {
@@ -483,7 +483,7 @@ impl SplTokenEngine {
         };
 
         let mut to_layout = TokenAccountLayout::from_bytes(to_account.data())
-            .map_err(|e| SvmError::SerializationError(e))?;
+            .map_err(SvmError::SerializationError)?;
 
         // 3. Debit sender, credit recipient
         from_layout.amount = from_layout.amount.checked_sub(amount)
@@ -541,7 +541,7 @@ impl SplTokenEngine {
             .ok_or_else(|| SvmError::AccountNotFound("Mint not found".into()))?;
 
         let layout = MintLayout::from_bytes(mint_account.data())
-            .map_err(|e| SvmError::SerializationError(e))?;
+            .map_err(SvmError::SerializationError)?;
 
         Ok(layout.supply)
     }

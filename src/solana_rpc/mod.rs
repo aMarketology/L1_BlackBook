@@ -971,7 +971,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         mint_arr.copy_from_slice(&mint_bytes_vec);
 
         let supply = SplTokenEngine::get_mint_supply(&self.svm_db, &mint_arr)
-            .map_err(|e| error_invalid_params(&format!("Mint error: {:?}", e)))?;
+            .map_err(|e| error_invalid_params(format!("Mint error: {:?}", e)))?;
 
         // Read decimals from the actual mint account
         let decimals = self.svm_db.get_account(&Pubkey::new_from_array(mint_arr))
@@ -1019,7 +1019,7 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         }
 
         let layout = TokenAccountLayout::from_bytes(stored.data())
-            .map_err(|e| error_invalid_params(&format!("Parse error: {}", e)))?;
+            .map_err(|e| error_invalid_params(format!("Parse error: {}", e)))?;
 
         // Read decimals from the mint
         use crate::svm::spl_token::{MintLayout, USDC_DECIMALS};

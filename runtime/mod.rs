@@ -14,7 +14,7 @@ pub mod poh_service;
 
 // PoH Service
 pub use poh_service::{
-    SharedPoHService, create_poh_service, create_poh_service_with_slot, run_poh_clock,
+    SharedPoHService, create_poh_service, run_poh_clock,
     TransactionPipeline,
     PipelinePacket,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,

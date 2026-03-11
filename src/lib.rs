@@ -1,15 +1,14 @@
-//! BlackBook L1 — Digital Central Bank
+//! BlackBook L1 — PURE SIGNATURE-VERIFYING BLOCKCHAIN
 //!
 //! Two Core Jobs (see MANIFESTO.md):
 //!   1. GATEKEEPER: USDT → $BB at 1:10 ratio (vault solvency)
-//!   2. INVISIBLE SECURITY: SSS 2-of-3 Shamir wallets (key never whole)
+//!   2. INVISIBLE SECURITY: Ed25519 signature verification
 //!
 //! Engine: Solana-style PoH + Sealevel parallel execution
 
 // Core modules
 pub mod storage;
 pub mod poh_blockchain;
-pub mod wallet_unified; // SSS 2-of-3 Shamir wallets
 pub mod svm;
 pub mod solana_rpc;
 pub mod relay;

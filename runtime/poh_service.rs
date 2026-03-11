@@ -596,7 +596,7 @@ impl PoHService {
         self.current_entries.clear();
         
         // Check epoch transition
-        if new_slot % self.config.slots_per_epoch == 0 {
+        if new_slot.is_multiple_of(self.config.slots_per_epoch) {
             self.current_epoch += 1;
             println!("📅 Epoch transition: now in epoch {} (slot {})", 
                      self.current_epoch, new_slot);
@@ -728,7 +728,7 @@ pub async fn run_poh_clock(poh_service: SharedPoHService) {
             poh.mix_pending_transactions();
             
             // Check if we should advance to next slot
-            let should_advance = tick_count % poh.config.ticks_per_slot == 0;
+            let should_advance = tick_count.is_multiple_of(poh.config.ticks_per_slot);
             
             (poh.current_slot.load(Ordering::Relaxed), should_advance)
         };

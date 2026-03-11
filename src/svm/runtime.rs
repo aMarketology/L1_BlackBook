@@ -61,6 +61,12 @@ pub struct BlockhashQueue {
     index: DashMap<[u8; 32], u64>,
 }
 
+impl Default for BlockhashQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlockhashQueue {
     pub fn new() -> Self {
         Self {
@@ -202,7 +208,7 @@ impl BlackBookSVM {
     pub fn current_blockhash(&self) -> Hash {
         self.blockhash_queue
             .latest_hash()
-            .unwrap_or_else(Hash::default)
+            .unwrap_or_default()
     }
 
     // ========================================================================

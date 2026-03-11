@@ -97,7 +97,7 @@ impl ProgramDerivedAddress {
         for bump in (0u8..=255).rev() {
             let mut hasher = Sha256::new();
             hasher.update(&seed_data);
-            hasher.update(&[bump]);
+            hasher.update([bump]);
             hasher.update(b"PDA");
             let hash = hasher.finalize();
 
@@ -344,6 +344,12 @@ pub struct ParallelScheduler {
     svm_db: Option<Arc<crate::svm::SvmAccountsDB>>,
 }
 
+impl Default for ParallelScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParallelScheduler {
     pub fn new() -> Self {
         let num_threads = num_cpus::get().max(4);
@@ -541,6 +547,12 @@ pub struct NetworkThrottler {
     max_per_window: u32,
 }
 
+impl Default for NetworkThrottler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkThrottler {
     pub fn new() -> Self {
         Self {
@@ -575,6 +587,12 @@ impl NetworkThrottler {
 pub struct CircuitBreaker {
     exemptions: Arc<dashmap::DashMap<String, bool>>,
     max_block_percent: f64,
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CircuitBreaker {
@@ -615,6 +633,12 @@ impl CircuitBreaker {
 #[derive(Debug, Clone)]
 pub struct LocalizedFeeMarket {
     base_fee: f64,
+}
+
+impl Default for LocalizedFeeMarket {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocalizedFeeMarket {

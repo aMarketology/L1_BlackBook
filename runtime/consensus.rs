@@ -350,7 +350,7 @@ impl VoteTower {
             }
         }
         // Pop expired
-        while self.votes.last().map_or(false, |v| v.is_expired(current)) { self.votes.pop(); }
+        while self.votes.last().is_some_and(|v| v.is_expired(current)) { self.votes.pop(); }
 
         // Same slot = re-confirm
         if let Some(top) = self.votes.last_mut() {
