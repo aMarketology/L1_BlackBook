@@ -209,7 +209,7 @@ fn test_mixed_valid_invalid_batch() {
 fn test_sign_verify_svm_transfer_pipeline() {
     const N: usize = 50;
     let tmpfile = NamedTempFile::new().unwrap();
-    let (accounts_db, mut svm) = make_svm(&tmpfile);
+    let (accounts_db, svm) = make_svm(&tmpfile);
 
     const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
@@ -287,7 +287,7 @@ fn test_sign_verify_svm_transfer_pipeline() {
 #[test]
 fn test_duplicate_tx_rejected() {
     let tmpfile = NamedTempFile::new().unwrap();
-    let (accounts_db, mut svm) = make_svm(&tmpfile);
+    let (accounts_db, svm) = make_svm(&tmpfile);
 
     const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
@@ -384,7 +384,7 @@ fn test_non_overlapping_svm_transfers_all_succeed() {
     // Accounts whose pubkeys have distinct first bytes land in different shards.
     // This verifies the ShardedAccountState contract: zero DashMap contention.
     let tmpfile = NamedTempFile::new().unwrap();
-    let (accounts_db, mut svm) = make_svm(&tmpfile);
+    let (accounts_db, svm) = make_svm(&tmpfile);
 
     const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
@@ -432,7 +432,7 @@ fn test_non_overlapping_svm_transfers_all_succeed() {
 #[test]
 fn test_insufficient_balance_rejected() {
     let tmpfile = NamedTempFile::new().unwrap();
-    let (accounts_db, mut svm) = make_svm(&tmpfile);
+    let (accounts_db, svm) = make_svm(&tmpfile);
 
     const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();

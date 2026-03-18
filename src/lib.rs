@@ -13,6 +13,7 @@ pub mod svm;
 pub mod solana_rpc;
 pub mod relay;
 pub mod reader;
+pub mod watcher;
 
 // Infrastructure
 #[path = "../protocol/mod.rs"]
@@ -46,5 +47,6 @@ pub use poh_blockchain::{
     verify_block, verify_chain,
     MAX_TXS_PER_BLOCK, BLOCK_INTERVAL_MS,
 };
+
 
 

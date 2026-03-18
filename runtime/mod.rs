@@ -9,6 +9,7 @@
 //!   - Sealevel parallel execution with account-level locking
 
 pub mod core;
+pub mod sealevel;
 pub mod consensus;
 pub mod poh_service;
 
@@ -25,5 +26,5 @@ pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};
 pub use consensus::TowerBFT;
 
 // Sealevel Parallel Execution
-pub use core::ParallelScheduler;
+pub use sealevel::{ParallelScheduler, SchedulerStats, TransactionResult as SealevelTxResult};
 

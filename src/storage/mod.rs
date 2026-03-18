@@ -76,6 +76,14 @@ pub const ESCROW_MARKET_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::n
 /// Prevents double-withdrawal per market — durable across restarts
 pub const ESCROW_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("escrow_claims");
 
+/// Deposit gateway requests: external_tx_hash (String) → DepositRecord JSON (bytes)
+/// Durable record of every wUSDC/wUSDT → BB deposit request submitted by users.
+const DEPOSIT_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deposit_requests");
+
+/// Withdrawal gateway requests: withdrawal_id (UUID) → WithdrawalRecord JSON (bytes)
+/// Durable record of every wUSDC → real USDC withdrawal initiated by users.
+const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdrawals");
+
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
 // feature was designed but never wired up. Recoverable from git history.
@@ -396,7 +404,9 @@ impl ConcurrentBlockchain {
             // Escrow tables
             let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
             let _ = write_txn.open_table(ESCROW_CLAIMS)?;
-            
+            let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
+            let _ = write_txn.open_table(WITHDRAWALS)?;
+
             // SVM tables (behind feature flag)
             {
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
@@ -822,7 +832,6 @@ impl ConcurrentBlockchain {
         let account_count = self.cache.len();
         BlockchainStats {
             total_accounts: account_count as u64,
-            current_slot: 0, // TODO: Hook up to PoH
             block_count: self.block_height.load(Ordering::Relaxed),
             total_supply: self.total_supply(),
             cache_hit_rate: 0.99, // DashMap is extremely fast
@@ -930,6 +939,78 @@ impl ConcurrentBlockchain {
         Ok(results)
     }
 
+    // ========================================================================
+    // DEPOSIT GATEWAY STORAGE (ReDB-backed)
+    // ========================================================================
+
+    /// Store (or overwrite) a deposit request record, keyed by external_tx_hash.
+    pub fn store_deposit_request(&self, record: &DepositRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(DEPOSIT_REQUESTS).map_err(|e| e.to_string())?;
+            table.insert(record.external_tx_hash.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load all deposit request records from ReDB (called at startup).
+    pub fn load_all_deposit_requests(&self) -> Result<Vec<DepositRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(DEPOSIT_REQUESTS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<DepositRecord>(value.value()) {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Check if an external tx hash has already been minted (replay protection).
+    pub fn is_bridge_tx_processed(&self, tx_hash: &str) -> bool {
+        self.processed_bridge_txs.contains_key(tx_hash)
+    }
+
+    /// Mark an external tx hash as processed and persist to ReDB.
+    pub fn mark_bridge_tx_processed(&self, tx_hash: &str, mint_tx_id: &str) -> Result<(), String> {
+        self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(PROCESSED_BRIDGE_TXS).map_err(|e| e.to_string())?;
+            table.insert(tx_hash, mint_tx_id).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Persist a withdrawal record (insert or overwrite).
+    pub fn store_withdrawal(&self, record: &WithdrawalRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(WITHDRAWALS).map_err(|e| e.to_string())?;
+            table.insert(record.withdrawal_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load all withdrawal records from ReDB (for startup recovery).
+    pub fn load_all_withdrawals(&self) -> Result<Vec<WithdrawalRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WITHDRAWALS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_key, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<WithdrawalRecord>(value.value()) {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
     /// Load all claims from ReDB (startup recovery)
     pub fn load_all_escrow_claims(&self) -> Result<Vec<(String, u64)>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
@@ -945,6 +1026,58 @@ impl ConcurrentBlockchain {
 }
 
 // ============================================================================
+// DEPOSIT GATEWAY RECORD
+// ============================================================================
+
+/// A single on-chain record of a user's wUSDC → BB deposit request.
+/// Keyed by the external chain tx hash.  Minimal — extend later as needed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DepositRecord {
+    /// BB wallet address (base58) that will receive the minted tokens
+    pub wallet_address: String,
+    /// Transaction hash from the external chain (Ethereum, Solana, etc.)
+    pub external_tx_hash: String,
+    /// "USDC" or "USDT"
+    pub asset: String,
+    /// Amount of stablecoin the user deposited to the custody wallet
+    pub amount_stablecoin: f64,
+    /// BB to mint: amount_stablecoin / 10  (10 USDC = 1 BB)
+    pub bb_to_mint: f64,
+    /// "pending" | "approved" | "rejected"
+    pub status: String,
+    /// Unix timestamp of the original user request
+    pub submitted_at: u64,
+    /// Unix timestamp when the dealer approved (None if still pending)
+    pub approved_at: Option<u64>,
+}
+
+// ============================================================================
+// WITHDRAWAL GATEWAY RECORD
+// ============================================================================
+
+/// A record of a user's wUSDC → real USDC (Solana) withdrawal request.
+/// Keyed by withdrawal_id (UUID). Created atomically when the user burns wUSDC.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WithdrawalRecord {
+    /// UUID assigned at request time — used as the primary key
+    pub withdrawal_id: String,
+    /// BB wallet address (base58) whose wUSDC was burned
+    pub wallet_address: String,
+    /// Solana wallet address (base58) where the dealer should send real USDC
+    pub solana_destination: String,
+    /// Amount of wUSDC burned (= amount of real USDC owed to user)
+    pub wusdc_amount: f64,
+    /// "pending" | "released" | "rejected"
+    pub status: String,
+    /// Unix timestamp of the original user request
+    pub requested_at: u64,
+    /// Unix timestamp when the dealer released (None if still pending)
+    pub released_at: Option<u64>,
+    /// Solana transaction hash the dealer used to send real USDC (set on release)
+    pub solana_tx_hash: Option<String>,
+}
+
+// ============================================================================
 // BLOCKCHAIN STATS
 // ============================================================================
 
@@ -952,7 +1085,7 @@ impl ConcurrentBlockchain {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockchainStats {
     pub total_accounts: u64,
-    pub current_slot: u64,
+
     pub block_count: u64,
     pub total_supply: f64,
     pub cache_hit_rate: f64,

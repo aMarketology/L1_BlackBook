@@ -15,21 +15,9 @@
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 use borsh::{BorshSerialize, BorshDeserialize};
-use tracing::info;
-
-// ============================================================================
-// SEALEVEL CONSTANTS
-// ============================================================================
-
-pub const OPTIMAL_BATCH_SIZE: usize = 256;
-pub const MAX_BATCH_SIZE: usize = 1_024;
-pub const MIN_BATCH_SIZE: usize = 32;
-pub const CONFLICT_THRESHOLD: f64 = 0.25;
 
 // ============================================================================
 // ACCOUNT TYPES (Minimal — L1 Settlement Only)
@@ -42,6 +30,7 @@ pub mod pda_namespace {
     pub const CONFIG: &str = "config";
     pub const TREASURY: &str = "treasury";
     pub const BRIDGE_ESCROW: &str = "bridge-escrow";
+    pub const RESERVE: &str = "reserve";
 }
 
 /// Account types on L1 — kept minimal for settlement layer
@@ -53,6 +42,7 @@ pub enum AccountType {
     Treasury,
     BridgeEscrow,
     Dealer,
+    GlobalReserve,
 }
 
 impl AccountType {
@@ -64,13 +54,15 @@ impl AccountType {
             AccountType::Treasury => pda_namespace::TREASURY,
             AccountType::BridgeEscrow => pda_namespace::BRIDGE_ESCROW,
             AccountType::Dealer => pda_namespace::WALLET,
+            AccountType::GlobalReserve => pda_namespace::RESERVE,
         }
     }
 
     #[allow(dead_code)] // used in integration tests
     pub fn can_hold_tokens(&self) -> bool {
         matches!(self, AccountType::UserWallet | AccountType::EscrowVault |
-                       AccountType::Treasury | AccountType::BridgeEscrow | AccountType::Dealer)
+                       AccountType::Treasury | AccountType::BridgeEscrow | AccountType::Dealer |
+                       AccountType::GlobalReserve)
     }
 }
 
@@ -243,297 +235,6 @@ impl Transaction {
 }
 
 // ============================================================================
-// ACCOUNT LOCK MANAGER — Sealevel Read/Write Locking
-// ============================================================================
-
-#[derive(Debug)]
-pub struct AccountLockManager {
-    read_locks: DashMap<String, AtomicU32>,
-    write_locks: DashMap<String, AtomicBool>,
-    pub total_acquisitions: AtomicU64,
-    pub total_conflicts: AtomicU64,
-}
-
-impl AccountLockManager {
-    pub fn new() -> Self {
-        Self {
-            read_locks: DashMap::new(),
-            write_locks: DashMap::new(),
-            total_acquisitions: AtomicU64::new(0),
-            total_conflicts: AtomicU64::new(0),
-        }
-    }
-
-    pub fn try_acquire_locks(&self, tx: &Transaction) -> bool {
-        self.total_acquisitions.fetch_add(1, Ordering::Relaxed);
-
-        for account in &tx.write_accounts {
-            if let Some(lock) = self.write_locks.get(account) {
-                if lock.load(Ordering::Acquire) {
-                    self.total_conflicts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-            if let Some(lock) = self.read_locks.get(account) {
-                if lock.load(Ordering::Acquire) > 0 {
-                    self.total_conflicts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-        }
-
-        for account in &tx.read_accounts {
-            if let Some(lock) = self.write_locks.get(account) {
-                if lock.load(Ordering::Acquire) {
-                    self.total_conflicts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-        }
-
-        for account in &tx.write_accounts {
-            self.write_locks.entry(account.clone()).or_insert_with(|| AtomicBool::new(false)).store(true, Ordering::Release);
-        }
-        for account in &tx.read_accounts {
-            self.read_locks.entry(account.clone()).or_insert_with(|| AtomicU32::new(0)).fetch_add(1, Ordering::Release);
-        }
-        true
-    }
-
-    pub fn release_locks(&self, tx: &Transaction) {
-        for account in &tx.write_accounts {
-            if let Some(lock) = self.write_locks.get(account) { lock.store(false, Ordering::Release); }
-        }
-        for account in &tx.read_accounts {
-            if let Some(lock) = self.read_locks.get(account) { lock.fetch_sub(1, Ordering::Release); }
-        }
-    }
-
-    pub fn get_conflict_rate(&self) -> f64 {
-        let total = self.total_acquisitions.load(Ordering::Relaxed);
-        if total == 0 { 0.0 } else { self.total_conflicts.load(Ordering::Relaxed) as f64 / total as f64 }
-    }
-
-    pub fn get_stats(&self) -> serde_json::Value {
-        serde_json::json!({
-            "acquisitions": self.total_acquisitions.load(Ordering::Relaxed),
-            "conflicts": self.total_conflicts.load(Ordering::Relaxed),
-            "conflict_rate": self.get_conflict_rate(),
-        })
-    }
-}
-
-impl Default for AccountLockManager {
-    fn default() -> Self { Self::new() }
-}
-
-// ============================================================================
-// PARALLEL SCHEDULER — Sealevel Execution Engine
-// ============================================================================
-
-pub struct ParallelScheduler {
-    thread_pool: rayon::ThreadPool,
-    pub lock_manager: Arc<AccountLockManager>,
-    current_batch_size: AtomicU64,
-    pub total_processed: AtomicU64,
-    pub total_batches: AtomicU64,
-
-    /// SVM accounts database — when set, Transfer transactions execute via
-    /// SvmAccountsDB.system_transfer() instead of the legacy f64 balance map.
-    /// DashMap hot_state is lock-free so parallel threads never contend here.
-    svm_db: Option<Arc<crate::svm::SvmAccountsDB>>,
-}
-
-impl Default for ParallelScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ParallelScheduler {
-    pub fn new() -> Self {
-        let num_threads = num_cpus::get().max(4);
-        let thread_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
-
-        info!("⚡ Sealevel: {} threads, batch: {}", num_threads, OPTIMAL_BATCH_SIZE);
-
-        Self {
-            thread_pool,
-            lock_manager: Arc::new(AccountLockManager::new()),
-            current_batch_size: AtomicU64::new(OPTIMAL_BATCH_SIZE as u64),
-            total_processed: AtomicU64::new(0),
-            total_batches: AtomicU64::new(0),
-            svm_db: None,
-        }
-    }
-
-    /// Attach an SVM accounts database so Transfer transactions go through
-    /// the lamport-based execution path instead of the legacy f64 map.
-    pub fn with_svm(mut self, db: Arc<crate::svm::SvmAccountsDB>) -> Self {
-        self.svm_db = Some(db);
-        self
-    }
-
-    pub fn get_batch_size(&self) -> usize {
-        self.current_batch_size.load(Ordering::Relaxed) as usize
-    }
-
-    pub fn tune_batch_size(&self) {
-        let rate = self.lock_manager.get_conflict_rate();
-        let current = self.current_batch_size.load(Ordering::Relaxed) as usize;
-        let new = if rate > CONFLICT_THRESHOLD {
-            (current / 2).max(MIN_BATCH_SIZE)
-        } else if rate < CONFLICT_THRESHOLD / 2.0 {
-            (current * 3 / 2).min(MAX_BATCH_SIZE)
-        } else {
-            current
-        };
-        if new != current {
-            self.current_batch_size.store(new as u64, Ordering::Relaxed);
-        }
-    }
-
-    /// Schedule into non-conflicting batches using lock manager
-    pub fn schedule_with_locks(&self, transactions: Vec<Transaction>) -> Vec<Vec<Transaction>> {
-        if transactions.is_empty() { return vec![]; }
-
-        let batch_size = self.get_batch_size();
-        let mut batches: Vec<Vec<Transaction>> = vec![];
-        let mut remaining = transactions;
-
-        while !remaining.is_empty() {
-            let mut batch: Vec<Transaction> = vec![];
-            let mut next: Vec<Transaction> = vec![];
-
-            for tx in remaining {
-                if batch.len() >= batch_size {
-                    next.push(tx);
-                    continue;
-                }
-                if self.lock_manager.try_acquire_locks(&tx) {
-                    batch.push(tx);
-                } else {
-                    next.push(tx);
-                }
-            }
-
-            for tx in &batch { self.lock_manager.release_locks(tx); }
-            if !batch.is_empty() { batches.push(batch); }
-            remaining = next;
-        }
-
-        self.total_batches.fetch_add(batches.len() as u64, Ordering::Relaxed);
-        batches
-    }
-
-    /// Execute batch with lock acquisition (thread-safe parallel).
-    /// When the `svm` feature is enabled and an SvmAccountsDB is attached,
-    /// `TransactionType::Transfer` transactions are routed through the lamport
-    /// execution path; all other types use the legacy f64 balance map.
-    pub fn execute_batch_with_locks(&self, batch: Vec<Transaction>, balances: &DashMap<String, f64>) -> Vec<TransactionResult> {
-        let len = batch.len();
-        let lm = self.lock_manager.clone();
-        let svm_db_ref = self.svm_db.clone();
-
-        let results = self.thread_pool.install(|| {
-            batch.par_iter().map(|tx| {
-                while !lm.try_acquire_locks(tx) { std::hint::spin_loop(); }
-                let result = {
-                    {
-                        match (&tx.tx_type, &svm_db_ref) {
-                            (TransactionType::Transfer, Some(db)) =>
-                                Self::execute_single_svm(tx, db),
-                            _ => Self::execute_single(tx, balances),
-                        }
-                    }
-                };
-                lm.release_locks(tx);
-                result
-            }).collect()
-        });
-
-        self.total_processed.fetch_add(len as u64, Ordering::Relaxed);
-        results
-    }
-
-    /// Execute a single Transfer via SvmAccountsDB (lamport path).
-    /// Address strings are mapped to Pubkeys via SHA-256 so they stay
-    /// consistent with BlockProducer's `legacy_addr_to_pubkey`.
-    fn execute_single_svm(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
-        use sha2::{Sha256, Digest};
-        use solana_sdk::pubkey::Pubkey;
-        use crate::svm::LAMPORTS_PER_BB;
-
-        let addr_to_pk = |addr: &str| -> Pubkey {
-            let stripped = addr.strip_prefix("bb_").unwrap_or(addr);
-            Pubkey::new_from_array(Sha256::digest(stripped.as_bytes()).into())
-        };
-
-        let from_pk = addr_to_pk(&tx.from);
-        let to_pk   = addr_to_pk(&tx.to);
-        let lamports = (tx.amount * LAMPORTS_PER_BB as f64) as u64;
-
-        match db.system_transfer(&from_pk, &to_pk, lamports) {
-            Ok(()) => TransactionResult { tx_id: tx.id.clone(), success: true, error: None },
-            Err(e) => TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(e.to_string()) },
-        }
-    }
-
-    fn execute_single(tx: &Transaction, balances: &DashMap<String, f64>) -> TransactionResult {
-        if !Self::is_system_account(&tx.from) {
-            let balance = balances.get(&tx.from).map(|b| *b).unwrap_or(0.0);
-            if balance < tx.amount {
-                return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("Insufficient: {} < {}", balance, tx.amount)) };
-            }
-            balances.entry(tx.from.clone()).and_modify(|b| *b -= tx.amount);
-        }
-
-        if tx.to != "burned_tokens" {
-            balances.entry(tx.to.clone()).and_modify(|b| *b += tx.amount).or_insert(tx.amount);
-        }
-
-        TransactionResult { tx_id: tx.id.clone(), success: true, error: None }
-    }
-
-    fn is_system_account(account: &str) -> bool {
-        matches!(account, "genesis" | "mining_reward" | "system" | "poh_validator" | "signup_bonus")
-    }
-
-    pub fn schedule_batch(&self, transactions: &[Transaction]) -> Vec<Vec<Transaction>> {
-        self.schedule_with_locks(transactions.to_vec())
-    }
-
-    pub fn get_stats(&self) -> SchedulerStats {
-        SchedulerStats {
-            total_processed: self.total_processed.load(Ordering::Relaxed),
-            total_batches: self.total_batches.load(Ordering::Relaxed),
-            current_batch_size: self.current_batch_size.load(Ordering::Relaxed) as usize,
-            conflict_rate: self.lock_manager.get_conflict_rate(),
-            thread_count: self.thread_pool.current_num_threads(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SchedulerStats {
-    pub total_processed: u64,
-    pub total_batches: u64,
-    pub current_batch_size: usize,
-    pub conflict_rate: f64,
-    pub thread_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct TransactionResult {
-    pub tx_id: String,
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-// ============================================================================
 // SECURITY INFRASTRUCTURE (Rate Limiting, Circuit Breakers, Fee Markets)
 // ============================================================================
 
@@ -678,17 +379,6 @@ mod tests {
 
         assert!(tx1.conflicts_with(&tx2)); // same sender
         assert!(!tx1.conflicts_with(&tx3)); // independent
-    }
-
-    #[test]
-    fn test_parallel_scheduling() {
-        let scheduler = ParallelScheduler::new();
-        let tx1 = Transaction::new("alice".into(), "bob".into(), 100.0, TransactionType::Transfer);
-        let tx2 = Transaction::new("alice".into(), "carol".into(), 50.0, TransactionType::Transfer);
-        let tx3 = Transaction::new("dave".into(), "eve".into(), 25.0, TransactionType::Transfer);
-
-        let batches = scheduler.schedule_batch(&[tx1, tx2, tx3]);
-        assert!(batches.len() >= 2); // tx1+tx2 conflict, tx3 is independent
     }
 
     #[test]

@@ -416,6 +416,68 @@ impl SplTokenEngine {
     }
 
     // ────────────────────────────────────────────────────────────────────────
+    // BURN TOKENS — destroy tokens, reducing total supply
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Burn tokens from a wallet's ATA, reducing both the ATA balance and the
+    /// mint's total supply.
+    ///
+    /// `amount` is in smallest units (1 wUSDC = 1_000_000).
+    pub fn burn(
+        accounts_db: &SvmAccountsDB,
+        mint_bytes: &[u8; 32],
+        wallet_pubkey: &Pubkey,
+        amount: u64,
+    ) -> Result<u64, SvmError> {
+        if amount == 0 {
+            return Err(SvmError::InvalidTransaction("Burn amount must be > 0".into()));
+        }
+
+        let mint_pubkey = Pubkey::new_from_array(*mint_bytes);
+
+        // 1. Load and validate the ATA
+        let ata_bytes   = derive_ata_address(&wallet_pubkey.to_bytes(), mint_bytes);
+        let ata_pubkey  = Pubkey::new_from_array(ata_bytes);
+        let mut ata_account = accounts_db
+            .get_account(&ata_pubkey)
+            .ok_or_else(|| SvmError::AccountNotFound(
+                format!("Token account not found: {}", bs58::encode(&ata_bytes).into_string())
+            ))?;
+
+        let mut token_layout = TokenAccountLayout::from_bytes(ata_account.data())
+            .map_err(SvmError::SerializationError)?;
+
+        if token_layout.amount < amount {
+            return Err(SvmError::InsufficientFunds {
+                required: amount,
+                available: token_layout.amount,
+            });
+        }
+
+        // 2. Debit the ATA
+        token_layout.amount -= amount;
+        ata_account.set_data_from_slice(&token_layout.to_bytes());
+        accounts_db.store_account(&ata_pubkey, ata_account);
+
+        // 3. Reduce the mint supply
+        let mut mint_account = accounts_db
+            .get_account(&mint_pubkey)
+            .ok_or_else(|| SvmError::AccountNotFound("Mint not found".into()))?;
+
+        let mut mint_layout = MintLayout::from_bytes(mint_account.data())
+            .map_err(SvmError::SerializationError)?;
+
+        mint_layout.supply = mint_layout.supply
+            .checked_sub(amount)
+            .ok_or_else(|| SvmError::InvalidTransaction("Burn would underflow mint supply".into()))?;
+
+        mint_account.set_data_from_slice(&mint_layout.to_bytes());
+        accounts_db.store_account(&mint_pubkey, mint_account);
+
+        Ok(mint_layout.supply)
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
     // TRANSFER TOKENS — move tokens between two ATAs
     // ────────────────────────────────────────────────────────────────────────
 

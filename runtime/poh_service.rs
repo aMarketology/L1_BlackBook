@@ -31,13 +31,9 @@ use super::{PoHConfig, PoHEntry};
 // PIPELINE CONSTANTS (Solana-style Transaction Pipeline) - TUNED
 // ============================================================================
 
-/// Pipeline stage buffer capacity
-/// TUNED: 100k buffer allows for traffic spikes without backpressure
 const PIPELINE_BUFFER_SIZE: usize = 100_000;
 
-/// Number of parallel sigverify workers
-/// TUNED: 8 workers (was 4) for better signature verification parallelism
-const SIGVERIFY_WORKERS: usize = 8;
+const SIGVERIFY_WORKERS: usize = 16; // TUNED: 16 workers for signature verification (CPU parallelism)
 
 /// Commit batch size for efficiency
 /// TUNED: 128 (was 64) matches Sealevel batch size for consistency

@@ -84,7 +84,6 @@ use layer1::svm;
 use layer1::solana_rpc;
 use layer1::relay;
 use layer1::reader;
-use layer1::watcher;
 use layer1::protocol;
 use layer1::runtime;
 
@@ -176,22 +175,6 @@ pub struct AppState {
     pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
     /// Double-withdrawal protection: "{market_id}:{address}" → true
     pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
-
-    // ===== Deposit Gateway =====
-    /// Custody wallet address users send wUSDC/wUSDT to (from CUSTODY_WALLET_ADDRESS env)
-    pub custody_wallet_address: String,
-    /// All deposit requests: external_tx_hash → DepositRecord (hot cache, ReDB-backed)
-    pub deposit_requests: Arc<dashmap::DashMap<String, storage::DepositRecord>>,
-    /// Background watcher that polls Solana RPC for custody wallet USDC/USDT balances.
-    /// None when CUSTODY_WALLET_ADDRESS is not set.
-    pub custody_watcher: Option<Arc<watcher::CustodyWatcher>>,
-
-    // ===== Withdrawal Gateway =====
-    /// Dealer address (base58) derived from DEALER_PRIVATE_KEY at startup.
-    /// Empty string when DEALER_PRIVATE_KEY is not set.
-    pub dealer_address: String,
-    /// All withdrawal requests: withdrawal_id (UUID) → WithdrawalRecord (hot cache, ReDB-backed)
-    pub withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>>,
 }
 
 // ============================================================================
@@ -273,24 +256,6 @@ async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 // ============================================================================
-// ADDRESS VALIDATION
-// ============================================================================
-
-/// Validates a BlackBook / Solana-style base58 wallet address.
-/// Rules:
-///  - Must NOT start with "0x" (EVM addresses are invalid here)
-///  - Must decode as valid base58 to exactly 32 bytes (Ed25519 pubkey)
-fn is_valid_bb_address(addr: &str) -> bool {
-    if addr.starts_with("0x") || addr.starts_with("0X") {
-        return false;
-    }
-    match bs58::decode(addr).into_vec() {
-        Ok(bytes) => bytes.len() == 32,
-        Err(_) => false,
-    }
-}
-
-// ============================================================================
 // BALANCE
 // ============================================================================
 
@@ -299,11 +264,6 @@ async fn balance_handler(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    if !is_valid_bb_address(&address) {
-        return Json(serde_json::json!({
-            "error": "Invalid address format. Expected base58 Solana-style address (32 bytes), not an 0x EVM address."
-        }));
-    }
     let balance = state.blockchain.get_balance(&address);
     Json(serde_json::json!({
         "address": address,
@@ -351,16 +311,6 @@ async fn signed_transfer_handler(
 
     if req.wallet_address.is_empty() || payload.to.is_empty() || payload.amount <= 0.0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid parameters" })));
-    }
-    if !is_valid_bb_address(&req.wallet_address) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid sender address. Expected base58 Solana-style address, not an 0x EVM address."
-        })));
-    }
-    if !is_valid_bb_address(&payload.to) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid recipient address. Expected base58 Solana-style address, not an 0x EVM address."
-        })));
     }
 
     // Verify Ed25519 signature
@@ -662,12 +612,16 @@ async fn gulf_stream_submit_handler(
     }))
 }
 
+#[cfg(feature = "unsafe_admin")]
+mod admin_handlers {
+use super::*;
+
+pub async fn noop() {}
 // ============================================================================
 // ADMIN — Dealer role for minting (L2 receipt settlement)
 // ============================================================================
 
 #[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
 struct MintRequest {
     to: String,
     amount: f64,
@@ -681,7 +635,6 @@ struct MintRequest {
 ///
 /// The Dealer collects losing bets from L2 via receipts, then mints
 /// those tokens to the Dealer wallet for payout to winners.
-#[cfg(feature = "unsafe_admin")]
 async fn admin_mint_handler(
     State(state): State<AppState>,
     Json(req): Json<MintRequest>,
@@ -694,11 +647,6 @@ async fn admin_mint_handler(
     if req.amount <= 0.0 || req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid mint parameters"
-        })));
-    }
-    if !is_valid_bb_address(&req.to) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid address format. Expected base58 Solana-style address, not an 0x EVM address."
         })));
     }
 
@@ -744,7 +692,6 @@ async fn admin_mint_handler(
 }
 
 #[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
 struct BurnRequest {
     from: String,
     amount: f64,
@@ -753,7 +700,6 @@ struct BurnRequest {
 }
 
 /// POST /admin/burn — Burn $BB tokens (Dealer only)
-#[cfg(feature = "unsafe_admin")]
 async fn admin_burn_handler(
     State(state): State<AppState>,
     Json(req): Json<BurnRequest>,
@@ -765,11 +711,6 @@ async fn admin_burn_handler(
 
     if req.amount <= 0.0 || req.from.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid burn parameters" })));
-    }
-    if !is_valid_bb_address(&req.from) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid address format. Expected base58 Solana-style address, not an 0x EVM address."
-        })));
     }
 
     let balance = state.blockchain.get_balance(&req.from);
@@ -939,7 +880,6 @@ async fn faucet_handler(
 ///
 /// Flow: L2 sends receipts of losing bets → Dealer mints to self → pays winners
 #[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
 struct DealerSettlementRequest {
     /// List of payouts: (address, amount) pairs
     payouts: Vec<PayoutEntry>,
@@ -948,13 +888,11 @@ struct DealerSettlementRequest {
 }
 
 #[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
 struct PayoutEntry {
     address: String,
     amount: f64,
 }
 
-#[cfg(feature = "unsafe_admin")]
 async fn dealer_settle_handler(
     State(state): State<AppState>,
     Json(req): Json<DealerSettlementRequest>,
@@ -1005,7 +943,6 @@ async fn dealer_settle_handler(
 // ============================================================================
 
 /// GET /admin/accounts — View all on-chain account balances (dynamic)
-#[cfg(feature = "unsafe_admin")]
 async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mut accounts: Vec<serde_json::Value> = Vec::new();
 
@@ -1043,7 +980,6 @@ async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoRespo
 }
 
 /// GET /admin/security/stats
-#[cfg(feature = "unsafe_admin")]
 async fn security_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "throttler": state.throttler.get_stats(),
@@ -1052,12 +988,13 @@ async fn security_stats_handler(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
+
+}
 // ============================================================================
 // USDC SPL TOKEN ENDPOINTS
 // ============================================================================
 
 #[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
 struct UsdcMintRequest {
     /// Recipient wallet address (base58)
     to: String,
@@ -1075,89 +1012,10 @@ struct UsdcTransferRequest {
     amount: f64,
 }
 
-#[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
-struct DealerSendWusdcRequest {
-    /// Recipient wallet address (base58) — the buyer's BB wallet
-    to: String,
-    /// Amount of wUSDC to send (human units, e.g. 5.0 = 5 wUSDC)
-    amount: f64,
-}
-
-/// POST /admin/dealer/send_wusdc — Transfer wUSDC from the dealer's ATA to a buyer's ATA.
-///
-/// Used when a user has purchased wUSDC and the dealer owes them the on-chain tokens.
-/// Requires DEALER_PRIVATE_KEY to be set — the dealer address is the sender.
-#[cfg(feature = "unsafe_admin")]
-async fn dealer_send_wusdc_handler(
-    State(state): State<AppState>,
-    Json(req): Json<DealerSendWusdcRequest>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "DEALER_PRIVATE_KEY not configured on this node"
-        })));
-    }
-    if req.amount <= 0.0 || req.to.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "amount must be > 0 and to must not be empty"
-        })));
-    }
-
-    let dealer_pubkey = match bs58::decode(&state.dealer_address).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
-        }
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Dealer address is invalid"
-        }))),
-    };
-    let to_pubkey = match bs58::decode(&req.to).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
-        }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid recipient address"
-        }))),
-    };
-
-    let mint       = usdc_mint_bytes();
-    let raw_amount = (req.amount * USDC_UNIT as f64).round() as u64;
-
-    match SplTokenEngine::transfer_tokens(
-        &state.blockchain.svm_accounts, &mint, &dealer_pubkey, &to_pubkey, raw_amount,
-    ) {
-        Ok(result) => {
-            info!("💸 DEALER→BUYER wUSDC: {:.6} to {} (dealer bal: {:.6})",
-                req.amount, req.to,
-                result.from_balance as f64 / USDC_UNIT as f64);
-            let _ = state.blockchain.svm_accounts.flush_block();
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "sent_wusdc": req.amount,
-                "from": state.dealer_address,
-                "to": req.to,
-                "dealer_ata": result.from_ata,
-                "recipient_ata": result.to_ata,
-                "dealer_remaining_wusdc": result.from_balance as f64 / USDC_UNIT as f64,
-                "recipient_wusdc_balance": result.to_balance as f64 / USDC_UNIT as f64,
-            })))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("{:?}", e)
-        }))),
-    }
-}
-
 /// POST /admin/usdc/mint — Mint USDC tokens to a wallet's ATA
 ///
 /// Called when bridge deposits arrive or for initial liquidity seeding.
 /// Only the Dealer (mint authority) should call this in production.
-#[cfg(feature = "unsafe_admin")]
 async fn usdc_mint_handler(
     State(state): State<AppState>,
     Json(req): Json<UsdcMintRequest>,
@@ -1544,47 +1402,6 @@ fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
 }
 
 // ============================================================================
-// SUPPLY AUDIT — Invariant: total_bb == total_wUSDC * 10
-// ============================================================================
-
-/// GET /supply/audit
-///
-/// Returns BB total supply, wUSDC total supply, and whether the 10:1 backing
-/// invariant holds.  A healthy chain should always have:
-///   total_bb == total_wUSDC * 10  (within floating-point tolerance)
-async fn supply_audit_handler(State(state): State<AppState>) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, usdc_mint_address, USDC_UNIT};
-
-    let bb_supply = state.blockchain.total_supply();
-
-    let usdc_mint = usdc_mint_bytes();
-    let raw_wusdc = match SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &usdc_mint) {
-        Ok(s) => s,
-        Err(_) => 0,
-    };
-    let wusdc_supply = raw_wusdc as f64 / USDC_UNIT as f64;
-
-    // Expected BB = wUSDC * 10
-    let expected_bb = wusdc_supply * 10.0;
-    let delta = (bb_supply - expected_bb).abs();
-    let tolerance = 0.000_001_f64.max(expected_bb * 0.000_001); // 1 ppm or 0.000001 BB
-    let invariant_ok = delta <= tolerance;
-
-    let ratio = if wusdc_supply > 0.0 { bb_supply / wusdc_supply } else { 0.0 };
-
-    Json(serde_json::json!({
-        "bb_total_supply": bb_supply,
-        "wusdc_total_supply": wusdc_supply,
-        "wusdc_mint": usdc_mint_address(),
-        "backing_ratio": ratio,
-        "target_ratio": 10.0,
-        "delta_from_target": delta,
-        "invariant_ok": invariant_ok,
-        "note": "Invariant: bb_total_supply == wusdc_total_supply * 10",
-    }))
-}
-
-// ============================================================================
 // ROUTER
 // ============================================================================
 
@@ -1594,12 +1411,10 @@ fn build_router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    #[allow(unused_mut)]
     let mut router = Router::new()
         // Public
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
-        .route("/supply/audit", get(supply_audit_handler))
         .route("/balance/:address", get(balance_handler))
         .route("/ledger", get(ledger_handler))
         // Transfers (Submission)
@@ -1621,17 +1436,8 @@ fn build_router(state: AppState) -> Router {
         .route("/escrow/withdraw", post(contracts::global_escrow::escrow_withdraw_handler))
         .route("/escrow/status", get(contracts::global_escrow::escrow_status_handler))
         .route("/escrow/market/:market_id", get(contracts::global_escrow::escrow_market_handler))
-        // Token Swap (AMM)
-        .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
-        .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
         // Faucet (public, rate-limited, Ed25519 verified)
         .route("/faucet", post(faucet_handler))
-        // Deposit Gateway (public submit + status)
-        .route("/deposit/request", post(contracts::deposit_gateway::deposit_request_handler))
-        .route("/deposit/status/:tx_hash", get(contracts::deposit_gateway::deposit_status_handler))
-        // Withdrawal Gateway (public request + status)
-        .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
-        .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
         // USDC SPL Token (Public read, private write)
         .route("/usdc/transfer", post(usdc_transfer_handler))
         .route("/usdc/balance/:address", get(usdc_balance_handler))
@@ -1648,12 +1454,7 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/accounts", get(admin_accounts_handler))
             .route("/admin/security/stats", get(security_stats_handler))
             // Admin USDC
-            .route("/admin/usdc/mint", post(usdc_mint_handler))
-            .route("/admin/dealer/send_wusdc", post(dealer_send_wusdc_handler))
-            // Deposit Gateway (admin approve)
-            .route("/admin/deposit/approve", post(contracts::deposit_gateway::deposit_approve_handler))
-            // Withdrawal Gateway (admin release)
-            .route("/admin/withdraw/release", post(contracts::withdrawal_gateway::withdraw_release_handler));
+            .route("/admin/usdc/mint", post(usdc_mint_handler));
     }
 
     router
@@ -1773,56 +1574,6 @@ async fn main() {
             "0000000000000000000000000000000000000000000000000000000000000000".to_string()
         });
     info!("🔑 L2 Sequencer pubkey: {}…", &l2_sequencer_pubkey[..l2_sequencer_pubkey.len().min(16)]);
-
-    // ── Deposit Gateway: custody wallet + reload pending requests ──
-    let custody_wallet_address = std::env::var("CUSTODY_WALLET_ADDRESS")
-        .unwrap_or_else(|_| {
-            warn!("⚠️  CUSTODY_WALLET_ADDRESS not set — deposit gateway disabled");
-            String::new()
-        });
-    if !custody_wallet_address.is_empty() {
-        info!("🏦 Custody wallet: {}", custody_wallet_address);
-    }
-    let deposit_requests: Arc<dashmap::DashMap<String, storage::DepositRecord>> =
-        Arc::new(dashmap::DashMap::new());
-    if let Ok(records) = blockchain.load_all_deposit_requests() {
-        let count = records.len();
-        for record in records {
-            deposit_requests.insert(record.external_tx_hash.clone(), record);
-        }
-        info!("📥 Loaded {} deposit request(s) from ReDB", count);
-    }
-
-    // ── Withdrawal requests: recover from ReDB ────────────────────────────
-    let withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>> =
-        Arc::new(dashmap::DashMap::new());
-    if let Ok(records) = blockchain.load_all_withdrawals() {
-        let count = records.len();
-        for record in records {
-            withdrawal_requests.insert(record.withdrawal_id.clone(), record);
-        }
-        info!("💸 Loaded {} withdrawal record(s) from ReDB", count);
-    }
-
-    // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
-    let dealer_address: String = match std::env::var("DEALER_PRIVATE_KEY") {
-        Ok(hex_key) if hex_key.len() == 64 => {
-            match hex::decode(&hex_key) {
-                Ok(bytes) => match bytes.as_slice().try_into() as Result<[u8; 32], _> {
-                    Ok(arr) => {
-                        use ed25519_dalek::SigningKey;
-                        let sk = SigningKey::from_bytes(&arr);
-                        let addr = bs58::encode(sk.verifying_key().to_bytes()).into_string();
-                        info!("💼 Dealer address: {}", addr);
-                        addr
-                    }
-                    Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY wrong length"); String::new() }
-                },
-                Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY invalid hex"); String::new() }
-            }
-        }
-        _ => { info!("ℹ️  DEALER_PRIVATE_KEY not set — dealer swap/withdrawal disabled"); String::new() }
-    };
 
     // Recover escrow state from ReDB (market roots + claims)
     let market_roots: Arc<dashmap::DashMap<String, [u8; 32]>> = Arc::new(dashmap::DashMap::new());
@@ -2112,31 +1863,6 @@ async fn main() {
         info!("📖 Reader sync task started → {}", config.writer_addr);
     }
 
-    // ── Custody Watcher — Solana RPC balance poller + auto-approver ───────────
-    let custody_watcher: Option<Arc<watcher::CustodyWatcher>> = if !custody_wallet_address.is_empty() {
-        let rpc_url = std::env::var("SOLANA_RPC_URL")
-            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-        let poll_secs = std::env::var("WATCHER_POLL_SECS")
-            .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
-        let usdc_mint_addr = std::env::var("USDC_MINT")
-            .unwrap_or_else(|_| watcher::USDC_MINT.to_string());
-        let usdt_mint_addr = std::env::var("USDT_MINT")
-            .unwrap_or_else(|_| watcher::USDT_MINT.to_string());
-        info!("👀 Custody watcher: rpc={} poll={}s", rpc_url, poll_secs);
-        Some(Arc::new(watcher::CustodyWatcher::new(
-            rpc_url,
-            custody_wallet_address.clone(),
-            usdc_mint_addr,
-            usdt_mint_addr,
-            poll_secs,
-            blockchain.clone(),
-            Arc::clone(&deposit_requests),
-            Arc::clone(&block_producer),
-        )))
-    } else {
-        None
-    };
-
     // 7. Build State
     let state = AppState {
         blockchain,
@@ -2161,109 +1887,7 @@ async fn main() {
         l2_sequencer_pubkey,
         market_roots,
         withdrawal_claims,
-        custody_wallet_address,
-        deposit_requests,
-        custody_watcher: custody_watcher.clone(),
-        dealer_address,
-        withdrawal_requests,
     };
-
-    // Start custody watcher background task (if custody wallet is configured)
-    if let Some(w) = custody_watcher {
-        w.start();
-    }
-
-    // ── Startup wUSDC invariant reconcile (unconditional on every boot) ──────────
-    // If BB supply exceeds wUSDC supply × 10 (legacy chain or first upgrade after
-    // the wUSDC feature was added), mint the deficit wUSDC to restore the 10:1
-    // backing invariant before any user activity begins.
-    // Recipient: dealer if configured, otherwise a deterministic protocol-reserve address.
-    {
-        use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-
-        // Deterministic protocol-reserve pubkey used when no dealer/authority is set.
-        let reserve_key = solana_sdk::pubkey::Pubkey::new_from_array(
-            *b"bb_protocol_reserve_v1__________"
-        );
-
-        let mint_authority: solana_sdk::pubkey::Pubkey = if !state.dealer_address.is_empty() {
-            bs58::decode(&state.dealer_address)
-                .into_vec()
-                .ok()
-                .and_then(|v| v.as_slice().try_into().ok())
-                .map(solana_sdk::pubkey::Pubkey::new_from_array)
-                .unwrap_or(reserve_key)
-        } else {
-            reserve_key
-        };
-
-        // Ensure the wUSDC mint account exists (idempotent — no-op if already bootstrapped)
-        let mint = usdc_mint_bytes();
-        match SplTokenEngine::bootstrap_usdc_mint(&state.blockchain.svm_accounts, &mint_authority) {
-            Ok(_)  => { let _ = state.blockchain.svm_accounts.flush_block(); }
-            Err(e) => warn!("⚠️  wUSDC mint bootstrap failed: {:?}", e),
-        }
-
-        let total_bb      = state.blockchain.total_supply();
-        let current_wusdc = SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &mint)
-            .map(|s| s as f64 / USDC_UNIT as f64)
-            .unwrap_or(0.0);
-        let expected_wusdc = total_bb / 10.0;
-        let missing        = expected_wusdc - current_wusdc;
-
-        let tolerance = 0.000_001_f64.max(expected_wusdc * 0.000_001);
-        if missing > tolerance {
-            // Under-issued — mint deficit wUSDC to authority
-            warn!(
-                "⚠️  Invariant mismatch at startup: {:.6} BB / {:.6} wUSDC — minting {:.6} wUSDC to {}",
-                total_bb, current_wusdc, missing, mint_authority
-            );
-            let raw_amount = (missing * USDC_UNIT as f64).round() as u64;
-            match SplTokenEngine::mint_to(
-                &state.blockchain.svm_accounts,
-                &mint,
-                &mint_authority,
-                raw_amount,
-            ) {
-                Ok(_)  => {
-                    info!("✅  Invariant restored: minted {:.6} wUSDC to {}", missing, mint_authority);
-                    match state.blockchain.svm_accounts.flush_block() {
-                        Ok(n)  => info!("💾  Flushed {} svm_accounts entries to ReDB", n),
-                        Err(e) => warn!("⚠️  svm_accounts flush failed: {:?}", e),
-                    }
-                }
-                Err(e) => warn!("❌  Invariant reconcile failed: {:?}", e),
-            }
-        } else if (-missing) > tolerance {
-            // Over-issued — burn excess wUSDC from the authority's ATA
-            let excess = -missing;
-            warn!(
-                "⚠️  wUSDC over-issued at startup: {:.6} wUSDC but only {:.6} expected — burning {:.6} from {}",
-                current_wusdc, expected_wusdc, excess, mint_authority
-            );
-            let raw_amount = (excess * USDC_UNIT as f64).round() as u64;
-            match SplTokenEngine::burn(
-                &state.blockchain.svm_accounts,
-                &mint,
-                &mint_authority,
-                raw_amount,
-            ) {
-                Ok(new_supply) => {
-                    info!("✅  Excess burned: new wUSDC supply = {:.6}", new_supply as f64 / USDC_UNIT as f64);
-                    match state.blockchain.svm_accounts.flush_block() {
-                        Ok(n)  => info!("💾  Flushed {} svm_accounts entries to ReDB", n),
-                        Err(e) => warn!("⚠️  svm_accounts flush failed: {:?}", e),
-                    }
-                }
-                Err(e) => warn!("❌  Invariant burn failed: {:?}", e),
-            }
-        } else {
-            info!(
-                "✅  Invariant OK at startup — {:.6} BB / {:.6} wUSDC",
-                total_bb, current_wusdc
-            );
-        }
-    }
 
     // Extract Arcs for RPC before state is moved into build_router
     let rpc_svm_accounts = Arc::clone(&state.blockchain.svm_accounts);
@@ -2336,11 +1960,6 @@ async fn main() {
     info!("   POST /admin/burn                Burn $BB");
     info!("   POST /admin/dealer/settle       Batch L2 settlement");
     info!("   GET  /admin/accounts            All account balances");
-    info!("");
-    info!("💳 DEPOSIT GATEWAY:");
-    info!("   POST /deposit/request           Submit wUSDC/wUSDT → BB deposit");
-    info!("   GET  /deposit/status/:tx_hash   Check deposit status");
-    info!("   POST /admin/deposit/approve     Approve deposit (mint BB)");
     info!("");
     info!("💵 USDC SPL TOKEN:");
     info!("   POST /admin/usdc/mint           Mint USDC to wallet");
