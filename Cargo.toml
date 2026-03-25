@@ -47,20 +47,11 @@ blake3 = "1.5"
 # Rand compatibility for FROST (uses rand_core 0.6)
 rand_core = "0.6"
 
-# BIP-39 / SLIP-0010 for hardware wallet compatible key derivation
+# BIP-39 for hardware wallet compatible key derivation (export_keypair example)
 bip39 = "2.0"
-sharks = "0.5"              # Shamir Secret Sharing 2-of-3 on seed bytes
-slip10_ed25519 = "0.1"
-hmac = "0.12"
-pbkdf2 = { version = "0.12", features = ["simple"] }
-
-# Wallet encryption - AES-256-GCM + Argon2id KDF
-aes-gcm = "0.10"
-argon2 = "0.5"
 
 # Async trait support
 async-trait = "0.1"
-zeroize = { version = "1.7", features = ["derive"] }
 
 # Parallel processing - Sealevel-style execution
 rayon = "1.10"

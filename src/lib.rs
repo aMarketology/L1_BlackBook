@@ -12,6 +12,7 @@ pub mod poh_blockchain;
 pub mod svm;
 pub mod solana_rpc;
 pub mod relay;
+pub mod settlement;
 pub mod reader;
 pub mod watcher;
 

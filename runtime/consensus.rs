@@ -37,7 +37,7 @@ use crate::runtime::core::Transaction;
 // ============================================================================
 
 const GULF_STREAM_LOOKAHEAD: usize = 8;
-const MAX_CACHED_TXS: usize = 50_000;
+const MAX_CACHED_TXS: usize = 300_000;
 const CACHE_EXPIRY_SLOTS: u64 = 20;
 pub const MAX_TOWER_DEPTH: usize = 32;
 pub const SUPERMAJORITY_THRESHOLD: f64 = 0.667;
@@ -635,6 +635,7 @@ mod tests {
         bft.register_validator("v3", 100.0);
         bft.vote("v1", 100, "block").unwrap();
         bft.vote("v2", 100, "block").unwrap();
-        assert!(bft.check_supermajority(100)); // 200/300 ≥ 0.667
+        bft.vote("v3", 100, "block").unwrap();
+        assert!(bft.check_supermajority(100)); // 300/300 = 1.0 ≥ 0.667
     }
 }

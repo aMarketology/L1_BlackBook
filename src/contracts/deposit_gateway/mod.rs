@@ -23,7 +23,7 @@ use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
 //        - The external tx hash is permanently recorded as processed
 //          (double-mint protection via PROCESSED_BRIDGE_TXS table)
 //
-// Rate: 10 USDC/USDT = 1 BB  (matches DepositUsdt in TxData)
+// Rate: 1 USDC/USDT = 10 BB  (BB_PER_STABLECOIN = 10.0)
 //
 // This module is intentionally minimal. Future upgrades:
 //   - Oracle verification of the external tx (on-chain proof)
@@ -184,8 +184,37 @@ pub async fn deposit_request_handler(
         &req.wallet_address[..8.min(req.wallet_address.len())],
         &req.external_tx_hash[..12.min(req.external_tx_hash.len())]);
 
-    // ── IMMEDIATE ON-CHAIN VERIFICATION (if watcher is configured) ────────
-    if let Some(ref watcher) = state.custody_watcher {
+    // ── IMMEDIATE ON-CHAIN VERIFICATION ──────────────────────────────────────
+    // Route to the correct chain verifier based on tx hash format:
+    //   0x…  → BSC (EVM receipt verification)
+    //   else → Solana (getTransaction verification)
+    let is_bsc_tx = req.external_tx_hash.starts_with("0x") || req.external_tx_hash.starts_with("0X");
+
+    if is_bsc_tx {
+        if let Some(ref bsc_watcher) = state.bsc_watcher {
+            match bsc_watcher.verify_and_approve(&req.external_tx_hash).await {
+                Ok(bb_minted) => {
+                    let new_balance = state.blockchain.get_balance(&req.wallet_address);
+                    return (StatusCode::OK, Json(serde_json::json!({
+                        "success": true,
+                        "status": "approved",
+                        "chain": "bsc",
+                        "message": "BSC deposit verified on-chain and approved instantly.",
+                        "wallet_address": req.wallet_address,
+                        "external_tx_hash": req.external_tx_hash,
+                        "asset": req.asset,
+                        "amount_stablecoin": req.amount_stablecoin,
+                        "bb_minted": bb_minted,
+                        "new_balance": new_balance,
+                    })));
+                }
+                Err(e) => {
+                    info!("💡 BSC auto-verify deferred ({}): {}",
+                        &req.external_tx_hash[..12.min(req.external_tx_hash.len())], e);
+                }
+            }
+        }
+    } else if let Some(ref watcher) = state.custody_watcher {
         match watcher.verify_and_approve(&req.external_tx_hash).await {
             Ok(bb_minted) => {
                 let new_balance = state.blockchain.get_balance(&req.wallet_address);
@@ -357,7 +386,7 @@ pub async fn deposit_approve_handler(
             from: "DEPOSIT_GATEWAY".to_string(),
             timestamp: now,
             data: TxData::DepositUsdt {
-                usdt_amount: (record.amount_stablecoin / 10.0) as u64,
+                usdt_amount: (record.amount_stablecoin * crate::svm::USDC_UNIT as f64) as u64,
                 external_tx_hash: Some(req.external_tx_hash.clone()),
             },
             signature: "dealer_approved".to_string(),

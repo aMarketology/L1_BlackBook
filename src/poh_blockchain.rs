@@ -8,7 +8,7 @@
 //! - Turbine-style data propagation via shreds
 //!
 //! Architecture:
-//! ```
+//! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
 //! │                    POH-INTEGRATED BLOCKCHAIN                            │
 //! ├─────────────────────────────────────────────────────────────────────────┤
@@ -56,11 +56,12 @@ use solana_sdk::{hash::Hash as SvmHash, pubkey::Pubkey};
 // ============================================================================
 
 /// Maximum transactions per block
-/// TUNED: 50,000 txs/block at 400ms slots = 125,000 TPS theoretical max
-pub const MAX_TXS_PER_BLOCK: usize = 50_000;
+/// TUNED: 240,000 txs/block at 400ms slots = 600,000 TPS theoretical max
+pub const MAX_TXS_PER_BLOCK: usize = 240_000;
 
 /// Block production interval in milliseconds
-/// TUNED: 400ms (matching Solana) = 2.5 blocks/second
+/// NOTE: The authoritative slot duration is POH_SLOT_DURATION_MS in main.rs.
+/// Set to 400ms for high-throughput production mode.
 #[allow(dead_code)] // Used by main_v4 and future scheduling
 pub const BLOCK_INTERVAL_MS: u64 = 400;
 
@@ -1103,7 +1104,16 @@ impl BlockProducer {
     /// Get the latest block
     pub fn get_latest_block(&self) -> Option<FinalizedBlock> {
         let blocks = self.blocks.read();
-        blocks.last().cloned()
+        if let Some(block) = blocks.last() {
+            return Some(block.clone());
+        }
+        drop(blocks);
+        
+        // Fallback to ReDB if cache is empty (e.g., right after startup)
+        if let Ok(Some(slot)) = self.blockchain.latest_block_slot() {
+            return self.blockchain.load_block(slot).ok().flatten();
+        }
+        None
     }
 
     /// Get total blocks produced (including ReDB-persisted)

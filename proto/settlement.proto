@@ -1,0 +1,121 @@
+syntax = "proto3";
+package settlement;
+
+// ============================================================================
+// BLACKBOOK L1 — SETTLEMENT SERVICE (gRPC)
+// ============================================================================
+//
+// Five RPCs bridging L2 (BlackBook game server) ↔ L1 (this chain).
+// All balance fields use SPL token units: 1 BB = 1,000,000 SPL units (6 decimals).
+//
+// Transport: tonic gRPC on port 50052 (separate from validator_relay on 50051)
+// ============================================================================
+
+service SettlementService {
+    // Called by L2 on every user entry into a BB market.
+    // L2 MUST use the returned depositor_wallet as canonical identity — never
+    // the user's self-reported wallet.
+    rpc VerifyDeposit(VerifyDepositRequest) returns (VerifyDepositResponse);
+
+    // Called by dealer before opening a BB market.
+    // Locks the dealer's prize reserve into the per-contest escrow vault.
+    rpc InitContestReserve(InitContestReserveRequest) returns (InitContestReserveResponse);
+
+    // Called by L2 sequencer after a BB market resolves.
+    // Submits the 32-byte Merkle root so users can claim winnings on L1.
+    rpc SubmitMerkleRoot(MerkleRootSubmission) returns (MerkleRootResponse);
+
+    // Called by L2 to query live contest state from L1.
+    rpc GetContestStatus(ContestStatusRequest) returns (ContestStatusResponse);
+
+    // Heartbeat / TPS monitoring.
+    rpc SyncBridge(SyncBridgeRequest) returns (SyncBridgeResponse);
+}
+
+// ── VerifyDeposit ─────────────────────────────────────────────────────────────
+
+message VerifyDepositRequest {
+    string contest_id       = 1;
+    string deposit_tx_sig   = 2; // external tx signature (base58 Solana sig or hex)
+    uint64 expected_amount  = 3; // SPL units — 0 means "any amount, just verify"
+}
+
+message VerifyDepositResponse {
+    bool   verified          = 1;
+    string depositor_wallet  = 2; // base58 — L2 uses this as canonical identity
+    uint64 actual_amount     = 3; // SPL units
+    uint64 deposit_slot      = 4; // L1 slot at time of verification
+    // "TX_NOT_FOUND" | "WRONG_CONTEST" | "WRONG_AMOUNT" | "ALREADY_USED"
+    // | "CONTEST_CLOSED" | "TX_NOT_FINAL"
+    string error_code        = 5;
+}
+
+// ── InitContestReserve ────────────────────────────────────────────────────────
+
+message InitContestReserveRequest {
+    string contest_id     = 1;
+    string dealer_address = 2; // base58 — dealer's BB wallet
+    uint64 bb_reserve     = 3; // SPL units to lock from dealer → escrow
+}
+
+message InitContestReserveResponse {
+    bool   confirmed      = 1;
+    string l1_tx_hash     = 2;
+    string error_message  = 3;
+}
+
+// ── SubmitMerkleRoot ─ 14-field canonical submission ─────────────────────────
+
+message MerkleRootSubmission {
+    string contest_id       =  1;
+    bytes  merkle_root      =  2; // exactly 32 bytes (SHA-256 Merkle root)
+    uint32 winner_count     =  3;
+    uint64 total_deposited  =  4; // SPL units — must equal total_payout + house_rake
+    uint64 total_payout     =  5; // SPL units — net payout to all winners combined
+    uint64 house_rake       =  6; // SPL units — platform cut
+    string winning_outcome  =  7;
+    int64  resolved_at      =  8; // Unix timestamp
+    // SHA-256 hex of "id:outcome:ts:deposited:payout:rake"
+    string receipt_hash     =  9;
+    string oracle_proof     = 10;
+    uint64 l2_block_number  = 11; // monotonic counter for replay protection
+    // Binary packed: contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
+    bytes  signed_message   = 12;
+    bytes  sequencer_pubkey = 13; // Ed25519 verifying key, 32 bytes
+    bytes  sequencer_sig    = 14; // Ed25519 signature over signed_message, 64 bytes
+}
+
+message MerkleRootResponse {
+    bool   success            = 1;
+    string l1_tx_hash         = 2;
+    uint64 l1_finalized_slot  = 3;
+    string error_message      = 4;
+}
+
+// ── GetContestStatus ──────────────────────────────────────────────────────────
+
+message ContestStatusRequest {
+    string contest_id = 1;
+}
+
+message ContestStatusResponse {
+    string contest_id           = 1;
+    string status               = 2; // "OPEN" | "SETTLED" | "EXPIRED"
+    uint64 total_deposited      = 3; // SPL units
+    uint64 total_claimed        = 4; // SPL units
+    bytes  merkle_root          = 5; // 32 bytes — zero if not yet settled
+    uint64 claim_deadline_slot  = 6;
+    string l1_tx_hash           = 7;
+}
+
+// ── SyncBridge ────────────────────────────────────────────────────────────────
+
+message SyncBridgeRequest {
+    string node_id = 1;
+}
+
+message SyncBridgeResponse {
+    string node_id       = 1;
+    uint64 latest_slot   = 2;
+    uint64 uptime_secs   = 3;
+}

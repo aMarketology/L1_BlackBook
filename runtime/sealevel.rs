@@ -22,9 +22,9 @@ use super::core::{Transaction, TransactionType};
 // SEALEVEL CONSTANTS
 // ============================================================================
 
-pub const OPTIMAL_BATCH_SIZE: usize = 256;
-pub const MAX_BATCH_SIZE: usize = 1_024;
-pub const MIN_BATCH_SIZE: usize = 32;
+pub const OPTIMAL_BATCH_SIZE: usize = 2_048;
+pub const MAX_BATCH_SIZE: usize = 20_000;
+pub const MIN_BATCH_SIZE: usize = 128;
 pub const CONFLICT_THRESHOLD: f64 = 0.25;
 
 // ============================================================================

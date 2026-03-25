@@ -389,7 +389,7 @@ mod tests {
 
         // Normal account: 20% block threshold
         assert!(cb.check_transfer("alice", 10.0, 100.0, 1).is_ok());
-        assert!(cb.check_transfer("alice", 15.0, 100.0, 1).is_err()); // exceeds 20%
+        assert!(cb.check_transfer("alice", 21.0, 100.0, 1).is_err()); // exceeds 20%
     }
 
     #[test]

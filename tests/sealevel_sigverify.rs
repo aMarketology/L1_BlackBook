@@ -38,6 +38,7 @@ use redb::Database;
 use layer1::svm::{
     accounts_db::SvmAccountsDB,
     runtime::{BlackBookSVM, TransferRequest},
+    LAMPORTS_PER_BB,
 };
 use layer1::svm::sigverify::{ParallelSigVerifier, SigVerifyRequest};
 
@@ -211,7 +212,6 @@ fn test_sign_verify_svm_transfer_pipeline() {
     let tmpfile = NamedTempFile::new().unwrap();
     let (accounts_db, svm) = make_svm(&tmpfile);
 
-    const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
 
     // Create N sender keypairs and fund them
@@ -289,7 +289,6 @@ fn test_duplicate_tx_rejected() {
     let tmpfile = NamedTempFile::new().unwrap();
     let (accounts_db, svm) = make_svm(&tmpfile);
 
-    const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
 
     let (_sk, from) = new_keypair();
@@ -325,8 +324,6 @@ fn test_duplicate_tx_rejected() {
 fn test_stale_blockhash_rejected() {
     let tmpfile = NamedTempFile::new().unwrap();
     let (accounts_db, mut svm) = make_svm(&tmpfile);
-
-    const LAMPORTS_PER_BB: u64 = 1_000_000_000;
 
     let (_sk, from) = new_keypair();
     let (_, to) = new_keypair();
@@ -386,7 +383,6 @@ fn test_non_overlapping_svm_transfers_all_succeed() {
     let tmpfile = NamedTempFile::new().unwrap();
     let (accounts_db, svm) = make_svm(&tmpfile);
 
-    const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
 
     // Create 16 pairs where each sender has a distinct first byte (shard bucket)
@@ -434,7 +430,6 @@ fn test_insufficient_balance_rejected() {
     let tmpfile = NamedTempFile::new().unwrap();
     let (accounts_db, svm) = make_svm(&tmpfile);
 
-    const LAMPORTS_PER_BB: u64 = 1_000_000_000;
     let genesis = svm.current_blockhash();
 
     let (_sk, from) = new_keypair();

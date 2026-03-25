@@ -5,6 +5,7 @@ use tracing::info;
 
 use std::sync::atomic::Ordering;
 use crate::AppState;
+use crate::storage::DepositRecord;
 // ============================================================================
 // GLOBAL ESCROW SMART CONTRACT (Native Module)
 // ============================================================================
@@ -141,14 +142,15 @@ pub async fn escrow_deposit_handler(
 
     let user_balance = state.blockchain.get_balance(&req.wallet_address);
     let escrow_balance = state.blockchain.get_balance(escrow_addr);
-    info!("🔒 ESCROW DEPOSIT: {} BB from {} → escrow", req.amount, req.wallet_address);
+    let tx_hash = uuid::Uuid::new_v4().to_string();
+    info!("🔒 ESCROW DEPOSIT: {} BB from {} → escrow (tx: {})", req.amount, req.wallet_address, tx_hash);
 
     // Record into PoH block
     {
         use layer1::protocol::Transaction as ProtoTx;
         use layer1::protocol::TxData;
         let tx = ProtoTx {
-            hash: uuid::Uuid::new_v4().to_string(),
+            hash: tx_hash.clone(),
             from: req.wallet_address.clone(),
             timestamp: now,
             data: TxData::EscrowDeposit {
@@ -161,9 +163,26 @@ pub async fn escrow_deposit_handler(
         state.block_producer.record_executed_transaction(tx);
     }
 
+    // Insert into deposit_requests so VerifyDeposit gRPC can find this deposit
+    let deposit_record = DepositRecord {
+        wallet_address: req.wallet_address.clone(),
+        external_tx_hash: tx_hash.clone(),
+        asset: "BB".to_string(),
+        amount_stablecoin: req.amount,
+        bb_to_mint: req.amount,
+        status: "approved".to_string(),
+        submitted_at: now,
+        approved_at: Some(now),
+    };
+    if let Err(e) = state.blockchain.store_deposit_request(&deposit_record) {
+        info!("⚠️ Failed to persist escrow deposit record: {}", e);
+    }
+    state.deposit_requests.insert(tx_hash.clone(), deposit_record);
+
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "deposited": req.amount,
+        "tx_hash": tx_hash,
         "wallet_address": req.wallet_address,
         "escrow_address": escrow_addr,
         "user_balance": user_balance,
@@ -182,14 +201,23 @@ pub struct EscrowSubmitStateRootRequest {
     /// Monotonically incrementing L2 block number — prevents timestamp-skew replay attacks.
     /// The L2 must increment this counter for every new state root submission.
     l2_block_number: u64,
+    /// Total SPL units deposited into this contest (1 BB = 1_000_000 units).
+    total_deposited: u64,
+    /// Net payout to all winners combined (SPL units).
+    total_payout: u64,
+    /// Platform rake (SPL units). MUST equal total_deposited - total_payout.
+    house_rake: u64,
+    /// Number of unique winning addresses in the Merkle tree.
+    winner_count: u32,
 }
 
 /// POST /escrow/submit-state-root — L2 sequencer submits a per-market merkle root
 ///
-/// The L2 Sequencer signs: "STATE_ROOT:{market_id}:{merkle_root}:{l2_block_number}"
+/// Binary signed message: contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
 /// L1 ONLY verifies the signature against the hardcoded L2_SEQUENCER_PUBKEY.
 /// L1 does NOT sign anything here — it is a pure verifier.
 /// l2_block_number ensures strict chronological ordering and prevents replay attacks.
+/// Zero-sum invariant enforced: total_deposited == total_payout + house_rake.
 /// This is TRUSTLESS — L1 trusts the math of the signature, not the server.
 pub async fn escrow_submit_state_root_handler(
     State(state): State<AppState>,
@@ -205,6 +233,18 @@ pub async fn escrow_submit_state_root_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "merkle_root must be 64 hex chars (32 bytes)" })));
     }
 
+    // ── ZERO-SUM INVARIANT ─────────────────────────────────────────────────
+    // total_deposited MUST equal total_payout + house_rake. This is the
+    // fundamental solvency guarantee: every deposited token is accounted for.
+    if req.total_deposited != req.total_payout.saturating_add(req.house_rake) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Zero-sum invariant violated: total_deposited != total_payout + house_rake",
+            "total_deposited": req.total_deposited,
+            "total_payout": req.total_payout,
+            "house_rake": req.house_rake,
+        })));
+    }
+
     // ── SEQUENCER Ed25519 VERIFICATION ─────────────────────────────────────
     if state.l2_sequencer_pubkey.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
@@ -212,7 +252,18 @@ pub async fn escrow_submit_state_root_handler(
         })));
     }
 
-    let message = format!("STATE_ROOT:{}:{}:{}", req.market_id, req.merkle_root, req.l2_block_number);
+    // Binary packed signed message (MUST match L2 settlement_bridge.rs):
+    //   contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
+    let root_bytes_for_sig = {
+        let b = hex::decode(&req.merkle_root).unwrap();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&b);
+        arr
+    };
+    let mut signed_message: Vec<u8> = Vec::with_capacity(req.market_id.len() + 8 + 32);
+    signed_message.extend_from_slice(req.market_id.as_bytes());
+    signed_message.extend_from_slice(&req.l2_block_number.to_le_bytes());
+    signed_message.extend_from_slice(&root_bytes_for_sig);
 
     let seq_pubkey_bytes = match hex::decode(&state.l2_sequencer_pubkey) {
         Ok(b) if b.len() == 32 => b,
@@ -229,7 +280,7 @@ pub async fn escrow_submit_state_root_handler(
     };
     let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
 
-    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+    if verifying_key.verify(&signed_message, &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
             "error": "Sequencer signature verification failed — L1 trusts only the math"
         })));
@@ -256,7 +307,31 @@ pub async fn escrow_submit_state_root_handler(
     state.market_roots.insert(req.market_id.clone(), root_bytes);
     let _ = state.blockchain.store_escrow_market_root(&req.market_id, &root_bytes);
 
-    info!("📋 STATE ROOT: market={} root={}… slot={}", req.market_id, &req.merkle_root[..16], current_slot);
+    // Create/update ContestState (Open → Settled)
+    // claim_deadline_slot: current_slot + 6_480_000 (≈30 days at 400ms/slot)
+    const CLAIM_WINDOW_SLOTS: u64 = 6_480_000;
+    let l1_tx_hash = uuid::Uuid::new_v4().to_string();
+    let contest = crate::storage::ContestState {
+        contest_id: req.market_id.clone(),
+        status: crate::storage::ContestStatus::Settled,
+        merkle_root: root_bytes,
+        total_deposited: req.total_deposited,
+        total_claimed: 0,
+        winner_count: req.winner_count,
+        house_rake: req.house_rake,
+        claim_deadline_slot: current_slot + CLAIM_WINDOW_SLOTS,
+        l1_tx_hash: l1_tx_hash.clone(),
+        last_l2_block: req.l2_block_number,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    state.contest_states.insert(req.market_id.clone(), contest.clone());
+    let _ = state.blockchain.store_contest_state(&contest);
+
+    info!("📋 STATE ROOT: market={} root={}… slot={} deadline_slot={}",
+        req.market_id, &req.merkle_root[..16], current_slot, current_slot + CLAIM_WINDOW_SLOTS);
 
     // Record into PoH block
     {
@@ -284,7 +359,9 @@ pub async fn escrow_submit_state_root_handler(
         "market_id": req.market_id,
         "merkle_root": req.merkle_root,
         "l2_block_number": req.l2_block_number,
-        "slot": current_slot,
+        "l1_tx_hash": l1_tx_hash,
+        "l1_finalized_slot": current_slot,
+        "claim_deadline_slot": current_slot + CLAIM_WINDOW_SLOTS,
     })))
 }
 
@@ -381,7 +458,7 @@ pub async fn escrow_withdraw_handler(
         })));
     }
 
-    // ── LOOKUP MARKET ROOT ─────────────────────────────────────────────────
+    // ── LOOKUP MARKET ROOT + CLAIM DEADLINE ───────────────────────────────
     let expected_root: [u8; 32] = match state.market_roots.get(&req.market_id) {
         Some(r) => *r.value(),
         None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -389,12 +466,45 @@ pub async fn escrow_withdraw_handler(
         }))),
     };
 
+    // Enforce claim deadline — reject withdrawals after the window closes.
+    {
+        let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(contest) = state.contest_states.get(&req.market_id) {
+            if current_slot > contest.claim_deadline_slot {
+                return (StatusCode::GONE, Json(serde_json::json!({
+                    "error": "Claim window has expired for this contest",
+                    "current_slot": current_slot,
+                    "claim_deadline_slot": contest.claim_deadline_slot,
+                })));
+            }
+            if contest.status != crate::storage::ContestStatus::Settled {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": format!("Contest is not settled (status: {:?})", contest.status),
+                })));
+            }
+        }
+    }
+
     // ── MERKLE PROOF VERIFICATION ──────────────────────────────────────────
-    // Compute leaf: SHA256(wallet_address_bytes || amount_le_bytes)
-    // This matches the MerkleTree leaf format in poh_blockchain.rs
+    // Compute leaf: SHA256(pubkey_raw_32_bytes ++ amount_spl_u64_le_bytes)
+    // This matches the L2 MerkleTree leaf format in settlement_bridge.rs.
+    // Both the pubkey (raw 32 bytes, not base58 string) and amount (u64 SPL
+    // units, not f64) must match exactly or the proof will never verify.
+    let pubkey_raw_32: [u8; 32] = match bs58::decode(&req.wallet_address).into_vec() {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "wallet_address must be a base58-encoded 32-byte Solana pubkey"
+        }))),
+    };
+    // 1 BB = 1_000_000 SPL units (6 decimals). Round to nearest unit.
+    let amount_spl: u64 = (req.amount * 1_000_000.0).round() as u64;
     let mut leaf_hasher = Sha256::new();
-    leaf_hasher.update(req.wallet_address.as_bytes());
-    leaf_hasher.update(req.amount.to_le_bytes());
+    leaf_hasher.update(&pubkey_raw_32);
+    leaf_hasher.update(&amount_spl.to_le_bytes());
     let mut current: [u8; 32] = leaf_hasher.finalize().into();
 
     // Walk the proof path — sorted hashing: smaller [u8;32] always goes first.
@@ -452,8 +562,17 @@ pub async fn escrow_withdraw_handler(
     state.withdrawal_claims.insert(claim_key.clone(), true);
     let _ = state.blockchain.store_escrow_claim(&claim_key, now);
 
+    // Update total_claimed on ContestState
+    let amount_spl_claimed = (req.amount * 1_000_000.0).round() as u64;
+    if let Some(mut contest_entry) = state.contest_states.get_mut(&req.market_id) {
+        contest_entry.total_claimed = contest_entry.total_claimed.saturating_add(amount_spl_claimed);
+        let contest_snapshot = contest_entry.clone();
+        drop(contest_entry); // release DashMap lock before blocking I/O
+        let _ = state.blockchain.store_contest_state(&contest_snapshot);
+    }
+
     let new_balance = state.blockchain.get_balance(&req.wallet_address);
-    info!("💰 ESCROW WITHDRAW: {} BB → {} (market: {})", req.amount, req.wallet_address, req.market_id);
+    info!("ESCROW WITHDRAW: {} BB -> {} (market: {})", req.amount, req.wallet_address, req.market_id);
 
     // Record into PoH block
     {
@@ -519,5 +638,53 @@ pub async fn escrow_market_handler(
     }
 }
 
-
-
+/// GET /escrow/contest/:contest_id — Query full ContestState over HTTP
+///
+/// HTTP equivalent of the `GetContestStatus` gRPC RPC. Use this endpoint when
+/// gRPC is unavailable (firewall, port issue) or for direct browser/curl access.
+///
+/// Automatically transitions `SETTLED` → `EXPIRED` when `current_slot > claim_deadline_slot`.
+/// Returns `claim_deadline_slot` so the L2 frontend can display "X days left to claim".
+pub async fn escrow_contest_handler(
+    State(state): State<AppState>,
+    Path(contest_id): Path<String>,
+) -> impl IntoResponse {
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+    match state.contest_states.get(&contest_id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("No contest found: {}", contest_id) })),
+        ),
+        Some(c_ref) => {
+            let mut c = c_ref.value().clone();
+            drop(c_ref);
+            // Auto-expire: transition Settled → Expired once claim window closes
+            if c.status == crate::storage::ContestStatus::Settled
+                && c.claim_deadline_slot > 0
+                && current_slot > c.claim_deadline_slot
+            {
+                c.status = crate::storage::ContestStatus::Expired;
+                state.contest_states.insert(c.contest_id.clone(), c.clone());
+                let _ = state.blockchain.store_contest_state(&c);
+            }
+            let status_str = match c.status {
+                crate::storage::ContestStatus::Open    => "OPEN",
+                crate::storage::ContestStatus::Settled => "SETTLED",
+                crate::storage::ContestStatus::Expired => "EXPIRED",
+            };
+            (StatusCode::OK, Json(serde_json::json!({
+                "contest_id": c.contest_id,
+                "status": status_str,
+                "total_deposited": c.total_deposited,
+                "total_claimed": c.total_claimed,
+                "winner_count": c.winner_count,
+                "house_rake": c.house_rake,
+                "merkle_root": hex::encode(c.merkle_root),
+                "claim_deadline_slot": c.claim_deadline_slot,
+                "l1_tx_hash": c.l1_tx_hash,
+                "last_l2_block": c.last_l2_block,
+                "created_at": c.created_at,
+            })))
+        }
+    }
+}

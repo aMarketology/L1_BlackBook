@@ -31,11 +31,11 @@ use tokio::sync::Semaphore;
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const BASE_URL: &str = "http://127.0.0.1:8080";
-const NUM_WALLETS: usize = 50;      // distinct sender keypairs
-const NUM_TXS:    usize = 2_000;    // total transfers to fire
-const CONCURRENCY: usize = 200;     // max in-flight at once
-const AMOUNT_PER_TX: f64 = 0.001;  // BB per transfer (tiny, won't drain wallets)
-const FUND_BB: f64 = 20.0;         // BB minted into each sender wallet upfront
+const NUM_WALLETS: usize = 200;      // distinct sender keypairs
+const NUM_TXS:    usize = 20_000;   // total transfers to fire
+const CONCURRENCY: usize = 1_000;   // max in-flight at once
+const AMOUNT_PER_TX: f64 = 0.00001; // BB per transfer (= 1 lamport, minimum unit)
+const FUND_BB: f64 = 0.1;           // BB per faucet claim (max allowed)
 const CHAIN_ID: u8 = 1;
 
 // ── Sender wallet ────────────────────────────────────────────────────────────
@@ -102,25 +102,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🔑  Generating {} Ed25519 keypairs...", NUM_WALLETS);
     let wallets: Vec<Wallet> = (0..NUM_WALLETS).map(|_| Wallet::new()).collect();
 
-    // ── 3. Fund each sender via admin/mint ──────────────────────────────────
-    println!("💰  Funding {} wallets × {} BB each...", NUM_WALLETS, FUND_BB);
+    // ── 3. Fund each sender via /faucet (Ed25519 signed) ────────────────────
+    println!("💰  Funding {} wallets × {} BB each via /faucet...", NUM_WALLETS, FUND_BB);
     let mut funded = 0usize;
-    for w in &wallets {
+    let fund_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (idx, w) in wallets.iter().enumerate() {
+        let nonce = format!("fund-{}-{}", idx, fastrand::u64(..));
+        let message = format!("FAUCET:{}:{}:{}:{}", w.address, FUND_BB, fund_ts, nonce);
+        let sig_hex = hex::encode(w.sk.sign(message.as_bytes()).to_bytes());
+
         let resp = client
-            .post(format!("{}/admin/mint", BASE_URL))
+            .post(format!("{}/faucet", BASE_URL))
             .json(&serde_json::json!({
-                "to":               w.address,
-                "amount":           FUND_BB,
-                "dealer_signature": null,
-                "l2_receipt_id":    null,
+                "wallet_address": w.address,
+                "amount":         FUND_BB,
+                "timestamp":      fund_ts,
+                "nonce":          nonce,
+                "signature":      sig_hex,
+                "public_key":     w.pubkey_hex,
             }))
             .send()
             .await;
 
         match resp {
             Ok(r) if r.status().is_success() => funded += 1,
-            Ok(r) => eprintln!("  ⚠  Mint failed for {}: {}", &w.address[..8], r.text().await?),
-            Err(e) => eprintln!("  ⚠  Mint request error: {}", e),
+            Ok(r) => eprintln!("  ⚠  Faucet failed for {}: {}", &w.address[..8], r.text().await.unwrap_or_default()),
+            Err(e) => eprintln!("  ⚠  Faucet request error: {}", e),
         }
     }
     println!("   Funded {}/{} wallets", funded, NUM_WALLETS);

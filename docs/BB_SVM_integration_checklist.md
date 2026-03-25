@@ -208,7 +208,7 @@ curl -s -X POST http://localhost:8899 \
 
 | Invariant | Verified by |
 |-----------|------------|
-| `LAMPORTS_PER_BB = 1_000_000` | `svm_invariant_tests.rs` |
+| `LAMPORTS_PER_BB = 100_000` | `svm_invariant_tests.rs` |
 | `RENT_EPOCH_EXEMPT = u64::MAX` | `svm_accounts_tests.rs` |
 | `Σ lamports = constant` across all transfers | `test_global_lamport_conservation` |
 | `cargo build` (no svm flag) compiles clean | CI |

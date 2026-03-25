@@ -1,0 +1,413 @@
+//! Settlement Service — gRPC server for L2↔L1 contest lifecycle
+//!
+//! Five RPCs:
+//!   - VerifyDeposit:       L2 confirms a user's deposit is on-chain before entry.
+//!   - InitContestReserve:  Dealer locks prize reserve into per-contest escrow.
+//!   - SubmitMerkleRoot:    L2 sequencer finalises a market with a 32-byte root.
+//!   - GetContestStatus:    L2 queries live contest state.
+//!   - SyncBridge:          Heartbeat / TPS monitoring.
+//!
+//! Runs on port 50052 (separate from validator_relay on 50051).
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use tonic::{Request, Response, Status};
+use tracing::{info, warn};
+
+use crate::poh_blockchain::BlockProducer;
+use crate::storage::{ConcurrentBlockchain, ContestState, ContestStatus};
+
+// Import generated protobuf types
+pub mod proto {
+    tonic::include_proto!("settlement");
+}
+
+use proto::settlement_service_server::{SettlementService, SettlementServiceServer};
+use proto::{
+    VerifyDepositRequest, VerifyDepositResponse,
+    InitContestReserveRequest, InitContestReserveResponse,
+    MerkleRootSubmission, MerkleRootResponse,
+    ContestStatusRequest, ContestStatusResponse,
+    SyncBridgeRequest, SyncBridgeResponse,
+};
+
+// ============================================================================
+// SERVICE STRUCT
+// ============================================================================
+
+pub struct BlackBookSettlementService {
+    pub blockchain: ConcurrentBlockchain,
+    pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
+    pub contest_states: Arc<dashmap::DashMap<String, ContestState>>,
+    pub current_slot: Arc<std::sync::atomic::AtomicU64>,
+    pub l2_sequencer_pubkey: String,
+    pub escrow_address: String,
+    pub block_producer: Arc<BlockProducer>,
+    pub deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
+    pub dealer_address: String,
+    start_time: Instant,
+}
+
+impl BlackBookSettlementService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        blockchain: ConcurrentBlockchain,
+        market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
+        contest_states: Arc<dashmap::DashMap<String, ContestState>>,
+        current_slot: Arc<std::sync::atomic::AtomicU64>,
+        l2_sequencer_pubkey: String,
+        escrow_address: String,
+        block_producer: Arc<BlockProducer>,
+        deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
+        dealer_address: String,
+    ) -> Self {
+        Self {
+            blockchain,
+            market_roots,
+            contest_states,
+            current_slot,
+            l2_sequencer_pubkey,
+            escrow_address,
+            block_producer,
+            deposit_requests,
+            dealer_address,
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Convert to a tonic gRPC server
+    pub fn into_server(self) -> SettlementServiceServer<Self> {
+        SettlementServiceServer::new(self)
+    }
+}
+
+// ============================================================================
+// gRPC IMPLEMENTATION
+// ============================================================================
+
+#[tonic::async_trait]
+impl SettlementService for BlackBookSettlementService {
+
+    // ── VerifyDeposit ─────────────────────────────────────────────────────
+
+    async fn verify_deposit(
+        &self,
+        request: Request<VerifyDepositRequest>,
+    ) -> Result<Response<VerifyDepositResponse>, Status> {
+        let req = request.into_inner();
+        info!("📥 VerifyDeposit: contest={} sig={}", req.contest_id, req.deposit_tx_sig);
+
+        if req.deposit_tx_sig.is_empty() {
+            return Ok(Response::new(VerifyDepositResponse {
+                verified: false,
+                depositor_wallet: String::new(),
+                actual_amount: 0,
+                deposit_slot: 0,
+                error_code: "TX_NOT_FOUND".to_string(),
+            }));
+        }
+
+        // Look up the deposit record by external tx signature
+        let record = self.deposit_requests.get(&req.deposit_tx_sig);
+        let current_slot = self.current_slot.load(Ordering::Relaxed);
+
+        match record {
+            None => {
+                warn!("VerifyDeposit: tx not found: {}", req.deposit_tx_sig);
+                Ok(Response::new(VerifyDepositResponse {
+                    verified: false,
+                    depositor_wallet: String::new(),
+                    actual_amount: 0,
+                    deposit_slot: current_slot,
+                    error_code: "TX_NOT_FOUND".to_string(),
+                }))
+            }
+            Some(dep) => {
+                // Convert stablecoin amount → SPL units (6 decimals, 1 BB = 1_000_000)
+                let actual_spl = (dep.amount_stablecoin * 1_000_000.0).round() as u64;
+
+                // Amount check: if caller specified a non-zero expected_amount, verify it
+                if req.expected_amount > 0 && actual_spl != req.expected_amount {
+                    return Ok(Response::new(VerifyDepositResponse {
+                        verified: false,
+                        depositor_wallet: dep.wallet_address.clone(),
+                        actual_amount: actual_spl,
+                        deposit_slot: current_slot,
+                        error_code: "WRONG_AMOUNT".to_string(),
+                    }));
+                }
+
+                // Check if deposit is approved (not just pending)
+                if dep.status != "approved" {
+                    return Ok(Response::new(VerifyDepositResponse {
+                        verified: false,
+                        depositor_wallet: dep.wallet_address.clone(),
+                        actual_amount: actual_spl,
+                        deposit_slot: dep.submitted_at,
+                        error_code: "TX_NOT_FINAL".to_string(),
+                    }));
+                }
+
+                info!("✅ VerifyDeposit OK: {} SPL for wallet {}", actual_spl, dep.wallet_address);
+                Ok(Response::new(VerifyDepositResponse {
+                    verified: true,
+                    depositor_wallet: dep.wallet_address.clone(),
+                    actual_amount: actual_spl,
+                    deposit_slot: dep.approved_at.unwrap_or(dep.submitted_at),
+                    error_code: String::new(),
+                }))
+            }
+        }
+    }
+
+    // ── InitContestReserve ────────────────────────────────────────────────
+
+    async fn init_contest_reserve(
+        &self,
+        request: Request<InitContestReserveRequest>,
+    ) -> Result<Response<InitContestReserveResponse>, Status> {
+        let req = request.into_inner();
+        info!("🏦 InitContestReserve: contest={} dealer={} reserve={}", req.contest_id, req.dealer_address, req.bb_reserve);
+
+        if req.contest_id.is_empty() || req.dealer_address.is_empty() {
+            return Err(Status::invalid_argument("contest_id and dealer_address are required"));
+        }
+        if req.bb_reserve == 0 {
+            return Err(Status::invalid_argument("bb_reserve must be > 0"));
+        }
+
+        // Check contest is not already settled
+        if let Some(existing) = self.contest_states.get(&req.contest_id) {
+            if existing.status == ContestStatus::Settled {
+                return Ok(Response::new(InitContestReserveResponse {
+                    confirmed: false,
+                    l1_tx_hash: String::new(),
+                    error_message: "Contest already settled".to_string(),
+                }));
+            }
+        }
+
+        // Convert SPL units → BB (6 decimals)
+        let bb_amount = req.bb_reserve as f64 / 1_000_000.0;
+
+        // Debit dealer → escrow
+        if let Err(e) = self.blockchain.debit(&req.dealer_address, bb_amount) {
+            return Ok(Response::new(InitContestReserveResponse {
+                confirmed: false,
+                l1_tx_hash: String::new(),
+                error_message: format!("Dealer debit failed: {} (balance check passed?)", e),
+            }));
+        }
+        if let Err(e) = self.blockchain.credit(&self.escrow_address, bb_amount) {
+            // Rollback
+            let _ = self.blockchain.credit(&req.dealer_address, bb_amount);
+            return Ok(Response::new(InitContestReserveResponse {
+                confirmed: false,
+                l1_tx_hash: String::new(),
+                error_message: format!("Escrow credit failed: {}", e),
+            }));
+        }
+
+        let l1_tx_hash = uuid::Uuid::new_v4().to_string();
+        let current_slot = self.current_slot.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Create Open ContestState
+        let contest = ContestState {
+            contest_id: req.contest_id.clone(),
+            status: ContestStatus::Open,
+            merkle_root: [0u8; 32],
+            total_deposited: req.bb_reserve,
+            total_claimed: 0,
+            winner_count: 0,
+            house_rake: 0,
+            claim_deadline_slot: 0, // set when Settled
+            l1_tx_hash: l1_tx_hash.clone(),
+            last_l2_block: 0,
+            created_at: now,
+        };
+        self.contest_states.insert(req.contest_id.clone(), contest.clone());
+        let _ = self.blockchain.store_contest_state(&contest);
+
+        info!("✅ InitContestReserve OK: {} BB locked for contest={} slot={}",
+            bb_amount, req.contest_id, current_slot);
+
+        Ok(Response::new(InitContestReserveResponse {
+            confirmed: true,
+            l1_tx_hash,
+            error_message: String::new(),
+        }))
+    }
+
+    // ── SubmitMerkleRoot ──────────────────────────────────────────────────
+    //
+    // This is the canonical settlement path. It:
+    //   1. Verifies the binary-packed Ed25519 sequencer signature
+    //   2. Enforces the zero-sum invariant
+    //   3. Stores the 32-byte root + ContestState in ReDB
+
+    async fn submit_merkle_root(
+        &self,
+        request: Request<MerkleRootSubmission>,
+    ) -> Result<Response<MerkleRootResponse>, Status> {
+        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+
+        let req = request.into_inner();
+        info!("📋 SubmitMerkleRoot: contest={} l2_block={}", req.contest_id, req.l2_block_number);
+
+        // ── Validate ──────────────────────────────────────────────────────
+        if req.contest_id.is_empty() {
+            return Err(Status::invalid_argument("contest_id is required"));
+        }
+        if req.merkle_root.len() != 32 {
+            return Err(Status::invalid_argument("merkle_root must be exactly 32 bytes"));
+        }
+        if req.sequencer_pubkey.len() != 32 {
+            return Err(Status::invalid_argument("sequencer_pubkey must be 32 bytes"));
+        }
+        if req.sequencer_sig.len() != 64 {
+            return Err(Status::invalid_argument("sequencer_sig must be 64 bytes"));
+        }
+
+        // ── Zero-sum invariant ────────────────────────────────────────────
+        if req.total_deposited != req.total_payout.saturating_add(req.house_rake) {
+            return Err(Status::invalid_argument(
+                "zero-sum violated: total_deposited != total_payout + house_rake"
+            ));
+        }
+
+        // ── Ed25519 signature verification ────────────────────────────────
+        // Signed message: contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
+        // (must match what L2 settlement_bridge.rs produces)
+        if !self.l2_sequencer_pubkey.is_empty() {
+            let seq_pubkey_bytes = match hex::decode(&self.l2_sequencer_pubkey) {
+                Ok(b) if b.len() == 32 => b,
+                _ => return Err(Status::internal("Invalid L2_SEQUENCER_PUBKEY on server")),
+            };
+            let verifying_key = VerifyingKey::from_bytes(
+                seq_pubkey_bytes.as_slice().try_into().unwrap()
+            ).map_err(|e| Status::internal(format!("Bad sequencer key: {}", e)))?;
+
+            let mut msg: Vec<u8> = Vec::with_capacity(req.contest_id.len() + 8 + 32);
+            msg.extend_from_slice(req.contest_id.as_bytes());
+            msg.extend_from_slice(&req.l2_block_number.to_le_bytes());
+            msg.extend_from_slice(&req.merkle_root);
+
+            let sig = Signature::from_bytes(
+                req.sequencer_sig.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_sig must be 64 bytes"))?
+            );
+            verifying_key.verify(&msg, &sig)
+                .map_err(|_| Status::unauthenticated("Sequencer signature verification failed"))?;
+        }
+
+        // ── Store root + ContestState ─────────────────────────────────────
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&req.merkle_root);
+
+        self.market_roots.insert(req.contest_id.clone(), root_arr);
+        let _ = self.blockchain.store_escrow_market_root(&req.contest_id, &root_arr);
+
+        const CLAIM_WINDOW_SLOTS: u64 = 6_480_000;
+        let current_slot = self.current_slot.load(Ordering::Relaxed);
+        let l1_tx_hash = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let contest = ContestState {
+            contest_id: req.contest_id.clone(),
+            status: ContestStatus::Settled,
+            merkle_root: root_arr,
+            total_deposited: req.total_deposited,
+            total_claimed: 0,
+            winner_count: req.winner_count,
+            house_rake: req.house_rake,
+            claim_deadline_slot: current_slot + CLAIM_WINDOW_SLOTS,
+            l1_tx_hash: l1_tx_hash.clone(),
+            last_l2_block: req.l2_block_number,
+            created_at: now,
+        };
+        self.contest_states.insert(req.contest_id.clone(), contest.clone());
+        let _ = self.blockchain.store_contest_state(&contest);
+
+        info!("✅ SubmitMerkleRoot OK: contest={} root={} deadline_slot={}",
+            req.contest_id, hex::encode(root_arr), current_slot + CLAIM_WINDOW_SLOTS);
+
+        Ok(Response::new(MerkleRootResponse {
+            success: true,
+            l1_tx_hash,
+            l1_finalized_slot: current_slot,
+            error_message: String::new(),
+        }))
+    }
+
+    // ── GetContestStatus ──────────────────────────────────────────────────
+
+    async fn get_contest_status(
+        &self,
+        request: Request<ContestStatusRequest>,
+    ) -> Result<Response<ContestStatusResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.contest_id.is_empty() {
+            return Err(Status::invalid_argument("contest_id is required"));
+        }
+
+        match self.contest_states.get(&req.contest_id) {
+            None => Err(Status::not_found(format!("No contest found: {}", req.contest_id))),
+            Some(c_ref) => {
+                let mut c = c_ref.value().clone();
+                drop(c_ref);
+                let current_slot = self.current_slot.load(Ordering::Relaxed);
+                // Auto-expire: transition Settled → Expired once the claim window closes
+                if c.status == ContestStatus::Settled
+                    && c.claim_deadline_slot > 0
+                    && current_slot > c.claim_deadline_slot
+                {
+                    c.status = ContestStatus::Expired;
+                    self.contest_states.insert(c.contest_id.clone(), c.clone());
+                    let _ = self.blockchain.store_contest_state(&c);
+                    info!("⏰ Contest {} expired at slot {}", c.contest_id, current_slot);
+                }
+                let status_str = match c.status {
+                    ContestStatus::Open    => "OPEN",
+                    ContestStatus::Settled => "SETTLED",
+                    ContestStatus::Expired => "EXPIRED",
+                };
+                Ok(Response::new(ContestStatusResponse {
+                    contest_id: c.contest_id.clone(),
+                    status: status_str.to_string(),
+                    total_deposited: c.total_deposited,
+                    total_claimed: c.total_claimed,
+                    merkle_root: c.merkle_root.to_vec(),
+                    claim_deadline_slot: c.claim_deadline_slot,
+                    l1_tx_hash: c.l1_tx_hash.clone(),
+                }))
+            }
+        }
+    }
+
+    // ── SyncBridge ────────────────────────────────────────────────────────
+
+    async fn sync_bridge(
+        &self,
+        request: Request<SyncBridgeRequest>,
+    ) -> Result<Response<SyncBridgeResponse>, Status> {
+        let req = request.into_inner();
+        let latest_slot = self.current_slot.load(Ordering::Relaxed);
+        let uptime_secs = self.start_time.elapsed().as_secs();
+        info!("💓 SyncBridge from node={} slot={} uptime={}s", req.node_id, latest_slot, uptime_secs);
+        Ok(Response::new(SyncBridgeResponse {
+            node_id: req.node_id,
+            latest_slot,
+            uptime_secs,
+        }))
+    }
+}

@@ -6,6 +6,7 @@
         .compile_protos(
             &[
                 "proto/validator_relay.proto",
+                "proto/settlement.proto",
             ],
             &["proto"],
         )?;

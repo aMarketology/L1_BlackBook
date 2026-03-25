@@ -44,11 +44,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use tracing::{info, warn};
 use crate::svm::accounts_db::SvmAccountsDB;
 use crate::svm::types::LAMPORTS_PER_BB;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::account::AccountSharedData;
+use solana_sdk::account::ReadableAccount;
 
 // ============================================================================
 // REDB TABLE DEFINITIONS (Type-Safe!)
@@ -83,6 +85,20 @@ const DEPOSIT_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("dep
 /// Withdrawal gateway requests: withdrawal_id (UUID) → WithdrawalRecord JSON (bytes)
 /// Durable record of every wUSDC → real USDC withdrawal initiated by users.
 const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdrawals");
+
+/// Per-contest settlement state: contest_id → ContestState JSON (bytes)
+/// Tracks lifecycle (Open → Settled → Expired), Merkle root, payout accounting,
+/// and claim deadline per BB market.
+const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("contest_states");
+
+/// Layer 5 creator coin registry: ticker → CreatorCoinRecord JSON (bytes)
+const CREATOR_COINS: TableDefinition<&str, &[u8]> = TableDefinition::new("creator_coins");
+
+/// Layer 5 AMM pool state: ticker → CoinPoolState JSON (bytes)
+const COIN_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("coin_pools");
+
+/// Layer 5 user coin balances: "{ticker}:{wallet}" → coin_units (u64, 6 decimals)
+const COIN_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("coin_balances");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -334,6 +350,10 @@ pub struct ConcurrentBlockchain {
 
     /// Per-account nonce tracker (prevents replay attacks)
     pub account_nonces: Arc<DashMap<String, u64>>,
+
+    /// Buffered transaction log — accumulated per-slot, flushed once at block boundary.
+    /// This eliminates synchronous ReDB writes from the hot path.
+    tx_log_buffer: Arc<Mutex<Vec<TransactionRecord>>>,
 }
 
 impl ConcurrentBlockchain {
@@ -406,6 +426,7 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(ESCROW_CLAIMS)?;
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
             let _ = write_txn.open_table(WITHDRAWALS)?;
+            let _ = write_txn.open_table(CONTEST_STATES)?;
 
             // SVM tables (behind feature flag)
             {
@@ -445,6 +466,20 @@ impl ConcurrentBlockchain {
         let db_arc = Arc::new(db);
         let svm_accounts = Arc::new(SvmAccountsDB::new(Arc::clone(&db_arc)).map_err(|e| e.to_string())?);
 
+        // ═══ HYDRATE DashMap cache from SVM hot_state on startup ═══
+        // This ensures legacy code paths that read `cache` see correct
+        // balances immediately after restart (no stale zeros).
+        let mut hydrated = 0usize;
+        for entry in svm_accounts.hot_state.iter() {
+            let pubkey = entry.key();
+            let lamports = entry.value().lamports();
+            let address = bs58::encode(pubkey.to_bytes()).into_string();
+            let bb = lamports as f64 / LAMPORTS_PER_BB as f64;
+            cache.insert(address, bb);
+            hydrated += 1;
+        }
+        info!(hydrated_accounts = hydrated, "DashMap cache hydrated from SVM hot_state");
+
         Ok(Self {
             db: db_arc,
             cache,
@@ -453,6 +488,7 @@ impl ConcurrentBlockchain {
             total_supply: Arc::new(AtomicU64::new(0)),
             svm_accounts,
             account_nonces: Arc::new(DashMap::new()),
+            tx_log_buffer: Arc::new(Mutex::new(Vec::with_capacity(1024))),
         })
     }
 
@@ -654,7 +690,12 @@ impl ConcurrentBlockchain {
         Ok(())
     }
 
-    /// Log a transaction to history with chain integrity
+    /// Buffer a transaction for batch persistence at block boundaries.
+    ///
+    /// Instead of opening a ReDB write transaction per tx (which forces an
+    /// fsync each time and caps throughput at ~500 TPS), we accumulate
+    /// records in memory and flush them all in one ACID commit via
+    /// `flush_tx_log_buffer()`.
     pub fn log_transaction(&self, mut tx_record: TransactionRecord) -> Result<(), String> {
         // Set block height from current chain state
         tx_record.block_height = self.block_height.load(Ordering::Relaxed);
@@ -664,19 +705,39 @@ impl ConcurrentBlockchain {
         
         // Increment block height for next transaction
         self.block_height.fetch_add(1, Ordering::Relaxed);
+
+        // Push into the in-memory buffer — NO disk I/O here
+        self.tx_log_buffer.lock().push(tx_record);
         
-        let tx_json = serde_json::to_vec(&tx_record)
-            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-        
+        Ok(())
+    }
+
+    /// Flush all buffered transaction logs to ReDB in a single ACID commit.
+    ///
+    /// Called once per slot (400ms) by the block production loop.
+    /// This converts N per-tx fsyncs into 1 batched fsync — critical for
+    /// achieving 600K TPS throughput.
+    pub fn flush_tx_log_buffer(&self) -> Result<usize, String> {
+        let records: Vec<TransactionRecord> = {
+            let mut buf = self.tx_log_buffer.lock();
+            if buf.is_empty() { return Ok(0); }
+            std::mem::take(&mut *buf)
+        };
+
+        let count = records.len();
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
-            table.insert(tx_record.tx_id.as_str(), tx_json.as_slice())
-                .map_err(|e| e.to_string())?;
+            for record in &records {
+                let tx_json = serde_json::to_vec(record)
+                    .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+                table.insert(record.tx_id.as_str(), tx_json.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
         }
         write_txn.commit().map_err(|e| e.to_string())?;
-        
-        Ok(())
+
+        Ok(count)
     }
     
     /// Get the hash of the last transaction for chain linking
@@ -1011,10 +1072,133 @@ impl ConcurrentBlockchain {
         Ok(results)
     }
 
+    // ========================================================================
+    // CONTEST STATE STORAGE (ReDB-backed)
+    // ========================================================================
+
+    /// Persist (insert or overwrite) a contest state record, keyed by contest_id.
+    pub fn store_contest_state(&self, state: &ContestState) -> Result<(), String> {
+        let bytes = serde_json::to_vec(state).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
+            table.insert(state.contest_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load a single contest state by contest_id.
+    pub fn load_contest_state(&self, contest_id: &str) -> Result<Option<ContestState>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
+        let result = table.get(contest_id).map_err(|e| e.to_string())?;
+        match result {
+            None => Ok(None),
+            Some(guard) => serde_json::from_slice::<ContestState>(guard.value())
+                .map(Some)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Load all contest states from ReDB (startup recovery).
+    pub fn load_all_contest_states(&self) -> Result<Vec<ContestState>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_key, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<ContestState>(value.value()) {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
     /// Load all claims from ReDB (startup recovery)
     pub fn load_all_escrow_claims(&self) -> Result<Vec<(String, u64)>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = read_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (key, value) = entry.map_err(|e| e.to_string())?;
+            results.push((key.value().to_string(), value.value()));
+        }
+        Ok(results)
+    }
+
+    // ── Layer 5: Creator Coin storage ─────────────────────────────────────────
+
+    pub fn store_creator_coin(&self, record: &CreatorCoinRecord) -> Result<(), String> {
+        let json = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(CREATOR_COINS).map_err(|e| e.to_string())?;
+            table.insert(record.ticker.as_str(), json.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn load_all_creator_coins(&self) -> Result<Vec<CreatorCoinRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read_txn.open_table(CREATOR_COINS) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()), // table not yet created
+        };
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_key, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<CreatorCoinRecord>(value.value()) {
+                results.push(record);
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn store_coin_pool(&self, pool: &CoinPoolState) -> Result<(), String> {
+        let json = serde_json::to_vec(pool).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(COIN_POOLS).map_err(|e| e.to_string())?;
+            table.insert(pool.ticker.as_str(), json.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn load_all_coin_pools(&self) -> Result<Vec<CoinPoolState>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read_txn.open_table(COIN_POOLS) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_key, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(pool) = serde_json::from_slice::<CoinPoolState>(value.value()) {
+                results.push(pool);
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn store_coin_balance(&self, key: &str, amount: u64) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(COIN_BALANCES).map_err(|e| e.to_string())?;
+            table.insert(key, amount).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn load_all_coin_balances(&self) -> Result<Vec<(String, u64)>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read_txn.open_table(COIN_BALANCES) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
         let mut results = Vec::new();
         let iter = table.iter().map_err(|e| e.to_string())?;
         for entry in iter {
@@ -1075,6 +1259,97 @@ pub struct WithdrawalRecord {
     pub released_at: Option<u64>,
     /// Solana transaction hash the dealer used to send real USDC (set on release)
     pub solana_tx_hash: Option<String>,
+}
+
+// ============================================================================
+// CONTEST STATE
+// ============================================================================
+
+/// Lifecycle status of a BB market settlement.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ContestStatus {
+    /// Accepting deposits; no merkle root yet.
+    Open,
+    /// Merkle root submitted and finalized; users may claim.
+    Settled,
+    /// Claim window (6,480,000 slots ≈ 30 days) elapsed.
+    Expired,
+}
+
+/// Per-contest settlement record stored in ReDB.
+///
+/// All balance fields are in SPL units (1 BB = 1_000_000 units, 6 decimals).
+/// The zero-sum invariant MUST hold on every `Settled` record:
+///   `total_deposited == total_payout + house_rake`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContestState {
+    pub contest_id: String,
+    pub status: ContestStatus,
+    /// SHA-256 Merkle root over all (pubkey, payout) winner leaves.
+    /// Zero bytes while `status == Open`.
+    pub merkle_root: [u8; 32],
+    /// Total SPL units deposited into this contest escrow.
+    pub total_deposited: u64,
+    /// Total SPL units successfully claimed by winners so far.
+    pub total_claimed: u64,
+    pub winner_count: u32,
+    /// Platform rake (SPL units). `total_deposited - total_payout`.
+    pub house_rake: u64,
+    /// Last L1 slot at which a claim is still valid.
+    /// `submit_slot + CLAIM_WINDOW_SLOTS` (≈ 6_480_000).
+    pub claim_deadline_slot: u64,
+    /// Hash of the L1 transaction that finalized the settlement.
+    pub l1_tx_hash: String,
+    pub last_l2_block: u64,
+    /// Unix timestamp (seconds) when the contest was first opened.
+    pub created_at: u64,
+}
+
+// ============================================================================
+// LAYER 5 — CREATOR COIN RECORDS
+// ============================================================================
+
+/// Metadata for a creator coin launched via the Layer 5 launchpad.
+/// Immutable after launch — stored in the CREATOR_COINS ReDB table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CreatorCoinRecord {
+    /// Ticker symbol (2–10 uppercase alphanumeric). e.g. "MAX".
+    pub ticker: String,
+    /// Human-readable coin name. e.g. "Max Token".
+    pub name: String,
+    /// Base58 BB wallet of the creator (receives trade fees + 50% initial supply).
+    pub creator_wallet: String,
+    /// Unix timestamp of launch.
+    pub launched_at: u64,
+    /// Fixed total supply in base units (6 decimals). Always 1,000,000,000,000,000.
+    pub total_supply: u64,
+    /// Optional description / tagline (max 280 chars).
+    pub description: Option<String>,
+}
+
+/// Constant-product AMM pool state for a creator coin.
+/// Updated on every trade — stored in the COIN_POOLS ReDB table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoinPoolState {
+    /// Ticker symbol (mirrors CreatorCoinRecord.ticker).
+    pub ticker: String,
+    /// BB in the pool, in lamports (u64, 5 decimals: 1 BB = 100_000 lamports).
+    pub reserve_bb: u64,
+    /// Creator coin units in the pool (6 decimals: 1 coin = 1_000_000 units).
+    pub reserve_coin: u64,
+    /// Cumulative BB fees sent to the creator wallet.
+    pub total_fees_bb: u64,
+    /// Cumulative coin fees sent to the creator wallet (from sells).
+    pub total_fees_coins: u64,
+    /// All-time trading volume in BB lamports.
+    pub volume_bb: u64,
+    /// Total number of trades executed against this pool.
+    pub tx_count: u64,
+    /// Unix timestamp when the pool was created.
+    pub created_at: u64,
+    /// Unix timestamp of the most recent trade.
+    pub last_trade_at: u64,
 }
 
 // ============================================================================

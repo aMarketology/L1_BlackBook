@@ -2,7 +2,7 @@
 
 > The microtransaction network for AI agents.
 > Target: Hetzner launch, early March 2026.
-> Last updated: 2026-03-01
+> Last updated: 2026-03-22
 
 ---
 
@@ -119,14 +119,19 @@ Unused dependencies also removed: `libp2p` (+ 9 sub-features), `memmap2`, `void`
 
 ## 5. After Launch — Week 1-2
 
-### AI-Agent Microtransaction Speed
+### AI-Agent Microtransaction Optimization & Scale
+
+These architectural upgrades are designed to accommodate non-human actors continuously trading, hedging, and deploying capital via code.
 
 | # | Feature | Effort | Why |
 |---|---------|--------|-----|
-| A | **`accountSubscribe` WebSocket push** | 2–3 days | AI agents need instant push, not polling `/balance` |
-| B | **Deterministic flat fee** (0.0001 BB per tx, encoded in genesis) | 4–8 hours | Agents pre-calculate cost of 10,000 hops before sending the first one |
-| C | **`simulateTransaction` RPC** | 2–4 hours | Phantom/Backpack pre-flight checks |
-| D | **Reader → Writer tx forwarding in RPC** | 2–3 hours | `sendTransaction` on Reader must forward to Writer |
+| A | **Event-Driven WebSockets** | 2–3 days | AI agents need instant <400ms feedback loops via `accountSubscribe`, not polling `/balance` APIs. |
+| B | **Session Keys (Delegated Spend)** | 3–5 days | Allow human users to sign a 24-hr allowance for an AI Agent's specific pubkey without handing over full private keys. |
+| C | **Localized Fee Markets (Anti-Spam)** | 1 week | Protect against runaway AI infinite-loop attacks. If a specific agent or contract spams, fees rise *only* for that local state. |
+| D | **Archiver Nodes & Garbage Collection** | 2 weeks | 600,000 TPS generates massive data. We need to prune `SvmAccountsDB` and offload historical txs to cold-storage "Archiver" nodes. |
+| E | **L2 Payment Channels (LLM Streaming)** | 2 weeks | For sub-cent continuous streams (e.g. paying per LLM token), agents need state channels that settle back to the L1 post-session. |
+| F | **`simulateTransaction` RPC** | 2–4 hours | Pre-flight checks before an AI commits non-recoverable funds to a complex swap. |
+| G | **Reader → Writer tx forwarding in RPC** | 2–3 hours | `sendTransaction` on Reader must forward to Writer. |
 
 ### Observability
 
@@ -174,4 +179,115 @@ Unused dependencies also removed: `libp2p` (+ 9 sub-features), `memmap2`, `void`
 
 ---
 
-*This document reflects the codebase as of 2026-03-01 (v5.0.0). Target: Hetzner launch March 3.*
+*This document reflects the codebase as of 2026-03-22 (v5.0.0). Target: Hetzner launch — imminent.*
+
+---
+
+## 8. The Architecture Vision — Where We Are Going
+
+These three pillars define what BlackBook will become beyond the initial launch. They are not hypothetical — the foundations already exist in the codebase today.
+
+### 8.1 Zero-Knowledge Proofs (ZKPs)
+
+**What it means:** A ZKP lets the network mathematically *prove* that a transaction is valid without requiring every node to re-execute it. Instead of 1,000 validators all burning electricity checking the same arithmetic, one node does the work and produces a small cryptographic proof. Every other node verifies the proof in microseconds.
+
+**Why it matters for BlackBook:**
+- Microtransactions between AI agents are extremely high-volume and repetitive in structure. ZKPs batch thousands of these into a single on-chain proof — collapsing the verification cost to near zero.
+- It enables **light-client validation** — a mobile phone or IoT device can verify the chain is honest without downloading every block.
+- Privacy extensions: ZKPs can optionally shield transaction amounts from public view while still proving they are valid, enabling private AI agent accounting.
+
+**What we have today:** Our SVM execution path in `src/svm/runtime.rs` is the execution layer. ZKP integration sits one layer above: a proving system (e.g., **PLONK** or **Groth16** via `bellman` or `halo2` crates) would wrap the SVM's state transitions and produce succinct proofs per block.
+
+**Roadmap step:** Introduce a `zkp/` module post-launch that wraps `flush_block()` output and generates a validity proof committed to the PoH hash chain.
+
+---
+
+### 8.2 PoH Speed — Without Hardware Centralization
+
+**What it means:** Solana's PoH is a cryptographic clock — a continuous SHA-256 hash chain that stamps the *exact order* of events before consensus even runs. This eliminates the most expensive part of blockchain consensus: arguing about time.
+
+**The problem with Solana's original design:** Running a Solana validator requires a $10,000+ server (high-core NVMe, 256 GB RAM, 10 Gbit NIC) because the state is enormous and transaction throughput is massive.
+
+**How BlackBook solves this:**
+- Our `SvmAccountsDB` uses a **two-layer architecture** — a hot `DashMap` in memory and a durable `ReDB` on disk. State is sharded and only *active* accounts are kept hot. Cold state is compressed to disk with zero overhead on the critical path.
+- The **400 ms slot** time and **12,500 hashes/tick** PoH clock (in `runtime/poh_service.rs`) are tuned to be achievable on commodity hardware — not just $10,000 datacenter rigs.
+- **Turbine shreds** (1,232 bytes, Reed-Solomon FEC 32+32, fanout 200) in `src/svm/` mean block propagation is O(log n), so even low-bandwidth nodes receive full blocks quickly.
+
+**The goal:** A fully validating BlackBook node should run comfortably on a $30/month VPS or a modern laptop — keeping the network genuinely decentralized, not permissioned by hardware cost.
+
+---
+
+### 8.3 Self-Healing Architecture
+
+**What it means:** The network should never halt. If the Writer node (block producer) goes down, the network automatically elects a new leader and resumes within seconds. No human intervention. No downtime for users.
+
+**What we have today:**
+- **Tower BFT** (`runtime/consensus.rs`) — exponential lockout, 2/3 supermajority, 32-deep root advancement. This is the Byzantine fault tolerance layer that lets the network agree on canonical blocks even if some nodes lie or go offline.
+- **Turbine + Gulf Stream** — block shreds are propagated and transactions are pre-forwarded to upcoming leaders, so the pipeline never empties even during leader rotation.
+- **1 Writer / N Readers** relay via gRPC — Readers continue serving RPC traffic even if the Writer is temporarily unreachable.
+
+**What comes next (Month 2-3):**
+- **Multi-Writer leader schedule** — rotate block production across multiple nodes on a deterministic schedule. If the current leader misses a slot, the next node automatically takes over.
+- **Automatic Writer failover** — Readers detect a stalled Writer (no block within 2 slots) and trigger a leader-change vote via Tower BFT.
+
+---
+
+## 9. First 100 Users — Launch Checklist
+
+This is the minimum viable set of work to go from "compiles and runs locally" to "live network with 100 real users transacting."
+
+### 9.1 Pre-Launch Gate (Must Be Done First)
+These block a live deployment entirely. See Section 3 for full details.
+
+```
+ ✅ PoH clock live
+ ✅ SVM execution live
+ ✅ SPL tokens live
+ ✅ Replay protection live
+ ✅ Faucet rate-limited
+ ✅ JavaScript SDK published
+
+ ❌ Remove real_wallets/ from Dockerfile            (15 min)
+ ❌ Gate /admin/* endpoints behind unsafe_admin     (1 hour)
+ ❌ Lock CORS to explicit origins                   (30 min)
+ ❌ Fix Shard B PIN auth (tautology bug)            (1 hour)
+ ❌ Wire SIGTERM → flush_final_block()              (1 hour)
+ ❌ Per-account nonce in storage                   (30 min)
+```
+
+### 9.2 First 100 Users — Onboarding Requirements
+
+| # | What | Why | Effort |
+|---|------|-----|--------|
+| 1 | **Public Writer node live** on writer.blackbook.io with TLS | Users can send real transactions | 2 hours |
+| 2 | **Geo-load-balanced Reader nodes** (Virginia + Oregon minimum) | Fast RPC reads for all US users | 2 hours |
+| 3 | **wallet.blackbook.io frontend** — create wallet, faucet, send | Non-technical users can onboard | 3–5 days |
+| 4 | **Block Explorer** at explorer.blackbook.io | Users and investors can see the chain is alive | 3–5 days |
+| 5 | **`accountSubscribe` WebSocket push** | Wallet UI shows live balance updates without polling | 2–3 days |
+| 6 | **`simulateTransaction` RPC** | Phantom/Backpack wallet compatibility, pre-flight checks | 2–4 hours |
+| 7 | **Reader → Writer tx forwarding** | `sendTransaction` on a Reader must forward to the Writer | 2–3 hours |
+| 8 | **Deterministic flat fee** (0.0001 BB/tx, genesis-encoded) | Users and AI agents can pre-calculate exact costs | 4–8 hours |
+| 9 | **Faucet UX** — one-click fund new wallet with 100 BB | No user should get stuck with zero balance on signup | 1 hour |
+| 10 | **CI/CD pipeline** (GitHub Actions → Docker push) | Every merge deploys tested code automatically | 4 hours |
+
+### 9.3 The 100-User Rollout Waves
+
+| Wave | Users | Method | Goal |
+|------|-------|--------|------|
+| **Wave 1** | 5 | Internal team + friends. Manual onboarding via CLI. | Smoke test on live network. Catch anything broken. |
+| **Wave 2** | 20 | Early beta invite list. Frontend live. | Validate wallet create → faucet → transfer UX is intuitive. |
+| **Wave 3** | 75 | Discord/community invite. Block explorer live. | Observe chain live. Organic first transactions. Real excitement. |
+| **Wave 4** | 100+ | Open signup via wallet.blackbook.io. | Sustained daily active users. Measure TPS under real load. |
+
+### 9.4 Success Criteria for 100 Users
+
+The launch is successful when all of the following are true simultaneously:
+- [ ] 100 unique wallets created and funded on the live chain
+- [ ] Block explorer shows a continuously growing block height
+- [ ] Average transaction confirmation time < 800 ms end-to-end
+- [ ] Zero unplanned chain halts in 72 hours of operation
+- [ ] At least one AI agent sending microtransactions autonomously on-chain
+
+---
+
+*Last updated: 2026-03-22. Next milestone: Ship the Pre-Launch Gate items (Section 9.1) and go live.*

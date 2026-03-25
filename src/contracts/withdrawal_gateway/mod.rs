@@ -279,6 +279,26 @@ pub async fn withdraw_release_handler(
         .unwrap_or_default()
         .as_secs();
 
+    // ── BURN wUSDC from dealer (zero-sum: real USDC leaves custody, wUSDC leaves supply) ─
+    {
+        let mint = usdc_mint_bytes();
+        let raw_amount = (record.wusdc_amount * USDC_UNIT as f64) as u64;
+        if let Ok(dealer_pubkey) = state.dealer_address.parse::<solana_sdk::pubkey::Pubkey>() {
+            match crate::svm::SplTokenEngine::burn(
+                &state.blockchain.svm_accounts,
+                &mint,
+                &dealer_pubkey,
+                raw_amount,
+            ) {
+                Ok(_) => {
+                    let _ = state.blockchain.svm_accounts.flush_block();
+                    info!("🔥 Burned {:.6} wUSDC from dealer (withdrawal {})", record.wusdc_amount, &req.withdrawal_id[..8]);
+                }
+                Err(e) => warn!("⚠️  wUSDC burn on release failed — supply may be inflated: {:?}", e),
+            }
+        }
+    }
+
     let mut updated = record.clone();
     updated.status = "released".to_string();
     updated.released_at = Some(now);

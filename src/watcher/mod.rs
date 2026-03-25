@@ -1,3 +1,6 @@
+pub mod bsc_watcher;
+pub use bsc_watcher::{BscWatcher, BSC_USDC_CONTRACT, BSC_USDT_CONTRACT};
+
 // ============================================================================
 // CUSTODY WALLET WATCHER
 // ============================================================================
@@ -136,6 +139,18 @@ struct TxTokenBalance {
     mint: String,
     owner: Option<String>,
     ui_token_amount: UiTokenAmount,
+}
+
+// getProgramAccounts
+#[derive(Deserialize)]
+struct ProgramAccountEntry {
+    pubkey: String,
+    account: ProgramAccountBody,
+}
+#[derive(Deserialize)]
+struct ProgramAccountBody {
+    /// ["base64data", "base64"]
+    data: Vec<String>,
 }
 
 /// Stripped result of a successful on-chain verification.
@@ -356,6 +371,9 @@ impl CustodyWatcher {
 
         // 2. Scan and auto-approve new finalized deposits
         self.scan_new_deposits().await;
+
+        // 3. Scan BlackBook Bridge program for non-custodial deposits
+        self.scan_bridge_program_deposits().await;
     }
 
     // ── Public: balance fetch ────────────────────────────────────────────────
@@ -379,6 +397,123 @@ impl CustodyWatcher {
     }
 
     // ── Private: signature scan ──────────────────────────────────────────────
+
+    // ── Private: Anchor bridge program scan (non-custodial Solana deposits) ────
+
+    /// Scan the BlackBook Bridge Anchor program for `DepositReceipt` PDAs that
+    /// have not yet been acknowledged (`bb_minted = false`) and mint BB for them.
+    ///
+    /// Requires `BRIDGE_PROGRAM_ID` env var — silently skips if unset (program
+    /// not yet deployed).
+    async fn scan_bridge_program_deposits(&self) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+
+        let program_id = match std::env::var("BRIDGE_PROGRAM_ID") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return, // bridge program not deployed yet, skip silently
+        };
+
+        // DepositReceipt::LEN = 127 bytes (discriminator 8 + all fields)
+        // bb_minted bool is at byte offset 117.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getProgramAccounts",
+            "params": [
+                program_id,
+                {
+                    "encoding": "base64",
+                    "filters": [
+                        { "dataSize": 127 }
+                    ]
+                }
+            ]
+        });
+
+        let resp: RpcEnvelope<Vec<ProgramAccountEntry>> = match self.rpc_call(body).await {
+            Ok(r) => r,
+            Err(e) => { warn!("⚠️  getProgramAccounts (bridge): {}", e); return; }
+        };
+
+        let accounts = match resp.result { Some(v) => v, None => return };
+        if accounts.is_empty() { return; }
+
+        let bb_per_usdc: f64 = 10.0;
+
+        for pa in &accounts {
+            // Decode base64 account data
+            let raw = match pa.account.data.first()
+                .and_then(|s| B64.decode(s).ok())
+            {
+                Some(b) => b,
+                None => continue,
+            };
+            if raw.len() < 127 { continue; }
+
+            // Byte layout (after 8-byte discriminator):
+            //   8..40  depositor Pubkey
+            //  40..84  l1_wallet_bytes [u8;44]
+            //     84   l1_wallet_len u8
+            //  85..93  usdc_amount u64 LE
+            //  93..101 deposit_index u64 LE
+            // 101..109 solana_slot u64 LE
+            // 109..117 created_at i64 LE
+            //    117   bb_minted bool
+            // 118..126 l1_mint_slot u64 LE
+            //    126   bump u8
+            let bb_minted = raw[117];
+            if bb_minted != 0 { continue; } // already processed on-chain
+
+            // Belt-and-suspenders: also check our local DB
+            let receipt_key = pa.pubkey.clone();
+            if self.blockchain.is_bridge_tx_processed(&receipt_key) { continue; }
+
+            let wallet_len = (raw[84] as usize).min(44);
+            let l1_wallet = match std::str::from_utf8(&raw[40..40 + wallet_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+
+            let usdc_raw = u64::from_le_bytes(
+                raw[85..93].try_into().unwrap_or_default()
+            );
+            let usdc_amount = usdc_raw as f64 / 1_000_000.0; // 6 decimals
+            let bb_to_mint = usdc_amount * bb_per_usdc;
+
+            if bb_to_mint <= 0.0 { continue; }
+
+            // Mint BB to the L1 wallet
+            match self.blockchain.credit(&l1_wallet, bb_to_mint) {
+                Ok(_) => {
+                    let mint_tx_id = uuid::Uuid::new_v4().to_string();
+                    let _ = self.blockchain.mark_bridge_tx_processed(&receipt_key, &mint_tx_id);
+
+                    // Record in PoH
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs();
+                    let proto_tx = ProtoTx {
+                        hash: mint_tx_id,
+                        from: format!("BRIDGE_PROGRAM:{}", program_id),
+                        timestamp: now,
+                        data: TxData::DepositUsdt {
+                            usdt_amount: usdc_raw / 10, // USDC units / rate
+                            external_tx_hash: Some(receipt_key.clone()),
+                        },
+                        signature: "bridge_program_scan".to_string(),
+                        signer_pubkey: "WATCHER".to_string(),
+                    };
+                    self.block_producer.record_executed_transaction(proto_tx);
+
+                    info!("✅ Bridge program: {:.6} USDC → {} BB for {} (receipt: {})",
+                        usdc_amount, bb_to_mint,
+                        &l1_wallet[..8.min(l1_wallet.len())],
+                        &receipt_key[..16.min(receipt_key.len())]);
+                }
+                Err(e) => warn!("⚠️  Bridge program mint failed ({}): {}", &receipt_key[..16.min(receipt_key.len())], e),
+            }
+        }
+    }
 
     async fn scan_new_deposits(&self) {
         let until_sig = self.last_signature.lock().await.clone();

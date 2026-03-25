@@ -273,27 +273,81 @@ Only `tests/litesvm_integration.rs` (5 tests) and 4 inline tests in `poh_blockch
 
 ---
 
-## Milestone 11: Priority Fee Model
+## Milestone 11: Localized Fee Markets & Priority Fee Model 
 
-**Goal**: Introduce micro-fees to prevent spam and create economic incentive for validators.
+**Goal**: Introduce micro-fees to prevent spam and create economic incentive for validators. Crucial for throttling runaway AI loops (Anti-Spam).
 
 ### Work Required
 
 | # | Task | File | Details |
 |---|------|------|---------|
 | 11.1 | Define fee constants | `src/svm/types.rs` | `BASE_FEE_LAMPORTS = 5_000` (0.000005 BB), `PRIORITY_FEE_PER_CU = 1` (lamport per compute unit) |
-| 11.2 | Deduct fee in `execute_transfer()` | `src/svm/runtime.rs` | Before transfer: `sender.lamports -= base_fee + priority_fee`. Fee goes to a `fee_collector` account (the Writer's identity). |
-| 11.3 | Update `getFeeForMessage` RPC | `src/solana_rpc/mod.rs` | Return actual fee calculation instead of 0 |
-| 11.4 | Update `getRecentPrioritizationFees` RPC | `src/solana_rpc/mod.rs` | Track and return per-slot fee stats |
-| 11.5 | Gulf Stream priority sorting by fee | `runtime/consensus.rs` | Higher-fee txs execute first within a slot |
-| 11.6 | SDK: estimate fee before transfer | `sdk/blackbook_sdk.js` | Call `getFeeForMessage` and display to user |
+| 11.2 | Localized Fee tracking | `runtime/core.rs` | Enable `LocalizedFeeMarket`. Throttles specific highly-contended state without globally hiking fees. |
+| 11.3 | Deduct fee in `execute_transfer()` | `src/svm/runtime.rs` | Before transfer: `sender.lamports -= base_fee + priority_fee`. |
+| 11.4 | Update `getRecentPrioritizationFees` RPC | `src/solana_rpc/mod.rs` | Track and return per-slot, per-market fee stats. |
+| 11.5 | Gulf Stream priority sorting by fee | `runtime/consensus.rs` | Higher-fee txs execute first within a slot. |
 
 ### Acceptance Criteria
-- [ ] Every transfer deducts a non-zero fee
-- [ ] Fee collector account accumulates fees
-- [ ] `getFeeForMessage` returns accurate fee estimate
-- [ ] Higher-fee transactions process before lower-fee in same slot
-- [ ] SDK displays fee before user confirms transfer
+- [ ] Spamming a single agent/account exponentially raises fees for just that state.
+- [ ] Fee collector account accumulates fees.
+- [ ] Safe AI transactions function normally despite a localized spam event.
+
+---
+
+## Milestone 12: Session Keys & Account Abstraction
+
+**Goal**: Allow human users to sign a delegated allowance for an AI Agent to spend a metered amount of BB without exposing the human's main private key.
+
+### Work Required
+
+| # | Task | File | Details |
+|---|------|------|---------|
+| 12.1 | Implement `DelegateInstruction` | `src/contracts/system/mod.rs` | Define `Delegate { agent_pubkey, max_amount, expiration, allowed_programs }`. |
+| 12.2 | Add Token Allowance Tracking | `src/svm/accounts_db.rs` | Track active delegated session keys directly in the `AccountSharedData` or an associated PDA. |
+| 12.3 | Signature Verification | `src/svm/sigverify.rs` | Support mapping an AI Agent's signature to the delegated allowance of the origin human wallet. |
+| 12.4 | Support in SDK | `sdk/wallet.sdk.ts` | Add `.createSessionKey(agentPubkey, constraints)` method. |
+
+### Acceptance Criteria
+- [ ] User grants AI Agent 50 BB budget. Agent signs tx and spends 10 BB. Main wallet loses 10 BB.
+- [ ] Agent attempts to spend 60 BB, tx fails (exceeded allowance).
+- [ ] Allowance expires automatically after X hours based on block timestamp.
+
+---
+
+## Milestone 13: Archiver Nodes & State Pruning
+
+**Goal**: Ensure Validator nodes don't bloat from 600,000 TPS of AI micro-chatter. Shift old tx history to cold-storage.
+
+### Work Required
+
+| # | Task | File | Details |
+|---|------|------|---------|
+| 13.1 | Implement `ReDB` Garbage Collection | `src/poh_blockchain.rs`| Drop blocks older than X epochs from primary `blockchain.redb`. |
+| 13.2 | Create `Archiver` Node Mode | `src/main.rs` | CLI mode `--mode archiver`. Subscribes to Writer but writes directly to massive cold storage. |
+| 13.3 | RPC Historical Routing | `src/solana_rpc/mod.rs` | Return `RpcError::HistoryPrecluded` if a Validator is asked for an old pruned signature, directing them to an Archiver. |
+
+### Acceptance Criteria
+- [ ] Writer Node natively deletes block hashes > 3 days old from its `ReDB` tree.
+- [ ] Archiver Node successfully ingests and stores the entire unbroken epoch history.
+
+---
+
+## Milestone 14: L2 Payment Channels (State Streaming)
+
+**Goal**: AI agents charging per LLM token need thousands of updates per second off-chain before settling on-chain.
+
+### Work Required
+
+| # | Task | File | Details |
+|---|------|------|---------|
+| 14.1 | Channel Open Instruction | `src/contracts/global_escrow/mod.rs` | Users lock X amount of BB in a multi-sig escrow on L1. |
+| 14.2 | Off-Chain SDK Module | `sdk/channels.sdk.ts` | AI agents pass signed Lamport updates back and forth directly via HTTP/WebRTC. |
+| 14.3 | Channel Close / Settlement | `src/contracts/global_escrow/mod.rs` | Either party submits the newest jointly-signed off-chain state. L1 unwinds the escrow and pays exact final balances. |
+
+### Acceptance Criteria
+- [ ] 2 entities lock 100 BB. 
+- [ ] They generate 10,000 off-chain micro-payments without hitting the RPC.
+- [ ] Final state (e.g., 80 BB / 20 BB) is settled to L1 flawlessly in exactly one on-chain tx.
 
 ---
 
@@ -313,10 +367,13 @@ Milestone 9 (Deploy automation) ─────┼── Required for production
                                       ▼
 Milestone 7 (WebSockets) ────────────┐
 Milestone 8 (Proof of Reserves) ─────┼── Required for 100 users
-Milestone 11 (Fee model) ────────────┘
+Milestone 11 (Fee model limits) ─────┘
                                       │
                                       ▼
-Milestone 10 (L2 Settlement) ────────── Required for L2 products (casino, DeFi)
+Milestone 10 (L2 Settlement) ────────┐
+Milestone 12 (Session Keys) ─────────┼── Required for AI Agent Economy Scale (600k TPS targeted)
+Milestone 13 (State Pruning) ────────┤
+Milestone 14 (L2 Payment Channels) ──┘
 ```
 
 ---

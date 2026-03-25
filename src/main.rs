@@ -83,6 +83,7 @@ use layer1::poh_blockchain;
 use layer1::svm;
 use layer1::solana_rpc;
 use layer1::relay;
+use layer1::settlement;
 use layer1::reader;
 use layer1::watcher;
 use layer1::protocol;
@@ -96,7 +97,7 @@ use storage::ConcurrentBlockchain;
 
 // Solana-style consensus infrastructure
 use runtime::{
-    PoHConfig, SharedPoHService, create_poh_service, run_poh_clock,
+    PoHConfig, SharedPoHService, create_poh_service_with_slot, run_poh_clock,
     TransactionPipeline, LeaderSchedule, GulfStreamService,
     ParallelScheduler, PipelinePacket,
     TowerBFT,
@@ -177,6 +178,11 @@ pub struct AppState {
     /// Double-withdrawal protection: "{market_id}:{address}" → true
     pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
 
+    // ===== Contest Settlement State =====
+    /// Per-contest lifecycle state: contest_id → ContestState
+    /// Hot cache, ReDB-backed via ConcurrentBlockchain.store_contest_state().
+    pub contest_states: Arc<dashmap::DashMap<String, storage::ContestState>>,
+
     // ===== Deposit Gateway =====
     /// Custody wallet address users send wUSDC/wUSDT to (from CUSTODY_WALLET_ADDRESS env)
     pub custody_wallet_address: String,
@@ -185,6 +191,9 @@ pub struct AppState {
     /// Background watcher that polls Solana RPC for custody wallet USDC/USDT balances.
     /// None when CUSTODY_WALLET_ADDRESS is not set.
     pub custody_watcher: Option<Arc<watcher::CustodyWatcher>>,
+    /// Background watcher that polls BSC (BNB Chain) for BEP-20 USDC/USDT transfers.
+    /// None when BSC_CUSTODY_WALLET is not set.
+    pub bsc_watcher: Option<Arc<watcher::BscWatcher>>,
 
     // ===== Withdrawal Gateway =====
     /// Dealer address (base58) derived from DEALER_PRIVATE_KEY at startup.
@@ -192,6 +201,14 @@ pub struct AppState {
     pub dealer_address: String,
     /// All withdrawal requests: withdrawal_id (UUID) → WithdrawalRecord (hot cache, ReDB-backed)
     pub withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>>,
+
+    // ===== Layer 5: Creator Coin Launchpad =====
+    /// Registry of all launched creator coins — ticker → CreatorCoinRecord.
+    pub creator_coins: Arc<dashmap::DashMap<String, storage::CreatorCoinRecord>>,
+    /// AMM pool state — ticker → CoinPoolState (constant-product AMM reserves).
+    pub coin_pools: Arc<dashmap::DashMap<String, storage::CoinPoolState>>,
+    /// User coin balances — "{ticker}:{wallet}" → coin units (6 decimals).
+    pub coin_balances: Arc<dashmap::DashMap<String, u64>>,
 }
 
 // ============================================================================
@@ -208,8 +225,9 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let tower_stats = state.tower_bft.get_stats();
     let svm_account_count = state.blockchain.svm_accounts.account_count();
 
-    // Block production staleness check
-    let latest_block = state.block_producer.get_block(current_slot.saturating_sub(1));
+    // Block production staleness check — get_latest_block() is correct even when
+    // produced slots are non-contiguous (e.g. right after startup or a gap).
+    let latest_block = state.block_producer.get_latest_block();
     let block_age_s = latest_block.as_ref().map(|b| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -421,54 +439,41 @@ async fn signed_transfer_handler(
         state.used_nonces.retain(|_, &mut ts| ts > cutoff);
     }
 
-    // Execute transfer
-    let from = &req.wallet_address;
-    let balance = state.blockchain.get_balance(from);
-
+    // ── BALANCE PRE-CHECK (fast reject before queuing) ─────────────────────
+    let from = req.wallet_address.clone();
+    let balance = state.blockchain.get_balance(&from);
     if balance < payload.amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": format!("Insufficient balance: {} < {}", balance, payload.amount)
         })));
     }
 
-    match state.blockchain.transfer(from, &payload.to, payload.amount) {
-        Ok(_) => {
-            let from_bal = state.blockchain.get_balance(from);
-            let to_bal   = state.blockchain.get_balance(&payload.to);
-            info!("💸 Transfer: {} → {} : {} BB", from, payload.to, payload.amount);
+    // ── SUBMIT TO GULF STREAM → SEALEVEL PIPELINE ─────────────────────────
+    // All transfers must go through the parallel execution engine.
+    // Direct blockchain.transfer() is intentionally not used here.
+    use runtime::core::{Transaction as RuntimeTx, TransactionType};
+    let mut tx = RuntimeTx::new(from.clone(), payload.to.clone(), payload.amount, TransactionType::Transfer);
+    let tx_id = tx.id.clone();
+    // Carry the Ed25519 signature as the nonce priority field for ordering
+    tx.nonce = req.timestamp;
 
-            // Record signed transfer into PoH block
-            {
-                use protocol::Transaction as ProtoTx;
-                use protocol::TxData;
-                let tx = ProtoTx {
-                    hash: uuid::Uuid::new_v4().to_string(),
-                    from: from.clone(),
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    data: TxData::TransferBb {
-                        to: payload.to.clone(),
-                        amount: (payload.amount * 100_000.0) as u64,
-                    },
-                    signature: req.signature.clone(),
-                    signer_pubkey: req.public_key.clone(),
-                };
-                state.block_producer.record_executed_transaction(tx);
-            }
-
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "from": from,
-                "to": payload.to,
-                "amount": payload.amount,
-                "from_balance": from_bal,
-                "to_balance": to_bal,
-            })))
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+    if let Err(e) = state.gulf_stream.submit(tx.clone()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Gulf Stream: {}", e) })));
     }
+
+    let packet = PipelinePacket::new(tx_id.clone(), from.clone(), payload.to.clone(), payload.amount);
+    let _ = state.pipeline.submit(packet).await;
+
+    info!("💸 Transfer queued → Sealevel: {} → {} : {} BB (tx: {})", from, payload.to, payload.amount, &tx_id[..8]);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "tx_id": tx_id,
+        "status": "pending",
+        "from": from,
+        "to": payload.to,
+        "amount": payload.amount,
+    })))
 }
 
 // ============================================================================
@@ -622,21 +627,104 @@ struct GulfStreamSubmitRequest {
     from: String,
     to: String,
     amount: f64,
+    /// Ed25519 public key (hex, 32 bytes)
+    public_key: String,
+    /// Ed25519 signature over the canonical message (hex, 64 bytes)
+    signature: String,
+    /// Unix timestamp (must be within 60s of server time)
+    timestamp: u64,
+    /// Unique nonce for replay protection
+    nonce: String,
+    /// Chain ID (must match this network)
+    chain_id: u8,
     #[serde(default)]
     priority: Option<u64>,
 }
 
 /// POST /sealevel/submit — Submit to Gulf Stream for parallel execution
+///
+/// Requires a valid Ed25519 signature over:
+///   `[chain_id] || payload_json || '\n' || timestamp || '\n' || nonce`
+/// where payload_json = `{"to":"<addr>","amount":<f64>}`
+///
+/// This uses the same signature scheme as /transfer/simple, ensuring
+/// that every transaction entering the Sealevel pipeline is authenticated.
 async fn gulf_stream_submit_handler(
     State(state): State<AppState>,
     Json(req): Json<GulfStreamSubmitRequest>,
 ) -> impl IntoResponse {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     use runtime::core::{Transaction as RuntimeTx, TransactionType};
 
     if req.from.is_empty() || req.to.is_empty() || req.amount <= 0.0 {
         return Json(serde_json::json!({ "error": "Invalid parameters" }));
     }
 
+    // ── ED25519 SIGNATURE VERIFICATION ─────────────────────────────────────
+    // Reconstruct the canonical message: chain_id || payload || \n || timestamp || \n || nonce
+    let payload_json = format!(r#"{{"to":"{}","amount":{}}}"#, req.to, req.amount);
+    let mut message = vec![req.chain_id];
+    message.extend_from_slice(payload_json.as_bytes());
+    message.extend_from_slice(b"\n");
+    message.extend_from_slice(req.timestamp.to_string().as_bytes());
+    message.extend_from_slice(b"\n");
+    message.extend_from_slice(req.nonce.as_bytes());
+
+    let pubkey_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return Json(serde_json::json!({ "error": "Invalid public key (must be 32 bytes hex)" })),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" })),
+    };
+
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => return Json(serde_json::json!({ "error": "Bad public key" })),
+    };
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+    if verifying_key.verify(&message, &signature).is_err() {
+        return Json(serde_json::json!({ "error": "Signature verification failed" }));
+    }
+
+    // Verify public key matches the claimed sender address
+    let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived_address != req.from {
+        return Json(serde_json::json!({
+            "error": "Public key does not match sender address",
+            "derived": derived_address,
+            "claimed": req.from
+        }));
+    }
+
+    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
+    let nonce_key = format!("sealevel:{}:{}", req.from, req.nonce);
+    if state.used_nonces.contains_key(&nonce_key) {
+        return Json(serde_json::json!({
+            "error": "Nonce already used — possible replay attack",
+            "nonce": req.nonce
+        }));
+    }
+
+    // Check timestamp freshness
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(req.timestamp) > 60 {
+        return Json(serde_json::json!({
+            "error": "Transaction too old (>60s)",
+            "server_time": now,
+            "tx_time": req.timestamp
+        }));
+    }
+
+    // Record nonce BEFORE queuing (fail-safe against replay)
+    state.used_nonces.insert(nonce_key, now);
+
+    // ── BALANCE CHECK & SUBMIT ─────────────────────────────────────────────
     let balance = state.blockchain.get_balance(&req.from);
     if balance < req.amount {
         return Json(serde_json::json!({
@@ -689,6 +777,9 @@ async fn admin_mint_handler(
     // Validate dealer signature (security gate for production)
     if req.dealer_signature.is_none() {
         warn!("\u{26a0}\u{fe0f} Mint request without dealer_signature from to={}", req.to);
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing dealer signature for admin mint"
+        })));
     }
 
     if req.amount <= 0.0 || req.to.is_empty() {
@@ -761,6 +852,9 @@ async fn admin_burn_handler(
     // Validate dealer signature (security gate for production)
     if req.dealer_signature.is_none() {
         warn!("\u{26a0}\u{fe0f} Burn request without dealer_signature from={}", req.from);
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Missing dealer signature for admin burn"
+        })));
     }
 
     if req.amount <= 0.0 || req.from.is_empty() {
@@ -873,6 +967,21 @@ async fn faucet_handler(
         })));
     }
 
+    // ── EPOCH RATE LIMITING ─────────────────────────────────────────────────
+    let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+    let current_epoch = current_slot / POH_SLOTS_PER_EPOCH;
+    if let Some(entry) = state.faucet_claims.get(&req.wallet_address) {
+        let (claimed_epoch, _claimed_amount) = *entry;
+        if claimed_epoch >= current_epoch {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                "error": "Faucet: already claimed this epoch",
+                "wallet": req.wallet_address,
+                "epoch": current_epoch,
+                "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
+            })));
+        }
+    }
+
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("faucet:{}:{}", req.wallet_address, req.nonce);
     if state.used_nonces.contains_key(&nonce_key) {
@@ -900,6 +1009,9 @@ async fn faucet_handler(
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.wallet_address);
             info!("🚰 FAUCET: {} BB → {} (Ed25519 verified)", amount, req.wallet_address);
+
+            // Record epoch claim for rate limiting
+            state.faucet_claims.insert(req.wallet_address.clone(), (current_epoch, amount));
 
             // Record faucet mint into PoH block
             {
@@ -1200,61 +1312,6 @@ async fn usdc_mint_handler(
             })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("{:?}", e)
-        }))),
-    }
-}
-
-/// POST /usdc/transfer — Transfer USDC between wallets
-async fn usdc_transfer_handler(
-    State(state): State<AppState>,
-    Json(req): Json<UsdcTransferRequest>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-
-    if req.amount <= 0.0 || req.from.is_empty() || req.to.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid transfer parameters"
-        })));
-    }
-
-    let raw_amount = (req.amount * USDC_UNIT as f64) as u64;
-
-    let parse_pubkey = |addr: &str| -> Result<solana_sdk::pubkey::Pubkey, String> {
-        let bytes = bs58::decode(addr).into_vec().map_err(|e| format!("Invalid base58: {}", e))?;
-        if bytes.len() != 32 { return Err("Address must be 32 bytes".into()); }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(solana_sdk::pubkey::Pubkey::new_from_array(arr))
-    };
-
-    let from_pubkey = match parse_pubkey(&req.from) {
-        Ok(pk) => pk,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
-    };
-    let to_pubkey = match parse_pubkey(&req.to) {
-        Ok(pk) => pk,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
-    };
-
-    let mint = usdc_mint_bytes();
-
-    match SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &from_pubkey, &to_pubkey, raw_amount) {
-        Ok(result) => {
-            info!("💵 USDC TRANSFER: {} USDC  {} → {}", req.amount, req.from, req.to);
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "amount_usdc": req.amount,
-                "raw_amount": result.amount,
-                "from": req.from,
-                "to": req.to,
-                "from_ata": result.from_ata,
-                "to_ata": result.to_ata,
-                "from_balance": result.from_balance,
-                "to_balance": result.to_balance,
-            })))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": format!("{:?}", e)
         }))),
     }
@@ -1621,9 +1678,7 @@ fn build_router(state: AppState) -> Router {
         .route("/escrow/withdraw", post(contracts::global_escrow::escrow_withdraw_handler))
         .route("/escrow/status", get(contracts::global_escrow::escrow_status_handler))
         .route("/escrow/market/:market_id", get(contracts::global_escrow::escrow_market_handler))
-        // Token Swap (AMM)
-        .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
-        .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
+        .route("/escrow/contest/:contest_id", get(contracts::global_escrow::escrow_contest_handler))
         // Faucet (public, rate-limited, Ed25519 verified)
         .route("/faucet", post(faucet_handler))
         // Deposit Gateway (public submit + status)
@@ -1633,7 +1688,6 @@ fn build_router(state: AppState) -> Router {
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
         // USDC SPL Token (Public read, private write)
-        .route("/usdc/transfer", post(usdc_transfer_handler))
         .route("/usdc/balance/:address", get(usdc_balance_handler))
         .route("/usdc/supply", get(usdc_supply_handler))
         .route("/usdc/accounts/:address", get(usdc_accounts_handler));
@@ -1709,7 +1763,7 @@ async fn main() {
     // 1. Logging
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,layer1=debug")))
+            .unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_level(true))
@@ -1730,14 +1784,19 @@ async fn main() {
     info!("║  Auth:      Ed25519 Signature Verification           ║");
     info!("╚══════════════════════════════════════════════════════╝");
 
-    // 2. PoH Clock
+    // Shared slot counter — PoH clock, BlockProducer, GulfStream, and the health
+    // handler all read/write the same Arc<AtomicU64> so the slot is always in sync.
+    // Starts at 0 and is bumped to recovered_slot once the blockchain is loaded.
+    let current_slot = Arc::new(AtomicU64::new(0u64));
+
+    // 2. PoH Clock — shares slot counter with the rest of the system
     let poh_config = PoHConfig {
         slot_duration_ms: POH_SLOT_DURATION_MS,
         hashes_per_tick: POH_HASHES_PER_TICK,
         ticks_per_slot: POH_TICKS_PER_SLOT,
         slots_per_epoch: POH_SLOTS_PER_EPOCH,
     };
-    let poh_service: SharedPoHService = create_poh_service(poh_config);
+    let poh_service: SharedPoHService = create_poh_service_with_slot(poh_config, current_slot.clone());
     let poh_runner = poh_service.clone();
     tokio::spawn(async move { run_poh_clock(poh_runner).await; });
     info!("🕐 PoH clock started ({}ms slots)", POH_SLOT_DURATION_MS);
@@ -1804,6 +1863,29 @@ async fn main() {
         info!("💸 Loaded {} withdrawal record(s) from ReDB", count);
     }
 
+    // ── Layer 5: Creator coin launchpad — recover from ReDB ───────────────
+    let creator_coins_map: Arc<dashmap::DashMap<String, storage::CreatorCoinRecord>> =
+        Arc::new(dashmap::DashMap::new());
+    if let Ok(coins) = blockchain.load_all_creator_coins() {
+        let count = coins.len();
+        for c in coins { creator_coins_map.insert(c.ticker.clone(), c); }
+        info!("🚀 L5: loaded {} creator coin(s) from ReDB", count);
+    }
+    let coin_pools_map: Arc<dashmap::DashMap<String, storage::CoinPoolState>> =
+        Arc::new(dashmap::DashMap::new());
+    if let Ok(pools) = blockchain.load_all_coin_pools() {
+        let count = pools.len();
+        for p in pools { coin_pools_map.insert(p.ticker.clone(), p); }
+        info!("🚀 L5: loaded {} AMM pool(s) from ReDB", count);
+    }
+    let coin_balances_map: Arc<dashmap::DashMap<String, u64>> =
+        Arc::new(dashmap::DashMap::new());
+    if let Ok(bals) = blockchain.load_all_coin_balances() {
+        let count = bals.len();
+        for (k, v) in bals { coin_balances_map.insert(k, v); }
+        info!("🚀 L5: loaded {} coin balance record(s) from ReDB", count);
+    }
+
     // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
     let dealer_address: String = match std::env::var("DEALER_PRIVATE_KEY") {
         Ok(hex_key) if hex_key.len() == 64 => {
@@ -1827,6 +1909,7 @@ async fn main() {
     // Recover escrow state from ReDB (market roots + claims)
     let market_roots: Arc<dashmap::DashMap<String, [u8; 32]>> = Arc::new(dashmap::DashMap::new());
     let withdrawal_claims: Arc<dashmap::DashMap<String, bool>> = Arc::new(dashmap::DashMap::new());
+    let contest_states: Arc<dashmap::DashMap<String, storage::ContestState>> = Arc::new(dashmap::DashMap::new());
     {
         // Reload market roots (raw 32-byte SHA-256 hashes)
         if let Ok(roots) = blockchain.load_all_escrow_market_roots() {
@@ -1848,6 +1931,13 @@ async fn main() {
             }
             info!("🔄 Recovered {} withdrawal claims from ReDB", withdrawal_claims.len());
         }
+        // Reload contest states
+        if let Ok(contests) = blockchain.load_all_contest_states() {
+            for c in &contests {
+                contest_states.insert(c.contest_id.clone(), c.clone());
+            }
+            info!("🔄 Recovered {} contest states from ReDB", contests.len());
+        }
     }
 
     // 3a. Startup Recovery — resume from persisted state
@@ -1867,16 +1957,15 @@ async fn main() {
         }
     };
 
-    // Sync PoH clock to recovered slot
+    // Jump the shared slot counter to the recovered position.
+    // Both the PoH clock and BlockProducer read this same Arc, so one store is enough.
     if recovered_slot > 0 {
-        let poh = poh_service.write();
-        poh.current_slot.store(recovered_slot, Ordering::Relaxed);
-        info!("🕐 PoH clock → slot {}", recovered_slot);
+        current_slot.store(recovered_slot, Ordering::Relaxed);
+        info!("🕐 Slot counter → slot {}", recovered_slot);
     }
 
     // 4. Consensus Infrastructure
     let validator_id = config.identity.clone();
-    let current_slot = Arc::new(AtomicU64::new(recovered_slot));
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
     {
         let mut schedule = leader_schedule.write();
@@ -1959,6 +2048,36 @@ async fn main() {
             }
         });
 
+        // Spawn Settlement gRPC server (L2↔L1 bridge RPCs)
+        {
+            let settlement_port: u16 = std::env::var("SETTLEMENT_GRPC_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(config.grpc_port + 1); // default: 50052 (relay + 1)
+            let settlement_svc = settlement::BlackBookSettlementService::new(
+                blockchain.clone(),
+                market_roots.clone(),
+                contest_states.clone(),
+                current_slot.clone(),
+                l2_sequencer_pubkey.clone(),
+                escrow_address.clone(),
+                block_producer.clone(),
+                deposit_requests.clone(),
+                dealer_address.clone(),
+            );
+            tokio::spawn(async move {
+                let addr = format!("0.0.0.0:{}", settlement_port).parse().unwrap();
+                info!("🔗 Settlement gRPC server starting on {}", addr);
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(settlement_svc.into_server())
+                    .serve(addr)
+                    .await
+                {
+                    error!("❌ Settlement gRPC server error: {}", e);
+                }
+            });
+        }
+
         let validator_id_for_loop = validator_id.clone();
         let relay_tx = block_sender.clone();
         {
@@ -1969,7 +2088,7 @@ async fn main() {
             let vid = validator_id_for_loop;
             tokio::spawn(async move {
                 info!("🏭 Block production loop started (400ms slots)");
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(400));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS));
                 let mut last_epoch: u64 = 0;
                 loop {
                     interval.tick().await;
@@ -2062,12 +2181,12 @@ async fn main() {
 
         tokio::spawn(async move {
             info!("⚡ Sealevel execution loop started");
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS / 4));
             loop {
                 interval.tick().await;
                 let slot = sealevel_slot.load(Ordering::Relaxed);
                 let leader = { sealevel_ls.read().get_leader(slot) };
-                let pending = sealevel_gs.get_pending_by_priority(&leader, 64);
+                let pending = sealevel_gs.get_pending_by_priority(&leader, poh_blockchain::MAX_TXS_PER_BLOCK);
                 if pending.is_empty() { continue; }
 
                 let batches = sealevel_sched.schedule_with_locks(pending);
@@ -2094,6 +2213,13 @@ async fn main() {
                 }
                 sealevel_gs.clear_leader_cache(&leader);
                 sealevel_sched.tune_batch_size();
+
+                // Flush buffered transaction logs to ReDB in one ACID commit
+                match sealevel_bc.flush_tx_log_buffer() {
+                    Ok(n) if n > 0 => tracing::debug!("💾 Flushed {} tx log entries to ReDB", n),
+                    Err(e) => warn!("⚠️  tx log flush failed: {}", e),
+                    _ => {}
+                }
             }
         });
     }
@@ -2137,6 +2263,34 @@ async fn main() {
         None
     };
 
+    // ── BSC watcher — construct before state so it can be stored in AppState ──
+    let bsc_watcher_arc: Option<Arc<watcher::BscWatcher>> = {
+        let bsc_custody = std::env::var("BSC_CUSTODY_WALLET").unwrap_or_default();
+        if !bsc_custody.is_empty() {
+            let bsc_rpc = std::env::var("BSC_RPC_URL")
+                .unwrap_or_else(|_| "https://bsc-dataseed.binance.org/".to_string());
+            let bsc_poll_secs = std::env::var("BSC_WATCHER_POLL_SECS")
+                .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
+            let bsc_usdc = std::env::var("BSC_USDC_CONTRACT")
+                .unwrap_or_else(|_| watcher::BSC_USDC_CONTRACT.to_string());
+            let bsc_usdt = std::env::var("BSC_USDT_CONTRACT")
+                .unwrap_or_else(|_| watcher::BSC_USDT_CONTRACT.to_string());
+            info!("⛓️  BSC watcher: rpc={} wallet={} poll={}s", bsc_rpc, bsc_custody, bsc_poll_secs);
+            Some(Arc::new(watcher::BscWatcher::new(
+                bsc_rpc,
+                bsc_custody,
+                bsc_usdc,
+                bsc_usdt,
+                bsc_poll_secs,
+                blockchain.clone(),
+                Arc::clone(&deposit_requests),
+                Arc::clone(&block_producer),
+            )))
+        } else {
+            None
+        }
+    };
+
     // 7. Build State
     let state = AppState {
         blockchain,
@@ -2161,15 +2315,26 @@ async fn main() {
         l2_sequencer_pubkey,
         market_roots,
         withdrawal_claims,
+        contest_states: contest_states.clone(),
         custody_wallet_address,
         deposit_requests,
         custody_watcher: custody_watcher.clone(),
+        bsc_watcher: bsc_watcher_arc.clone(),
         dealer_address,
         withdrawal_requests,
+        // Layer 5: creator coin hot caches (pre-loaded before state construction)
+        creator_coins: creator_coins_map,
+        coin_pools: coin_pools_map,
+        coin_balances: coin_balances_map,
     };
 
     // Start custody watcher background task (if custody wallet is configured)
     if let Some(w) = custody_watcher {
+        w.start();
+    }
+
+    // Start BSC watcher background task (if BSC custody wallet is configured)
+    if let Some(w) = bsc_watcher_arc {
         w.start();
     }
 
@@ -2312,42 +2477,36 @@ async fn main() {
     info!("");
     info!("rocket Listening on http://{}", addr);
     info!("");
-    info!("📡 ENDPOINTS:");
+    info!("📡 CORE ENDPOINTS:");
     info!("   GET  /health                    Health check");
     info!("   GET  /balance/{{address}}         Balance lookup");
-    info!("   POST /transfer/simple           Broadcast Signed TX");
-    info!("   POST /faucet                    Faucet (Ed25519 verified)");
     info!("   GET  /ledger                    Transaction history");
     info!("");
-    info!("⚡ ENGINE:");
+    info!("⚡ SEALEVEL EXECUTION ENGINE (all transfers):");
+    info!("   POST /transfer/simple           Ed25519 signed → Gulf Stream → Sealevel");
+    info!("   POST /sealevel/submit           Ed25519 signed → Gulf Stream → Sealevel");
+    info!("   POST /faucet                    Faucet (Ed25519 verified, rate-limited)");
+    info!("");
+    info!("🕐 PoH / CONSENSUS:");
     info!("   GET  /poh/status                PoH clock");
     info!("   GET  /poh/block/latest          Latest block");
-    info!("   POST /sealevel/submit           Parallel execution");
+    info!("   GET  /poh/block/:slot           Block by slot");
+    info!("   GET  /poh/tx/:tx_id/status      TX finality status");
+    info!("   GET  /consensus/tower           Tower BFT state");
+    info!("   GET  /turbine/status            Turbine shred status");
     info!("");
     info!("🏦 GLOBAL ESCROW:");
     info!("   POST /escrow/deposit            Lock tokens into escrow");
     info!("   POST /escrow/submit-state-root  L2 sequencer merkle root");
     info!("   POST /escrow/withdraw           Withdraw via merkle proof");
-    info!("   GET  /escrow/status             PDA balance + settled market count");
-    info!("   GET  /escrow/market/{{id}}        Market settlement details");
+    info!("   GET  /escrow/status             PDA balance + settled markets");
     info!("");
-    info!("🔐 ADMIN:");
-    info!("   POST /admin/mint                Mint $BB");
-    info!("   POST /admin/burn                Burn $BB");
-    info!("   POST /admin/dealer/settle       Batch L2 settlement");
-    info!("   GET  /admin/accounts            All account balances");
+    info!("💵 wUSDC READ (write = admin only):");
+    info!("   GET  /usdc/balance/{{address}}    wUSDC balance");
+    info!("   GET  /usdc/supply               Total wUSDC supply");
     info!("");
-    info!("💳 DEPOSIT GATEWAY:");
-    info!("   POST /deposit/request           Submit wUSDC/wUSDT → BB deposit");
-    info!("   GET  /deposit/status/:tx_hash   Check deposit status");
-    info!("   POST /admin/deposit/approve     Approve deposit (mint BB)");
-    info!("");
-    info!("💵 USDC SPL TOKEN:");
-    info!("   POST /admin/usdc/mint           Mint USDC to wallet");
-    info!("   POST /usdc/transfer             Transfer USDC");
-    info!("   GET  /usdc/balance/{{address}}    USDC balance");
-    info!("   GET  /usdc/supply               Total USDC supply");
-    info!("   GET  /usdc/accounts/{{address}}   Token accounts");
+    info!("🔐 ADMIN (unsafe_admin feature):");
+    info!("   POST /admin/mint  /admin/burn  /admin/dealer/settle");
     info!("");
     info!("🌐 gRPC: 0.0.0.0:{}", config.grpc_port);
     info!("");
@@ -2376,7 +2535,7 @@ async fn main() {
         let ticker_svm = Arc::clone(&rpc_svm);
         let ticker_poh = poh_service.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(400));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS));
             loop {
                 interval.tick().await;
                 // Read canonical slot from PoH clock (single source of truth)
