@@ -89,6 +89,15 @@ pub struct LeaderSchedule {
 }
 
 impl LeaderSchedule {
+    /// Finds the next unique writer in the schedule after the current slot
+    pub fn nominate_next_writer(&self, current_slot: u64) -> String {
+        let current_leader = self.get_leader(current_slot);
+        
+        self.schedule.iter()
+            .find(|(s, l)| *s > current_slot && *l != current_leader)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| "genesis_validator".to_string())
+    }
     pub fn new() -> Self {
         Self { stakes: HashMap::new(), schedule: Vec::new(), epoch: 0 }
     }
@@ -193,6 +202,22 @@ pub struct GulfStreamService {
 }
 
 impl GulfStreamService {
+    /// Extract all cached in-flight transactions globally across all upcoming leaders
+    pub fn get_all_pending(&self) -> Vec<Transaction> {
+        let mut txs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        
+        for entry in self.cache.iter() {
+            for fwd in entry.value().iter() {
+                if seen.insert(fwd.tx.id.clone()) {
+                    txs.push(fwd.tx.clone());
+                }
+            }
+        }
+        
+        txs.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(std::cmp::Ordering::Equal));
+        txs
+    }
     pub fn new(ls: Arc<RwLock<LeaderSchedule>>, slot: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self {
             leader_schedule: ls, current_slot: slot,

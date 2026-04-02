@@ -1,0 +1,10 @@
+{
+  "alice": {
+    "address": "EB8tsQcA8Ewuqni2pqW5RiME95oiUAHj5eC9Lz2zX3j5",
+    "secretHex": "1c12a697254491cc286dd6431e9c84acda48ae85b667e08f8527eeb810f9316bc3c0aa0bad64ed2c74d91c24682ae5a4021960e2b70f629296c51a01190f5870"
+  },
+  "bob": {
+    "address": "9a66KD7KTTUnwXdfxM5c4E5Z8rqyDbP4zm3qCgZsmGoo",
+    "secretHex": "f4366aec8e6f4f0a099f32a784a587b78ab18ef46ed7732ef7143a8b29090d257f576b5234264a3a8ea6f58cfe941f5aba6583679cfed70d11048a0956c622f6"
+  }
+}

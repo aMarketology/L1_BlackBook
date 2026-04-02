@@ -225,11 +225,23 @@ impl ParallelScheduler {
 
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
-                while !lm.try_acquire_locks(tx) { std::hint::spin_loop(); }
+                let mut backoff = 1;
+                while !lm.try_acquire_locks(tx) {
+                    if backoff < 1024 {
+                        for _ in 0..backoff { std::hint::spin_loop(); }
+                        backoff *= 2;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
                 let result = {
                     match (&tx.tx_type, &svm_db_ref) {
                         (TransactionType::Transfer, Some(db)) =>
                             Self::execute_single_svm(tx, db),
+                        (TransactionType::SwapUsdcForBb, Some(db)) =>
+                            Self::execute_swap_usdc_for_bb(tx, db),
+                        (TransactionType::SwapBbForUsdc, Some(db)) =>
+                            Self::execute_swap_bb_for_usdc(tx, db),
                         _ => Self::execute_single(tx, balances),
                     }
                 };
@@ -243,14 +255,29 @@ impl ParallelScheduler {
     }
 
     /// Execute a single Transfer via SvmAccountsDB (lamport path).
-    /// Address strings are mapped to Pubkeys via SHA-256 so they stay
-    /// consistent with BlockProducer's `legacy_addr_to_pubkey`.
+    ///
+    /// Address resolution matches `ConcurrentBlockchain::addr_to_pubkey`:
+    ///   1. Try base58 decode (Solana-style 32-byte pubkey) — fast path for real wallets.
+    ///   2. Fall back to SHA-256 of the stripped string — for legacy internal addresses.
+    ///
+    /// This MUST stay in sync with `addr_to_pubkey` in `src/storage/mod.rs`.
     fn execute_single_svm(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
         use sha2::{Sha256, Digest};
         use solana_sdk::pubkey::Pubkey;
         use crate::svm::LAMPORTS_PER_BB;
 
+        // Resolve an address string to a Pubkey using the same logic as 
+        // `ConcurrentBlockchain::addr_to_pubkey`.
         let addr_to_pk = |addr: &str| -> Pubkey {
+            // Fast path: valid base58-encoded 32-byte Ed25519 pubkey (real wallets)
+            if let Ok(bytes) = bs58::decode(addr).into_vec() {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    return Pubkey::new_from_array(arr);
+                }
+            }
+            // Fallback: deterministic SHA-256 (legacy / internal addresses)
             let stripped = addr.strip_prefix("bb_").unwrap_or(addr);
             Pubkey::new_from_array(Sha256::digest(stripped.as_bytes()).into())
         };
@@ -263,6 +290,84 @@ impl ParallelScheduler {
             Ok(()) => TransactionResult { tx_id: tx.id.clone(), success: true, error: None },
             Err(e) => TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(e.to_string()) },
         }
+    }
+
+    fn execute_swap_usdc_for_bb(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
+        use sha2::{Sha256, Digest};
+        use solana_sdk::pubkey::Pubkey;
+        use crate::svm::{LAMPORTS_PER_BB, USDC_UNIT, usdc_mint_bytes, SplTokenEngine};
+
+        let addr_to_pk = |addr: &str| -> Pubkey {
+            if let Ok(bytes) = bs58::decode(addr).into_vec() {
+                if bytes.len() == 32 {
+                    return Pubkey::new_from_array(bytes.try_into().unwrap());
+                }
+            }
+            let stripped = addr.replace("0x", "").to_lowercase();
+            Pubkey::new_from_array(Sha256::digest(stripped.as_bytes()).into())
+        };
+
+        let from_pk = addr_to_pk(&tx.from);
+        let to_pk = addr_to_pk(&tx.to);
+
+        let usdc_amount_f64 = tx.amount;
+        let usdc_raw = (usdc_amount_f64 * USDC_UNIT as f64) as u64;
+        let bb_amount_f64 = usdc_amount_f64 * 10.0;
+        let bb_lamports = (bb_amount_f64 * LAMPORTS_PER_BB as f64) as u64;
+        let mint = usdc_mint_bytes();
+
+        // 1. Debit wUSDC from user, credit wUSDC to dealer
+        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &from_pk, &to_pk, usdc_raw) {
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDC transfer failed: {}", e)) };
+        }
+
+        // 2. Debit BB from dealer, credit BB to user (using system_transfer)
+        if let Err(e) = db.system_transfer(&to_pk, &from_pk, bb_lamports) {
+            // Unwind wUSDC since BB failed
+            let _ = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw);
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
+        }
+
+        TransactionResult { tx_id: tx.id.clone(), success: true, error: None }
+    }
+
+    fn execute_swap_bb_for_usdc(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
+        use sha2::{Sha256, Digest};
+        use solana_sdk::pubkey::Pubkey;
+        use crate::svm::{LAMPORTS_PER_BB, USDC_UNIT, usdc_mint_bytes, SplTokenEngine};
+
+        let addr_to_pk = |addr: &str| -> Pubkey {
+            if let Ok(bytes) = bs58::decode(addr).into_vec() {
+                if bytes.len() == 32 {
+                    return Pubkey::new_from_array(bytes.try_into().unwrap());
+                }
+            }
+            let stripped = addr.replace("0x", "").to_lowercase();
+            Pubkey::new_from_array(Sha256::digest(stripped.as_bytes()).into())
+        };
+
+        let from_pk = addr_to_pk(&tx.from);
+        let to_pk = addr_to_pk(&tx.to);
+
+        let bb_amount_f64 = tx.amount;
+        let bb_lamports = (bb_amount_f64 * LAMPORTS_PER_BB as f64) as u64;
+        let usdc_amount_f64 = bb_amount_f64 / 10.0;
+        let usdc_raw = (usdc_amount_f64 * USDC_UNIT as f64) as u64;
+        let mint = usdc_mint_bytes();
+
+        // 1. Debit BB from user, credit BB to dealer
+        if let Err(e) = db.system_transfer(&from_pk, &to_pk, bb_lamports) {
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
+        }
+
+        // 2. Debit wUSDC from dealer, credit wUSDC to user
+        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw) {
+            // Unwind BB
+            let _ = db.system_transfer(&to_pk, &from_pk, bb_lamports);
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDC transfer failed: {}", e)) };
+        }
+
+        TransactionResult { tx_id: tx.id.clone(), success: true, error: None }
     }
 
     fn execute_single(tx: &Transaction, balances: &DashMap<String, f64>) -> TransactionResult {

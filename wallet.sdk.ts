@@ -10,7 +10,7 @@
  *                  Ed25519 private key. L1 never holds private keys.
  *
  * Dependencies (install before use):
- *   npm install @noble/ed25519 @noble/hashes bs58
+ *   npm install @noble/ed25519 @noble/hashes bs58 @scure/bip39
  *
  * Quick start:
  *   const kp  = await BlackBookWallet.generate();
@@ -152,12 +152,34 @@ export interface EscrowMarketResponse {
  * These are peer dependencies that must be installed in your project.
  */
 async function getCrypto() {
-  const [ed, { bytesToHex, hexToBytes }, bs58] = await Promise.all([
+  const [
+    ed, 
+    { bytesToHex, hexToBytes }, 
+    bs58, 
+    bip39, 
+    english, 
+    { hmac }, 
+    { sha512 }
+  ] = await Promise.all([
     import("@noble/ed25519"),
     import("@noble/hashes/utils"),
     import("bs58"),
+    import("@scure/bip39"),
+    import("@scure/bip39/wordlists/english.js"),
+    import("@noble/hashes/hmac.js"),
+    import("@noble/hashes/sha2.js")
   ]);
-  return { ed, bytesToHex, hexToBytes, bs58: bs58.default ?? bs58 };
+  
+  return { 
+    ed, 
+    bytesToHex, 
+    hexToBytes, 
+    bs58: (bs58 as any).default || bs58, 
+    bip39, 
+    wordlist: english.wordlist, 
+    hmac, 
+    sha512 
+  };
 }
 
 /** Returns the current Unix timestamp in seconds */
@@ -178,12 +200,64 @@ function randomNonce(): string {
 
 export class BlackBookWallet {
   /**
-   * Generate a new random keypair.
+   * Generate a completely new 24-word BIP39 mnemonic phrase.
+   * This is the standard way to create secure human-readable wallet backups.
+   */
+  static async generateMnemonicPhrase(): Promise<string> {
+    const { bip39, wordlist } = await getCrypto();
+    return bip39.generateMnemonic(wordlist, 256);
+  }
+
+  /**
+   * Derive a keypair directly from a valid 24-word BIP39 mnemonic.
+   * It uses SLIP-0010 hardened paths ("m/44'/1984'/0'/0'") under the hood.
+   */
+  static async fromMnemonic(phrase: string): Promise<Keypair> {
+    const { ed, bytesToHex, bs58, bip39, wordlist, hmac, sha512 } = await getCrypto();
+    
+    // Validate
+    if (!bip39.validateMnemonic(phrase.trim().toLowerCase(), wordlist)) {
+      throw new Error("Invalid BIP39 mnemonic phrase.");
+    }
+
+    // Convert to Seed
+    const seed = bip39.mnemonicToSeedSync(phrase.trim().toLowerCase());
+
+    // SLIP-0010 Hardened Path derivation
+    const master = hmac(sha512, new TextEncoder().encode('ed25519 seed'), seed);
+    let privKey = master.slice(0, 32);
+    let chainCode = master.slice(32);
+
+    // Derivation path "m/44'/1984'/0'/0'"
+    const path = "m/44'/1984'/0'/0'";
+    const segments = path.split('/').slice(1);
+    
+    for (const seg of segments) {
+      const idx = (parseInt(seg, 10) >>> 0) + 0x80000000;
+      const data = new Uint8Array(37);
+      data[0] = 0x00;
+      data.set(privKey, 1);
+      new DataView(data.buffer).setUint32(33, idx, false);
+      const child = hmac(sha512, chainCode, data);
+      privKey = child.slice(0, 32);
+      chainCode = child.slice(32);
+    }
+
+    const pubBytes = await ed.getPublicKeyAsync(privKey);
+    return {
+      address: bs58.encode(pubBytes),
+      privateKeyHex: bytesToHex(privKey),
+      publicKeyHex: bytesToHex(pubBytes),
+    };
+  }
+
+  /**
+   * Generate a new random keypair (raw, no mnemonic backup).
    * Store privateKeyHex securely — it cannot be recovered if lost.
    */
   static async generate(): Promise<Keypair> {
     const { ed, bytesToHex, bs58 } = await getCrypto();
-    const privBytes = ed.utils.randomPrivateKey();
+    const privBytes = ed.utils.randomSecretKey();
     const pubBytes = await ed.getPublicKeyAsync(privBytes);
     return {
       address: bs58.encode(pubBytes),
@@ -371,12 +445,12 @@ export class BlackBookSDK {
     const chainId = new Uint8Array([1]);
     const encoder = new TextEncoder();
     const message = new Uint8Array([
-      ...chainId,
-      ...encoder.encode(payload),
-      ...encoder.encode("\n"),
-      ...encoder.encode(String(timestamp)),
-      ...encoder.encode("\n"),
-      ...encoder.encode(nonce),
+      ...Array.from(chainId),
+      ...Array.from(encoder.encode(payload)),
+      ...Array.from(encoder.encode("\n")),
+      ...Array.from(encoder.encode(String(timestamp))),
+      ...Array.from(encoder.encode("\n")),
+      ...Array.from(encoder.encode(nonce)),
     ]);
 
     const sigBytes = await ed.signAsync(message, hexToBytes(kp.privateKeyHex));

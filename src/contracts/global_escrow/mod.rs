@@ -88,11 +88,19 @@ pub async fn escrow_deposit_handler(
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(message.as_bytes(), &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
@@ -118,6 +126,8 @@ pub async fn escrow_deposit_handler(
             "request_time": req.timestamp
         })));
     }
+
+    // Record nonce BEFORE executing (fail-safe against replay)
     state.used_nonces.insert(nonce_key, now);
 
     // ── BALANCE CHECK ──────────────────────────────────────────────────────
@@ -255,7 +265,10 @@ pub async fn escrow_submit_state_root_handler(
     // Binary packed signed message (MUST match L2 settlement_bridge.rs):
     //   contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
     let root_bytes_for_sig = {
-        let b = hex::decode(&req.merkle_root).unwrap();
+        let b = match hex::decode(&req.merkle_root) {
+            Ok(b) => b,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid merkle root hex" }))),
+        };
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&b);
         arr
@@ -278,7 +291,11 @@ pub async fn escrow_submit_state_root_handler(
         Ok(k) => k,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid L2 sequencer public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(&signed_message, &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
@@ -417,11 +434,19 @@ pub async fn escrow_withdraw_handler(
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature" }))),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(message.as_bytes(), &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
@@ -446,7 +471,6 @@ pub async fn escrow_withdraw_handler(
             "request_time": req.timestamp
         })));
     }
-    state.used_nonces.insert(nonce_key, now);
 
     // ── DOUBLE-WITHDRAWAL CHECK ────────────────────────────────────────────
     let claim_key = format!("{}:{}", req.market_id, req.wallet_address);

@@ -119,6 +119,8 @@ pub enum TxType {
     BridgeIn,
     Lock,
     Unlock,
+    SwapUsdcForBb,
+    SwapBbForUsdc,
 }
 
 impl std::fmt::Display for TxType {
@@ -131,6 +133,8 @@ impl std::fmt::Display for TxType {
             TxType::BridgeIn => write!(f, "BRIDGE_IN"),
             TxType::Lock => write!(f, "LOCK"),
             TxType::Unlock => write!(f, "UNLOCK"),
+            TxType::SwapUsdcForBb => write!(f, "SWAP_USDC_FOR_BB"),
+            TxType::SwapBbForUsdc => write!(f, "SWAP_BB_FOR_USDC"),
         }
     }
 }
@@ -235,7 +239,64 @@ pub struct TransactionRecord {
 }
 
 impl TransactionRecord {
-    /// Create a new transaction record with computed hash
+    /// Create a new transaction record with computed hash, and optionally a specific ID
+    pub fn with_id(
+        tx_id: String,
+        tx_type: TxType,
+        from: &str,
+        to: &str,
+        amount: f64,
+        nonce: u64,
+        balance_before: f64,
+        balance_after: f64,
+        recipient_balance_after: f64,
+        auth_type: AuthType,
+    ) -> Self {
+        let timestamp = chrono::Utc::now().timestamp() as u64;
+        
+        // Compute transaction hash (SHA-256 — cryptographically secure)
+        use sha2::{Sha256, Digest};
+        let hash_input = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            tx_id, tx_type, from, to, amount, timestamp, nonce
+        );
+        let hash_bytes = Sha256::digest(hash_input.as_bytes());
+        let tx_hash = format!("{:x}", hash_bytes);
+        
+        Self {
+            tx_id,
+            tx_type: tx_type.to_string(),
+            from_address: from.to_string(),
+            to_address: to.to_string(),
+            amount,
+            timestamp,
+            status: "finalized".to_string(),
+            
+            block_height: 0,
+            tx_hash,
+            prev_tx_hash: String::new(),
+            merkle_root: String::new(),
+            
+            zk_proof_ref: None,
+            session_id: None,
+            auth_type: auth_type.to_string(),
+            gas_fee: 0.0,
+            
+            nonce,
+            balance_before,
+            balance_after,
+            recipient_balance_after,
+            validator_sig: None,
+            
+            from_username: None,
+            to_username: None,
+            
+            signature: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a new transaction record with computed hash (autogenerates ID)
     pub fn new(
         tx_type: TxType,
         from: &str,
@@ -793,6 +854,20 @@ impl ConcurrentBlockchain {
     /// Get all recent transactions (for ledger display)
     pub fn get_all_transactions(&self, limit: usize) -> Vec<TransactionRecord> {
         self.get_transactions(None, limit, 0).unwrap_or_default()
+    }
+
+    /// Retrieve a specific transaction by its tx_id
+    pub fn get_tx_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+        let result = table.get(tx_id).map_err(|e| e.to_string())?;
+        
+        if let Some(guard) = result {
+            let record: TransactionRecord = serde_json::from_slice(guard.value()).map_err(|e| e.to_string())?;
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Transfer tokens between addresses (atomic) — legacy API (no SVM receipt).

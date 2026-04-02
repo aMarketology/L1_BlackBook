@@ -113,7 +113,6 @@ pub async fn deposit_request_handler(
             "error": "Request too old (>60s)"
         })));
     }
-    state.used_nonces.insert(nonce_key, now);
 
     // ── ALREADY PROCESSED OR PENDING? ─────────────────────────────────────
     if state.blockchain.is_bridge_tx_processed(&req.external_tx_hash) {
@@ -142,11 +141,19 @@ pub async fn deposit_request_handler(
         Ok(b) if b.len() == 64 => b,
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
     if verifying_key.verify(message.as_bytes(), &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
     }
@@ -328,10 +335,10 @@ pub async fn deposit_approve_handler(
         })));
     }
 
-    // ── MINT BB ───────────────────────────────────────────────────────────
-    if let Err(e) = state.blockchain.credit(&record.wallet_address, record.bb_to_mint) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
-    }
+    // ── MINT BB (DISABLED per request to avoid double-minting) ───────────────
+    // if let Err(e) = state.blockchain.credit(&record.wallet_address, record.bb_to_mint) {
+    //     return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
+    // }
     let new_balance = state.blockchain.get_balance(&record.wallet_address);
 
     // ── MINT wUSDC (1:1 with stablecoin deposited) ────────────────────────
@@ -393,6 +400,23 @@ pub async fn deposit_approve_handler(
             signer_pubkey: "DEALER".to_string(),
         };
         state.block_producer.record_executed_transaction(tx);
+    }
+
+    // ── CREATE VISUAL LEDGER RECEIPT ─────────────────────────────────────────
+    let tx_record = crate::storage::TransactionRecord::with_id(
+        mint_tx_id.clone(),
+        crate::storage::TxType::BridgeIn,
+        "DEPOSIT_GATEWAY",
+        &record.wallet_address,
+        record.amount_stablecoin,
+        0,                // nonce
+        0.0,              // from_balance_before
+        0.0,              // from_balance_after
+        wusdc_minted,     // to_balance_after
+        crate::storage::AuthType::SystemInternal,
+    );
+    if let Err(e) = state.blockchain.log_transaction(tx_record) {
+        warn!("⚠️ Failed to log transaction receipt for deposit: {}", e);
     }
 
     info!("✅ DEPOSIT APPROVED: {} {} → {} BB + {:.6} wUSDC → {} (ext_tx: {})",

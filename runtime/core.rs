@@ -178,6 +178,8 @@ pub enum TransactionType {
     Burn,
     BridgeLock,
     BridgeUnlock,
+    SwapUsdcForBb,
+    SwapBbForUsdc,
     Vote,
     SystemReward,
 }

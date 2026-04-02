@@ -106,11 +106,19 @@ pub async fn withdraw_request_handler(
             "error": "Invalid signature (must be 64 bytes hex)"
         }))),
     };
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
     if verifying_key.verify(message.as_bytes(), &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
     }
@@ -172,7 +180,6 @@ pub async fn withdraw_request_handler(
     }
 
     // ── Nonce consumed after funds are moved (prevents replay) ────────────
-    state.used_nonces.insert(nonce_key, now);
 
     // ── Create withdrawal record ──────────────────────────────────────────
     let withdrawal_id = uuid::Uuid::new_v4().to_string();

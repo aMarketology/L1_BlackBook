@@ -398,11 +398,19 @@ async fn signed_transfer_handler(
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature" }))),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(&message, &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
@@ -639,6 +647,9 @@ struct GulfStreamSubmitRequest {
     chain_id: u8,
     #[serde(default)]
     priority: Option<u64>,
+    /// Optional Transaction Type (e.g. "Transfer", "SwapUsdcForBb", "SwapBbForUsdc")
+    #[serde(default)]
+    tx_type: Option<String>,
 }
 
 /// POST /sealevel/submit — Submit to Gulf Stream for parallel execution
@@ -661,8 +672,12 @@ async fn gulf_stream_submit_handler(
     }
 
     // ── ED25519 SIGNATURE VERIFICATION ─────────────────────────────────────
-    // Reconstruct the canonical message: chain_id || payload || \n || timestamp || \n || nonce
-    let payload_json = format!(r#"{{"to":"{}","amount":{}}}"#, req.to, req.amount);
+    // Reconstruct the canonical message
+    let payload_json = if let Some(ref t) = req.tx_type {
+        format!(r#"{{"to":"{}","amount":{},"tx_type":"{}"}}"#, req.to, req.amount, t)
+    } else {
+        format!(r#"{{"to":"{}","amount":{}}}"#, req.to, req.amount)
+    };
     let mut message = vec![req.chain_id];
     message.extend_from_slice(payload_json.as_bytes());
     message.extend_from_slice(b"\n");
@@ -679,11 +694,19 @@ async fn gulf_stream_submit_handler(
         _ => return Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" })),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return Json(serde_json::json!({ "error": "Invalid pubkey length" })),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return Json(serde_json::json!({ "error": "Bad public key" })),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return Json(serde_json::json!({ "error": "Invalid signature length" })),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(&message, &signature).is_err() {
         return Json(serde_json::json!({ "error": "Signature verification failed" }));
@@ -732,7 +755,12 @@ async fn gulf_stream_submit_handler(
         }));
     }
 
-    let mut tx = RuntimeTx::new(req.from.clone(), req.to.clone(), req.amount, TransactionType::Transfer);
+    let tx_type_enum = match req.tx_type.as_deref() {
+        Some("SwapUsdcForBb") => TransactionType::SwapUsdcForBb,
+        Some("SwapBbForUsdc") => TransactionType::SwapBbForUsdc,
+        _ => TransactionType::Transfer,
+    };
+    let mut tx = RuntimeTx::new(req.from.clone(), req.to.clone(), req.amount, tx_type_enum);
     let tx_id = tx.id.clone();
     if let Some(p) = req.priority { tx.nonce = p; }
 
@@ -947,11 +975,19 @@ async fn faucet_handler(
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr = match pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid pubkey length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
-    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let sig_arr = match sig_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
+    };
+    let signature = Signature::from_bytes(sig_arr);
 
     if verifying_key.verify(message.as_bytes(), &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
@@ -1002,6 +1038,8 @@ async fn faucet_handler(
             "request_time": req.timestamp
         })));
     }
+
+    // Record nonce BEFORE minting (fail-safe against replay)
     state.used_nonces.insert(nonce_key, now);
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
@@ -1411,7 +1449,162 @@ async fn usdc_accounts_handler(
     })))
 }
 
+/// POST /usdc/transfer - Direct REST transfer of USDC
+async fn usdc_transfer_handler(
+    State(state): State<AppState>,
+    Json(req): Json<UsdcTransferRequest>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+
+    if req.amount <= 0.0 || req.to.is_empty() || req.from.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid parameters"
+        })));
+    }
+
+    let from_pubkey = match bs58::decode(&req.from).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid from address"
+        }))),
+    };
+
+    let to_pubkey = match bs58::decode(&req.to).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid to address"
+        }))),
+    };
+
+    let mint       = usdc_mint_bytes();
+    let raw_amount = (req.amount * USDC_UNIT as f64).round() as u64;
+
+    match SplTokenEngine::transfer_tokens(
+        &state.blockchain.svm_accounts, &mint, &from_pubkey, &to_pubkey, raw_amount,
+    ) {
+        Ok(result) => {
+            let _ = state.blockchain.svm_accounts.flush_block();
+            let from_bal = result.from_balance as f64 / USDC_UNIT as f64;
+            
+            // Add block history
+            let tx_id = format!("usdc_{}", uuid::Uuid::new_v4());
+            let proto_tx = protocol::Transaction {
+                hash: tx_id.clone(),
+                from: req.from.clone(),
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                data: protocol::TxData::TransferBb { // using this data structure as generic log
+                    to: req.to.clone(),
+                    amount: raw_amount,
+                },
+                signature: String::new(),
+                signer_pubkey: String::new(),
+            };
+            
+            let r_tx_type = crate::storage::TxType::Transfer;
+            let tx_record = crate::storage::TransactionRecord::with_id(
+                tx_id.clone(),
+                r_tx_type,
+                &req.from,
+                &req.to,
+                req.amount,
+                0,
+                from_bal + req.amount,
+                from_bal,
+                result.to_balance as f64 / USDC_UNIT as f64,
+                crate::storage::AuthType::SystemInternal,
+            );
+            
+            if let Err(e) = state.blockchain.log_transaction(tx_record) {
+                tracing::warn!("Failed to log USDC REST transfer: {}", e);
+            }
+            state.block_producer.record_executed_transaction(proto_tx);
+            if let Some(slot) = state.blockchain.latest_block_slot().unwrap_or(Some(0)) {
+                state.finality_tracker.record_inclusion(&tx_id, slot);
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "amount_usdc": req.amount,
+                "from": req.from,
+                "to": req.to,
+                "tx_id": tx_id
+            })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("{:?}", e)
+        }))),
+    }
+}
+
 // ============================================================================
+/// GET /tx/:tx_id - Get full transaction details
+async fn transaction_details_handler(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> impl IntoResponse {
+    if let Ok(Some(record)) = state.blockchain.get_tx_by_id(&tx_id) {
+        Json(serde_json::json!({
+            "success": true,
+            "status": "Finalized",
+            "transaction": record
+        }))
+    } else {
+        // If not finalized, check if it's pending in memory
+        let status = state.finality_tracker.get_status(&tx_id);
+        match status {
+            crate::runtime::poh_service::ConfirmationStatus::Pending | crate::runtime::poh_service::ConfirmationStatus::Processing { .. } => {
+                Json(serde_json::json!({
+                    "success": true,
+                    "status": "Pending",
+                    "transaction": null
+                }))
+            },
+            _ => {
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Transaction not found"
+                }))
+            }
+        }
+    }
+}
+
+/// GET /address/:address/transactions - Get transaction history for a specific wallet
+async fn address_transactions_handler(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(query): Query<LedgerQuery> // Reuse LedgerQuery for pagination
+) -> impl IntoResponse {
+    let limit = query.limit.min(100).max(1);
+    let offset = (query.page.max(1) - 1) * limit;
+    
+    // Fallback to searching all or mapping via the fast index if available
+    let all_txs = state.blockchain.get_all_transactions(10000); // Temporary brute force until full index
+    let filtered_txs: Vec<_> = all_txs.into_iter().filter(|tx| {
+        tx.from_address == address || tx.to_address == address
+    }).collect();
+    
+    let total = filtered_txs.len();
+    let start = offset.min(total);
+    let end = (offset + limit).min(total);
+    let paginated = &filtered_txs[start..end];
+
+    Json(serde_json::json!({
+        "success": true,
+        "address": address,
+        "page": query.page,
+        "limit": limit,
+        "total": total,
+        "transactions": paginated
+    }))
+}
+
 // LEDGER — ASCII Art Visualization
 // ============================================================================
 
@@ -1658,6 +1851,8 @@ fn build_router(state: AppState) -> Router {
         .route("/stats", get(stats_handler))
         .route("/supply/audit", get(supply_audit_handler))
         .route("/balance/:address", get(balance_handler))
+        .route("/tx/:tx_id", get(transaction_details_handler))
+        .route("/address/:address/transactions", get(address_transactions_handler))
         .route("/ledger", get(ledger_handler))
         // Transfers (Submission)
         .route("/transfer/simple", post(signed_transfer_handler))
@@ -1687,10 +1882,14 @@ fn build_router(state: AppState) -> Router {
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
+        // Swap
+        .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
+        .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
         // USDC SPL Token (Public read, private write)
         .route("/usdc/balance/:address", get(usdc_balance_handler))
         .route("/usdc/supply", get(usdc_supply_handler))
-        .route("/usdc/accounts/:address", get(usdc_accounts_handler));
+        .route("/usdc/accounts/:address", get(usdc_accounts_handler))
+        .route("/usdc/transfer", post(usdc_transfer_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {
@@ -2193,8 +2392,8 @@ async fn main() {
                 for batch in batches {
                     let results = sealevel_sched.execute_batch_with_locks(batch.clone(), &sealevel_bc.cache);
                     for (i, result) in results.iter().enumerate() {
+                        let tx = &batch[i];
                         if result.success {
-                            let tx = &batch[i];
                             let proto_tx = protocol::Transaction {
                                 hash: tx.id.clone(),
                                 from: tx.from.clone(),
@@ -2208,6 +2407,34 @@ async fn main() {
                             };
                             sealevel_bp.record_executed_transaction(proto_tx);
                             sealevel_fin.record_inclusion(&tx.id, slot);
+
+                            let r_tx_type = match tx.tx_type {
+                                runtime::core::TransactionType::Mint => crate::storage::TxType::Mint,
+                                runtime::core::TransactionType::Burn => crate::storage::TxType::Burn,
+                                runtime::core::TransactionType::BridgeLock => crate::storage::TxType::Lock,
+                                runtime::core::TransactionType::BridgeUnlock => crate::storage::TxType::Unlock,
+                                runtime::core::TransactionType::SwapUsdcForBb => crate::storage::TxType::SwapUsdcForBb,
+                                runtime::core::TransactionType::SwapBbForUsdc => crate::storage::TxType::SwapBbForUsdc,
+                                _ => crate::storage::TxType::Transfer,
+                            };
+                            let from_bal = sealevel_bc.get_balance(&tx.from);
+                            let tx_record = crate::storage::TransactionRecord::with_id(
+                                tx.id.clone(),
+                                r_tx_type,
+                                &tx.from,
+                                &tx.to,
+                                tx.amount,
+                                tx.nonce,
+                                from_bal + tx.amount,
+                                from_bal,
+                                sealevel_bc.get_balance(&tx.to),
+                                crate::storage::AuthType::Ed25519,
+                            );
+                            if let Err(e) = sealevel_bc.log_transaction(tx_record) {
+                                tracing::warn!("Failed to log sealevel transaction history {}: {}", tx.id, e);
+                            }
+                        } else {
+                            tracing::error!("❌ Sealevel Tx Failed ({}): {:?}", tx.id, result.error);
                         }
                     }
                 }
@@ -2296,10 +2523,10 @@ async fn main() {
         blockchain,
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
-        leader_schedule,
+        leader_schedule: leader_schedule.clone(),
         pipeline,
         parallel_scheduler,
-        gulf_stream,
+        gulf_stream: gulf_stream.clone(),
         block_producer,
         finality_tracker,
         tower_bft,
@@ -2580,6 +2807,14 @@ async fn main() {
     // GRACEFUL SHUTDOWN CLEANUP
     // ═══════════════════════════════════════════════════════════════
     warn!("🛑 Shutting down — flushing state…");
+
+    // 0. Capture mempool and nominate next leader
+    let slot = current_slot.load(std::sync::atomic::Ordering::SeqCst);
+    let pending_txs = gulf_stream.get_all_pending();
+    warn!("📦 Captured {} in-flight transactions from GulfStream", pending_txs.len());
+    
+    let next_leader = leader_schedule.read().nominate_next_writer(slot);
+    warn!("👑 Nominated next leader for handoff: {}", next_leader);
 
     // 1. Flush dirty SVM accounts to ReDB (ACID commit)
     match rpc_svm_accounts.flush_block() {

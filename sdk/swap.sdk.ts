@@ -242,8 +242,8 @@ export class SwapSDK {
    * POST /swap/bb-to-usdc — Swap $BB tokens for USDC.
    *
    * Rate: 1 BB = 10 USDC (fixed, no slippage)
-   * The treasury must hold enough USDC liquidity.
-   * No user signature required — stateless treasury swap.
+   * Synchronous — executes atomically and returns final balances immediately.
+   * Signs: `SWAP_BB_USDC:<wallet>:<bb_amount>:<timestamp>:<nonce>`
    *
    * @param bbAmount  Amount of $BB to sell (must be > 0, must not exceed balance)
    *
@@ -255,9 +255,28 @@ export class SwapSDK {
   async bbToUsdc(bbAmount: number): Promise<SwapBbToUsdcResponse> {
     if (bbAmount <= 0) throw new Error("bbAmount must be > 0");
     const kp = this.requireWallet();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    const message = `SWAP_BB_USDC:${kp.address}:${bbAmount}:${timestamp}:${nonce}`;
+    const { ed, hexToBytes, bytesToHex } = await import("@noble/ed25519").then(
+      async (ed) => ({
+        ed,
+        hexToBytes: (await import("@noble/hashes/utils")).hexToBytes,
+        bytesToHex: (await import("@noble/hashes/utils")).bytesToHex,
+      })
+    );
+    const sigBytes = await ed.signAsync(
+      new TextEncoder().encode(message),
+      hexToBytes(kp.privateKeyHex)
+    );
     return this.post<SwapBbToUsdcResponse>("/swap/bb-to-usdc", {
       wallet_address: kp.address,
       bb_amount: bbAmount,
+      timestamp,
+      nonce,
+      public_key: kp.publicKeyHex,
+      signature: bytesToHex(sigBytes),
     });
   }
 
@@ -265,8 +284,8 @@ export class SwapSDK {
    * POST /swap/usdc-to-bb — Swap USDC for $BB tokens.
    *
    * Rate: 10 USDC = 1 BB (fixed, no slippage)
-   * The treasury must hold enough BB liquidity.
-   * No user signature required — stateless treasury swap.
+   * Synchronous — executes atomically and returns final balances immediately.
+   * Signs: `SWAP_USDC_BB:<wallet>:<usdc_amount>:<timestamp>:<nonce>`
    *
    * @param usdcAmount  Amount of USDC to sell (must be > 0, must not exceed balance)
    *
@@ -278,9 +297,28 @@ export class SwapSDK {
   async usdcToBb(usdcAmount: number): Promise<SwapUsdcToBbResponse> {
     if (usdcAmount <= 0) throw new Error("usdcAmount must be > 0");
     const kp = this.requireWallet();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    const message = `SWAP_USDC_BB:${kp.address}:${usdcAmount}:${timestamp}:${nonce}`;
+    const { ed, hexToBytes, bytesToHex } = await import("@noble/ed25519").then(
+      async (ed) => ({
+        ed,
+        hexToBytes: (await import("@noble/hashes/utils")).hexToBytes,
+        bytesToHex: (await import("@noble/hashes/utils")).bytesToHex,
+      })
+    );
+    const sigBytes = await ed.signAsync(
+      new TextEncoder().encode(message),
+      hexToBytes(kp.privateKeyHex)
+    );
     return this.post<SwapUsdcToBbResponse>("/swap/usdc-to-bb", {
       wallet_address: kp.address,
       usdc_amount: usdcAmount,
+      timestamp,
+      nonce,
+      public_key: kp.publicKeyHex,
+      signature: bytesToHex(sigBytes),
     });
   }
 
