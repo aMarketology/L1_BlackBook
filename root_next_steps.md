@@ -75,4 +75,50 @@
 * **L1 Context:** We claim BlackBook is the ultimate high-frequency transaction vessel. This milestone objectively proves that our PoH clock, Sealevel parallel lock manager, and ReDB setup can genuinely handle the massive volume our ecosystem will generate on Day 1.
 
 ---
-*Follow the order precisely. Security > Integrity > Scale.*
+
+## Phase 4 — Networking & Throughput (The 100k TPS UDP Pipeline)
+*HTTP/REST is fundamentally incapable of supporting 100k+ TPS due to TCP handshake overhead, string parsing, and lack of real-time streaming capabilities. To shatter the TPS ceiling, we must bypass the web server entirely for transaction ingestion.*
+
+### 1. Implement a UDP Transaction Processing Unit (TPU)
+* **Action:** Spin up a dedicated `tokio::net::UdpSocket` alongside the actix-web server strictly for receiving raw transaction bytes.
+* **L1 Context:** UDP streams are "fire-and-forget", eliminating the TCP 3-way handshake and connection state exhaustion (which causes OS-level socket exhaustion during load tests). The TPU will rapidly ingest packets and feed them directly into a crossbeam channel feeding the Sealevel parallel lock manager.
+
+### 2. Replace JSON payloads with Binary Serialization (Bincode)
+* **Action:** Switch the transaction struct serialization from `serde_json` to `bincode`. Provide a binary decoding function explicitly for the UDP TPU receiver.
+* **L1 Context:** Parsing JSON strings is excessively heavy on the CPU and inflates transaction payload sizes. Bincode shrinks a standard ~150-byte JSON structure down to a ~70-byte strict binary payload, halving network bandwidth requirements and allowing the CPU to deserialize thousands of transactions in the time it takes to parse a single JSON request.
+
+### 3. Implement Stake-Weighted Network QoS (Quality of Service)
+* **Action:** Add a lightweight packet filter at the UDP ingestion layer that checks the sender's IP or attached signature against a known list of trusted RPC nodes or staked validators.
+* **L1 Context:** Raw UDP ports are highly vulnerable to DDoS attacks. By implementing an eBPF or rapid software-level filter *before* deserialization, the node can instantly drop spam traffic from unknown sources, ensuring 100% of the validator's CPU is dedicated to processing legitimate, fee-paying transactions.
+
+### 4. Deploy Dedicated RPC "Meatshield" Nodes
+* **Action:** Separate the client-facing HTTP/JSON API from the Block Producing Validator. Build a standalone "RPC Node" binary that accepts HTTP JSON from the wallets, converts it to Bincode, and blasts it to the Validator's UDP TPU.
+* **L1 Context:** The Validator node should spend 0% of its resources managing HTTP connections with end users. Offloading this to scalable edge RPC nodes ensures the core execution engine isolates its compute specifically for Solana-style parallel state transitions.
+
+### 5. Benchmark the UDP TPU against HTTP
+* **Action:** Update `sealevel_load_test.rs` to open a single UDP socket, serialize transactions into Bincode, and blast parallel datagrams directly to the new TPU port without waiting for HTTP responses.
+* **L1 Context:** This is the final validation. By aggressively streaming raw binary packets over UDP locally or across a VPC, we will bypass Windows/Linux TCP socket limits and objectively prove the raw TPS limit of the Sealevel execution engine.
+
+---
+
+## Phase 5 — Layer 2 Prediction Market Integration (Using BB)
+*With the L1 engine optimized and the UDP TPU capable of handling massive throughput, the next step is to physically connect the Layer 2 prediction mechanism. This phase transitions our focus from L1 infrastructure to active L2 betting markets powered by the native BB token.*
+
+### 1. Run the L1 Validator and UDP TPU Server
+* **Action:** Boot the primary L1 execution engine (`cargo run --release`), initializing the Sealevel lock manager, the ReDB state storage, and the high-throughput UDP TPU.
+* **L1 Context:** The L1 must run passively in the background, acting as the ultimate settlement layer and Global Escrow for all L2 activities.
+
+### 2. Scaffold and Connect the L2 Prediction Market
+* **Action:** Initialize the L2 sequencer or betting interface to connect to the L1 via the newly established high-speed pipelines. Ensure the L2 can read BB token balances and lock them in escrow.
+* **L1 Context:** Prediction markets require high-frequency micro-transactions. The L2 sequencer will aggregate these bets and periodically settle the outcome to the L1.
+
+### 3. Place Bets via L2 using BB Tokens
+* **Action:** Execute the first live user interactions. Deposit BB tokens into the smart contract and place directional bets (e.g., Yes/No) on the L2 prediction market.
+* **L1 Context:** Validating that BB tokens effectively act as the standardized liquidity routing asset across layer 2 rollups.
+
+### 4. Settle L2 Market Outcomes to L1
+* **Action:** Trigger the L2 market resolution, generate the state root, and submit the final settlement transaction to the L1, updating all participating wallet balances atomically.
+* **L1 Context:** This proves the core architecture works: fast, cheap bets on L2, secured by the mathematical finality of the L1.
+
+---
+*Follow the order precisely. Security > Integrity > Scale > Speed > Ecosystem.*

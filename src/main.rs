@@ -112,6 +112,26 @@ use poh_blockchain::{
 };
 
 
+use runtime::tpu::TpuService;
+
+/// JSON request body for the HTTP `/sealevel/submit` endpoint.
+/// For the binary UDP equivalent, see `runtime::tpu::TpuPacket`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct GulfStreamSubmitRequest {
+    pub from: String,
+    pub to: String,
+    pub amount: f64,
+    pub public_key: String,
+    pub signature: String,
+    pub timestamp: u64,
+    pub nonce: String,
+    pub chain_id: u8,
+    #[serde(default)]
+    pub priority: Option<u64>,
+    #[serde(default)]
+    pub tx_type: Option<String>,
+}
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -629,28 +649,6 @@ async fn turbine_status_handler(
 // ============================================================================
 // SEALEVEL PARALLEL EXECUTION
 // ============================================================================
-
-#[derive(Deserialize)]
-struct GulfStreamSubmitRequest {
-    from: String,
-    to: String,
-    amount: f64,
-    /// Ed25519 public key (hex, 32 bytes)
-    public_key: String,
-    /// Ed25519 signature over the canonical message (hex, 64 bytes)
-    signature: String,
-    /// Unix timestamp (must be within 60s of server time)
-    timestamp: u64,
-    /// Unique nonce for replay protection
-    nonce: String,
-    /// Chain ID (must match this network)
-    chain_id: u8,
-    #[serde(default)]
-    priority: Option<u64>,
-    /// Optional Transaction Type (e.g. "Transfer", "SwapUsdcForBb", "SwapBbForUsdc")
-    #[serde(default)]
-    tx_type: Option<String>,
-}
 
 /// POST /sealevel/submit — Submit to Gulf Stream for parallel execution
 ///
@@ -1548,7 +1546,13 @@ async fn transaction_details_handler(
     State(state): State<AppState>,
     Path(tx_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Ok(Some(record)) = state.blockchain.get_tx_by_id(&tx_id) {
+    // Try lookup by tx_id first, then fall back to tx_hash
+    let found = state.blockchain.get_tx_by_id(&tx_id)
+        .ok()
+        .flatten()
+        .or_else(|| state.blockchain.get_tx_by_hash(&tx_id).ok().flatten());
+
+    if let Some(record) = found {
         Json(serde_json::json!({
             "success": true,
             "status": "Finalized",
@@ -2698,7 +2702,7 @@ async fn main() {
     // On fresh start, ReDB→SVM seeding happens in ConcurrentBlockchain::new().
 
     // 10. HTTP Server
-    let app = build_router(state);
+    let app = build_router(state.clone());
     let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
 
     info!("");
@@ -2797,6 +2801,19 @@ async fn main() {
             }
         }
     }
+
+    // 12. Start TPU Service (UDP ingestion — high-throughput binary pipeline)
+    let tpu_port = 8003;
+    let tpu_addr: std::net::SocketAddr = format!("0.0.0.0:{}", tpu_port).parse().unwrap();
+    let tpu_service = TpuService::new(
+        state.gulf_stream.clone(),
+        state.pipeline.clone(),
+        state.blockchain.clone(),
+        state.used_nonces.clone(),
+    );
+    tokio::spawn(async move {
+        tpu_service.run(tpu_addr).await;
+    });
 
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())

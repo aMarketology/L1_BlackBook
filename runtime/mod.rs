@@ -12,6 +12,7 @@ pub mod core;
 pub mod sealevel;
 pub mod consensus;
 pub mod poh_service;
+pub mod tpu;
 
 // PoH Service
 pub use poh_service::{
@@ -20,6 +21,8 @@ pub use poh_service::{
     PipelinePacket,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
+
+pub use tpu::TpuService;
 
 // Consensus — Tower BFT + PoH + Gulf Stream
 pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};

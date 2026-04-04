@@ -27,11 +27,11 @@ use tokio::sync::Semaphore;
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const BASE_URL: &str = "http://127.0.0.1:8080";
-const NUM_WALLETS: usize = 200;     // distinct sender keypairs
-const NUM_TXS:    usize = 20_000;   // total sealevel submissions
-const CONCURRENCY: usize = 1_000;   // max in-flight at once
-const AMOUNT_PER_TX: f64 = 0.00001; // 1 lamport per tx
-const FUND_BB: f64 = 0.1;           // BB per faucet claim (max allowed)
+const NUM_WALLETS: usize = 10_000;    // distinct sender keypairs 
+const NUM_TXS:    usize = 500_000;   // total sealevel submissions
+const CONCURRENCY: usize = 4_000;     // safe queue level to prevent Windows socket exhaustion
+const AMOUNT_PER_TX: f64 = 0.00001;   // 1 lamport per tx
+const FUND_BB: f64 = 0.1;             // BB per faucet claim (max allowed)
 
 // ── Wallet ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(CONCURRENCY)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
     // ── 1. Health check ─────────────────────────────────────────────────────

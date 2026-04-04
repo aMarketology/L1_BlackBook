@@ -1,8 +1,0 @@
-node_modules/
-dist/
-cache/
-artifacts/
-typechain-types/
-coverage/
-coverage.json
-.env.local

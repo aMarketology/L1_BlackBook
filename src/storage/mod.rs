@@ -388,31 +388,16 @@ impl TransactionRecord {
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
     db: Arc<Database>,
-    
-    /// Legacy f64 cache — MIRROR ONLY, not authoritative.
-    /// Kept for backward compat with code that reads `cache` directly.
-    /// Populated from SVM on writes. Never used for balance decisions.
-    /// PUBLIC: Used by Sealevel ParallelScheduler for direct batch execution
     pub cache: Arc<DashMap<String, f64>>,
-    
-    /// Processed bridge TX cache (for fast replay checks)
     #[allow(dead_code)]
     processed_bridge_txs: Arc<DashMap<String, String>>,
-    
-    /// Block height counter
     block_height: Arc<AtomicU64>,
-    
-    /// Total supply tracker (deprecated — use svm_accounts.total_lamports())
     total_supply: Arc<AtomicU64>,
     
-    /// SVM Accounts Database — THE authoritative balance store.
-    /// All balance reads and writes go here. u64 lamports, no f64.
     pub svm_accounts: Arc<SvmAccountsDB>,
 
     /// Per-account nonce tracker (prevents replay attacks)
     pub account_nonces: Arc<DashMap<String, u64>>,
-
-    /// Buffered transaction log — accumulated per-slot, flushed once at block boundary.
     /// This eliminates synchronous ReDB writes from the hot path.
     tx_log_buffer: Arc<Mutex<Vec<TransactionRecord>>>,
 }
@@ -868,6 +853,13 @@ impl ConcurrentBlockchain {
         } else {
             Ok(None)
         }
+    }
+
+    /// Retrieve a specific transaction by its tx_hash (hex string).
+    /// Falls back to a full scan — use only for explorer lookup.
+    pub fn get_tx_by_hash(&self, tx_hash: &str) -> Result<Option<TransactionRecord>, String> {
+        let all = self.get_transactions(None, usize::MAX, 0).unwrap_or_default();
+        Ok(all.into_iter().find(|r| r.tx_hash == tx_hash))
     }
 
     /// Transfer tokens between addresses (atomic) — legacy API (no SVM receipt).
