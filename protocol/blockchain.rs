@@ -14,6 +14,7 @@
 // ============================================================================
 
 use serde::{Deserialize, Serialize};
+use borsh::{BorshSerialize, BorshDeserialize};
 
 // NOTE: Token ledgers, Tier1/Tier2 vault structs, AccountSecurity, and their
 // impl blocks were removed — they were dead code (never constructed outside
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // TRANSACTIONS
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Transaction {
     pub hash: String,
     pub from: String,
@@ -33,7 +34,7 @@ pub struct Transaction {
     pub signer_pubkey: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub enum TxData {
     // ========== Tier 1: USDT → $BB Gateway ==========
 

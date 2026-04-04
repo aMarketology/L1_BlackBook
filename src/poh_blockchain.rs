@@ -33,7 +33,7 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
@@ -41,6 +41,8 @@ use sha2::{Sha256, Digest};
 use tracing::error;
 use serde::{Serialize, Deserialize};
 use tracing::{info, warn};
+use borsh::{BorshSerialize, BorshDeserialize};
+use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::storage::ConcurrentBlockchain;
 use crate::runtime::{
@@ -138,9 +140,14 @@ impl TurbineShredder {
     
     /// Shred a finalized block into propagatable pieces
     pub fn shred_block(&self, block: &FinalizedBlock) -> Vec<Shred> {
-        // Serialize the block
-        let block_data = serde_json::to_vec(block).unwrap_or_default();
-        
+        // Serialize using Borsh (50-80% smaller than JSON)
+        let block_data = borsh::to_vec(block).unwrap_or_default();
+        // Prefix with 4-byte big-endian payload length so RS padding can be
+        // stripped cleanly on reassembly without re-serialising.
+        let mut framed = (block_data.len() as u32).to_be_bytes().to_vec();
+        framed.extend(block_data);
+        let block_data = framed;
+
         // Split into shred-sized chunks
         let mut shreds = Vec::new();
         let chunks: Vec<&[u8]> = block_data.chunks(SHRED_SIZE).collect();
@@ -174,74 +181,178 @@ impl TurbineShredder {
         shreds
     }
     
-    /// Generate coding shreds for Forward Error Correction
+    /// Generate Reed-Solomon coding shreds for Forward Error Correction.
+    ///
+    /// Uses GF(2^8) polynomial arithmetic via the `reed-solomon-erasure` crate.
+    /// Each FEC set of `DATA_SHREDS_PER_FEC_SET` (32) data shreds produces an equal
+    /// number of RS parity shreds — giving 50% erasure tolerance.  Any 32 of the 64
+    /// shreds in a set are sufficient to reconstruct all 32 data shreds, regardless
+    /// of which 32 are missing (vs XOR which can only recover exactly one drop).
     fn generate_coding_shreds(&self, data_shreds: &[Shred]) -> Vec<Shred> {
+        let n = DATA_SHREDS_PER_FEC_SET;
+        let rs = match ReedSolomon::new(n, n) {
+            Ok(r)  => r,
+            Err(e) => { warn!("🌊 Turbine: RS init failed: {}", e); return vec![]; }
+        };
+
         let mut coding_shreds = Vec::new();
-        
-        // Group data shreds into FEC sets
-        for (fec_index, fec_set) in data_shreds.chunks(DATA_SHREDS_PER_FEC_SET).enumerate() {
-            // Generate coding shreds (simplified XOR-based, real impl uses Reed-Solomon)
-            // One coding shred per FEC set for simplicity
-            let mut xor_data = vec![0u8; SHRED_SIZE];
-            
-            for shred in fec_set {
-                for (i, byte) in shred.data.iter().enumerate() {
-                    if i < xor_data.len() {
-                        xor_data[i] ^= byte;
-                    }
-                }
+
+        for (fec_index, fec_set) in data_shreds.chunks(n).enumerate() {
+            // Pad each data shard to exactly SHRED_SIZE (RS requires equal-length rows)
+            let mut shards: Vec<Vec<u8>> = fec_set.iter()
+                .map(|s| { let mut p = s.data.clone(); p.resize(SHRED_SIZE, 0); p })
+                .collect();
+
+            // If the last FEC set has < n data shreds, pad with zero shards so the
+            // RS matrix is always n×n (lets the decoder use a fixed codec).
+            while shards.len() < n {
+                shards.push(vec![0u8; SHRED_SIZE]);
             }
-            
-            let coding_shred = Shred {
-                slot: self.slot,
-                index: (data_shreds.len() + fec_index) as u32,
-                total_shreds: data_shreds.len() as u32,
-                is_coding: true,
-                fec_set_index: fec_index as u32,
-                data: xor_data,
-                merkle_proof: vec![],
-                signature: format!("sig_{}_{}_fec", self.leader, fec_index),
-            };
-            coding_shreds.push(coding_shred);
+
+            // Append n zero-filled parity shards — rs.encode() fills them in-place
+            for _ in 0..n {
+                shards.push(vec![0u8; SHRED_SIZE]);
+            }
+
+            // GF(2^8) erasure encode: parity rows written into shards[n..2n]
+            if let Err(e) = rs.encode(&mut shards) {
+                warn!("🌊 Turbine: RS encode failed for FEC set {}: {}", fec_index, e);
+                continue;
+            }
+
+            // Emit one coding Shred per parity row
+            for (c, parity_data) in shards[n..].iter().enumerate() {
+                coding_shreds.push(Shred {
+                    slot: self.slot,
+                    index: (data_shreds.len() + fec_index * n + c) as u32,
+                    total_shreds: data_shreds.len() as u32,
+                    is_coding: true,
+                    fec_set_index: fec_index as u32,
+                    data: parity_data.clone(),
+                    merkle_proof: vec![],
+                    signature: format!("sig_{}_fec_{}_{}", self.leader, fec_index, c),
+                });
+            }
         }
-        
+
         coding_shreds
     }
     
-    /// Reassemble a block from shreds
+    /// Reassemble a block from shreds using Reed-Solomon recovery.
+    ///
+    /// Tolerates up to `DATA_SHREDS_PER_FEC_SET` (32) missing shreds per FEC window.
+    /// Any combination of data + coding shreds totalling ≥ 32 per window is enough;
+    /// the receiver does not need to know *which* shreds were dropped.
     #[allow(dead_code)] // Wired in Phase 5+ (P2P Turbine receiver)
     pub fn reassemble_block(shreds: &[Shred]) -> Result<FinalizedBlock, String> {
-        // Filter to data shreds only, sorted by index
-        let mut data_shreds: Vec<_> = shreds.iter()
-            .filter(|s| !s.is_coding)
-            .collect();
-        data_shreds.sort_by_key(|s| s.index);
-        
-        // Check we have all shreds
-        if data_shreds.is_empty() {
-            return Err("No data shreds".to_string());
+        if shreds.is_empty() {
+            return Err("No shreds provided".to_string());
         }
-        
-        let expected_total = data_shreds[0].total_shreds as usize;
-        if data_shreds.len() < expected_total {
-            // Try to recover using coding shreds
-            // Simplified - real impl would use Reed-Solomon
+
+        let n = DATA_SHREDS_PER_FEC_SET;
+
+        // Total data shred count is encoded in every shred header
+        let total_data = shreds.iter()
+            .find(|s| !s.is_coding)
+            .map(|s| s.total_shreds as usize)
+            .ok_or("No data shreds found")?;
+
+        let n_fec_sets = total_data.div_ceil(n);
+
+        // Group all shreds by FEC set
+        let mut by_fec: HashMap<u32, Vec<&Shred>> = HashMap::new();
+        for s in shreds {
+            by_fec.entry(s.fec_set_index).or_default().push(s);
+        }
+
+        let rs = ReedSolomon::new(n, n)
+            .map_err(|e| format!("RS init failed: {}", e))?;
+
+        let mut recovered: Vec<Option<Vec<u8>>> = vec![None; total_data];
+
+        for fec_idx in 0..n_fec_sets {
+            let set_shreds = by_fec.get(&(fec_idx as u32)).map(|v| v.as_slice()).unwrap_or(&[]);
+
+            let data_start = fec_idx * n;
+            let data_end   = (data_start + n).min(total_data);
+
+            let data_in_set: Vec<_>   = set_shreds.iter().filter(|s| !s.is_coding).copied().collect();
+            let coding_in_set: Vec<_> = set_shreds.iter().filter(|s|  s.is_coding).copied().collect();
+
+            // Fast path — all data shreds present, no RS needed
+            if data_in_set.len() == (data_end - data_start) {
+                for s in data_in_set {
+                    recovered[s.index as usize] = Some(s.data.clone());
+                }
+                continue;
+            }
+
+            // Build the shard matrix: rows 0..n are data, rows n..2n are parity
+            let mut shard_opts: Vec<Option<Vec<u8>>> = vec![None; 2 * n];
+
+            for s in &data_in_set {
+                let local = s.index as usize - data_start;
+                if local < n {
+                    let mut padded = s.data.clone();
+                    padded.resize(SHRED_SIZE, 0);
+                    shard_opts[local] = Some(padded);
+                }
+            }
+
+            // Coding shreds were emitted at global index:
+            //   total_data + fec_idx * n + coding_col
+            // so: coding_col = shred.index - total_data - fec_idx * n
+            let coding_global_start = total_data + fec_idx * n;
+            for s in &coding_in_set {
+                let col = s.index as usize - coding_global_start;
+                if col < n {
+                    let mut padded = s.data.clone();
+                    padded.resize(SHRED_SIZE, 0);
+                    shard_opts[n + col] = Some(padded);
+                }
+            }
+
+            let available = shard_opts.iter().filter(|o| o.is_some()).count();
+            if available < n {
+                return Err(format!(
+                    "FEC set {fec_idx}: need {n} shards to reconstruct, only have {available} — unrecoverable"
+                ));
+            }
+
+            // GF(2^8) reconstruction — fills in every None row
+            rs.reconstruct_data(&mut shard_opts)
+                .map_err(|e| format!("RS reconstruct FEC set {fec_idx}: {}", e))?;
+
+            for local in 0..(data_end - data_start) {
+                let global = data_start + local;
+                if recovered[global].is_none() {
+                    recovered[global] = shard_opts[local].take();
+                }
+            }
+        }
+
+        // Concatenate all data rows then strip the 4-byte length prefix
+        let mut raw: Vec<u8> = Vec::with_capacity(total_data * SHRED_SIZE);
+        for (i, shard) in recovered.into_iter().enumerate() {
+            raw.extend(
+                shard.ok_or_else(|| format!("Missing data shard {i} after RS recovery"))?
+            );
+        }
+
+        if raw.len() < 4 {
+            return Err("Reassembled payload too short to contain length prefix".to_string());
+        }
+        let payload_len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        if raw.len() < 4 + payload_len {
             return Err(format!(
-                "Missing shreds: have {}, need {}",
-                data_shreds.len(),
-                expected_total
+                "Truncated payload: expected {} bytes, got {}",
+                4 + payload_len,
+                raw.len()
             ));
         }
-        
-        // Concatenate data
-        let mut block_data = Vec::new();
-        for shred in data_shreds {
-            block_data.extend(&shred.data);
-        }
-        
-        // Deserialize block
-        serde_json::from_slice(&block_data)
-            .map_err(|e| format!("Failed to deserialize block: {}", e))
+
+        borsh::from_slice(&raw[4..4 + payload_len])
+            .map_err(|e| format!("Borsh deserialize failed: {}", e))
     }
 }
 
@@ -496,7 +607,7 @@ impl MerkleProof {
 // ============================================================================
 
 /// A transaction with PoH ordering metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct OrderedTransaction {
     /// The underlying transaction
     pub tx: Transaction,
@@ -515,7 +626,7 @@ pub struct OrderedTransaction {
 // ============================================================================
 
 /// A fully finalized block with PoH integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct FinalizedBlock {
     /// Block header
     pub slot: u64,
