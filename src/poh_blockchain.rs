@@ -485,7 +485,7 @@ impl MerkleTree {
     /// Compute merkle root from leaves using sorted hashing.
     /// Each pair is combined via `combine_hashes` (smaller hash first),
     /// so the root is independent of insertion order.
-    fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    pub fn compute_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
             return [0u8; 32];
         }
@@ -687,6 +687,98 @@ impl FinalizedBlock {
 // BLOCK PRODUCER
 // ============================================================================
 
+/// Leaf cache for the Incremental Sparse Merkle Tree.
+///
+/// Holds the full sorted set of account leaf hashes so that `compute_state_root`
+/// can update only dirty/deleted leaves instead of rescanning `hot_state`
+/// on every block (the old O(N) DashMap scan bottleneck).
+///
+/// Stored as a `BTreeMap` so the leaf order is always sorted lexicographically
+/// by address string — matching the sort contract used by `MerkleTree`.
+pub struct LeafCache {
+    /// address → SHA-256(address ++ balance_le_bytes) leaf hash
+    leaves: Arc<RwLock<BTreeMap<String, [u8; 32]>>>,
+}
+
+impl LeafCache {
+    pub fn new() -> Self {
+        Self { leaves: Arc::new(RwLock::new(BTreeMap::new())) }
+    }
+
+    /// Seed the cache from the SVM hot_state on a fresh start.
+    pub fn warm_from_hot_state(&self, hot_state: &crate::svm::SvmAccountsDB) {
+        use crate::svm::types::LAMPORTS_PER_BB;
+        use solana_sdk::account::ReadableAccount;
+        use sha2::Digest;
+        let mut leaves = self.leaves.write();
+        for entry in hot_state.hot_state.iter() {
+            let lamports = entry.value().lamports();
+            if lamports > 0 {
+                let addr = entry.key().to_string();
+                let balance = lamports as f64 / LAMPORTS_PER_BB as f64;
+                let mut hasher = Sha256::new();
+                hasher.update(addr.as_bytes());
+                hasher.update(balance.to_le_bytes());
+                let hash: [u8; 32] = hasher.finalize().into();
+                leaves.insert(addr, hash);
+            }
+        }
+    }
+
+    /// Apply a set of dirty (modified) and deleted accounts to the leaf cache.
+    /// Returns the new `state_root` computed from the updated leaf set.
+    pub fn apply_and_compute_root(
+        &self,
+        modified: &[[u8; 32]],   // pubkey byte arrays (DirtySet)
+        deleted: &[[u8; 32]],    // pubkey byte arrays (DirtySet::deleted)
+        hot_state: &crate::svm::SvmAccountsDB,
+    ) -> String {
+        use crate::svm::types::LAMPORTS_PER_BB;
+        use solana_sdk::account::ReadableAccount;
+        use sha2::Digest;
+        use solana_sdk::pubkey::Pubkey;
+
+        let mut leaves = self.leaves.write();
+
+        // Update modified leaves — recompute only for changed accounts (O(dirty))
+        for key_bytes in modified {
+            let pubkey = Pubkey::new_from_array(*key_bytes);
+            let addr = pubkey.to_string();
+            if let Some(account) = hot_state.hot_state.get(&pubkey) {
+                let lamports = account.lamports();
+                if lamports > 0 {
+                    let balance = lamports as f64 / LAMPORTS_PER_BB as f64;
+                    let mut hasher = Sha256::new();
+                    hasher.update(addr.as_bytes());
+                    hasher.update(balance.to_le_bytes());
+                    let hash: [u8; 32] = hasher.finalize().into();
+                    leaves.insert(addr, hash);
+                } else {
+                    // Lamports hit zero — treat as deletion
+                    leaves.remove(&addr);
+                }
+            }
+        }
+
+        // Zero-out deleted leaves — they are no longer part of the state
+        for key_bytes in deleted {
+            let pubkey = Pubkey::new_from_array(*key_bytes);
+            leaves.remove(&pubkey.to_string());
+        }
+
+        // Build tree from the cached leaf set (O(leaves) tree construction,
+        // but we skipped the O(N) DashMap scan — only the leaf array rebuild
+        // remains, which is fast in practice).
+        let leaf_vec: Vec<[u8; 32]> = leaves.values().copied().collect();
+        let root = MerkleTree::compute_root(&leaf_vec);
+        hex::encode(root)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.leaves.read().is_empty()
+    }
+}
+
 /// Produces blocks by integrating PoH, transactions, and state
 pub struct BlockProducer {
     /// Reference to blockchain storage
@@ -722,6 +814,9 @@ pub struct BlockProducer {
 
     /// Last slot we produced a block for (prevents double-production)
     last_produced_slot: Arc<AtomicU64>,
+
+    /// Incremental Merkle leaf cache (Phase 2 — avoids O(N) hot_state scan per block)
+    leaf_cache: Arc<LeafCache>,
 }
 
 impl BlockProducer {
@@ -748,6 +843,10 @@ impl BlockProducer {
 
         info!("🏭 BlockProducer initialized for validator: {}", validator_id);
         
+        let leaf_cache = Arc::new(LeafCache::new());
+        // Warm the leaf cache from whatever accounts are already on disk
+        leaf_cache.warm_from_hot_state(&blockchain.svm_accounts);
+
         Self {
             blockchain,
             poh,
@@ -760,6 +859,7 @@ impl BlockProducer {
             validator_id,
             svm,
             last_produced_slot: Arc::new(AtomicU64::new(u64::MAX)), // sentinel: no block produced yet
+            leaf_cache,
         }
     }
 
@@ -1035,6 +1135,25 @@ impl BlockProducer {
             }
         }
 
+        // Persist slot terminal hash for PoH chaining
+        {
+            use crate::storage::SlotMeta;
+            let meta = SlotMeta { slot, terminal_hash: block_hash.clone() };
+            if let Err(e) = self.blockchain.save_slot_meta(slot, &meta) {
+                warn!("Failed to persist SlotMeta for slot {}: {}", slot, e);
+            }
+        }
+
+        // Spawn background GC for orphaned Merkle nodes (non-blocking)
+        {
+            let db_clone = self.blockchain.clone();
+            tokio::spawn(async move {
+                if let Err(e) = db_clone.gc_merkle_nodes(slot) {
+                    tracing::warn!(slot, error = %e, "gc_merkle_nodes failed");
+                }
+            });
+        }
+
         // Mark this slot as produced
         self.last_produced_slot.store(slot, Ordering::Relaxed);
 
@@ -1170,13 +1289,25 @@ impl BlockProducer {
         Ok(Pubkey::new_from_array(bytes))
     }
 
-    /// Compute merkle state root from current account balances
+    /// Compute merkle state root incrementally using only dirty/deleted accounts.
+    ///
+    /// Instead of the O(N) full hot_state DashMap scan, we:
+    ///   1. Drain only the accounts that changed this slot from the DirtySet.
+    ///   2. Sort them lexicographically (bundles adjacent tree paths together).
+    ///   3. Update only those leaves in the persistent LeafCache.
+    ///   4. Rebuild the root from the cached leaf array — O(dirty) leaf updates
+    ///      + one O(leaves) tree construction pass.
     fn compute_state_root(&self) -> String {
-        // Get all accounts from blockchain
-        // Note: In production, you'd want a more efficient way to iterate accounts
-        let accounts = self.get_all_accounts();
-        let tree = MerkleTree::from_accounts(&accounts);
-        tree.root_hex()
+        let (modified, deleted) = self.blockchain.svm_accounts.dirty.drain_for_merkle();
+
+        if modified.is_empty() && deleted.is_empty() && !self.leaf_cache.is_empty() {
+            // Nothing changed — return whatever root the cache already has
+            let leaf_vec: Vec<[u8; 32]> = self.leaf_cache.leaves.read().values().copied().collect();
+            let root = MerkleTree::compute_root(&leaf_vec);
+            return hex::encode(root);
+        }
+
+        self.leaf_cache.apply_and_compute_root(&modified, &deleted, &self.blockchain.svm_accounts)
     }
 
     /// Get all accounts (for state root computation).

@@ -642,17 +642,24 @@ impl PoHService {
     
     /// Verify the current slot's PoH entries are valid
     /// This proves the entries were computed sequentially and haven't been tampered with
-    pub fn verify_current_entries(&self) -> bool {
+    pub fn verify_current_entries(&self, db: &crate::storage::ConcurrentBlockchain) -> bool {
         if self.current_entries.is_empty() {
             return true;
         }
         
         // Get the starting hash (hash before first entry in this slot)
-        // For simplicity, we verify entries are internally consistent
         let starting_hash = if let Some(_first_entry) = self.current_entries.first() {
-            // Reconstruct what the hash should have been before first entry
-            // by working backwards (this is a simplified check)
-            Self::compute_genesis_hash() // In production, would track slot boundaries
+            let current_slot = self.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+            if current_slot > 0 {
+                // Attempt to load from get_slot_meta
+                if let Some(meta) = db.get_slot_meta(current_slot - 1) {
+                    meta.terminal_hash
+                } else {
+                    return false; // Could not find previous block hash
+                }
+            } else {
+                Self::compute_genesis_hash()
+            }
         } else {
             return true;
         };

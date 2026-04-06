@@ -125,8 +125,8 @@ impl SettlementService for BlackBookSettlementService {
                 }))
             }
             Some(dep) => {
-                // Convert stablecoin amount → SPL units (6 decimals, 1 BB = 1_000_000)
-                let actual_spl = (dep.amount_stablecoin * 1_000_000.0).round() as u64;
+                // Convert stablecoin amount -> SPL units (5 decimals, 1 BB = 100_000)
+                let actual_spl = (dep.amount_stablecoin * 100_000.0).round() as u64;
 
                 // Amount check: if caller specified a non-zero expected_amount, verify it
                 if req.expected_amount > 0 && actual_spl != req.expected_amount {
@@ -189,8 +189,8 @@ impl SettlementService for BlackBookSettlementService {
             }
         }
 
-        // Convert SPL units → BB (6 decimals)
-        let bb_amount = req.bb_reserve as f64 / 1_000_000.0;
+        // Convert SPL units -> BB (5 decimals)
+        let bb_amount = req.bb_reserve as f64 / 100_000.0;
 
         // Debit dealer → escrow
         if let Err(e) = self.blockchain.debit(&req.dealer_address, bb_amount) {

@@ -48,6 +48,9 @@ pub struct ReaderNode {
 
     /// Blocks failed counter
     blocks_failed: AtomicU64,
+
+    /// Channel to broadcast received blocks (e.g. for WebSockets)
+    pub block_tx: tokio::sync::broadcast::Sender<crate::poh_blockchain::FinalizedBlock>,
 }
 
 impl ReaderNode {
@@ -56,6 +59,7 @@ impl ReaderNode {
         blockchain: ConcurrentBlockchain,
         current_slot: Arc<AtomicU64>,
         reader_id: String,
+        block_tx: tokio::sync::broadcast::Sender<crate::poh_blockchain::FinalizedBlock>,
     ) -> Self {
         // Initialize latest_hash from storage (for chain continuity)
         let latest_hash = match blockchain.latest_block_slot() {
@@ -77,6 +81,7 @@ impl ReaderNode {
             latest_hash: parking_lot::RwLock::new(latest_hash),
             blocks_verified: AtomicU64::new(0),
             blocks_failed: AtomicU64::new(0),
+            block_tx,
         }
     }
 
@@ -228,6 +233,9 @@ impl ReaderNode {
                 &block.hash[..block.hash.len().min(16)]
             );
         }
+
+        // Broadcast for WebSockets
+        let _ = self.block_tx.send(block);
 
         Ok(())
     }

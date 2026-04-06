@@ -78,6 +78,16 @@ pub const ESCROW_MARKET_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::n
 /// Prevents double-withdrawal per market — durable across restarts
 pub const ESCROW_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("escrow_claims");
 
+/// Slot metadata: Slot (u64) -> SlotMeta JSON (bytes)
+pub const SLOT_META: TableDefinition<u64, &[u8]> = TableDefinition::new("slot_meta");
+
+/// Incremental Sparse Merkle Tree interior nodes.
+/// Schema: (Slot u64, NodePath &[u8]) → NodeHash [u8; 32]
+///
+/// Keyed by (slot, path) instead of NodeHash alone so fork branches never
+/// overwrite each other. GC prunes entries where slot < current - FINALIZATION_DEPTH.
+pub const MERKLE_NODES: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("merkle_nodes");
+
 /// Deposit gateway requests: external_tx_hash (String) → DepositRecord JSON (bytes)
 /// Durable record of every wUSDC/wUSDT → BB deposit request submitted by users.
 const DEPOSIT_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deposit_requests");
@@ -107,6 +117,13 @@ const COIN_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("coin_bal
 // ============================================================================
 // ENHANCED LEDGER ENUMS (Type-Safe Blockchain Integrity)
 // ============================================================================
+
+/// Metadata about a generated slot
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SlotMeta {
+    pub slot: u64,
+    pub terminal_hash: String,
+}
 
 /// Transaction type enum for type-safe categorization
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -441,7 +458,113 @@ impl ConcurrentBlockchain {
         self.cache.insert(address.to_string(), bb);
     }
 
-    /// Create or open a blockchain database.
+    /// Retrieve the slot metadata (e.g. terminal hash) for a given slot
+    pub fn get_slot_meta(&self, slot: u64) -> Option<SlotMeta> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(SLOT_META).ok()?;
+        let value = table.get(&slot).ok()??;
+        serde_json::from_slice(value.value()).ok()
+    }
+
+    /// Save the slot metadata (e.g. terminal hash) for a given slot
+    pub fn save_slot_meta(&self, slot: u64, meta: &SlotMeta) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SLOT_META)?;
+            let json = serde_json::to_vec(meta)?;
+            table.insert(&slot, json.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // MERKLE NODE STORAGE (Phase 2 — Incremental SMT)
+    // ========================================================================
+
+    /// Finalization window: nodes from slots older than current - FINALIZATION_DEPTH
+    /// are safe to garbage-collect.
+    const FINALIZATION_DEPTH: u64 = 32;
+
+    /// Read a persisted Merkle interior node for a given (slot, path).
+    pub fn read_merkle_node(&self, slot: u64, path: &[u8]) -> Option<[u8; 32]> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(MERKLE_NODES).ok()?;
+        let guard = table.get(&(slot, path)).ok()??;
+        let bytes: &[u8] = guard.value();
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Some(arr)
+        } else {
+            None
+        }
+    }
+
+    /// Write a Merkle interior node for a given (slot, path) in a batch.
+    /// `nodes` is a slice of (path_bytes, hash_32) pairs — all written in a
+    /// single ACID transaction to avoid per-node I/O overhead.
+    pub fn write_merkle_nodes(&self, slot: u64, nodes: &[(&[u8], [u8; 32])]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(MERKLE_NODES)?;
+            for (path, hash) in nodes {
+                table.insert(&(slot, *path), hash.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Garbage-collect Merkle interior nodes for all slots older than
+    /// `current_slot - FINALIZATION_DEPTH`.
+    ///
+    /// Redb does NOT shrink the .redb file when rows are deleted — it marks
+    /// those pages as free for future writes.  The file size will stabilise
+    /// (stop growing) once GC is running steadily.  A shrinking file is NOT
+    /// required for the GC to be considered working correctly.
+    pub fn gc_merkle_nodes(&self, current_slot: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        if current_slot < Self::FINALIZATION_DEPTH {
+            return Ok(0);
+        }
+        let cutoff = current_slot - Self::FINALIZATION_DEPTH;
+
+        let write_txn = self.db.begin_write()?;
+        let pruned;
+        {
+            let mut table = write_txn.open_table(MERKLE_NODES)?;
+            // Collect keys to delete (can't delete while iterating over a mutable table)
+            let to_delete: Vec<(u64, Vec<u8>)> = {
+                let read_txn_inner = self.db.begin_read()?;
+                let read_table = read_txn_inner.open_table(MERKLE_NODES)?;
+                let mut keys = Vec::new();
+                let mut iter = read_table.iter()?;
+                while let Some(Ok((k, _))) = iter.next() {
+                    let (slot, path) = k.value();
+                    if slot < cutoff {
+                        keys.push((slot, path.to_vec()));
+                    }
+                }
+                keys
+            };
+
+            pruned = to_delete.len() as u64;
+            for (slot, path) in &to_delete {
+                table.remove(&(*slot, path.as_slice()))?;
+            }
+        }
+        write_txn.commit()?;
+
+        if pruned > 0 {
+            tracing::info!(pruned_nodes = pruned, cutoff_slot = cutoff, "gc_merkle_nodes: pruned orphaned Merkle nodes");
+        }
+        Ok(pruned)
+    }
+
+    /// Create or open a unified SVM-backed blockchain layer.
     /// Accepts either:
     ///   - A full file path ending in .redb (e.g. "/data/blockchain_data/blockchain.redb")
     ///   - A directory path (e.g. "./blockchain_data") — appends "/blockchain.redb"
@@ -470,6 +593,8 @@ impl ConcurrentBlockchain {
             // Escrow tables
             let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
             let _ = write_txn.open_table(ESCROW_CLAIMS)?;
+            let _ = write_txn.open_table(SLOT_META)?;
+            let _ = write_txn.open_table(MERKLE_NODES)?;
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
             let _ = write_txn.open_table(WITHDRAWALS)?;
             let _ = write_txn.open_table(CONTEST_STATES)?;

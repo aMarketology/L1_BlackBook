@@ -99,8 +99,13 @@ pub const SVM_ADDR_SIGS: TableDefinition<&str, u64> =
 /// Tracks which pubkeys have been mutated since the last flush.
 /// Uses a lock-free set so the scheduler can mark dirty accounts
 /// concurrently with other reads.
+///
+/// Also tracks deleted accounts (lamports drained to zero by a smart contract)
+/// so the Merkle tree can update their leaf to `[0u8; 32]` (empty hash) rather
+/// than leaving a ghost entry in the state root.
 pub struct DirtySet {
     inner: DashMap<[u8; 32], ()>,
+    deleted: DashMap<[u8; 32], ()>,
 }
 
 impl Default for DirtySet {
@@ -111,11 +116,19 @@ impl Default for DirtySet {
 
 impl DirtySet {
     pub fn new() -> Self {
-        Self { inner: DashMap::new() }
+        Self { inner: DashMap::new(), deleted: DashMap::new() }
     }
 
     pub fn mark(&self, key: [u8; 32]) {
         self.inner.insert(key, ());
+    }
+
+    /// Explicitly mark an account as deleted (balance zeroed / account closed).
+    /// The Merkle layer will zero-hash this leaf rather than reading a ghost balance.
+    pub fn mark_deleted(&self, key: [u8; 32]) {
+        self.deleted.insert(key, ());
+        // Remove from modified set — deleted supersedes modified
+        self.inner.remove(&key);
     }
 
     pub fn drain(&self) -> Vec<[u8; 32]> {
@@ -124,9 +137,26 @@ impl DirtySet {
         keys
     }
 
+    /// Drain the deleted-account set.
+    pub fn drain_deleted(&self) -> Vec<[u8; 32]> {
+        let keys: Vec<[u8; 32]> = self.deleted.iter().map(|e| *e.key()).collect();
+        self.deleted.clear();
+        keys
+    }
+
+    /// Returns sorted (modified, deleted) pubkey byte arrays for the Merkle builder.
+    /// Sorting lexicographically maximises path-prefix sharing in the bottom-up pass.
+    pub fn drain_for_merkle(&self) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+        let mut modified = self.drain();
+        let mut deleted  = self.drain_deleted();
+        modified.sort_unstable();
+        deleted.sort_unstable();
+        (modified, deleted)
+    }
+
     #[allow(dead_code)] // Used in flush_block diagnostics
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.deleted.is_empty()
     }
 }
 
@@ -159,7 +189,7 @@ pub struct SvmAccountsDB {
 
     /// Set of accounts mutated since the last flush.
     /// Populated by store_account; consumed by flush_block.
-    dirty: Arc<DirtySet>,
+    pub dirty: Arc<DirtySet>,
 }
 
 impl SvmAccountsDB {
@@ -305,12 +335,13 @@ impl SvmAccountsDB {
     ///   - After a successful flush, the dirty set is cleared.
     pub fn flush_block(&self) -> Result<usize, SvmError> {
         let dirty_keys = self.dirty.drain();
-        if dirty_keys.is_empty() {
+        let deleted_keys = self.dirty.drain_deleted();
+        if dirty_keys.is_empty() && deleted_keys.is_empty() {
             debug!("flush_block: nothing to flush");
             return Ok(0);
         }
 
-        let count = dirty_keys.len();
+        let count = dirty_keys.len() + deleted_keys.len();
         let write_txn = self.db.begin_write()?;
 
         {
@@ -325,9 +356,13 @@ impl SvmAccountsDB {
                             .map_err(|e| SvmError::SerializationError(e.to_string()))?;
                         table.insert(key_bytes.as_slice(), serialized.as_slice())?;
                     }
-                    // If account was deleted (lamports=0), tombstone it
-                    // (leave in table with 0 lamports — account stays but empty)
                 }
+            }
+
+            // Tombstone deleted accounts by removing them from ReDB entirely,
+            // so they cannot reappear in a future hot_state reload from disk.
+            for key_bytes in &deleted_keys {
+                table.remove(key_bytes.as_slice())?;
             }
         }
 

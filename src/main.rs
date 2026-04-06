@@ -18,6 +18,8 @@ use axum::{
     response::IntoResponse,
     http::StatusCode,
 };
+use futures_util::{stream::StreamExt, SinkExt};
+use solana_sdk::account::ReadableAccount;
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::trace::TraceLayer;
 use serde::Deserialize;
@@ -157,6 +159,70 @@ const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
 // APPLICATION STATE
 // ============================================================================
 
+use tokio::sync::mpsc;
+
+#[derive(serde::Deserialize)]
+struct RpcRequest {
+    method: String,
+    params: Option<Vec<serde_json::Value>>,
+    id: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<u64>, // Subscription ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>, // "accountNotification"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<RpcParams>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcParams {
+    subscription: u64,
+    result: RpcAccountResult,
+}
+
+#[derive(serde::Serialize)]
+struct RpcAccountResult {
+    context: RpcContext,
+    value: RpcAccountValue,
+}
+
+#[derive(serde::Serialize)]
+struct RpcContext {
+    slot: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RpcAccountValue {
+    lamports: u64,
+    data: Vec<String>,
+    owner: String,
+    executable: bool,
+    #[serde(rename = "rentEpoch")]
+    rent_epoch: u64,
+}
+
+pub type WsSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
+pub struct WsSubscriptions {
+    pub clients: dashmap::DashMap<std::net::SocketAddr, WsSender>,
+    pub account_subs: dashmap::DashMap<String, dashmap::DashSet<std::net::SocketAddr>>,
+}
+
+impl WsSubscriptions {
+    pub fn new() -> Self {
+        Self {
+            clients: dashmap::DashMap::new(),
+            account_subs: dashmap::DashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     // Core blockchain (ReDB + DashMap cache)
@@ -179,6 +245,8 @@ pub struct AppState {
 
     // Security infrastructure
     pub throttler: Arc<NetworkThrottler>,
+    pub ws_subscriptions: Arc<WsSubscriptions>,
+    pub block_tx: tokio::sync::broadcast::Sender<FinalizedBlock>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub fee_market: Arc<LocalizedFeeMarket>,
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
@@ -1842,7 +1910,144 @@ async fn supply_audit_handler(State(state): State<AppState>) -> impl IntoRespons
 // ROUTER
 // ============================================================================
 
+// ============================================================================ 
+// EVENT BROADCASTER
+// ============================================================================ 
+
+pub fn spawn_account_notification_broadcaster(state: AppState) {
+    let mut rx = state.block_tx.subscribe();
+    let ws_state = state.clone();
+    
+    tokio::spawn(async move {
+        while let Ok(block) = rx.recv().await {
+            let mut modified_keys = std::collections::HashSet::new();
+            for otx in &block.transactions {
+                // Target recipient
+                match &otx.tx.data {
+                    crate::protocol::blockchain::TxData::TransferBb { to, .. } => {
+                        modified_keys.insert(crate::storage::ConcurrentBlockchain::addr_to_pubkey(to));
+                    }
+                    _ => {}
+                }
+            }
+
+            for pubkey in modified_keys {
+                // In Solana, pubkeys are tracked via base58 string.
+                let pubkey_b58 = solana_sdk::bs58::encode(pubkey).into_string(); 
+                if let Some(subs) = ws_state.ws_subscriptions.account_subs.get(&pubkey_b58) {
+                    if subs.is_empty() { continue; }
+                    
+                    if let Some(acct) = ws_state.blockchain.svm_accounts.get_account(&pubkey) {
+                        let res = RpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: None,
+                            result: None,
+                            method: Some("accountNotification".to_string()),
+                            params: Some(RpcParams {
+                                subscription: 1, // Dummy fixed ID
+                                result: RpcAccountResult {
+                                    context: RpcContext { slot: block.slot },
+                                    value: RpcAccountValue {
+                                        lamports: acct.lamports(),
+                                        data: vec!["".to_string(), "base64".to_string()],
+                                        owner: "11111111111111111111111111111111".to_string(),
+                                        executable: false,
+                                        rent_epoch: 0,
+                                    }
+                                }
+                            })
+                        };
+                        
+                        let msg_text = serde_json::to_string(&res).unwrap();
+                        for client_addr in subs.iter() {
+                            if let Some(tx) = ws_state.ws_subscriptions.clients.get(&*client_addr) {
+                                let _ = tx.send(axum::extract::ws::Message::Text(msg_text.clone().into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ============================================================================ 
+// ROUTER
+// ============================================================================ 
+
+async fn ws_handler(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
+}
+
+async fn handle_socket(socket: axum::extract::ws::WebSocket, who: std::net::SocketAddr, state: AppState) {
+    use futures_util::stream::StreamExt;
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    
+    state.ws_subscriptions.clients.insert(who, tx);
+    
+    let mut send_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            use futures_util::SinkExt;
+            if sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut recv_task = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = receiver.next().await {
+                if let axum::extract::ws::Message::Text(text) = msg {
+                    if let Ok(req) = serde_json::from_str::<RpcRequest>(&text) {
+                        if req.method == "accountSubscribe" {
+                            if let Some(params) = req.params {
+                                if let Some(pubkey_val) = params.get(0) {
+                                    if let Some(pubkey) = pubkey_val.as_str() {
+                                        state.ws_subscriptions.account_subs
+                                            .entry(pubkey.to_string())
+                                            .or_insert_with(dashmap::DashSet::new)
+                                            .insert(who);
+
+                                        let res = RpcResponse {
+                                            jsonrpc: "2.0".to_string(),
+                                            id: req.id,
+                                            result: Some(1), // Sub ID
+                                            method: None,
+                                            params: None,
+                                        };
+                                        if let Some(tx) = state.ws_subscriptions.clients.get(&who) {
+                                            let _ = tx.send(axum::extract::ws::Message::Text(serde_json::to_string(&res).unwrap().into()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
+
+    // Cleanup
+    state.ws_subscriptions.clients.remove(&who);
+    for mut entry in state.ws_subscriptions.account_subs.iter_mut() {
+        entry.value_mut().remove(&who);
+    }
+}
+
 fn build_router(state: AppState) -> Router {
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -1852,6 +2057,7 @@ fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         // Public
         .route("/health", get(health_handler))
+        .route("/ws", get(ws_handler))
         .route("/stats", get(stats_handler))
         .route("/supply/audit", get(supply_audit_handler))
         .route("/balance/:address", get(balance_handler))
@@ -1971,6 +2177,8 @@ async fn main() {
             .with_target(true)
             .with_level(true))
         .init();
+
+    let (block_tx, _) = tokio::sync::broadcast::channel(256);
 
     let mode_label = match config.mode {
         NodeMode::Writer => "WRITER (Block Producer)",
@@ -2235,6 +2443,7 @@ async fn main() {
             block_producer.clone(),
             blockchain.clone(),
             validator_id.clone(),
+            block_tx.clone(),
         );
 
         // Spawn gRPC relay server
@@ -2462,6 +2671,7 @@ async fn main() {
             blockchain.clone(),
             current_slot.clone(),
             validator_id.clone(),
+            block_tx.clone(),
         ));
         tokio::spawn(async move {
             reader_node.run().await;
@@ -2537,6 +2747,8 @@ async fn main() {
         node_mode: config.mode,
         validator_id: validator_id.clone(),
         throttler,
+        ws_subscriptions: Arc::new(WsSubscriptions::new()),
+        block_tx: block_tx.clone(),
         circuit_breaker,
         fee_market,
         account_metadata,
@@ -2700,6 +2912,9 @@ async fn main() {
     // All balances are stored in svm_accounts (u64 lamports).
     // The f64 DashMap cache is a read-behind mirror for backward compat.
     // On fresh start, ReDB→SVM seeding happens in ConcurrentBlockchain::new().
+
+    // 9. Start WS Broadcaster
+    spawn_account_notification_broadcaster(state.clone());
 
     // 10. HTTP Server
     let app = build_router(state.clone());

@@ -345,14 +345,13 @@ pub fn create_relay(
     block_producer: Arc<BlockProducer>,
     blockchain: ConcurrentBlockchain,
     validator_id: String,
+    block_tx: broadcast::Sender<FinalizedBlock>,
 ) -> (WriterRelayService, broadcast::Sender<FinalizedBlock>) {
-    // Buffer 256 blocks — readers that lag more than this must catchup
-    let (tx, _rx) = broadcast::channel::<FinalizedBlock>(256);
     let service = WriterRelayService::new(
-        tx.clone(),
+        block_tx.clone(),
         block_producer,
         blockchain,
         validator_id,
     );
-    (service, tx)
+    (service, block_tx)
 }

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 use serde::Serialize;
 use tracing::info;
 
-use super::core::{Transaction, TransactionType};
+use super::core::{Transaction, TransactionType, AccountValidator, AccountAccess, AccountType};
 
 // ============================================================================
 // SEALEVEL CONSTANTS
@@ -127,6 +127,8 @@ pub struct ParallelScheduler {
     /// SvmAccountsDB.system_transfer() instead of the legacy f64 balance map.
     /// DashMap hot_state is lock-free so parallel threads never contend here.
     svm_db: Option<Arc<crate::svm::SvmAccountsDB>>,
+
+    pub account_validator: Arc<AccountValidator>,
 }
 
 impl Default for ParallelScheduler {
@@ -152,6 +154,7 @@ impl ParallelScheduler {
             total_processed: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
             svm_db: None,
+            account_validator: Arc::new(AccountValidator::new(Arc::new(DashMap::new()))),
         }
     }
 
@@ -222,6 +225,7 @@ impl ParallelScheduler {
         let len = batch.len();
         let lm = self.lock_manager.clone();
         let svm_db_ref = self.svm_db.clone();
+        let validator = self.account_validator.clone();
 
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
@@ -234,7 +238,27 @@ impl ParallelScheduler {
                         std::thread::yield_now();
                     }
                 }
-                let result = {
+
+                // Account validation before mutation
+                let mut validation_err = None;
+                for account in tx.read_accounts.iter().chain(tx.write_accounts.iter()) {
+                    let access = AccountAccess {
+                        address: account.clone(),
+                        expected_type: AccountType::UserWallet,
+                        is_signer: false, // Defaulting: specific signer checks require deeper Tx parsing
+                        is_writable: tx.write_accounts.contains(account),
+                        pda_owner: None, // Stub
+                        pda_index: None, // Stub
+                    };
+                    if let Err(e) = validator.validate(&access) {
+                        validation_err = Some(e.to_string());
+                        break;
+                    }
+                }
+
+                let result = if let Some(err) = validation_err {
+                    TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(err) }
+                } else {
                     match (&tx.tx_type, &svm_db_ref) {
                         (TransactionType::Transfer, Some(db)) =>
                             Self::execute_single_svm(tx, db),
@@ -245,6 +269,7 @@ impl ParallelScheduler {
                         _ => Self::execute_single(tx, balances),
                     }
                 };
+
                 lm.release_locks(tx);
                 result
             }).collect()

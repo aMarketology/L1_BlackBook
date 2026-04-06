@@ -68,7 +68,6 @@ impl AccountType {
 
 /// PDA derivation — deterministic off-curve address from seeds
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
-#[allow(dead_code)] // Phase 5+: PDA accounts for program-owned state
 pub struct ProgramDerivedAddress {
     pub address: String,
     pub account_type: AccountType,
@@ -129,6 +128,8 @@ pub struct AccountAccess {
     pub expected_type: AccountType,
     pub is_signer: bool,
     pub is_writable: bool,
+    pub pda_owner: Option<String>,
+    pub pda_index: Option<String>,
 }
 
 /// Account validation error types
@@ -159,9 +160,50 @@ pub struct AccountValidator {
 }
 
 impl AccountValidator {
-    #[allow(dead_code)]
     pub fn new(accounts: Arc<DashMap<String, AccountMetadata>>) -> Self {
         Self { accounts }
+    }
+
+    pub fn validate(&self, access: &AccountAccess) -> Result<(), AccountValidationError> {
+        // Enforce strong assertions about PDA logic
+        if let Some(owner) = &access.pda_owner {
+            // Ensure this address actually derives from these seeds + program ID
+            let derived = ProgramDerivedAddress::derive(access.expected_type.clone(), owner, access.pda_index.as_deref());
+            match derived {
+                Ok(pda) => {
+                    if pda.address != access.address {
+                         return Err(AccountValidationError::PermissionDenied(
+                             format!("PDA seed derivation mismatch: expected {}, got {}", pda.address, access.address)
+                         ));
+                    }
+                },
+                Err(e) => {
+                    return Err(AccountValidationError::PermissionDenied(
+                        format!("Failed to derive PDA: {}", e)
+                    ));
+                }
+            }
+            // A PDA cannot be a traditional signer (since there is no private key), but it can "sign" 
+            // for itself organically if the deriving program executing it provided the valid seeds.
+        } else if access.is_signer {
+            // Traditional Ed25519 asymmetric signature needed for this slot/instruction
+            // Currently delayed: Signature verification is checked during the network intake boundary 
+            // and `Transaction::verify()` block. 
+        }
+
+        // Execution-Level Metadata checks
+        if let Some(meta) = self.accounts.get(&access.address) {
+            if meta.frozen {
+                return Err(AccountValidationError::Frozen(access.address.clone()));
+            }
+            
+            // Expected type enforcement (Token vs Swap vs Escrow)
+            if access.expected_type != AccountType::UserWallet && meta.account_type != access.expected_type {
+                 return Err(AccountValidationError::InvalidType { expected: access.expected_type.clone(), found: meta.account_type.clone() });
+            }
+        }
+        
+        Ok(())
     }
 }
 
