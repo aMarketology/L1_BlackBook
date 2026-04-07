@@ -94,7 +94,7 @@ pub async fn swap_bb_for_usdc_handler(
     }
 
     // ── REPLAY PROTECTION & TIMESTAMP ──
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if now.saturating_sub(req.timestamp) > 60 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Transaction too old" })));
     }
@@ -123,7 +123,11 @@ pub async fn swap_bb_for_usdc_handler(
     }
     
     // Check that pubkey matches address
-    let expected_addr = bs58::encode(hex::decode(&req.public_key).unwrap()).into_string();
+    let pubkey_decoded = match hex::decode(&req.public_key) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid public key hex" }))),
+    };
+    let expected_addr = bs58::encode(&pubkey_decoded).into_string();
     if expected_addr != req.wallet_address {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Public key does not match wallet address" })));
     }
@@ -199,7 +203,7 @@ pub async fn swap_usdc_for_bb_handler(
     }
 
     // ── REPLAY PROTECTION & TIMESTAMP ──
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if now.saturating_sub(req.timestamp) > 60 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Transaction too old" })));
     }
@@ -228,7 +232,11 @@ pub async fn swap_usdc_for_bb_handler(
     }
     
     // Check that pubkey matches address
-    let expected_addr = bs58::encode(hex::decode(&req.public_key).unwrap()).into_string();
+    let pubkey_decoded = match hex::decode(&req.public_key) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid public key hex" }))),
+    };
+    let expected_addr = bs58::encode(&pubkey_decoded).into_string();
     if expected_addr != req.wallet_address {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Public key does not match wallet address" })));
     }

@@ -230,13 +230,17 @@ impl TpuService {
                         continue;
                     }
 
-                    // ── 7. Replay protection ──────────────────────────────────
+                    // ── 7. Replay protection (atomic via entry API) ──────────
                     let nonce_key = format!("tpu:{}:{}", pkt.from, pkt.nonce);
-                    if nn.contains_key(&nonce_key) {
-                        warn!("⚠ TPU replay attack detected from {}", peer);
-                        continue;
+                    match nn.entry(nonce_key) {
+                        dashmap::mapref::entry::Entry::Occupied(_) => {
+                            warn!("⚠ TPU replay attack detected from {}", peer);
+                            continue;
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(v) => {
+                            v.insert(now_unix);
+                        }
                     }
-                    nn.insert(nonce_key, now_unix);
 
                     // ── 8. Balance check ──────────────────────────────────────
                     let balance = bc.get_balance(&pkt.from);

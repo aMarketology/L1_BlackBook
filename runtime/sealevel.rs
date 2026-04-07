@@ -229,14 +229,34 @@ impl ParallelScheduler {
 
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
-                let mut backoff = 1;
-                while !lm.try_acquire_locks(tx) {
+                // Bounded retry with exponential backoff — never spin indefinitely.
+                // Max attempts: ~20 (1+2+4+...+1024 spins, then up to 10 yields).
+                // Total worst-case wait: ~10 thread yields ≈ microseconds, not CPU starvation.
+                const MAX_YIELD_ATTEMPTS: u32 = 10;
+                let mut backoff = 1u32;
+                let mut yield_count = 0u32;
+                let acquired = loop {
+                    if lm.try_acquire_locks(tx) {
+                        break true;
+                    }
                     if backoff < 1024 {
                         for _ in 0..backoff { std::hint::spin_loop(); }
                         backoff *= 2;
                     } else {
                         std::thread::yield_now();
+                        yield_count += 1;
+                        if yield_count >= MAX_YIELD_ATTEMPTS {
+                            break false;
+                        }
                     }
+                };
+
+                if !acquired {
+                    return TransactionResult {
+                        tx_id: tx.id.clone(),
+                        success: false,
+                        error: Some("Lock contention timeout — transaction aborted".to_string()),
+                    };
                 }
 
                 // Account validation before mutation
@@ -270,7 +290,10 @@ impl ParallelScheduler {
                     }
                 };
 
-                lm.release_locks(tx);
+                // Only release locks if we actually acquired them
+                if acquired {
+                    lm.release_locks(tx);
+                }
                 result
             }).collect()
         });
@@ -325,7 +348,9 @@ impl ParallelScheduler {
         let addr_to_pk = |addr: &str| -> Pubkey {
             if let Ok(bytes) = bs58::decode(addr).into_vec() {
                 if bytes.len() == 32 {
-                    return Pubkey::new_from_array(bytes.try_into().unwrap());
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    return Pubkey::new_from_array(arr);
                 }
             }
             let stripped = addr.replace("0x", "").to_lowercase();
@@ -364,7 +389,9 @@ impl ParallelScheduler {
         let addr_to_pk = |addr: &str| -> Pubkey {
             if let Ok(bytes) = bs58::decode(addr).into_vec() {
                 if bytes.len() == 32 {
-                    return Pubkey::new_from_array(bytes.try_into().unwrap());
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    return Pubkey::new_from_array(arr);
                 }
             }
             let stripped = addr.replace("0x", "").to_lowercase();

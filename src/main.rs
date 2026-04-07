@@ -506,12 +506,6 @@ async fn signed_transfer_handler(
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("transfer:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
 
     // Check timestamp freshness (reject transactions older than 60 seconds)
     let now = std::time::SystemTime::now()
@@ -526,8 +520,18 @@ async fn signed_transfer_handler(
         })));
     }
 
-    // Record nonce BEFORE executing transfer (fail-safe)
-    state.used_nonces.insert(nonce_key, now);
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": req.nonce
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
+    }
 
     // Prune old nonces periodically
     if state.used_nonces.len() > 100_000 {
@@ -790,12 +794,6 @@ async fn gulf_stream_submit_handler(
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("sealevel:{}:{}", req.from, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        }));
-    }
 
     // Check timestamp freshness
     let now = std::time::SystemTime::now()
@@ -810,8 +808,18 @@ async fn gulf_stream_submit_handler(
         }));
     }
 
-    // Record nonce BEFORE queuing (fail-safe against replay)
-    state.used_nonces.insert(nonce_key, now);
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": req.nonce
+            }));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
+    }
 
     // ── BALANCE CHECK & SUBMIT ─────────────────────────────────────────────
     let balance = state.blockchain.get_balance(&req.from);
@@ -1086,12 +1094,6 @@ async fn faucet_handler(
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("faucet:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1105,8 +1107,18 @@ async fn faucet_handler(
         })));
     }
 
-    // Record nonce BEFORE minting (fail-safe against replay)
-    state.used_nonces.insert(nonce_key, now);
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": req.nonce
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
+    }
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
     match state.blockchain.credit(&req.wallet_address, amount) {
@@ -1556,8 +1568,6 @@ async fn usdc_transfer_handler(
     ) {
         Ok(result) => {
             let _ = state.blockchain.svm_accounts.flush_block();
-            let from_bal = result.from_balance as f64 / USDC_UNIT as f64;
-            
             // Add block history
             let tx_id = format!("usdc_{}", uuid::Uuid::new_v4());
             let proto_tx = protocol::Transaction {
@@ -1578,11 +1588,11 @@ async fn usdc_transfer_handler(
                 r_tx_type,
                 &req.from,
                 &req.to,
-                req.amount,
+                raw_amount,
                 0,
-                from_bal + req.amount,
-                from_bal,
-                result.to_balance as f64 / USDC_UNIT as f64,
+                result.from_balance.saturating_add(raw_amount),
+                result.from_balance,
+                result.to_balance,
                 crate::storage::AuthType::SystemInternal,
             );
             
@@ -1958,7 +1968,10 @@ pub fn spawn_account_notification_broadcaster(state: AppState) {
                             })
                         };
                         
-                        let msg_text = serde_json::to_string(&res).unwrap();
+                        let msg_text = match serde_json::to_string(&res) {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
                         for client_addr in subs.iter() {
                             if let Some(tx) = ws_state.ws_subscriptions.clients.get(&*client_addr) {
                                 let _ = tx.send(axum::extract::ws::Message::Text(msg_text.clone().into()));
@@ -2022,7 +2035,9 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, who: std::net::Sock
                                             params: None,
                                         };
                                         if let Some(tx) = state.ws_subscriptions.clients.get(&who) {
-                                            let _ = tx.send(axum::extract::ws::Message::Text(serde_json::to_string(&res).unwrap().into()));
+                                            if let Ok(text) = serde_json::to_string(&res) {
+                                                let _ = tx.send(axum::extract::ws::Message::Text(text.into()));
+                                            }
                                         }
                                     }
                                 }
@@ -2232,7 +2247,16 @@ async fn main() {
             runtime::core::AccountType::EscrowVault,
             "GLOBAL_ESCROW",
             None,
-        ).expect("Failed to derive escrow PDA");
+        ).unwrap_or_else(|e| {
+            error!("Failed to derive escrow PDA: {} — using fallback", e);
+            ProgramDerivedAddress {
+                address: "ESCROW_FALLBACK".to_string(),
+                account_type: runtime::core::AccountType::EscrowVault,
+                namespace: "escrow_vault".to_string(),
+                owner: "GLOBAL_ESCROW".to_string(),
+                bump: 0,
+            }
+        });
         let addr = pda.address.clone();
         info!("🔐 Escrow PDA: {}", addr);
         addr
@@ -2449,7 +2473,10 @@ async fn main() {
         // Spawn gRPC relay server
         let grpc_port = config.grpc_port;
         tokio::spawn(async move {
-            let addr = format!("0.0.0.0:{}", grpc_port).parse().unwrap();
+            let addr: std::net::SocketAddr = match format!("0.0.0.0:{}", grpc_port).parse() {
+                Ok(a) => a,
+                Err(e) => { error!("Invalid gRPC relay address: {}", e); return; }
+            };
             info!("📡 Writer relay gRPC server starting on {}", addr);
             if let Err(e) = tonic::transport::Server::builder()
                 .add_service(relay_service.into_server())
@@ -2478,7 +2505,10 @@ async fn main() {
                 dealer_address.clone(),
             );
             tokio::spawn(async move {
-                let addr = format!("0.0.0.0:{}", settlement_port).parse().unwrap();
+                let addr: std::net::SocketAddr = match format!("0.0.0.0:{}", settlement_port).parse() {
+                    Ok(a) => a,
+                    Err(e) => { error!("Invalid settlement gRPC address: {}", e); return; }
+                };
                 info!("🔗 Settlement gRPC server starting on {}", addr);
                 if let Err(e) = tonic::transport::Server::builder()
                     .add_service(settlement_svc.into_server())
@@ -2630,17 +2660,18 @@ async fn main() {
                                 runtime::core::TransactionType::SwapBbForUsdc => crate::storage::TxType::SwapBbForUsdc,
                                 _ => crate::storage::TxType::Transfer,
                             };
-                            let from_bal = sealevel_bc.get_balance(&tx.from);
+                            let amount_lamports = (tx.amount * 100_000.0).round() as u64;
+                            let from_bal = sealevel_bc.get_balance_lamports(&tx.from);
                             let tx_record = crate::storage::TransactionRecord::with_id(
                                 tx.id.clone(),
                                 r_tx_type,
                                 &tx.from,
                                 &tx.to,
-                                tx.amount,
+                                amount_lamports,
                                 tx.nonce,
-                                from_bal + tx.amount,
+                                from_bal.saturating_add(amount_lamports),
                                 from_bal,
-                                sealevel_bc.get_balance(&tx.to),
+                                sealevel_bc.get_balance_lamports(&tx.to),
                                 crate::storage::AuthType::Ed25519,
                             );
                             if let Err(e) = sealevel_bc.log_transaction(tx_record) {
@@ -2918,7 +2949,8 @@ async fn main() {
 
     // 10. HTTP Server
     let app = build_router(state.clone());
-    let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse()
+        .expect("Failed to parse HTTP listen address — check http_port config");
 
     info!("");
     info!("rocket Listening on http://{}", addr);
@@ -2957,7 +2989,8 @@ async fn main() {
     info!("🌐 gRPC: 0.0.0.0:{}", config.grpc_port);
     info!("");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .expect("Failed to bind HTTP listener — port may be in use");
 
     // 11. Solana JSON-RPC server on port 8899 (Phase 2A+2B)
     {
@@ -3019,7 +3052,8 @@ async fn main() {
 
     // 12. Start TPU Service (UDP ingestion — high-throughput binary pipeline)
     let tpu_port = 8003;
-    let tpu_addr: std::net::SocketAddr = format!("0.0.0.0:{}", tpu_port).parse().unwrap();
+    let tpu_addr: std::net::SocketAddr = format!("0.0.0.0:{}", tpu_port).parse()
+        .expect("Failed to parse TPU listen address");
     let tpu_service = TpuService::new(
         state.gulf_stream.clone(),
         state.pipeline.clone(),

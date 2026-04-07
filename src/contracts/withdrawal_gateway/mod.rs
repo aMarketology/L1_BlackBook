@@ -82,10 +82,16 @@ pub async fn withdraw_request_handler(
         })));
     }
     let nonce_key = format!("withdraw:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack"
-        })));
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack"
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
     }
 
     // ── Ed25519 signature verification ────────────────────────────────────
@@ -195,7 +201,10 @@ pub async fn withdraw_request_handler(
     };
 
     if let Err(e) = state.blockchain.store_withdrawal(&record) {
-        warn!("⚠️  Failed to persist withdrawal record: {}", e);
+        tracing::error!("Failed to persist withdrawal record to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist withdrawal record — transaction aborted"
+        })));
     }
     state.withdrawal_requests.insert(withdrawal_id.clone(), record);
 
@@ -311,10 +320,13 @@ pub async fn withdraw_release_handler(
     updated.released_at = Some(now);
     updated.solana_tx_hash = Some(req.solana_tx_hash.clone());
 
-    state.withdrawal_requests.insert(req.withdrawal_id.clone(), updated.clone());
     if let Err(e) = state.blockchain.store_withdrawal(&updated) {
-        warn!("⚠️  Failed to persist withdrawal release: {}", e);
+        tracing::error!("Failed to persist withdrawal release to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist withdrawal release — transaction aborted"
+        })));
     }
+    state.withdrawal_requests.insert(req.withdrawal_id.clone(), updated.clone());
 
     info!("✅ WITHDRAWAL RELEASED: {:.6} wUSDC → {} on Solana (tx: {}) (id: {})",
         record.wusdc_amount,

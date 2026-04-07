@@ -115,7 +115,7 @@ pub struct PipelinePacket {
 
 impl PipelinePacket {
     pub fn new(tx_id: String, from: String, to: String, amount: f64) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Self {
             tx_id,
             data: Vec::new(),
@@ -400,7 +400,7 @@ impl TransactionPipeline {
                 // Commit in batches for efficiency
                 if batch.len() >= COMMIT_BATCH_SIZE {
                     let slot = current_slot.load(Ordering::Relaxed);
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                     
                     for exec in batch.drain(..) {
                         let pipeline_time = now.saturating_sub(exec.packet.received_at) * 1000;
@@ -504,7 +504,7 @@ impl PoHService {
     /// Pipeline, FinalityTracker, and Tower BFT all see the same slot.
     pub fn with_slot(config: PoHConfig, current_slot: Arc<AtomicU64>) -> Self {
         let genesis_hash = Self::compute_genesis_hash();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         
         println!("⏰ PoH Service initialized with genesis hash: {}...", &genesis_hash[..16]);
         

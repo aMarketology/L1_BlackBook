@@ -342,7 +342,9 @@ impl TurbineShredder {
         if raw.len() < 4 {
             return Err("Reassembled payload too short to contain length prefix".to_string());
         }
-        let payload_len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        let len_bytes: [u8; 4] = raw[..4].try_into()
+            .map_err(|_| "Failed to read length prefix from reassembled payload".to_string())?;
+        let payload_len = u32::from_be_bytes(len_bytes) as usize;
         if raw.len() < 4 + payload_len {
             return Err(format!(
                 "Truncated payload: expected {} bytes, got {}",
@@ -1061,7 +1063,7 @@ impl BlockProducer {
         // Compute block hash
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         
         let block_hash = FinalizedBlock::compute_hash(

@@ -290,7 +290,8 @@ impl SettlementService for BlackBookSettlementService {
                 _ => return Err(Status::internal("Invalid L2_SEQUENCER_PUBKEY on server")),
             };
             let verifying_key = VerifyingKey::from_bytes(
-                seq_pubkey_bytes.as_slice().try_into().unwrap()
+                seq_pubkey_bytes.as_slice().try_into()
+                    .map_err(|_| Status::internal("L2_SEQUENCER_PUBKEY must be 32 bytes"))?
             ).map_err(|e| Status::internal(format!("Bad sequencer key: {}", e)))?;
 
             let mut msg: Vec<u8> = Vec::with_capacity(req.contest_id.len() + 8 + 32);

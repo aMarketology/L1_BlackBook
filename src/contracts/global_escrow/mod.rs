@@ -108,12 +108,6 @@ pub async fn escrow_deposit_handler(
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("escrow_deposit:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -127,8 +121,18 @@ pub async fn escrow_deposit_handler(
         })));
     }
 
-    // Record nonce BEFORE executing (fail-safe against replay)
-    state.used_nonces.insert(nonce_key, now);
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": req.nonce
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
+    }
 
     // ── BALANCE CHECK ──────────────────────────────────────────────────────
     let balance = state.blockchain.get_balance(&req.wallet_address);
@@ -185,7 +189,10 @@ pub async fn escrow_deposit_handler(
         approved_at: Some(now),
     };
     if let Err(e) = state.blockchain.store_deposit_request(&deposit_record) {
-        info!("⚠️ Failed to persist escrow deposit record: {}", e);
+        tracing::error!("Failed to persist escrow deposit record to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist deposit record — transaction aborted"
+        })));
     }
     state.deposit_requests.insert(tx_hash.clone(), deposit_record);
 
@@ -287,7 +294,11 @@ pub async fn escrow_submit_state_root_handler(
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
 
-    let verifying_key = match VerifyingKey::from_bytes(seq_pubkey_bytes.as_slice().try_into().unwrap()) {
+    let pubkey_arr: [u8; 32] = match seq_pubkey_bytes.as_slice().try_into() {
+        Ok(arr) => arr,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid L2 sequencer public key length" }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&pubkey_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid L2 sequencer public key" }))),
     };
@@ -308,6 +319,18 @@ pub async fn escrow_submit_state_root_handler(
     // The L2 must use a monotonically incrementing counter on its end.
     let current_slot = state.current_slot.load(Ordering::Relaxed);
 
+    // ── MONOTONICITY CHECK ─────────────────────────────────────────────────
+    // Prevent replay of older state roots by ensuring strictly increasing l2_block_number
+    if let Ok(Some(existing_state)) = state.blockchain.load_contest_state(&req.market_id) {
+        if req.l2_block_number <= existing_state.last_l2_block {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "L2 block number must be strictly greater than previous submission",
+                "provided_block": req.l2_block_number,
+                "last_seen_block": existing_state.last_l2_block,
+            })));
+        }
+    }
+
     // ── STORE MARKET ROOT (32 bytes only — L1 is a vault, not a filing cabinet) ──
     let root_bytes: [u8; 32] = match hex::decode(&req.merkle_root) {
         Ok(b) if b.len() == 32 => {
@@ -319,10 +342,6 @@ pub async fn escrow_submit_state_root_handler(
             "error": "merkle_root must decode to exactly 32 bytes"
         }))),
     };
-
-    // Persist to DashMap (hot) + ReDB (durable) — raw 32 bytes, no JSON
-    state.market_roots.insert(req.market_id.clone(), root_bytes);
-    let _ = state.blockchain.store_escrow_market_root(&req.market_id, &root_bytes);
 
     // Create/update ContestState (Open → Settled)
     // claim_deadline_slot: current_slot + 6_480_000 (≈30 days at 400ms/slot)
@@ -344,8 +363,24 @@ pub async fn escrow_submit_state_root_handler(
             .unwrap_or_default()
             .as_secs(),
     };
+
+    // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────────
+    if let Err(e) = state.blockchain.store_escrow_market_root(&req.market_id, &root_bytes) {
+        tracing::error!("Failed to persist market root to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist market root — transaction aborted"
+        })));
+    }
+    if let Err(e) = state.blockchain.store_contest_state(&contest) {
+        tracing::error!("Failed to persist contest state to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist contest state — transaction aborted"
+        })));
+    }
+
+    // ── UPDATE CACHE (HOT) ONLY AFTER SUCCESSFUL DURABLE WRITE ──────────
+    state.market_roots.insert(req.market_id.clone(), root_bytes);
     state.contest_states.insert(req.market_id.clone(), contest.clone());
-    let _ = state.blockchain.store_contest_state(&contest);
 
     info!("📋 STATE ROOT: market={} root={}… slot={} deadline_slot={}",
         req.market_id, &req.merkle_root[..16], current_slot, current_slot + CLAIM_WINDOW_SLOTS);
@@ -454,12 +489,6 @@ pub async fn escrow_withdraw_handler(
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
     let nonce_key = format!("escrow_withdraw:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack",
-            "nonce": req.nonce
-        })));
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -470,6 +499,18 @@ pub async fn escrow_withdraw_handler(
             "server_time": now,
             "request_time": req.timestamp
         })));
+    }
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack",
+                "nonce": req.nonce
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
     }
 
     // ── DOUBLE-WITHDRAWAL CHECK ────────────────────────────────────────────
@@ -582,17 +623,28 @@ pub async fn escrow_withdraw_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("User credit failed: {}", e) })));
     }
 
-    // Mark as claimed (DashMap + ReDB)
+    // Mark as claimed (ReDB FIRST + DashMap)
+    if let Err(e) = state.blockchain.store_escrow_claim(&claim_key, now) {
+        tracing::error!("Failed to persist escrow claim to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist claim — transaction aborted"
+        })));
+    }
     state.withdrawal_claims.insert(claim_key.clone(), true);
-    let _ = state.blockchain.store_escrow_claim(&claim_key, now);
 
     // Update total_claimed on ContestState
     let amount_spl_claimed = (req.amount * 1_000_000.0).round() as u64;
-    if let Some(mut contest_entry) = state.contest_states.get_mut(&req.market_id) {
-        contest_entry.total_claimed = contest_entry.total_claimed.saturating_add(amount_spl_claimed);
-        let contest_snapshot = contest_entry.clone();
+    if let Some(contest_entry) = state.contest_states.get(&req.market_id) {
+        let mut contest_snapshot = contest_entry.clone();
+        contest_snapshot.total_claimed = contest_snapshot.total_claimed.saturating_add(amount_spl_claimed);
         drop(contest_entry); // release DashMap lock before blocking I/O
-        let _ = state.blockchain.store_contest_state(&contest_snapshot);
+
+        if let Err(e) = state.blockchain.store_contest_state(&contest_snapshot) {
+            tracing::error!("Failed to persist updated contest state to ReDB: {}", e);
+        } else {
+            // Only update cache if DB write succeeds
+            state.contest_states.insert(req.market_id.clone(), contest_snapshot);
+        }
     }
 
     let new_balance = state.blockchain.get_balance(&req.wallet_address);
@@ -688,8 +740,11 @@ pub async fn escrow_contest_handler(
                 && current_slot > c.claim_deadline_slot
             {
                 c.status = crate::storage::ContestStatus::Expired;
-                state.contest_states.insert(c.contest_id.clone(), c.clone());
-                let _ = state.blockchain.store_contest_state(&c);
+                if let Err(e) = state.blockchain.store_contest_state(&c) {
+                    tracing::error!("Failed to persist expired contest state to ReDB: {}", e);
+                } else {
+                    state.contest_states.insert(c.contest_id.clone(), c.clone());
+                }
             }
             let status_str = match c.status {
                 crate::storage::ContestStatus::Open    => "OPEN",

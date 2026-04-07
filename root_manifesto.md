@@ -79,7 +79,7 @@ The L1 hosts six core contracts that serve as the financial spine of the entire 
 | **Global Escrow** | PDA vault holding ALL BB tokens for all open markets. Verifies deposits, stores Merkle roots, enables winner payouts. |
 | **Deposit Gateway** | USDT → $BB at 1:10 ratio. Custody wallet monitoring on Solana + BSC. Watcher threads poll real balances. |
 | **Withdrawal Gateway** | BB → USDT redemption. Dealer address derived from key. Double-spend protection via withdrawal claims set. |
-| **Token Swap** | wUSDC ↔ BB atomic swaps at 10:1 ratio, executed through Sealevel. |
+| **Token Swap** | wUSDT ↔ BB atomic swaps at 10:1 ratio, executed through Sealevel. |
 | **Layer2 Market** | BB market resolution. Per-market Merkle trees. Contest state tracking (Open → Settled → Expired). |
 | **Creator Coin** | Launchpad for user-created tokens. Constant-product AMM pools. Per-ticker registry + balances. |
 
@@ -100,9 +100,9 @@ ZERO-SUM:         total_payout + house_rake == total_deposited
 #### Safety Controls
 
 - Network throttler & circuit breaker: 20% supply cap per single transfer.
-- Nonce deduplication for replay attack prevention.
+- Atomic nonce deduplication via DashMap `entry()` API for replay attack prevention.
 - No hardcoded test accounts — all accounts created at runtime via wallet creation.
-- Faucet removed; users bridge capital via Deposit Gateway only.
+- Faucet available for testnet onboarding (rate-limited, 0.1 BB per request).
 
 ---
 
@@ -120,7 +120,9 @@ The L2 is a rollup execution environment purpose-built for prediction markets �
 
 3. **Bulletproof Global Escrows.** The L1's `global_escrow` contract is a mathematically secure mechanism to lock stablecoins (collateral) on L1 while the liquidity is actively traded on L2. The L2 never holds BB directly — it only references L1's escrow.
 
-4. **Settlement Bridge (L1 ↔ L2):**
+4. **Dealer SDK.** The `sdk/dealer.sdk.ts` provides the L2 operator with a complete TypeScript interface to manage the full prediction market lifecycle: bankroll management, escrow deposits, Merkle tree construction, state root submission, batch winner settlement, and deposit/withdrawal gateway operations.
+
+5. **Settlement Bridge (L1 ↔ L2):**
 
 ```
 User Deposit (Solana/BSC tx)
@@ -244,7 +246,7 @@ The L3 is a specialized app-chain / app-ecosystem where creators mint NFTs that 
 - ✅ PoH clock (continuous, stable 400ms slots)
 - ✅ Tower BFT voting & finality (32-confirmation rooting)
 - ✅ Gulf Stream (mempool-less transaction forwarding)
-- ✅ Sealevel parallel execution (conflict detection, lock manager)
+- ✅ Sealevel parallel execution (conflict detection, lock manager, bounded retry)
 - ✅ Transaction pipeline (4-stage async processing)
 - ✅ Merkle tree building & proof generation
 - ✅ Deposit gateway (custody watcher on Solana + BSC)
@@ -252,7 +254,12 @@ The L3 is a specialized app-chain / app-ecosystem where creators mint NFTs that 
 - ✅ ReDB persistence (ACID transactions)
 - ✅ Turbine shredding (block propagation with FEC)
 - ✅ Network throttler & circuit breaker
-- ✅ Nonce deduplication (replay protection)
+- ✅ Atomic nonce deduplication (DashMap `entry()` API — replay protection)
+- ✅ Ed25519 signature enforcement on all signed endpoints
+- ✅ Graceful error handling (zero `.unwrap()` on user input paths)
+- ✅ Sealevel deadlock prevention (bounded spin-loop with backoff)
+- ✅ Dealer SDK (`sdk/dealer.sdk.ts` — full L2 operator lifecycle)
+- ✅ Faucet endpoint (rate-limited testnet onboarding)
 
 ### Yellow — Planned / Partially Wired
 

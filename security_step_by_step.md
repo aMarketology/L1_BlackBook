@@ -1,10 +1,134 @@
 # Production Security & Infrastructure — Step-by-Step
 
-Three subjects are covered here in full detail:
+> **The complete roadmap from current state to globally deployed, multi-node BlackBook L1.**
+>
+> This document is the authoritative checklist for production readiness. Every item
+> maps directly to the architecture described in `root_manifesto.md` and the phased
+> plan in `root_next_steps.md`. Items are ordered by blast radius — if the L1 goes
+> down or loses funds, the L2 prediction markets and L3 creator shield instantly fail.
 
-1. **HashiCorp Vault** — keep `.env` secrets off every server, readable only by you
-2. **gRPC Port Lockdown** — restrict ports 50051/50052 so only your L2 game servers (Rollup 2 and Rollup 3) can reach them
-3. **Multi-Node Global Network** — how to run multiple BlackBook L1 nodes around the world
+---
+
+## Production Readiness — Master Checklist
+
+### Phase 1: Security & Core Stability (Must Do First)
+
+If these fail, the core L1 crashes or loses funds.
+
+- [x] **Fix Panics** — Audit all RPC/REST layers and signature decoders. Replace `.unwrap()`,
+  `.expect()`, and unchecked `try_into()` with proper graceful error handling so a single
+  malformed payload never crashes the node or disrupts the PoH clock.
+  - [x] `src/contracts/token_swap/mod.rs` — `hex::decode().unwrap()`, `SystemTime::now().unwrap()`
+  - [x] `src/main.rs` — WebSocket `serde_json::to_string().unwrap()`, `SocketAddr::parse().unwrap()`, `TcpListener::bind().unwrap()`, PDA derivation `.expect()`
+  - [x] `src/poh_blockchain.rs` — `try_into().unwrap()` on reassembled payload length, `SystemTime`
+  - [x] `src/settlement/mod.rs` — `try_into().unwrap()` on sequencer pubkey slice
+  - [x] `src/contracts/global_escrow/mod.rs` — `try_into().unwrap()` on sequencer pubkey
+  - [x] `runtime/sealevel.rs` — `try_into().unwrap()` in swap `addr_to_pk` closures
+  - [x] `runtime/poh_service.rs` — `SystemTime::now().unwrap()` (3 sites)
+  - [x] `runtime/core.rs` — `SystemTime::now().unwrap()` in `Transaction::new()`
+
+- [x] **Atomic Replay Protection** — Refactor all nonce checks from `contains_key()` + `insert()`
+  (TOCTOU race) to DashMap's `entry()` API for single-operation atomic check+insert.
+  - [x] `src/main.rs` — `/transfer/simple`, `/sealevel/submit`, `/faucet`
+  - [x] `runtime/tpu.rs` — UDP TPU replay check
+  - [x] `src/contracts/deposit_gateway/mod.rs`
+  - [x] `src/contracts/withdrawal_gateway/mod.rs` (was also missing the insert entirely — fixed)
+  - [x] `src/contracts/global_escrow/mod.rs` — escrow deposit + escrow withdraw
+  - [x] `src/contracts/token_swap/mod.rs` — already used `entry()` (verified)
+
+- [x] **Sealevel Deadlock Prevention** — Replace the infinite `while !try_acquire_locks` spin-loop
+  with bounded retries (exponential backoff up to 1024 spins, then max 10 `thread::yield_now()`
+  calls). Transactions that exceed the bound are cleanly aborted with an error, preventing
+  CPU starvation under hot-spot lock contention. Locks are only released when actually acquired.
+
+- [x] **Token Swap Ed25519 Enforcement** — Both `/swap/bb-to-usdc` and `/swap/usdc-to-bb`
+  already had `verify_swap_signature()` with proper Ed25519 verification. Fixed the remaining
+  panics in the pubkey-to-address mapping (`hex::decode().unwrap()` → graceful error return).
+
+- [ ] **Vault Integration** — Remove plaintext `.env` files from servers. Set up HashiCorp Vault
+  (AppRole + Vault Agent) to securely inject secrets (`DEALER_PRIVATE_KEY`, `SERVER_MASTER_KEY`)
+  into the node at runtime. *(See Part 1 below for full instructions.)*
+
+---
+
+### Phase 2: Financial Integrity
+
+- [x] **Float Removal** — Eradicate `f64` floating-point math across all ledgers/escrows and
+  replace with `u64`/`u128` lamports for absolute precision. The SVM AccountsDB already uses
+  `u64` lamports internally — the remaining `f64` surface is in the REST API boundary, the
+  `credit()`/`debit()` function signatures, and the `DashMap<String, f64>` cache.
+
+- [x] **Persistence Guarantee** — Reverse the storage order in gateways: write and flush data
+  to ReDB fully *before* updating the DashMap hot caches. Currently `credit()`/`debit()` write
+  to SVM first (which is correct), but the `mirror_balance_to_cache()` call should only happen
+  after the ReDB transaction log flush confirms success.
+
+- [ ] **Circuit Breakers & Rate Limits** — Add global and per-wallet rate-limiting on all
+  HTTP/RPC endpoints. Deploy localized circuit breakers per smart contract so an L3 bug can be
+  quarantined without halting L2 prediction markets.
+
+---
+
+### Phase 3: High-Throughput Networking (Path to 100k TPS)
+
+- [ ] **UDP TPU** — Build a dedicated `tokio::net::UdpSocket` for pure binary transaction
+  ingestion, bypassing HTTP/TCP overhead. *(Already scaffolded in `runtime/tpu.rs`.)*
+
+- [ ] **Binary Serialization** — Switch from `serde_json` to `bincode` for transaction payloads
+  on the TPU path. Shrinks ~150-byte JSON to ~70-byte binary, halving bandwidth and CPU cost.
+
+- [ ] **Stake-Weighted QoS** — Implement a packet filter at the UDP ingestion layer that checks
+  sender IP or attached signature against a known list of trusted RPC nodes or staked validators.
+  Drops spam traffic before deserialization.
+
+- [ ] **Dedicated RPC "Meatshield" Nodes** — Separate client-facing HTTP from the block-producing
+  validator. RPC nodes accept wallet JSON, convert to bincode, and blast to the validator's UDP TPU.
+
+---
+
+### Phase 4: Multi-Node Global Network
+
+Currently only a single standalone instance runs. To cross into a distributed consensus network:
+
+- [ ] **Wire the gRPC Relay** — Connect the `relay/` skeleton so the Writer node broadcasts
+  `Turbine` shred packets and `FinalizedBlock` structures to Reader nodes via port 50051.
+  *(See Part 2 & Part 3 below for full instructions.)*
+
+- [ ] **Firewall Lockdown** — Bind gRPC ports to `127.0.0.1` in `docker-compose.prod.yml`.
+  Use `ufw` to whitelist only known L2 sequencer IPs and Reader node IPs.
+
+- [ ] **Reader Node Deployment** — Provision global servers (US, Asia, EU backup), configure
+  with `NODE_MODE=reader`, connect to Writer's 50051, and put behind GeoDNS load balancer.
+
+---
+
+### Phase 5: L2 / L3 Settlement & Integration
+
+- [ ] **L2 Sequencer Allowlist** — Implement contract registration to authorize trusted L2
+  sequencer public keys. Currently `L2_SEQUENCER_PUBKEY` is a single env var.
+
+- [x] **L2 State Root Monotonicity** — Enforce that incoming `l2_block_number` is strictly
+  greater than the last processed block number, preventing sequencer manipulation.
+
+- [ ] **Implement `settle_market_and_generate_root()`** — Replace the `[0u8; 32]` placeholder
+  in `layer2_market` with real Merkle root computation from verified L2 sequencer payloads.
+
+- [ ] **L3 Anchoring Interface** — Build the endpoint for L3 to submit copyright Merkle roots
+  to L1 for immutable provenance anchoring.
+
+- [ ] **End-to-End Load Test** — Run a continuous load generator: 10,000 deposits + L2 bet
+  generations + Merkle root submissions + user withdrawals, tracking memory limits and TPS.
+
+---
+
+*Follow the order precisely: Security → Integrity → Scale → Speed → Ecosystem.*
+
+---
+
+## Detailed Infrastructure Guides
+
+The following three sections provide step-by-step implementation guides for the
+infrastructure items referenced in the checklist above.
 
 ---
 

@@ -99,11 +99,6 @@ pub async fn deposit_request_handler(
 
     // ── REPLAY PROTECTION (nonce) ─────────────────────────────────────────
     let nonce_key = format!("deposit_request:{}:{}", req.wallet_address, req.nonce);
-    if state.used_nonces.contains_key(&nonce_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used — possible replay attack"
-        })));
-    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -112,6 +107,17 @@ pub async fn deposit_request_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Request too old (>60s)"
         })));
+    }
+    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack"
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
     }
 
     // ── ALREADY PROCESSED OR PENDING? ─────────────────────────────────────
@@ -381,8 +387,14 @@ pub async fn deposit_approve_handler(
     let mut updated = record.clone();
     updated.status = "approved".to_string();
     updated.approved_at = Some(now);
+
+    if let Err(e) = state.blockchain.store_deposit_request(&updated) {
+        tracing::error!("Failed to persist deposit approval to ReDB: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Failed to persist deposit approval — transaction aborted"
+        })));
+    }
     state.deposit_requests.insert(req.external_tx_hash.clone(), updated.clone());
-    let _ = state.blockchain.store_deposit_request(&updated);
 
     // ── RECORD IN POH BLOCK ───────────────────────────────────────────────
     {

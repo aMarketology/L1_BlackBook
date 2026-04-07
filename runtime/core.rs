@@ -248,7 +248,7 @@ pub struct Transaction {
 impl Transaction {
     pub fn new(from: String, to: String, amount: f64, tx_type: TransactionType) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let read_accounts = vec![from.clone()];
         let write_accounts = vec![from.clone(), to.clone()];
 

@@ -193,7 +193,7 @@ pub struct TransactionRecord {
     pub tx_type: String,  // "transfer", "mint", "burn", "bridge_out", "bridge_in"
     pub from_address: String,
     pub to_address: String,
-    pub amount: f64,
+    pub amount: u64,
     pub timestamp: u64,  // Unix timestamp (seconds)
     pub status: String,  // "completed", "failed", "pending", "finalized"
     
@@ -223,7 +223,7 @@ pub struct TransactionRecord {
     pub auth_type: String,
     /// Gas/computational fee (0 for users, tracked for health)
     #[serde(default)]
-    pub gas_fee: f64,
+    pub gas_fee: u64,
     
     // === STATE VALIDATION (The Health Check) ===
     /// Transaction nonce - prevents replay attacks
@@ -231,13 +231,13 @@ pub struct TransactionRecord {
     pub nonce: u64,
     /// Sender's balance before transaction
     #[serde(default)]
-    pub balance_before: f64,
+    pub balance_before: u64,
     /// Sender's balance after transaction
     #[serde(default)]
-    pub balance_after: f64,
+    pub balance_after: u64,
     /// Recipient's balance after transaction
     #[serde(default)]
-    pub recipient_balance_after: f64,
+    pub recipient_balance_after: u64,
     /// Validator's Ed25519 signature (hex)
     #[serde(default)]
     pub validator_sig: Option<String>,
@@ -262,11 +262,11 @@ impl TransactionRecord {
         tx_type: TxType,
         from: &str,
         to: &str,
-        amount: f64,
+        amount: u64,
         nonce: u64,
-        balance_before: f64,
-        balance_after: f64,
-        recipient_balance_after: f64,
+        balance_before: u64,
+        balance_after: u64,
+        recipient_balance_after: u64,
         auth_type: AuthType,
     ) -> Self {
         let timestamp = chrono::Utc::now().timestamp() as u64;
@@ -297,7 +297,7 @@ impl TransactionRecord {
             zk_proof_ref: None,
             session_id: None,
             auth_type: auth_type.to_string(),
-            gas_fee: 0.0,
+            gas_fee: 0,
             
             nonce,
             balance_before,
@@ -318,11 +318,11 @@ impl TransactionRecord {
         tx_type: TxType,
         from: &str,
         to: &str,
-        amount: f64,
+        amount: u64,
         nonce: u64,
-        balance_before: f64,
-        balance_after: f64,
-        recipient_balance_after: f64,
+        balance_before: u64,
+        balance_after: u64,
+        recipient_balance_after: u64,
         auth_type: AuthType,
     ) -> Self {
         let timestamp = chrono::Utc::now().timestamp() as u64;
@@ -352,7 +352,7 @@ impl TransactionRecord {
             zk_proof_ref: None,
             session_id: None,
             auth_type: auth_type.to_string().to_lowercase(),
-            gas_fee: 0.0,
+            gas_fee: 0,
             nonce,
             balance_before,
             balance_after,
@@ -367,8 +367,8 @@ impl TransactionRecord {
     
     /// Check if balance reconciles: BEFORE - AMOUNT - GAS == AFTER
     pub fn is_reconciled(&self) -> bool {
-        let expected = self.balance_before - self.amount - self.gas_fee;
-        (expected - self.balance_after).abs() < 0.0001
+        let expected = self.balance_before.saturating_sub(self.amount).saturating_sub(self.gas_fee);
+        expected == self.balance_after
     }
     
     /// Get abbreviated tx_hash (first 8 + last 4 chars)
@@ -739,7 +739,6 @@ impl ConcurrentBlockchain {
         // Update total supply tracker
         self.total_supply.fetch_add(add_lamports, Ordering::Relaxed);
         
-        let new_balance_bb = new_lamports as f64 / LAMPORTS_PER_BB as f64;
         let is_new_wallet = current_lamports == 0;
         
         if is_new_wallet {
@@ -752,11 +751,11 @@ impl ConcurrentBlockchain {
             TxType::Mint,
             "USDC_TREASURY",
             address,
-            amount,
+            add_lamports,
             0, // nonce
-            0.0, // balance_before (treasury has unlimited)
-            0.0, // balance_after (treasury unchanged)
-            new_balance_bb, // recipient_balance_after
+            0, // balance_before (treasury has unlimited)
+            0, // balance_after (treasury unchanged)
+            new_lamports, // recipient_balance_after
             AuthType::SystemInternal,
         );
         
@@ -792,7 +791,7 @@ impl ConcurrentBlockchain {
             }
         }
         
-        info!(address = %address, amount = amount, new_balance = new_balance_bb, "✅ Tokens ADDED to wallet");
+        info!(address = %address, amount = amount, new_balance = new_lamports as f64 / LAMPORTS_PER_BB as f64, "✅ Tokens ADDED to wallet");
         Ok(())
     }
 
@@ -838,18 +837,16 @@ impl ConcurrentBlockchain {
         self.total_supply.fetch_sub(sub_lamports, Ordering::Relaxed);
         
         let new_balance_bb = new_lamports as f64 / LAMPORTS_PER_BB as f64;
-        let balance_before_bb = current_lamports as f64 / LAMPORTS_PER_BB as f64;
-        
         // Log burn transaction to ledger with enhanced fields
         let tx_record = TransactionRecord::new(
             TxType::Burn,
             address,
             "DESTROYED",
-            amount,
+            sub_lamports,
             0, // nonce
-            balance_before_bb,
-            new_balance_bb,
-            0.0, // recipient_balance_after (destroyed)
+            current_lamports,
+            new_lamports,
+            0, // recipient_balance_after (destroyed)
             AuthType::SystemInternal,
         );
         
@@ -1042,24 +1039,21 @@ impl ConcurrentBlockchain {
         self.mirror_balance_to_cache(to, to_new_lamports);
         
         // Compute f64 values for logging only
-        let from_balance_before = from_current as f64 / LAMPORTS_PER_BB as f64;
-        let from_balance = from_new_lamports as f64 / LAMPORTS_PER_BB as f64;
-        let to_balance = to_new_lamports as f64 / LAMPORTS_PER_BB as f64;
         
         // Log transaction to ledger with enhanced fields
         let tx_record = TransactionRecord::new(
             TxType::Transfer,
             from,
             to,
-            amount,
+            lamports,
             {
                 let mut entry = self.account_nonces.entry(from.to_string()).or_insert(0);
                 *entry.value_mut() += 1;
                 *entry.value()
             },
-            from_balance_before,
-            from_balance,
-            to_balance,
+            from_current,
+            from_new_lamports,
+            to_new_lamports,
             auth_type,
         );
         
@@ -1229,13 +1223,15 @@ impl ConcurrentBlockchain {
 
     /// Mark an external tx hash as processed and persist to ReDB.
     pub fn mark_bridge_tx_processed(&self, tx_hash: &str, mint_tx_id: &str) -> Result<(), String> {
-        self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write_txn.open_table(PROCESSED_BRIDGE_TXS).map_err(|e| e.to_string())?;
             table.insert(tx_hash, mint_tx_id).map_err(|e| e.to_string())?;
         }
-        write_txn.commit().map_err(|e| e.to_string())
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
+        Ok(())
     }
 
     /// Persist a withdrawal record (insert or overwrite).
