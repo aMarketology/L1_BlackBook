@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // BNB CHAIN (BSC) CUSTODY WATCHER
 // ============================================================================
 //
@@ -588,25 +588,11 @@ impl BscWatcher {
     /// direct HTTP verification path.
     async fn mint_and_record(&self, tx_hash: &str, record: &crate::storage::DepositRecord) -> Result<f64, String> {
         // Mint BB
+        // BB is the sole asset minted on deposit. wUSDT stays in the dealer
+        // reserve pool; users acquire it only by explicitly swapping BB.
         self.blockchain
             .credit(&record.wallet_address, record.bb_to_mint)
             .map_err(|e| format!("BB mint failed: {}", e))?;
-
-        // Mint wUSDC
-        {
-            use crate::svm::{usdc_mint_bytes, SplTokenEngine, USDC_UNIT};
-            use solana_sdk::pubkey::Pubkey;
-            use std::str::FromStr;
-            if let Ok(wallet_pubkey) = Pubkey::from_str(&record.wallet_address) {
-                let mint = usdc_mint_bytes();
-                let raw_units = (record.amount_stablecoin * USDC_UNIT as f64) as u64;
-                match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_units) {
-                    Ok(_) => info!("💵 BSC wUSDC minted: {:.4} → {}", record.amount_stablecoin,
-                        &record.wallet_address[..8.min(record.wallet_address.len())]),
-                    Err(e) => info!("⚠️  BSC wUSDC mint skipped: {:?}", e),
-                }
-            }
-        }
 
         // Double-mint guard
         let mint_tx_id = Uuid::new_v4().to_string();

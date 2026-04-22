@@ -1,4 +1,4 @@
-use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
+﻿use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
 use serde::Deserialize;
 use tracing::{info, warn};
 use ed25519_dalek::{Verifier, VerifyingKey, Signature};
@@ -12,10 +12,10 @@ use std::str::FromStr;
 // WITHDRAWAL GATEWAY SMART CONTRACT (Native Module)
 // ============================================================================
 //
-// Handles the wUSDC → real USDC cashout lifecycle:
+// Handles the wUSDT → real USDC cashout lifecycle:
 //
 //   1. User calls POST /withdraw/request (Ed25519 signed)
-//      → wUSDC burned from user's SVM account (transferred to dealer)
+//      → wUSDT burned from user's SVM account (transferred to dealer)
 //      → WithdrawalRecord{status:"pending"} created in ReDB + DashMap
 //      → Returns a withdrawal_id (UUID)
 //
@@ -37,8 +37,8 @@ pub struct WithdrawRequestBody {
     pub wallet_address: String,
     /// Solana wallet address (base58) where the dealer should send real USDC
     pub solana_destination: String,
-    /// Amount of wUSDC to withdraw (must equal real USDC owed: 1 wUSDC = 1 real USDC)
-    pub wusdc_amount: f64,
+    /// Amount of wUSDT to withdraw (must equal real USDC owed: 1 wUSDT = 1 real USDC)
+    pub wusdt_amount: f64,
     /// Ed25519 public key (hex, 32 bytes) — must match wallet_address
     pub public_key: String,
     /// Ed25519 signature (hex, 64 bytes) over message below
@@ -49,9 +49,9 @@ pub struct WithdrawRequestBody {
     pub nonce: String,
 }
 
-/// POST /withdraw/request — Burn user's wUSDC and create a withdrawal record.
+/// POST /withdraw/request — Burn user's wUSDT and create a withdrawal record.
 ///
-/// The user burns their wUSDC on L1 by transferring it to the dealer.
+/// The user burns their wUSDT on L1 by transferring it to the dealer.
 /// The dealer is then obligated to send real USDC on Solana.
 /// Message signed: "WITHDRAW_REQUEST:{wallet}:{solana_dest}:{amount}:{ts}:{nonce}"
 pub async fn withdraw_request_handler(
@@ -64,9 +64,9 @@ pub async fn withdraw_request_handler(
             "error": "wallet_address and solana_destination are required"
         })));
     }
-    if req.wusdc_amount <= 0.0 {
+    if req.wusdt_amount <= 0.0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "wusdc_amount must be greater than 0"
+            "error": "wusdt_amount must be greater than 0"
         })));
     }
 
@@ -98,7 +98,7 @@ pub async fn withdraw_request_handler(
     let message = format!(
         "WITHDRAW_REQUEST:{}:{}:{:.6}:{}:{}",
         req.wallet_address, req.solana_destination,
-        req.wusdc_amount, req.timestamp, req.nonce
+        req.wusdt_amount, req.timestamp, req.nonce
     );
     let pubkey_bytes = match hex::decode(&req.public_key) {
         Ok(b) if b.len() == 32 => b,
@@ -159,20 +159,20 @@ pub async fn withdraw_request_handler(
         }))),
     };
 
-    // ── Check user wUSDC balance ──────────────────────────────────────────
+    // ── Check user wUSDT balance ──────────────────────────────────────────
     let mint = usdc_mint_bytes();
-    let raw_required = (req.wusdc_amount * USDC_UNIT as f64) as u64;
-    let user_wusdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &user_pubkey);
-    if user_wusdc < raw_required {
-        let user_balance_human = user_wusdc as f64 / USDC_UNIT as f64;
+    let raw_required = (req.wusdt_amount * USDC_UNIT as f64) as u64;
+    let user_wusdt = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &user_pubkey);
+    if user_wusdt < raw_required {
+        let user_balance_human = user_wusdt as f64 / USDC_UNIT as f64;
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Insufficient wUSDC balance",
-            "required": req.wusdc_amount,
+            "error": "Insufficient wUSDT balance",
+            "required": req.wusdt_amount,
             "available": user_balance_human,
         })));
     }
 
-    // ── Transfer wUSDC from user to dealer (dealer holds as withdrawal obligation) ──
+    // ── Transfer wUSDT from user to dealer (dealer holds as withdrawal obligation) ──
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
@@ -181,7 +181,7 @@ pub async fn withdraw_request_handler(
         raw_required,
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("wUSDC burn failed: {}", e)
+            "error": format!("wUSDT burn failed: {}", e)
         })));
     }
 
@@ -193,7 +193,7 @@ pub async fn withdraw_request_handler(
         withdrawal_id: withdrawal_id.clone(),
         wallet_address: req.wallet_address.clone(),
         solana_destination: req.solana_destination.clone(),
-        wusdc_amount: req.wusdc_amount,
+        wusdt_amount: req.wusdt_amount,
         status: "pending".to_string(),
         requested_at: now,
         released_at: None,
@@ -208,8 +208,8 @@ pub async fn withdraw_request_handler(
     }
     state.withdrawal_requests.insert(withdrawal_id.clone(), record);
 
-    info!("💸 WITHDRAWAL REQUEST: {:.6} wUSDC from {} → Solana {} (id: {})",
-        req.wusdc_amount,
+    info!("💸 WITHDRAWAL REQUEST: {:.6} wUSDT from {} → Solana {} (id: {})",
+        req.wusdt_amount,
         &req.wallet_address[..8.min(req.wallet_address.len())],
         &req.solana_destination[..8.min(req.solana_destination.len())],
         &withdrawal_id[..8]);
@@ -220,8 +220,8 @@ pub async fn withdraw_request_handler(
         "status": "pending",
         "wallet_address": req.wallet_address,
         "solana_destination": req.solana_destination,
-        "wusdc_burned": req.wusdc_amount,
-        "message": "wUSDC burned. The dealer will send real USDC to your Solana address shortly.",
+        "wusdt_burned": req.wusdt_amount,
+        "message": "wUSDT burned. The dealer will send real USDC to your Solana address shortly.",
     })))
 }
 
@@ -238,7 +238,7 @@ pub async fn withdraw_status_handler(
             "withdrawal_id": record.withdrawal_id,
             "wallet_address": record.wallet_address,
             "solana_destination": record.solana_destination,
-            "wusdc_amount": record.wusdc_amount,
+            "wusdt_amount": record.wusdt_amount,
             "status": record.status,
             "requested_at": record.requested_at,
             "released_at": record.released_at,
@@ -295,10 +295,10 @@ pub async fn withdraw_release_handler(
         .unwrap_or_default()
         .as_secs();
 
-    // ── BURN wUSDC from dealer (zero-sum: real USDC leaves custody, wUSDC leaves supply) ─
+    // ── BURN wUSDT from dealer (zero-sum: real USDC leaves custody, wUSDT leaves supply) ─
     {
         let mint = usdc_mint_bytes();
-        let raw_amount = (record.wusdc_amount * USDC_UNIT as f64) as u64;
+        let raw_amount = (record.wusdt_amount * USDC_UNIT as f64) as u64;
         if let Ok(dealer_pubkey) = state.dealer_address.parse::<solana_sdk::pubkey::Pubkey>() {
             match crate::svm::SplTokenEngine::burn(
                 &state.blockchain.svm_accounts,
@@ -308,9 +308,9 @@ pub async fn withdraw_release_handler(
             ) {
                 Ok(_) => {
                     let _ = state.blockchain.svm_accounts.flush_block();
-                    info!("🔥 Burned {:.6} wUSDC from dealer (withdrawal {})", record.wusdc_amount, &req.withdrawal_id[..8]);
+                    info!("🔥 Burned {:.6} wUSDT from dealer (withdrawal {})", record.wusdt_amount, &req.withdrawal_id[..8]);
                 }
-                Err(e) => warn!("⚠️  wUSDC burn on release failed — supply may be inflated: {:?}", e),
+                Err(e) => warn!("⚠️  wUSDT burn on release failed — supply may be inflated: {:?}", e),
             }
         }
     }
@@ -328,8 +328,8 @@ pub async fn withdraw_release_handler(
     }
     state.withdrawal_requests.insert(req.withdrawal_id.clone(), updated.clone());
 
-    info!("✅ WITHDRAWAL RELEASED: {:.6} wUSDC → {} on Solana (tx: {}) (id: {})",
-        record.wusdc_amount,
+    info!("✅ WITHDRAWAL RELEASED: {:.6} wUSDT → {} on Solana (tx: {}) (id: {})",
+        record.wusdt_amount,
         &record.solana_destination[..8.min(record.solana_destination.len())],
         &req.solana_tx_hash[..16.min(req.solana_tx_hash.len())],
         &req.withdrawal_id[..8]);
@@ -340,7 +340,7 @@ pub async fn withdraw_release_handler(
         "status": "released",
         "wallet_address": record.wallet_address,
         "solana_destination": record.solana_destination,
-        "wusdc_amount": record.wusdc_amount,
+        "wusdt_amount": record.wusdt_amount,
         "solana_tx_hash": req.solana_tx_hash,
         "released_at": now,
     })))

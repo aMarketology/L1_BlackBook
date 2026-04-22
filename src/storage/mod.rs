@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // BLACKBOOK L1 — UNIFIED STORAGE LAYER (v2 — SVM-native)
 // ============================================================================
 //
@@ -89,11 +89,11 @@ pub const SLOT_META: TableDefinition<u64, &[u8]> = TableDefinition::new("slot_me
 pub const MERKLE_NODES: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("merkle_nodes");
 
 /// Deposit gateway requests: external_tx_hash (String) → DepositRecord JSON (bytes)
-/// Durable record of every wUSDC/wUSDT → BB deposit request submitted by users.
+/// Durable record of every wUSDT/wUSDT → BB deposit request submitted by users.
 const DEPOSIT_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deposit_requests");
 
 /// Withdrawal gateway requests: withdrawal_id (UUID) → WithdrawalRecord JSON (bytes)
-/// Durable record of every wUSDC → real USDC withdrawal initiated by users.
+/// Durable record of every wUSDT → real USDC withdrawal initiated by users.
 const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdrawals");
 
 /// Per-contest settlement state: contest_id → ContestState JSON (bytes)
@@ -109,6 +109,9 @@ const COIN_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("coin_pool
 
 /// Layer 5 user coin balances: "{ticker}:{wallet}" → coin_units (u64, 6 decimals)
 const COIN_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("coin_balances");
+
+/// Maxx Token Market state: ticker → MaxxTokenState JSON (bytes)
+pub const MAXX_TOKEN_MARKET: TableDefinition<&str, &[u8]> = TableDefinition::new("maxx_token_market");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -404,7 +407,7 @@ impl TransactionRecord {
 #[derive(Clone)]
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
-    db: Arc<Database>,
+    pub db: Arc<Database>,
     pub cache: Arc<DashMap<String, f64>>,
     #[allow(dead_code)]
     processed_bridge_txs: Arc<DashMap<String, String>>,
@@ -1401,7 +1404,7 @@ impl ConcurrentBlockchain {
 // DEPOSIT GATEWAY RECORD
 // ============================================================================
 
-/// A single on-chain record of a user's wUSDC → BB deposit request.
+/// A single on-chain record of a user's wUSDT → BB deposit request.
 /// Keyed by the external chain tx hash.  Minimal — extend later as needed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DepositRecord {
@@ -1427,18 +1430,18 @@ pub struct DepositRecord {
 // WITHDRAWAL GATEWAY RECORD
 // ============================================================================
 
-/// A record of a user's wUSDC → real USDC (Solana) withdrawal request.
-/// Keyed by withdrawal_id (UUID). Created atomically when the user burns wUSDC.
+/// A record of a user's wUSDT → real USDC (Solana) withdrawal request.
+/// Keyed by withdrawal_id (UUID). Created atomically when the user burns wUSDT.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WithdrawalRecord {
     /// UUID assigned at request time — used as the primary key
     pub withdrawal_id: String,
-    /// BB wallet address (base58) whose wUSDC was burned
+    /// BB wallet address (base58) whose wUSDT was burned
     pub wallet_address: String,
     /// Solana wallet address (base58) where the dealer should send real USDC
     pub solana_destination: String,
-    /// Amount of wUSDC burned (= amount of real USDC owed to user)
-    pub wusdc_amount: f64,
+    /// Amount of wUSDT burned (= amount of real USDC owed to user)
+    pub wusdt_amount: f64,
     /// "pending" | "released" | "rejected"
     pub status: String,
     /// Unix timestamp of the original user request

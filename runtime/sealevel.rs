@@ -1,4 +1,4 @@
-//! Sealevel — Parallel Transaction Execution Engine
+﻿//! Sealevel — Parallel Transaction Execution Engine
 //!
 //! Solana-inspired parallel execution with account-level read/write locking.
 //! Non-conflicting transactions execute concurrently across all available CPU cores.
@@ -217,58 +217,31 @@ impl ParallelScheduler {
         batches
     }
 
-    /// Execute batch with lock acquisition (thread-safe parallel).
-    /// When an SvmAccountsDB is attached, `TransactionType::Transfer` transactions
-    /// are routed through the lamport execution path; all other types use the
-    /// legacy f64 balance map.
-    pub fn execute_batch_with_locks(&self, batch: Vec<Transaction>, balances: &DashMap<String, f64>) -> Vec<TransactionResult> {
+    /// Execute a pre-scheduled conflict-free batch in parallel via Rayon.
+    ///
+    /// Batches supplied here MUST come from `schedule_with_locks`, which already
+    /// partitions transactions so that no two entries in the same batch share a
+    /// write account. Phase-two runtime locking is therefore unnecessary and has
+    /// been removed. Rayon threads execute every transaction concurrently with
+    /// zero spin-wait overhead. All transaction types are routed through
+    /// `SvmAccountsDB` — the legacy f64 balance map is gone.
+    pub fn execute_batch_with_locks(&self, batch: Vec<Transaction>) -> Vec<TransactionResult> {
         let len = batch.len();
-        let lm = self.lock_manager.clone();
         let svm_db_ref = self.svm_db.clone();
         let validator = self.account_validator.clone();
 
         let results = self.thread_pool.install(|| {
             batch.par_iter().map(|tx| {
-                // Bounded retry with exponential backoff — never spin indefinitely.
-                // Max attempts: ~20 (1+2+4+...+1024 spins, then up to 10 yields).
-                // Total worst-case wait: ~10 thread yields ≈ microseconds, not CPU starvation.
-                const MAX_YIELD_ATTEMPTS: u32 = 10;
-                let mut backoff = 1u32;
-                let mut yield_count = 0u32;
-                let acquired = loop {
-                    if lm.try_acquire_locks(tx) {
-                        break true;
-                    }
-                    if backoff < 1024 {
-                        for _ in 0..backoff { std::hint::spin_loop(); }
-                        backoff *= 2;
-                    } else {
-                        std::thread::yield_now();
-                        yield_count += 1;
-                        if yield_count >= MAX_YIELD_ATTEMPTS {
-                            break false;
-                        }
-                    }
-                };
-
-                if !acquired {
-                    return TransactionResult {
-                        tx_id: tx.id.clone(),
-                        success: false,
-                        error: Some("Lock contention timeout — transaction aborted".to_string()),
-                    };
-                }
-
                 // Account validation before mutation
                 let mut validation_err = None;
                 for account in tx.read_accounts.iter().chain(tx.write_accounts.iter()) {
                     let access = AccountAccess {
                         address: account.clone(),
                         expected_type: AccountType::UserWallet,
-                        is_signer: false, // Defaulting: specific signer checks require deeper Tx parsing
+                        is_signer: false,
                         is_writable: tx.write_accounts.contains(account),
-                        pda_owner: None, // Stub
-                        pda_index: None, // Stub
+                        pda_owner: None,
+                        pda_index: None,
                     };
                     if let Err(e) = validator.validate(&access) {
                         validation_err = Some(e.to_string());
@@ -276,25 +249,28 @@ impl ParallelScheduler {
                     }
                 }
 
-                let result = if let Some(err) = validation_err {
-                    TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(err) }
-                } else {
-                    match (&tx.tx_type, &svm_db_ref) {
-                        (TransactionType::Transfer, Some(db)) =>
-                            Self::execute_single_svm(tx, db),
-                        (TransactionType::SwapUsdcForBb, Some(db)) =>
-                            Self::execute_swap_usdc_for_bb(tx, db),
-                        (TransactionType::SwapBbForUsdc, Some(db)) =>
-                            Self::execute_swap_bb_for_usdc(tx, db),
-                        _ => Self::execute_single(tx, balances),
-                    }
-                };
-
-                // Only release locks if we actually acquired them
-                if acquired {
-                    lm.release_locks(tx);
+                if let Some(err) = validation_err {
+                    return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(err) };
                 }
-                result
+
+                match (&tx.tx_type, &svm_db_ref) {
+                    (TransactionType::Transfer, Some(db)) =>
+                        Self::execute_single_svm(tx, db),
+                    (TransactionType::SwapUsdcForBb, Some(db)) =>
+                        Self::execute_swap_usdc_for_bb(tx, db),
+                    (TransactionType::SwapBbForUsdc, Some(db)) =>
+                        Self::execute_swap_bb_for_usdc(tx, db),
+                    (_, None) => TransactionResult {
+                        tx_id: tx.id.clone(),
+                        success: false,
+                        error: Some("SVM database not attached to scheduler".to_string()),
+                    },
+                    _ => TransactionResult {
+                        tx_id: tx.id.clone(),
+                        success: false,
+                        error: Some(format!("Unsupported transaction type for SVM: {:?}", tx.tx_type)),
+                    },
+                }
             }).collect()
         });
 
@@ -366,14 +342,14 @@ impl ParallelScheduler {
         let bb_lamports = (bb_amount_f64 * LAMPORTS_PER_BB as f64) as u64;
         let mint = usdc_mint_bytes();
 
-        // 1. Debit wUSDC from user, credit wUSDC to dealer
+        // 1. Debit wUSDT from user, credit wUSDT to dealer
         if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &from_pk, &to_pk, usdc_raw) {
-            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDC transfer failed: {}", e)) };
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDT transfer failed: {}", e)) };
         }
 
         // 2. Debit BB from dealer, credit BB to user (using system_transfer)
         if let Err(e) = db.system_transfer(&to_pk, &from_pk, bb_lamports) {
-            // Unwind wUSDC since BB failed
+            // Unwind wUSDT since BB failed
             let _ = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw);
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
         }
@@ -412,34 +388,14 @@ impl ParallelScheduler {
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
         }
 
-        // 2. Debit wUSDC from dealer, credit wUSDC to user
+        // 2. Debit wUSDT from dealer, credit wUSDT to user
         if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw) {
             // Unwind BB
             let _ = db.system_transfer(&to_pk, &from_pk, bb_lamports);
-            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDC transfer failed: {}", e)) };
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDT transfer failed: {}", e)) };
         }
 
         TransactionResult { tx_id: tx.id.clone(), success: true, error: None }
-    }
-
-    fn execute_single(tx: &Transaction, balances: &DashMap<String, f64>) -> TransactionResult {
-        if !Self::is_system_account(&tx.from) {
-            let balance = balances.get(&tx.from).map(|b| *b).unwrap_or(0.0);
-            if balance < tx.amount {
-                return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("Insufficient: {} < {}", balance, tx.amount)) };
-            }
-            balances.entry(tx.from.clone()).and_modify(|b| *b -= tx.amount);
-        }
-
-        if tx.to != "burned_tokens" {
-            balances.entry(tx.to.clone()).and_modify(|b| *b += tx.amount).or_insert(tx.amount);
-        }
-
-        TransactionResult { tx_id: tx.id.clone(), success: true, error: None }
-    }
-
-    fn is_system_account(account: &str) -> bool {
-        matches!(account, "genesis" | "mining_reward" | "system" | "poh_validator" | "signup_bonus")
     }
 
     pub fn schedule_batch(&self, transactions: &[Transaction]) -> Vec<Vec<Transaction>> {

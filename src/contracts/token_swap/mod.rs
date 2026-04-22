@@ -1,4 +1,4 @@
-use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
+﻿use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use crate::AppState;
@@ -10,13 +10,13 @@ use std::str::FromStr;
 // TOKEN SWAP / AMM SMART CONTRACT (Native Module)
 // ============================================================================
 //
-// Fixed-rate BB ↔ wUSDC swap backed by the dealer's on-chain liquidity.
-// The dealer holds both $BB and wUSDC and acts as the sole market maker.
+// Fixed-rate BB ↔ wUSDT swap backed by the dealer's on-chain liquidity.
+// The dealer holds both $BB and wUSDT and acts as the sole market maker.
 //
-// Rate: 10 BB = 1 wUSDC  (same as deposit gateway)
+// Rate: 10 BB = 1 wUSDT  (same as deposit gateway)
 // ============================================================================
 
-pub const BB_TO_USDC_RATE: f64 = 10.0; // 10 BB = 1 wUSDC
+pub const BB_TO_USDC_RATE: f64 = 10.0; // 10 BB = 1 wUSDT
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SwapInstruction {
@@ -152,11 +152,11 @@ pub async fn swap_bb_for_usdc_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Insufficient BB balance" })));
     }
 
-    // 2. Check dealer wUSDC balance
+    // 2. Check dealer wUSDT balance
     let mint = usdc_mint_bytes();
     let dealer_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &dealer_pubkey);
     if dealer_usdc < usdc_raw_output {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient wUSDC liquidity" })));
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient wUSDT liquidity" })));
     }
 
     // 3. Execute swap atomically:
@@ -166,7 +166,7 @@ pub async fn swap_bb_for_usdc_handler(
     }
     let _ = state.blockchain.credit(&state.dealer_address, bb_required);
 
-    //    B) Transfer wUSDC from dealer → user
+    //    B) Transfer wUSDT from dealer → user
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
@@ -177,16 +177,16 @@ pub async fn swap_bb_for_usdc_handler(
         // Rollback BB
         let _ = state.blockchain.debit(&state.dealer_address, bb_required);
         let _ = state.blockchain.credit(&req.wallet_address, bb_required);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDC transfer failed: {}", e) })));
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT transfer failed: {}", e) })));
     }
 
-    info!("🔄 SWAP: {} swapped {} BB for {:.6} wUSDC", req.wallet_address, bb_required, usdc_output);
+    info!("🔄 SWAP: {} swapped {} BB for {:.6} wUSDT", req.wallet_address, bb_required, usdc_output);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "message": "Swap executed",
         "bb_debited": bb_required,
-        "wusdc_credited": usdc_output,
+        "wusdt_credited": usdc_output,
     })))
 }
 
@@ -255,11 +255,11 @@ pub async fn swap_usdc_for_bb_handler(
     let usdc_raw_required = (usdc_required * USDC_UNIT as f64) as u64;
     let bb_output = req.usdc_amount * BB_TO_USDC_RATE;
 
-    // 1. Check user wUSDC balance
+    // 1. Check user wUSDT balance
     let mint = usdc_mint_bytes();
     let user_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
     if user_usdc < usdc_raw_required {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Insufficient wUSDC balance" })));
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Insufficient wUSDT balance" })));
     }
 
     // 2. Check dealer BB balance
@@ -269,7 +269,7 @@ pub async fn swap_usdc_for_bb_handler(
     }
 
     // 3. Execute swap atomically:
-    //    A) Transfer wUSDC from user → dealer
+    //    A) Transfer wUSDT from user → dealer
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
@@ -277,23 +277,23 @@ pub async fn swap_usdc_for_bb_handler(
         &dealer_pubkey,
         usdc_raw_required,
     ) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDC debit failed: {}", e) })));
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT debit failed: {}", e) })));
     }
 
     //    B) Transfer BB from dealer → user
     if let Err(e) = state.blockchain.debit(&state.dealer_address, bb_output) {
-        // Rollback wUSDC
+        // Rollback wUSDT
         let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &dealer_pubkey, &wallet_pubkey, usdc_raw_required);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB credit failed: {}", e) })));
     }
     let _ = state.blockchain.credit(&req.wallet_address, bb_output);
 
-    info!("🔄 SWAP: {} swapped {:.6} wUSDC for {} BB", req.wallet_address, usdc_required, bb_output);
+    info!("🔄 SWAP: {} swapped {:.6} wUSDT for {} BB", req.wallet_address, usdc_required, bb_output);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "message": "Swap executed",
-        "wusdc_debited": usdc_required,
+        "wusdt_debited": usdc_required,
         "bb_credited": bb_output,
     })))
 }

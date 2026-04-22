@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 // BLACKBOOK SVM — SPL TOKEN (Native Implementation)
 // ============================================================================
 //
@@ -232,6 +232,43 @@ pub fn usdc_mint_address() -> String {
 }
 
 // ============================================================================
+// MAXX MINT CONSTANTS
+// ============================================================================
+
+/// Seed used to derive the $MAXX mint address on BlackBook L1.
+/// NEVER change after deployment.
+pub const MAXX_MINT_SEED: &str = "BlackBook_MAXX_Mint_v1";
+
+/// $MAXX has 12 decimal places (picoMAXX). 1 MAXX = 1_000_000_000_000.
+pub const MAXX_DECIMALS: u8 = 12;
+
+/// 1 MAXX in smallest units (picoMAXX).
+pub const MAXX_UNIT: u64 = 1_000_000_000_000;
+
+/// Seed for the bonding-curve vault that holds wUSDT reserves backing $MAXX.
+pub const MAXX_VAULT_SEED: &str = "BlackBook_MAXX_Vault_v1";
+
+/// Get the deterministic $MAXX mint address bytes.
+pub fn maxx_mint_bytes() -> [u8; 32] {
+    derive_mint_address(MAXX_MINT_SEED)
+}
+
+/// Get the $MAXX mint address as a base58 string.
+pub fn maxx_mint_address() -> String {
+    bs58::encode(maxx_mint_bytes()).into_string()
+}
+
+/// Get the deterministic $MAXX bonding-curve vault pubkey bytes.
+pub fn maxx_vault_bytes() -> [u8; 32] {
+    derive_mint_address(MAXX_VAULT_SEED)
+}
+
+/// Get the $MAXX vault address as a base58 string.
+pub fn maxx_vault_address() -> String {
+    bs58::encode(maxx_vault_bytes()).into_string()
+}
+
+// ============================================================================
 // SPL TOKEN ENGINE — operates on SvmAccountsDB
 // ============================================================================
 
@@ -315,6 +352,62 @@ impl SplTokenEngine {
             decimals = USDC_DECIMALS,
             authority = %mint_authority,
             "✅ USDC SPL Token Mint bootstrapped on BlackBook L1"
+        );
+
+        Ok(mint_address)
+    }
+
+    /// Bootstrap the $MAXX mint account into the SVM accounts database.
+    ///
+    /// Creates the $MAXX SPL Mint (12 decimals, 0 initial supply). The
+    /// mint authority should be the bonding-curve contract / dealer wallet —
+    /// this address is the only one allowed to mint new $MAXX from buy orders.
+    ///
+    /// IDEMPOTENT: If the mint already exists, this is a no-op.
+    pub fn bootstrap_maxx_mint(
+        accounts_db: &SvmAccountsDB,
+        mint_authority: &Pubkey,
+    ) -> Result<String, SvmError> {
+        let mint_bytes = maxx_mint_bytes();
+        let mint_pubkey = Pubkey::new_from_array(mint_bytes);
+
+        if accounts_db.account_exists(&mint_pubkey) {
+            let existing = accounts_db.get_account(&mint_pubkey).unwrap();
+            if existing.data().len() == 82 {
+                tracing::info!(
+                    mint = %bs58::encode(&mint_bytes).into_string(),
+                    "$MAXX mint already exists — skipping bootstrap"
+                );
+                return Ok(bs58::encode(&mint_bytes).into_string());
+            }
+        }
+
+        let mint_layout = MintLayout {
+            mint_authority_option: 1,
+            mint_authority: mint_authority.to_bytes(),
+            supply: 0,
+            decimals: MAXX_DECIMALS,
+            is_initialized: true,
+            freeze_authority_option: 0,
+            freeze_authority: [0u8; 32],
+        };
+
+        let mint_account = AccountSharedData::from(Account {
+            lamports: 1_000_000,
+            data: mint_layout.to_bytes(),
+            owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
+            executable: false,
+            rent_epoch: RENT_EPOCH_EXEMPT,
+        });
+
+        accounts_db.store_account(&mint_pubkey, mint_account);
+
+        let mint_address = bs58::encode(&mint_bytes).into_string();
+        tracing::info!(
+            mint = %mint_address,
+            decimals = MAXX_DECIMALS,
+            authority = %mint_authority,
+            "✅ $MAXX SPL Token Mint bootstrapped on BlackBook L1"
         );
 
         Ok(mint_address)
@@ -422,7 +515,7 @@ impl SplTokenEngine {
     /// Burn tokens from a wallet's ATA, reducing both the ATA balance and the
     /// mint's total supply.
     ///
-    /// `amount` is in smallest units (1 wUSDC = 1_000_000).
+    /// `amount` is in smallest units (1 wUSDT = 1_000_000).
     pub fn burn(
         accounts_db: &SvmAccountsDB,
         mint_bytes: &[u8; 32],

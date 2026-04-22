@@ -41,4 +41,11 @@ pub use spl_token::{
     usdc_mint_bytes,
     USDC_DECIMALS,
     USDC_UNIT,
+    // MAXX ($XX) bonding-curve token
+    maxx_mint_address,
+    maxx_mint_bytes,
+    maxx_vault_address,
+    maxx_vault_bytes,
+    MAXX_DECIMALS,
+    MAXX_UNIT,
 };

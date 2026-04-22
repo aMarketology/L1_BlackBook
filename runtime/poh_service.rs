@@ -697,60 +697,70 @@ pub fn create_poh_service_with_slot(config: PoHConfig, slot: Arc<AtomicU64>) -> 
     Arc::new(RwLock::new(PoHService::with_slot(config, slot)))
 }
 
-/// Run the PoH clock continuously (call this in a tokio::spawn)
+/// Run the PoH clock on a dedicated OS thread, isolated from Tokio's async
+/// worker pool and the Rayon transaction thread pool.
+///
+/// Each tick computes 12,500 SHA-256 hashes — CPU-bound work that must never
+/// run on a shared async worker. The spawned thread uses `std::thread::sleep`
+/// for sub-millisecond precision timing and runs until the process exits.
 pub async fn run_poh_clock(poh_service: SharedPoHService) {
-    println!("🚀 Starting continuous PoH clock...");
-    
-    // Mark as running
-    {
-        let mut poh = poh_service.write();
-        poh.is_running = true;
-    }
-    
+    // Compute tick interval (milliseconds) before handing ownership to thread.
     let tick_interval = {
         let poh = poh_service.read();
-        let interval = poh.config.slot_duration_ms / poh.config.ticks_per_slot;
-        Duration::from_millis(interval.max(1))
+        let interval_ms = poh.config.slot_duration_ms / poh.config.ticks_per_slot.max(1);
+        Duration::from_millis(interval_ms.max(1))
     };
-    
-    let mut interval = tokio::time::interval(tick_interval);
-    let mut tick_count = 0u64;
-    let mut last_slot_log = 0u64;
-    
-    loop {
-        interval.tick().await;
-        
-        let (_current_slot, should_advance) = {
-            let mut poh = poh_service.write();
-            
-            // Perform a tick
-            poh.tick();
-            tick_count += 1;
-            
-            // Mix any pending transactions
-            poh.mix_pending_transactions();
-            
-            // Check if we should advance to next slot
-            let should_advance = tick_count.is_multiple_of(poh.config.ticks_per_slot);
-            
-            (poh.current_slot.load(Ordering::Relaxed), should_advance)
-        };
-        
-        if should_advance {
-            let new_slot = {
+
+    std::thread::Builder::new()
+        .name("poh-clock".to_string())
+        .spawn(move || {
+            println!("🚀 PoH clock running on dedicated OS thread (tick={:?})", tick_interval);
+
+            {
                 let mut poh = poh_service.write();
-                poh.advance_slot()
-            };
-            
-            // Log every 10 slots to avoid spam
-            if new_slot - last_slot_log >= 10 {
-                let poh = poh_service.read();
-                println!("🎟️ PoH: Slot {} | Epoch {} | {} hashes | {} entries", 
-                         new_slot, poh.current_epoch, poh.num_hashes, poh.current_entries.len());
-                last_slot_log = new_slot;
+                poh.is_running = true;
             }
-        }
-    }
+
+            let mut tick_count = 0u64;
+            let mut last_slot_log = 0u64;
+
+            loop {
+                let tick_start = Instant::now();
+
+                let (_current_slot, should_advance) = {
+                    let mut poh = poh_service.write();
+                    poh.tick();
+                    tick_count += 1;
+                    poh.mix_pending_transactions();
+                    let should_advance = tick_count.is_multiple_of(poh.config.ticks_per_slot);
+                    (poh.current_slot.load(Ordering::Relaxed), should_advance)
+                };
+
+                if should_advance {
+                    let new_slot = {
+                        let mut poh = poh_service.write();
+                        poh.advance_slot()
+                    };
+
+                    // Log every 10 slots to avoid console spam
+                    if new_slot.saturating_sub(last_slot_log) >= 10 {
+                        let poh = poh_service.read();
+                        println!(
+                            "🎟️ PoH: Slot {} | Epoch {} | {} hashes | {} entries",
+                            new_slot, poh.current_epoch, poh.num_hashes, poh.current_entries.len()
+                        );
+                        last_slot_log = new_slot;
+                    }
+                }
+
+                // Precise sleep: subtract the time already spent computing this tick
+                let elapsed = tick_start.elapsed();
+                if let Some(remaining) = tick_interval.checked_sub(elapsed) {
+                    std::thread::sleep(remaining);
+                }
+            }
+        })
+        .expect("failed to spawn poh-clock thread");
 }
 
 // ============================================================================

@@ -1,4 +1,4 @@
-pub mod bsc_watcher;
+﻿pub mod bsc_watcher;
 pub use bsc_watcher::{BscWatcher, BSC_USDC_CONTRACT, BSC_USDT_CONTRACT};
 
 // ============================================================================
@@ -207,7 +207,7 @@ impl CustodyWatcher {
     }
 
     /// On first start, reads the live on-chain USDC + USDT balance of the custody wallet
-    /// and auto-mints the equivalent BB + wUSDC to the dealer if the chain is fresh.
+    /// and auto-mints the equivalent BB + wUSDT to the dealer if the chain is fresh.
     /// Uses DEALER_PRIVATE_KEY from env to derive the dealer address.
     async fn startup_balance_sync(&self) {
         let dealer_sk_hex = match std::env::var("DEALER_PRIVATE_KEY") {
@@ -231,9 +231,9 @@ impl CustodyWatcher {
 
         // Only run full sync if dealer has no BB yet (fresh chain)
         if self.blockchain.get_balance(&dealer_addr) > 0.0 {
-            info!("👀 Startup sync: dealer {} already funded — checking wUSDC invariant", &dealer_addr[..8]);
-            // Invariant reconciliation: if BB exists but wUSDC supply is 0, mint the missing wUSDC
-            self.reconcile_wusdc_invariant(&dealer_addr, &signing_key.verifying_key().to_bytes()).await;
+            info!("👀 Startup sync: dealer {} already funded — checking wUSDT invariant", &dealer_addr[..8]);
+            // Invariant reconciliation: if BB exists but wUSDT supply is 0, mint the missing wUSDT
+            self.reconcile_wusdt_invariant(&dealer_addr, &signing_key.verifying_key().to_bytes()).await;
             return;
         }
 
@@ -277,7 +277,7 @@ impl CustodyWatcher {
             Err(e) => { error!("❌ Startup sync BB mint failed: {}", e); return; }
         }
 
-        // Mint wUSDC (if USDC balance > 0)
+        // Mint wUSDT (if USDC balance > 0)
         if usdc_bal > 0.0 {
             use crate::svm::{SplTokenEngine, usdc_mint_bytes};
             let mint_bytes = usdc_mint_bytes();
@@ -286,9 +286,9 @@ impl CustodyWatcher {
             );
             let usdc_units = (usdc_bal * 1_000_000.0).round() as u64;
             match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint_bytes, &dealer_pubkey, usdc_units) {
-                Ok(r) => info!("💵  Startup sync: {:.6} wUSDC → dealer {} (ATA: {})",
+                Ok(r) => info!("💵  Startup sync: {:.6} wUSDT → dealer {} (ATA: {})",
                     usdc_bal, &dealer_addr[..8], bs58::encode(r.ata).into_string()),
-                Err(e) => warn!("⚠️   Startup sync wUSDC mint skipped: {:?}", e),
+                Err(e) => warn!("⚠️   Startup sync wUSDT mint skipped: {:?}", e),
             }
         }
 
@@ -319,42 +319,42 @@ impl CustodyWatcher {
         info!("✅ Startup sync complete — custody balance minted to dealer");
     }
 
-    /// Reconcile wUSDC supply against BB supply.
+    /// Reconcile wUSDT supply against BB supply.
     ///
-    /// Called when the dealer already has BB but wUSDC total supply is 0 (or
+    /// Called when the dealer already has BB but wUSDT total supply is 0 (or
     /// less than expected).  This can happen when an existing chain is upgraded
-    /// to the wUSDC-aware version for the first time.  The missing wUSDC is
+    /// to the wUSDT-aware version for the first time.  The missing wUSDT is
     /// minted to the dealer so the 10:1 invariant is restored.
-    async fn reconcile_wusdc_invariant(&self, dealer_addr: &str, dealer_pubkey_bytes: &[u8; 32]) {
+    async fn reconcile_wusdt_invariant(&self, dealer_addr: &str, dealer_pubkey_bytes: &[u8; 32]) {
         use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
         let mint_bytes = usdc_mint_bytes();
         let dealer_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(*dealer_pubkey_bytes);
 
-        // Current wUSDC total supply on-chain
-        let current_wusdc_supply = match SplTokenEngine::get_mint_supply(&self.blockchain.svm_accounts, &mint_bytes) {
+        // Current wUSDT total supply on-chain
+        let current_wusdt_supply = match SplTokenEngine::get_mint_supply(&self.blockchain.svm_accounts, &mint_bytes) {
             Ok(s) => s as f64 / USDC_UNIT as f64,
             Err(_) => 0.0,
         };
 
-        // Expected wUSDC = total BB supply / 10
+        // Expected wUSDT = total BB supply / 10
         let total_bb = self.blockchain.total_supply();
-        let expected_wusdc = total_bb / 10.0;
-        let missing_wusdc = expected_wusdc - current_wusdc_supply;
+        let expected_wusdt = total_bb / 10.0;
+        let missing_wusdt = expected_wusdt - current_wusdt_supply;
 
-        if missing_wusdc <= 0.000_001 {
-            info!("✅ Invariant OK — {:.6} BB backed by {:.6} wUSDC (ratio {:.2})",
-                total_bb, current_wusdc_supply, if current_wusdc_supply > 0.0 { total_bb / current_wusdc_supply } else { 0.0 });
+        if missing_wusdt <= 0.000_001 {
+            info!("✅ Invariant OK — {:.6} BB backed by {:.6} wUSDT (ratio {:.2})",
+                total_bb, current_wusdt_supply, if current_wusdt_supply > 0.0 { total_bb / current_wusdt_supply } else { 0.0 });
             return;
         }
 
-        warn!("⚠️  Invariant broken: {:.6} BB but only {:.6} wUSDC — minting {:.6} wUSDC to dealer to reconcile",
-            total_bb, current_wusdc_supply, missing_wusdc);
+        warn!("⚠️  Invariant broken: {:.6} BB but only {:.6} wUSDT — minting {:.6} wUSDT to dealer to reconcile",
+            total_bb, current_wusdt_supply, missing_wusdt);
 
-        let raw_units = (missing_wusdc * USDC_UNIT as f64).round() as u64;
+        let raw_units = (missing_wusdt * USDC_UNIT as f64).round() as u64;
         match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint_bytes, &dealer_pubkey, raw_units) {
-            Ok(_) => info!("✅ Reconciled: minted {:.6} wUSDC to dealer {} — invariant restored",
-                missing_wusdc, &dealer_addr[..8.min(dealer_addr.len())]),
-            Err(e) => warn!("❌ Reconcile wUSDC mint failed: {:?}", e),
+            Ok(_) => info!("✅ Reconciled: minted {:.6} wUSDT to dealer {} — invariant restored",
+                missing_wusdt, &dealer_addr[..8.min(dealer_addr.len())]),
+            Err(e) => warn!("❌ Reconcile wUSDT mint failed: {:?}", e),
         }
     }
 
@@ -584,25 +584,10 @@ impl CustodyWatcher {
         }
 
         // ── Mint BB ───────────────────────────────────────────────────────
+        // BB is the sole asset minted on deposit. wUSDT stays in the dealer
+        // reserve pool; users acquire it only by explicitly swapping BB.
         self.blockchain.credit(&record.wallet_address, record.bb_to_mint)
             .map_err(|e| format!("BB mint failed: {}", e))?;
-
-        // ── Mint wUSDC (1:1 with stablecoin deposited) ────────────────────
-        {
-            use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-            use solana_sdk::pubkey::Pubkey;
-            use std::str::FromStr;
-            if let Ok(wallet_pubkey) = Pubkey::from_str(&record.wallet_address) {
-                let mint = usdc_mint_bytes();
-                let raw_units = (record.amount_stablecoin * USDC_UNIT as f64) as u64;
-                match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_units) {
-                    Ok(_) => info!("💵 wUSDC auto-minted: {:.6} → {}",
-                        record.amount_stablecoin,
-                        &record.wallet_address[..8.min(record.wallet_address.len())]),
-                    Err(e) => warn!("⚠️  wUSDC auto-mint failed (BB already minted): {:?}", e),
-                }
-            }
-        }
 
         // ── Double-mint lock ──────────────────────────────────────────────
         let mint_tx_id = Uuid::new_v4().to_string();

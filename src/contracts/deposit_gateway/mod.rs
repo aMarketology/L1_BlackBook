@@ -1,18 +1,17 @@
-use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+﻿use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use serde::Deserialize;
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
 use tracing::{info, warn};
 
 use crate::AppState;
 use crate::storage::DepositRecord;
-use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
 
 // ============================================================================
 // DEPOSIT GATEWAY SMART CONTRACT (Native Module)
 // ============================================================================
 //
 // Flow:
-//   1. User sends wUSDC or wUSDT to the custody wallet (off-chain, one key)
+//   1. User sends wUSDT or wUSDT to the custody wallet (off-chain, one key)
 //   2. User calls POST /deposit/request with:
 //        - their BB wallet address
 //        - the external tx hash proving the on-chain transfer
@@ -65,7 +64,7 @@ pub struct DepositApproveBody {
 
 // ── POST /deposit/request ─────────────────────────────────────────────────
 
-/// POST /deposit/request — User submits a wUSDC/wUSDT → BB deposit request.
+/// POST /deposit/request — User submits a wUSDT/wUSDT → BB deposit request.
 ///
 /// The user proves ownership of their BB wallet via Ed25519 signature.
 /// The dealer will verify the external tx and call /admin/deposit/approve.
@@ -341,36 +340,14 @@ pub async fn deposit_approve_handler(
         })));
     }
 
-    // ── MINT BB (DISABLED per request to avoid double-minting) ───────────────
-    // if let Err(e) = state.blockchain.credit(&record.wallet_address, record.bb_to_mint) {
-    //     return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
-    // }
+    // ── MINT BB ────────────────────────────────────────────────────────────
+    // BB is the sole on-chain asset minted on deposit. wUSDT stays in the
+    // dealer reserve pool and is only transferred when the user explicitly
+    // swaps via /sealevel/submit (SwapBbForUsdc / SwapUsdcForBb).
+    if let Err(e) = state.blockchain.credit(&record.wallet_address, record.bb_to_mint) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
+    }
     let new_balance = state.blockchain.get_balance(&record.wallet_address);
-
-    // ── MINT wUSDC (1:1 with stablecoin deposited) ────────────────────────
-    let wusdc_minted = {
-        use solana_sdk::pubkey::Pubkey;
-        use std::str::FromStr;
-        match Pubkey::from_str(&record.wallet_address) {
-            Ok(wallet_pubkey) => {
-                let mint = usdc_mint_bytes();
-                let raw_units = (record.amount_stablecoin * USDC_UNIT as f64) as u64;
-                match SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_units) {
-                    Ok(_) => {
-                        info!("💵 wUSDC minted: {:.6} → {}",
-                            record.amount_stablecoin,
-                            &record.wallet_address[..8.min(record.wallet_address.len())]);
-                        record.amount_stablecoin
-                    }
-                    Err(e) => {
-                        warn!("⚠️  wUSDC mint failed (BB already minted): {:?}", e);
-                        0.0
-                    }
-                }
-            }
-            Err(_) => { warn!("⚠️  Invalid wallet pubkey for wUSDC mint"); 0.0 }
-        }
-    };
 
     // ── MARK AS PROCESSED (double-mint lock) ─────────────────────────────
     let mint_tx_id = uuid::Uuid::new_v4().to_string();
@@ -424,16 +401,15 @@ pub async fn deposit_approve_handler(
         0,                // nonce
         0.0,              // from_balance_before
         0.0,              // from_balance_after
-        wusdc_minted,     // to_balance_after
+        new_balance,      // to_balance_after
         crate::storage::AuthType::SystemInternal,
     );
     if let Err(e) = state.blockchain.log_transaction(tx_record) {
         warn!("⚠️ Failed to log transaction receipt for deposit: {}", e);
     }
 
-    info!("✅ DEPOSIT APPROVED: {} {} → {} BB + {:.6} wUSDC → {} (ext_tx: {})",
+    info!("✅ DEPOSIT APPROVED: {} {} → {} BB → {} (ext_tx: {})",
         record.amount_stablecoin, record.asset, record.bb_to_mint,
-        wusdc_minted,
         &record.wallet_address[..8.min(record.wallet_address.len())],
         &req.external_tx_hash[..12.min(req.external_tx_hash.len())]);
 
@@ -444,7 +420,6 @@ pub async fn deposit_approve_handler(
         "asset": record.asset,
         "amount_stablecoin": record.amount_stablecoin,
         "bb_minted": record.bb_to_mint,
-        "wusdc_minted": wusdc_minted,
         "new_balance": new_balance,
         "mint_tx_id": mint_tx_id,
     })))
