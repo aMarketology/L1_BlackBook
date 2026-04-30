@@ -126,6 +126,8 @@ export interface DepositStatusResult {
   wallet_address?: string;
   asset?: string;
   amount_stablecoin?: number;
+  /** Amount in 6-decimal micro-units (preferred — matches L1 u64 field) */
+  amount_micro_stablecoin?: number;
   bb_to_mint?: number;
 }
 
@@ -386,9 +388,12 @@ export class BlackBookDeposit {
     const timestamp = nowSecs();
     const nonce = randomNonce();
 
+    // Convert to micro-units (6 decimals) — L1 now expects u64 integer
+    const amountMicro = Math.round(usdcAmount * 1_000_000);
+
     // Construct the L1 signature message
-    // Must match: "DEPOSIT_REQUEST:{wallet}:{tx_hash}:{amount}:{asset}:{ts}:{nonce}"
-    const message = `DEPOSIT_REQUEST:${walletAddress}:${solanaTxHash}:${usdcAmount}:USDC:${timestamp}:${nonce}`;
+    // Must match: "DEPOSIT_REQUEST:{wallet}:{tx_hash}:{amount_micro}:{asset}:{ts}:{nonce}"
+    const message = `DEPOSIT_REQUEST:${walletAddress}:${solanaTxHash}:${amountMicro}:USDC:${timestamp}:${nonce}`;
     const messageBytes = new TextEncoder().encode(message);
 
     // Sign with the wallet (same Ed25519 key used for Solana)
@@ -413,7 +418,7 @@ export class BlackBookDeposit {
         wallet_address: walletAddress,
         external_tx_hash: solanaTxHash,
         asset: "USDC",
-        amount_stablecoin: usdcAmount,
+        amount_micro_stablecoin: amountMicro,
         public_key: publicKeyHex,
         signature: signatureHex,
         timestamp,

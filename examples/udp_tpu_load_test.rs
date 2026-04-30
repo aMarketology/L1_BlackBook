@@ -31,7 +31,7 @@ const BASE_URL: &str = "http://127.0.0.1:8080";    // HTTP for health + faucet o
 const NUM_WALLETS: usize = 2_000;
 const NUM_TXS: usize = 500_000;
 const CONCURRENCY: usize = 8_000;                  // UDP has no socket state — much higher is safe
-const AMOUNT_PER_TX: f64 = 0.00001;
+const AMOUNT_PER_TX: u64 = 1_000;                  // 1_000 lamports = 0.01 BB
 const FUND_BB: f64 = 0.1;
 const CHAIN_ID: u8 = 1;
 
@@ -41,7 +41,7 @@ const CHAIN_ID: u8 = 1;
 struct TpuPacket {
     from: String,
     to: String,
-    amount: f64,
+    amount: u64,        // lamports (1 BB = 100_000 lamports)
     public_key: String,
     signature: String,
     timestamp: u64,
@@ -178,13 +178,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let nonce = format!("udp-{}-{}", i, fastrand::u64(..));
             let priority = (i % 10) as u64;
 
-            // Build canonical message (must match TPU verification logic)
-            let payload_json = format!(r#"{{"to":"{}","amount":{}}}"#, sink_addr, AMOUNT_PER_TX);
-            let mut message = vec![CHAIN_ID];
-            message.extend_from_slice(payload_json.as_bytes());
-            message.extend_from_slice(b"\n");
-            message.extend_from_slice(tx_ts.to_string().as_bytes());
-            message.extend_from_slice(b"\n");
+            // Build canonical binary message — must exactly match runtime/tpu.rs verification:
+            // chain_id(1) || from_utf8 || '|' || to_utf8 || '|' || amount_le8 || '|' || ts_le8 || '|' || nonce_utf8
+            let mut message: Vec<u8> = Vec::with_capacity(128);
+            message.push(CHAIN_ID);
+            message.extend_from_slice(wallet.address.as_bytes());
+            message.push(b'|');
+            message.extend_from_slice(sink_addr.as_bytes());
+            message.push(b'|');
+            message.extend_from_slice(&AMOUNT_PER_TX.to_le_bytes());
+            message.push(b'|');
+            message.extend_from_slice(&tx_ts.to_le_bytes());
+            message.push(b'|');
             message.extend_from_slice(nonce.as_bytes());
 
             let sig = wallet.sk.sign(&message);

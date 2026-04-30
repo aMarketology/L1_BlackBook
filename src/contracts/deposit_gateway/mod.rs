@@ -1,4 +1,4 @@
-﻿use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use serde::Deserialize;
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
 use tracing::{info, warn};
@@ -30,8 +30,6 @@ use crate::storage::DepositRecord;
 //   - Support for multiple custody wallets / asset types
 // ============================================================================
 
-pub const BB_PER_STABLECOIN: f64 = 10.0; // 1 USDC = 10 BB
-
 // ── Request types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -42,12 +40,12 @@ pub struct DepositRequestBody {
     pub external_tx_hash: String,
     /// "USDC" or "USDT"
     pub asset: String,
-    /// Amount of stablecoin sent to the custody wallet
-    pub amount_stablecoin: f64,
+    /// Amount of stablecoin sent to the custody wallet (in 6-decimal micro-units)
+    pub amount_micro_stablecoin: u64,
     /// Ed25519 public key (hex, 32 bytes) matching wallet_address
     pub public_key: String,
     /// Ed25519 signature (hex, 64 bytes)
-    /// Signs: "DEPOSIT_REQUEST:{wallet_address}:{external_tx_hash}:{amount_stablecoin}:{asset}:{timestamp}:{nonce}"
+    /// Signs: "DEPOSIT_REQUEST:{wallet_address}:{external_tx_hash}:{amount_micro_stablecoin}:{asset}:{timestamp}:{nonce}"
     pub signature: String,
     /// Unix timestamp (must be within 60s of server time)
     pub timestamp: u64,
@@ -82,8 +80,8 @@ pub async fn deposit_request_handler(
     if req.wallet_address.is_empty() || req.external_tx_hash.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Missing required fields" })));
     }
-    if req.amount_stablecoin <= 0.0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "amount_stablecoin must be > 0" })));
+    if req.amount_micro_stablecoin == 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "amount_micro_stablecoin must be > 0" })));
     }
     if req.asset != "USDC" && req.asset != "USDT" {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "asset must be 'USDC' or 'USDT'" })));
@@ -135,7 +133,7 @@ pub async fn deposit_request_handler(
     let message = format!(
         "DEPOSIT_REQUEST:{}:{}:{}:{}:{}:{}",
         req.wallet_address, req.external_tx_hash,
-        req.amount_stablecoin, req.asset,
+        req.amount_micro_stablecoin, req.asset,
         req.timestamp, req.nonce
     );
     let pubkey_bytes = match hex::decode(&req.public_key) {
@@ -173,13 +171,15 @@ pub async fn deposit_request_handler(
     }
 
     // ── CREATE RECORD ─────────────────────────────────────────────────────
-    let bb_to_mint = req.amount_stablecoin * BB_PER_STABLECOIN;
+    // Use u64 directly from API boundary
+    let amount_micro_stablecoin = req.amount_micro_stablecoin;
+    let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(amount_micro_stablecoin);
     let record = DepositRecord {
         wallet_address: req.wallet_address.clone(),
         external_tx_hash: req.external_tx_hash.clone(),
         asset: req.asset.clone(),
-        amount_stablecoin: req.amount_stablecoin,
-        bb_to_mint,
+        amount_micro_stablecoin,
+        bb_lamports,
         status: "pending".to_string(),
         submitted_at: now,
         approved_at: None,
@@ -191,8 +191,9 @@ pub async fn deposit_request_handler(
     }
     state.deposit_requests.insert(req.external_tx_hash.clone(), record.clone());
 
-    info!("📥 DEPOSIT REQUEST: {} {} → {} BB for {} (tx: {})",
-        req.amount_stablecoin, req.asset, bb_to_mint,
+    info!("📥 DEPOSIT REQUEST: {:.6} {} → {:.5} BB for {} (tx: {})",
+        req.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64, req.asset,
+        bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         &req.wallet_address[..8.min(req.wallet_address.len())],
         &req.external_tx_hash[..12.min(req.external_tx_hash.len())]);
 
@@ -215,7 +216,7 @@ pub async fn deposit_request_handler(
                         "wallet_address": req.wallet_address,
                         "external_tx_hash": req.external_tx_hash,
                         "asset": req.asset,
-                        "amount_stablecoin": req.amount_stablecoin,
+                        "amount_stablecoin": req.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
                         "bb_minted": bb_minted,
                         "new_balance": new_balance,
                     })));
@@ -237,7 +238,7 @@ pub async fn deposit_request_handler(
                     "wallet_address": req.wallet_address,
                     "external_tx_hash": req.external_tx_hash,
                     "asset": req.asset,
-                    "amount_stablecoin": req.amount_stablecoin,
+                    "amount_stablecoin": req.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
                     "bb_minted": bb_minted,
                     "new_balance": new_balance,
                     "custody_wallet": state.custody_wallet_address,
@@ -258,8 +259,8 @@ pub async fn deposit_request_handler(
         "wallet_address": record.wallet_address,
         "external_tx_hash": record.external_tx_hash,
         "asset": record.asset,
-        "amount_stablecoin": record.amount_stablecoin,
-        "bb_to_mint": record.bb_to_mint,
+        "amount_stablecoin": record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+        "bb_to_mint": record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         "custody_wallet": state.custody_wallet_address,
         "message": "Request received. The dealer will verify your deposit and mint BB shortly."
     })))
@@ -279,8 +280,8 @@ pub async fn deposit_status_handler(
             "external_tx_hash": record.external_tx_hash,
             "wallet_address": record.wallet_address,
             "asset": record.asset,
-            "amount_stablecoin": record.amount_stablecoin,
-            "bb_to_mint": record.bb_to_mint,
+            "amount_stablecoin": record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+            "bb_to_mint": record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
             "status": record.status,
             "submitted_at": record.submitted_at,
             "approved_at": record.approved_at,
@@ -297,7 +298,9 @@ pub async fn deposit_status_handler(
     }
     Json(serde_json::json!({
         "found": false,
-        "error": "No deposit request found for this tx hash"
+        "status": "pending",
+        "external_tx_hash": tx_hash,
+        "note": "No deposit request found yet — it may still be processing."
     }))
 }
 
@@ -340,21 +343,25 @@ pub async fn deposit_approve_handler(
         })));
     }
 
-    // ── MINT BB ────────────────────────────────────────────────────────────
-    // BB is the sole on-chain asset minted on deposit. wUSDT stays in the
-    // dealer reserve pool and is only transferred when the user explicitly
-    // swaps via /sealevel/submit (SwapBbForUsdc / SwapUsdcForBb).
-    if let Err(e) = state.blockchain.credit(&record.wallet_address, record.bb_to_mint) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
+    // ── MINT BB (Bug #2: reserve-before-mint, no TOCTOU race) ──────────────
+    let mint_tx_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = state.blockchain.reserve_bridge_tx(&req.external_tx_hash) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("Double-mint blocked: {}", e)
+        })));
+    }
+    match state.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
+        Ok(_) => {
+            if let Err(e) = state.blockchain.commit_bridge_tx(&req.external_tx_hash, &mint_tx_id) {
+                warn!("⚠️  Failed to persist bridge tx committed flag: {}", e);
+            }
+        }
+        Err(e) => {
+            state.blockchain.cancel_bridge_tx(&req.external_tx_hash);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
+        }
     }
     let new_balance = state.blockchain.get_balance(&record.wallet_address);
-
-    // ── MARK AS PROCESSED (double-mint lock) ─────────────────────────────
-    let mint_tx_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = state.blockchain.mark_bridge_tx_processed(&req.external_tx_hash, &mint_tx_id) {
-        warn!("⚠️  Failed to persist bridge tx processed flag: {}", e);
-        // Non-fatal: DashMap is already updated, server restart would re-check
-    }
 
     // ── UPDATE RECORD ─────────────────────────────────────────────────────
     let now = std::time::SystemTime::now()
@@ -382,7 +389,7 @@ pub async fn deposit_approve_handler(
             from: "DEPOSIT_GATEWAY".to_string(),
             timestamp: now,
             data: TxData::DepositUsdt {
-                usdt_amount: (record.amount_stablecoin * crate::svm::USDC_UNIT as f64) as u64,
+                usdt_amount: record.amount_micro_stablecoin,
                 external_tx_hash: Some(req.external_tx_hash.clone()),
             },
             signature: "dealer_approved".to_string(),
@@ -391,25 +398,28 @@ pub async fn deposit_approve_handler(
         state.block_producer.record_executed_transaction(tx);
     }
 
-    // ── CREATE VISUAL LEDGER RECEIPT ─────────────────────────────────────────
+    // ── CREATE VISUAL LEDGER RECEIPT ─────────────────────────────────────
+    let new_balance_micro = (new_balance * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
     let tx_record = crate::storage::TransactionRecord::with_id(
         mint_tx_id.clone(),
         crate::storage::TxType::BridgeIn,
         "DEPOSIT_GATEWAY",
         &record.wallet_address,
-        record.amount_stablecoin,
+        record.amount_micro_stablecoin,
         0,                // nonce
-        0.0,              // from_balance_before
-        0.0,              // from_balance_after
-        new_balance,      // to_balance_after
+        0u64,             // from_balance_before
+        0u64,             // from_balance_after
+        new_balance_micro, // to_balance_after
         crate::storage::AuthType::SystemInternal,
     );
     if let Err(e) = state.blockchain.log_transaction(tx_record) {
         warn!("⚠️ Failed to log transaction receipt for deposit: {}", e);
     }
 
-    info!("✅ DEPOSIT APPROVED: {} {} → {} BB → {} (ext_tx: {})",
-        record.amount_stablecoin, record.asset, record.bb_to_mint,
+    info!("✅ DEPOSIT APPROVED: {:.6} {} → {:.5} BB → {} (ext_tx: {})",
+        record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+        record.asset,
+        record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         &record.wallet_address[..8.min(record.wallet_address.len())],
         &req.external_tx_hash[..12.min(req.external_tx_hash.len())]);
 
@@ -418,8 +428,162 @@ pub async fn deposit_approve_handler(
         "external_tx_hash": req.external_tx_hash,
         "wallet_address": record.wallet_address,
         "asset": record.asset,
-        "amount_stablecoin": record.amount_stablecoin,
-        "bb_minted": record.bb_to_mint,
+        "amount_stablecoin": record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+        "bb_minted": record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
+        "new_balance": new_balance,
+        "mint_tx_id": mint_tx_id,
+    })))
+}
+
+// ── POST /deposit/claim ────────────────────────────────────────────────────
+
+/// Request body for claiming an unattributed deposit.
+#[derive(Deserialize)]
+pub struct ClaimDepositBody {
+    /// BB wallet address (base58) to receive the minted BB
+    pub wallet_address: String,
+    /// The on-chain tx hash of the unattributed deposit
+    pub external_tx_hash: String,
+    /// Ed25519 public key (hex, 32 bytes) matching wallet_address
+    pub public_key: String,
+    /// Ed25519 signature (hex, 64 bytes)
+    /// Signs: "CLAIM_DEPOSIT:{wallet_address}:{external_tx_hash}:{timestamp}:{nonce}"
+    pub signature: String,
+    /// Unix timestamp (must be within 60s of server time)
+    pub timestamp: u64,
+    /// Random nonce for replay protection
+    pub nonce: String,
+}
+
+/// POST /deposit/claim — Claim an unattributed deposit by proving wallet ownership.
+///
+/// Called by users who sent stablecoin directly to the custody wallet without
+/// calling /deposit/request first. The watcher queued their deposit as
+/// "unattributed"; this endpoint lets them prove ownership and receive BB.
+pub async fn deposit_claim_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ClaimDepositBody>,
+) -> impl IntoResponse {
+    if req.wallet_address.is_empty() || req.external_tx_hash.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Missing required fields" })));
+    }
+
+    if !crate::is_valid_bb_address(&req.wallet_address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid wallet_address. Must be a base58 address."
+        })));
+    }
+
+    // ── Timestamp freshness ───────────────────────────────────────────────
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Request too old (>60s)" })));
+    }
+
+    // ── Nonce / replay protection ─────────────────────────────────────────
+    let nonce_key = format!("deposit_claim:{}:{}", req.wallet_address, req.nonce);
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "Nonce already used" })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
+    }
+
+    // ── Ed25519 signature verification ─────────────────────────────────────
+    let message = format!(
+        "CLAIM_DEPOSIT:{}:{}:{}:{}",
+        req.wallet_address, req.external_tx_hash, req.timestamp, req.nonce
+    );
+    let pubkey_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid public_key" }))),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature" }))),
+    };
+    let pubkey_arr: &[u8; 32] = match pubkey_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad pubkey length" }))),
+    };
+    let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(pubkey_arr) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
+    };
+    let sig_arr: &[u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad sig length" }))),
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(sig_arr);
+    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
+    }
+    let derived = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived != req.wallet_address {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "public_key does not match wallet_address"
+        })));
+    }
+
+    // ── Look up the unattributed deposit ──────────────────────────────────
+    let record = match state.blockchain.get_unattributed_deposit(&req.external_tx_hash) {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "No unattributed deposit found for this tx hash. It may already be attributed or never existed."
+        }))),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+    };
+
+    if record.claimed_by.is_some() {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "This deposit has already been claimed.",
+            "claimed_by": record.claimed_by,
+        })));
+    }
+
+    // ── Reserve → credit → commit (Bug #2 atomic pattern) ────────────────
+    let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(record.amount_micro_stablecoin);
+    let mint_tx_id = uuid::Uuid::new_v4().to_string();
+
+    if let Err(e) = state.blockchain.reserve_bridge_tx(&req.external_tx_hash) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": format!("Double-mint blocked: {}", e) })));
+    }
+    match state.blockchain.credit_lamports(&req.wallet_address, bb_lamports) {
+        Ok(_) => {
+            if let Err(e) = state.blockchain.commit_bridge_tx(&req.external_tx_hash, &mint_tx_id) {
+                tracing::warn!("⚠️  claim commit_bridge_tx: {}", e);
+            }
+        }
+        Err(e) => {
+            state.blockchain.cancel_bridge_tx(&req.external_tx_hash);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
+        }
+    }
+
+    // ── Mark claimed in ReDB ──────────────────────────────────────────────
+    if let Err(e) = state.blockchain.mark_unattributed_claimed(&req.external_tx_hash, &req.wallet_address) {
+        tracing::warn!("⚠️  Failed to mark unattributed deposit claimed: {}", e);
+    }
+
+    let new_balance = state.blockchain.get_balance(&req.wallet_address);
+
+    tracing::info!("✅ CLAIM: {:.6} {} → {:.5} BB → {} (tx: {})",
+        record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+        record.asset,
+        bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
+        &req.wallet_address[..8.min(req.wallet_address.len())],
+        &req.external_tx_hash[..16.min(req.external_tx_hash.len())]);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "external_tx_hash": req.external_tx_hash,
+        "wallet_address": req.wallet_address,
+        "asset": record.asset,
+        "amount_stablecoin": record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+        "bb_minted": bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         "new_balance": new_balance,
         "mint_tx_id": mint_tx_id,
     })))

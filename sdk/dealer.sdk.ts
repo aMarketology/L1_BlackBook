@@ -413,6 +413,20 @@ export class DealerSDK {
   }
 
   /**
+   * Get the dealer's BB, wUSDT, $XX, and $DECAY balances in a single call.
+   * Returns HTTP 503 if DEALER_PRIVATE_KEY is not set on the node.
+   */
+  async getAllBalances(): Promise<{
+    dealer_address: string;
+    bb: { balance: number; lamports: number; unit: string };
+    wusdt: { balance: number; raw: number; unit: string };
+    maxx: { balance: number; raw: number; unit: string };
+    decay: { token_count: number; token_ids: number[]; unit: string };
+  }> {
+    return this.get("/dealer/balances");
+  }
+
+  /**
    * Check if the dealer has enough BB to bankroll a market.
    * @param requiredBB  Minimum BB balance needed
    * @returns true if balance >= requiredBB
@@ -656,6 +670,7 @@ export class DealerSDK {
       total_deposited: Number(totalDeposited),
       total_payout: Number(totalPayout),
       house_rake: Number(houseRake),
+      winner_count: tree.leaves.length,
     });
   }
 
@@ -1029,6 +1044,82 @@ export class DealerSDK {
     }
 
     return { healthy, balance, sufficient, supplyInvariant, escrowConfigured, errors };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  UDP TPU — High-throughput binary transaction submission
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build the canonical binary message that must be signed for a TPU packet.
+   *
+   * Format (matches runtime/tpu.rs Ed25519 verification):
+   *   chain_id(1) | from_utf8 | '|' | to_utf8 | '|' | amount_le(8) | '|' | timestamp_le(8) | '|' | nonce_utf8
+   *
+   * @param from       Sender base58 address
+   * @param to         Recipient base58 address
+   * @param lamports   Amount in lamports (1 BB = 100_000 lamports)
+   * @param timestamp  Unix seconds
+   * @param nonce      Replay-protection nonce string
+   * @param chainId    Must be 1 for BlackBook mainnet
+   */
+  buildTpuPacketBytes(
+    from: string,
+    to: string,
+    lamports: bigint,
+    timestamp: number,
+    nonce: string,
+    chainId = 1,
+  ): Uint8Array {
+    const enc = new TextEncoder();
+    const sep = new Uint8Array([0x7c]); // '|'
+    const amountBuf = new Uint8Array(8);
+    const tsBuf = new Uint8Array(8);
+    // Write lamports as little-endian u64
+    let v = lamports;
+    for (let i = 0; i < 8; i++) { amountBuf[i] = Number(v & 0xffn); v >>= 8n; }
+    // Write timestamp as little-endian u64
+    let t = BigInt(timestamp);
+    for (let i = 0; i < 8; i++) { tsBuf[i] = Number(t & 0xffn); t >>= 8n; }
+
+    const parts = [
+      new Uint8Array([chainId]),
+      enc.encode(from), sep,
+      enc.encode(to), sep,
+      amountBuf, sep,
+      tsBuf, sep,
+      enc.encode(nonce),
+    ];
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) { out.set(p, offset); offset += p.length; }
+    return out;
+  }
+
+  /**
+   * Sign a TPU packet and return the hex signature.
+   * The canonical message is binary (not JSON) — see buildTpuPacketBytes().
+   *
+   * @param to        Recipient base58 address
+   * @param lamports  Amount in lamports (1 BB = 100_000 lamports)
+   * @param nonce     Unique nonce string for replay protection
+   * @param chainId   Must be 1 for BlackBook mainnet
+   * @returns { signature, timestamp, nonce } ready to embed in TpuPacket
+   */
+  async signTpuPacket(
+    to: string,
+    lamports: bigint,
+    nonce?: string,
+    chainId = 1,
+  ): Promise<{ signature: string; timestamp: number; nonce: string }> {
+    const { ed, hexToBytes, bytesToHex } = await getCrypto();
+    const ts = nowSecs();
+    const n = nonce ?? randomNonce();
+    const msg = this.buildTpuPacketBytes(this.wallet.address, to, lamports, ts, n, chainId);
+    const privBytes = hexToBytes(this.wallet.privateKeyHex);
+    const sigBytes = await ed.signAsync(msg, privBytes);
+    return { signature: bytesToHex(sigBytes), timestamp: ts, nonce: n };
   }
 }
 

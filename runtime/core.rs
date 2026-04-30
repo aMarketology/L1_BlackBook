@@ -232,7 +232,9 @@ pub struct Transaction {
     pub id: String,
     pub from: String,
     pub to: String,
-    pub amount: f64,
+    /// Amount in raw lamports (1 BB = 100_000 lamports).
+    /// For SwapUsdcForBb: stores microUSDT. For all others: stores lamports.
+    pub amount: u64,
     pub timestamp: u64,
     pub signature: String,
     #[serde(default)]
@@ -246,7 +248,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(from: String, to: String, amount: f64, tx_type: TransactionType) -> Self {
+    pub fn new(from: String, to: String, amount: u64, tx_type: TransactionType) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let read_accounts = vec![from.clone()];
@@ -408,18 +410,19 @@ mod tests {
 
     #[test]
     fn test_transaction_new() {
-        let tx = Transaction::new("alice".into(), "bob".into(), 100.0, TransactionType::Transfer);
+        // 100 BB = 10_000_000 lamports (100 * 100_000)
+        let tx = Transaction::new("alice".into(), "bob".into(), 10_000_000u64, TransactionType::Transfer);
         assert_eq!(tx.from, "alice");
         assert_eq!(tx.to, "bob");
-        assert_eq!(tx.amount, 100.0);
+        assert_eq!(tx.amount, 10_000_000u64);
         assert!(!tx.id.is_empty());
     }
 
     #[test]
     fn test_conflict_detection() {
-        let tx1 = Transaction::new("alice".into(), "bob".into(), 100.0, TransactionType::Transfer);
-        let tx2 = Transaction::new("alice".into(), "carol".into(), 50.0, TransactionType::Transfer);
-        let tx3 = Transaction::new("dave".into(), "eve".into(), 25.0, TransactionType::Transfer);
+        let tx1 = Transaction::new("alice".into(), "bob".into(), 10_000_000u64, TransactionType::Transfer);
+        let tx2 = Transaction::new("alice".into(), "carol".into(), 5_000_000u64, TransactionType::Transfer);
+        let tx3 = Transaction::new("dave".into(), "eve".into(), 2_500_000u64, TransactionType::Transfer);
 
         assert!(tx1.conflicts_with(&tx2)); // same sender
         assert!(!tx1.conflicts_with(&tx3)); // independent

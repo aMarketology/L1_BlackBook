@@ -1,4 +1,4 @@
-# BlackBook L1 — HTTP Endpoint Guide
+﻿# BlackBook L1 â€” HTTP Endpoint Guide
 
 > **Base URL:** `https://blackbook.id`  
 > **Engine:** Solana-style PoH + Sealevel parallel execution  
@@ -9,194 +9,194 @@
 
 blackbook.id					BlackBook L1: Blockchain HTTP API Reference
 
-	/health		GET	Health check, node status	BlackBook L1 — Node Health & Status Endpoint
-		→ Send: nothing (no body)
-		← 200:  { status, version, network, blockchain: { total_supply, account_count, block_count, svm_accounts }, poh_clock, consensus, block_production, infrastructure }
+	/health		GET	Health check, node status	BlackBook L1 â€” Node Health & Status Endpoint
+		â†’ Send: nothing (no body)
+		â† 200:  { status, version, network, blockchain: { total_supply, account_count, block_count, svm_accounts }, poh_clock, consensus, block_production, infrastructure }
 
-	/stats		GET	Pipeline + execution stats	BlackBook L1 — Blockchain Statistics Endpoint
-		→ Send: nothing (no body)
-		← 200:  { blockchain: { total_accounts, block_count, total_supply, cache_hit_rate }, pipeline, gulf_stream, parallel_execution }
+	/stats		GET	Pipeline + execution stats	BlackBook L1 â€” Blockchain Statistics Endpoint
+		â†’ Send: nothing (no body)
+		â† 200:  { blockchain: { total_accounts, block_count, total_supply, cache_hit_rate }, pipeline, gulf_stream, parallel_execution }
 
 	/balance/:address		GET	$BB balance lookup	Check $BB Balance by Address | BlackBook L1
-		→ Send: :address in URL path (base58 public key)
-		← 200:  { address, name, balance, unit: "BB" }
+		â†’ Send: :address in URL path (base58 public key)
+		â† 200:  { address, name, balance, unit: "BB" }
 
 	/ledger		GET	Paginated transaction ledger	Transaction Ledger & Audit Log | BlackBook L1
-		→ Send: ?page=1&limit=50 (query params, both optional)
-		← 200:  text/plain — ASCII table of all transactions
+		â†’ Send: ?page=1&limit=50 (query params, both optional)
+		â† 200:  text/plain â€” ASCII table of all transactions
 
-	/transfer/simple		POST	Ed25519 signed transfer	Signed Transfer — Send $BB Tokens | BlackBook L1
-		→ Send: { public_key: hex64, wallet_address: base58, payload: "{\"to\":\"...\",\"amount\":50.0}", timestamp: u64, nonce: string, chain_id: u8, signature: hex128 }
-		← 200:  { success, from, to, amount, from_balance, to_balance }
+	/transfer/simple		POST	Ed25519 signed transfer	Signed Transfer â€” Send $BB Tokens | BlackBook L1
+		â†’ Send: { public_key: hex64, wallet_address: base58, payload: "{\"to\":\"...\",\"amount\":50.0}", timestamp: u64, nonce: string, chain_id: u8, signature: hex128 }
+		â† 200:  { success, from, to, amount, from_balance, to_balance }
 
-	/faucet		POST	Public testnet faucet	Faucet — Free Test Tokens | BlackBook L1
-		→ Send: { to: base58, amount: f64 }
-		← 200:  { success, minted, to, new_balance, epoch, remaining_this_epoch }
-		← 429:  epoch limit reached
+	/faucet		POST	Public testnet faucet	Faucet â€” Free Test Tokens | BlackBook L1
+		â†’ Send: { to: base58, amount: f64 }
+		â† 200:  { success, minted, to, new_balance, epoch, remaining_this_epoch }
+		â† 429:  epoch limit reached
 
 	/poh
 		/status	GET	PoH clock state	Proof of History Status | BlackBook L1
-			→ Send: nothing
-			← 200:  { current_slot, num_hashes, current_hash, is_running }
+			â†’ Send: nothing
+			â† 200:  { current_slot, num_hashes, current_hash, is_running }
 
 		/block/latest	GET	Latest block	Get Latest Block | BlackBook L1
-			→ Send: nothing
-			← 200:  { success, block: { slot, timestamp, hash, previous_hash, tx_count, leader, epoch } }
+			â†’ Send: nothing
+			â† 200:  { success, block: { slot, timestamp, hash, previous_hash, tx_count, leader, epoch } }
 
 		/block/:slot	GET	Block by slot number	Get Block by Slot | BlackBook L1
-			→ Send: :slot in URL path (u64)
-			← 200:  { success, block: { slot, timestamp, hash, previous_hash, poh_hash, poh_sequence, state_root, tx_count, transactions[], leader, epoch, confirmations } }
+			â†’ Send: :slot in URL path (u64)
+			â† 200:  { success, block: { slot, timestamp, hash, previous_hash, poh_hash, poh_sequence, state_root, tx_count, transactions[], leader, epoch, confirmations } }
 
 		/tx/:tx_id/status	GET	Transaction status	Transaction Status Lookup | BlackBook L1
-			→ Send: :tx_id in URL path (string)
-			← 200:  { tx_id, status, is_finalized }
+			â†’ Send: :tx_id in URL path (string)
+			â† 200:  { tx_id, status, is_finalized }
 
 	/consensus
 		/tower	GET	Tower BFT vote state	Tower BFT Consensus State | BlackBook L1
-			→ Send: nothing
-			← 200:  { validator_count, total_stake, global_root, confirmed_slots, active_forks, supermajority_threshold, max_tower_depth, current_slot, best_fork }
+			â†’ Send: nothing
+			â† 200:  { validator_count, total_stake, global_root, confirmed_slots, active_forks, supermajority_threshold, max_tower_depth, current_slot, best_fork }
 
 	/turbine
 		/status	GET	Shred propagation stats	Turbine Shred Propagation | BlackBook L1
-			→ Send: nothing
-			← 200:  { current_slot, latest_shredded_slot, data_shreds, fec_shreds, block_bytes, validator_count, propagation_max_hops, turbine_fanout }
+			â†’ Send: nothing
+			â† 200:  { current_slot, latest_shredded_slot, data_shreds, fec_shreds, block_bytes, validator_count, propagation_max_hops, turbine_fanout }
 
 	/sealevel
-		/submit	POST	Gulf Stream parallel submit	Sealevel — Submit Transaction | BlackBook L1
-			→ Send: { from: base58, to: base58, amount: f64, priority?: u64 }
-			← 200:  { success, tx_id, status: "pending" }
+		/submit	POST	Gulf Stream parallel submit	Sealevel â€” Submit Transaction | BlackBook L1
+			â†’ Send: { from: base58, to: base58, amount: f64, priority?: u64 }
+			â† 200:  { success, tx_id, status: "pending" }
 
 	/credit
 		/open	POST	Lock tokens for L2 session	Open L2 Credit Session | BlackBook L1
-			→ Send: { wallet: base58, amount: f64, session_id?: string }
-			← 200:  { success, session_id, locked_amount }
+			â†’ Send: { wallet: base58, amount: f64, session_id?: string }
+			â† 200:  { success, session_id, locked_amount }
 
-		/settle	POST	Settle L2 session ± PnL	Settle L2 Credit Session | BlackBook L1
-			→ Send: { session_id: string, net_pnl: f64 }
-			← 200:  { success, session_id, net_pnl, returned, new_balance }
+		/settle	POST	Settle L2 session Â± PnL	Settle L2 Credit Session | BlackBook L1
+			â†’ Send: { session_id: string, net_pnl: f64 }
+			â† 200:  { success, session_id, net_pnl, returned, new_balance }
 
 	/wallet
-		/create	POST	Create SSS 2-of-3 wallet	Create Wallet — SSS + BIP-39 | BlackBook L1
-			→ Send: { username: string, password?: string, pin?: string, daily_limit?: u64 }
-			← 200:  { wallet_id, mnemonic, share_a, share_a_is_encrypted, share_c, public_key, address, session_token }
+		/create	POST	Create SSS 2-of-3 wallet	Create Wallet â€” SSS + BIP-39 | BlackBook L1
+			â†’ Send: { username: string, password?: string, pin?: string, daily_limit?: u64 }
+			â† 200:  { wallet_id, mnemonic, share_a, share_a_is_encrypted, share_c, public_key, address, session_token }
 
-		/login	POST	Reconstruct seed, start session	Wallet Login — Session Auth | BlackBook L1
-			→ Send: { wallet_id: string, shard_1: hex|encrypted, shard_2: hex|encrypted, password?: string, shard_2_is_server_encrypted?: bool }
-			← 200:  { success, wallet_id, session_token }
+		/login	POST	Reconstruct seed, start session	Wallet Login â€” Session Auth | BlackBook L1
+			â†’ Send: { wallet_id: string, shard_1: hex|encrypted, shard_2: hex|encrypted, password?: string, shard_2_is_server_encrypted?: bool }
+			â† 200:  { success, wallet_id, session_token }
 
-		/logout	POST	Revoke session, wipe seed	Wallet Logout — Revoke Session | BlackBook L1
-			→ Send: { session_token?: string, wallet_id?: string } (at least one required)
-			← 200:  { success: true }
+		/logout	POST	Revoke session, wipe seed	Wallet Logout â€” Revoke Session | BlackBook L1
+			â†’ Send: { session_token?: string, wallet_id?: string } (at least one required)
+			â† 200:  { success: true }
 
 		/secure/shard-b	POST	Retrieve server shard	Retrieve Shard B | BlackBook L1
-			→ Send: { wallet_id: string, pin?: string }
-			← 200:  { shard_b: hex, status: "Released" }
+			â†’ Send: { wallet_id: string, pin?: string }
+			â† 200:  { shard_b: hex, status: "Released" }
 
 		/verify-sss	POST	Verify 2-of-3 reconstruction	Verify SSS Shares | BlackBook L1
-			→ Send: { wallet_id: string, shard_1: hex, shard_2: hex, password?: string, shard_2_is_server_encrypted?: bool }
-			← 200:  { success, wallet_id, derived_address, matches: bool, message }
+			â†’ Send: { wallet_id: string, shard_1: hex, shard_2: hex, password?: string, shard_2_is_server_encrypted?: bool }
+			â† 200:  { success, wallet_id, derived_address, matches: bool, message }
 
 	/transfer		POST	SSS shard-authenticated transfer	Transfer with SSS Shares | BlackBook L1
-		→ Send: { from_wallet_id: string, to_address: base58, amount: f64, share_a: hex|encrypted, password?: string }
-		← 200:  { success, signature, from, to, amount, from_balance, to_balance, session_token }
+		â†’ Send: { from_wallet_id: string, to_address: base58, amount: f64, share_a: hex|encrypted, password?: string }
+		â† 200:  { success, signature, from, to, amount, from_balance, to_balance, session_token }
 
-	/transfer/session		POST	Session-authenticated transfer	Session Transfer — Fast Path | BlackBook L1
-		→ Send: { from_wallet_id: string, to_address: base58, amount: f64, session_token: uuid }
-		← 200:  { success, signature, from, to, amount, from_balance, to_balance, session_token }
+	/transfer/session		POST	Session-authenticated transfer	Session Transfer â€” Fast Path | BlackBook L1
+		â†’ Send: { from_wallet_id: string, to_address: base58, amount: f64, session_token: uuid }
+		â† 200:  { success, signature, from, to, amount, from_balance, to_balance, session_token }
 
 	/admin
 		/mint	POST	Mint $BB (Dealer)	Admin Mint $BB Tokens | BlackBook L1
-			→ Send: { to: base58, amount: f64, dealer_signature?: hex, l2_receipt_id?: string }
-			← 200:  { success, minted, to, new_balance, l2_receipt_id }
+			â†’ Send: { to: base58, amount: f64, dealer_signature?: hex, l2_receipt_id?: string }
+			â† 200:  { success, minted, to, new_balance, l2_receipt_id }
 
 		/burn	POST	Burn $BB (Dealer)	Admin Burn $BB Tokens | BlackBook L1
-			→ Send: { from: base58, amount: f64, dealer_signature?: hex, l2_receipt_id?: string }
-			← 200:  { success, burned, from, new_balance, l2_receipt_id }
+			â†’ Send: { from: base58, amount: f64, dealer_signature?: hex, l2_receipt_id?: string }
+			â† 200:  { success, burned, from, new_balance, l2_receipt_id }
 
 		/dealer/settle	POST	Batch L2 settlement	Dealer Batch Settlement | BlackBook L1
-			→ Send: { payouts: [{ address: base58, amount: f64 }], batch_receipt_id: string }
-			← 200:  { success, batch_receipt_id, total_paid, payout_count, results[] }
+			â†’ Send: { payouts: [{ address: base58, amount: f64 }], batch_receipt_id: string }
+			â† 200:  { success, batch_receipt_id, total_paid, payout_count, results[] }
 
 		/wallet/migrate	POST	Migrate wallet balances	Admin Wallet Migration | BlackBook L1
-			→ Send: { mappings: [{ name, old_address, new_address }], drain_old?: bool (default true), migrate_shares?: bool }
-			← 200:  MigrationReport { success_count, failed_count, results[] }
+			â†’ Send: { mappings: [{ name, old_address, new_address }], drain_old?: bool (default true), migrate_shares?: bool }
+			â† 200:  MigrationReport { success_count, failed_count, results[] }
 
-		/accounts	GET	All account balances	Admin — All Accounts | BlackBook L1
-			→ Send: nothing
-			← 200:  { accounts: [{ name, address, balance, version, role, active }], total_supply, dealer_address, wallet_version }
+		/accounts	GET	All account balances	Admin â€” All Accounts | BlackBook L1
+			â†’ Send: nothing
+			â† 200:  { accounts: [{ name, address, balance, version, role, active }], total_supply, dealer_address, wallet_version }
 
-		/security/stats	GET	Throttle + circuit breaker	Admin — Security Stats | BlackBook L1
-			→ Send: nothing
-			← 200:  { throttler, circuit_breaker, fee_market }
+		/security/stats	GET	Throttle + circuit breaker	Admin â€” Security Stats | BlackBook L1
+			â†’ Send: nothing
+			â† 200:  { throttler, circuit_breaker, fee_market }
 
 		/usdc/mint	POST	Mint USDC SPL tokens	Admin Mint USDC | BlackBook L1
-			→ Send: { to: base58, amount: f64 }
-			← 200:  { success, minted_usdc, raw_amount, to, ata, mint, new_total_supply }
+			â†’ Send: { to: base58, amount: f64 }
+			â† 200:  { success, minted_usdc, raw_amount, to, ata, mint, new_total_supply }
 
 	/usdc
 		/transfer	POST	Transfer USDC between wallets	USDC Transfer | BlackBook L1
-			→ Send: { from: base58, to: base58, amount: f64 }
-			← 200:  { success, amount_usdc, raw_amount, from, to, from_ata, to_ata, from_balance, to_balance }
+			â†’ Send: { from: base58, to: base58, amount: f64 }
+			â† 200:  { success, amount_usdc, raw_amount, from, to, from_ata, to_ata, from_balance, to_balance }
 
 		/balance/:address	GET	USDC balance for wallet	USDC Balance Lookup | BlackBook L1
-			→ Send: :address in URL path (base58)
-			← 200:  { address, usdc_balance, raw_balance, decimals: 6, mint }
+			â†’ Send: :address in URL path (base58)
+			â† 200:  { address, usdc_balance, raw_balance, decimals: 6, mint }
 
 		/supply	GET	Total USDC supply	USDC Total Supply | BlackBook L1
-			→ Send: nothing
-			← 200:  { mint, total_supply, raw_supply, decimals: 6 }
+			â†’ Send: nothing
+			â† 200:  { mint, total_supply, raw_supply, decimals: 6 }
 
 		/accounts/:address	GET	USDC token accounts	USDC Token Accounts | BlackBook L1
-			→ Send: :address in URL path (base58)
-			← 200:  { owner, token_accounts: [{ address, mint, owner, balance_usdc, raw_balance, decimals }] }
+			â†’ Send: :address in URL path (base58)
+			â† 200:  { owner, token_accounts: [{ address, mint, owner, balance_usdc, raw_balance, decimals }] }
 
-	/solana-rpc (port 8899)		All POST JSON-RPC 2.0 → { "jsonrpc":"2.0", "id":1, "method":"...", "params":[...] }
+	/solana-rpc (port 8899)		All POST JSON-RPC 2.0 â†’ { "jsonrpc":"2.0", "id":1, "method":"...", "params":[...] }
 
-		getHealth	POST JSON-RPC	Health probe	Solana RPC — getHealth | BlackBook L1
-			→ Send: { method: "getHealth", params: [] }
-			← 200:  "ok"
+		getHealth	POST JSON-RPC	Health probe	Solana RPC â€” getHealth | BlackBook L1
+			â†’ Send: { method: "getHealth", params: [] }
+			â† 200:  "ok"
 
-		getBalance	POST JSON-RPC	Lamport balance	Solana RPC — getBalance | BlackBook L1
-			→ Send: { method: "getBalance", params: ["<pubkey>"] }
-			← 200:  { value: u64 (lamports) }
+		getBalance	POST JSON-RPC	Lamport balance	Solana RPC â€” getBalance | BlackBook L1
+			â†’ Send: { method: "getBalance", params: ["<pubkey>"] }
+			â† 200:  { value: u64 (lamports) }
 
-		getAccountInfo	POST JSON-RPC	Full account state	Solana RPC — getAccountInfo | BlackBook L1
-			→ Send: { method: "getAccountInfo", params: ["<pubkey>", { encoding?: "base64" }] }
-			← 200:  { value: { lamports, data, owner, executable, rentEpoch } }
+		getAccountInfo	POST JSON-RPC	Full account state	Solana RPC â€” getAccountInfo | BlackBook L1
+			â†’ Send: { method: "getAccountInfo", params: ["<pubkey>", { encoding?: "base64" }] }
+			â† 200:  { value: { lamports, data, owner, executable, rentEpoch } }
 
-		sendTransaction	POST JSON-RPC	Submit signed tx	Solana RPC — sendTransaction | BlackBook L1
-			→ Send: { method: "sendTransaction", params: ["<base64_tx>", { encoding?: "base64" }] }
-			← 200:  "<signature_base58>"
+		sendTransaction	POST JSON-RPC	Submit signed tx	Solana RPC â€” sendTransaction | BlackBook L1
+			â†’ Send: { method: "sendTransaction", params: ["<base64_tx>", { encoding?: "base64" }] }
+			â† 200:  "<signature_base58>"
 
-		getBlock	POST JSON-RPC	Block by slot	Solana RPC — getBlock | BlackBook L1
-			→ Send: { method: "getBlock", params: [<slot_u64>, { encoding?: "json", transactionDetails?: "full" }] }
-			← 200:  { blockHeight, blockTime, blockhash, transactions[] }
+		getBlock	POST JSON-RPC	Block by slot	Solana RPC â€” getBlock | BlackBook L1
+			â†’ Send: { method: "getBlock", params: [<slot_u64>, { encoding?: "json", transactionDetails?: "full" }] }
+			â† 200:  { blockHeight, blockTime, blockhash, transactions[] }
 
-		blackbook_getProfile	POST JSON-RPC	Wallet profile	BB Extension — getProfile | BlackBook L1
-			→ Send: { method: "blackbook_getProfile", params: ["<pubkey>"] }
-			← 200:  { registered, walletAddress, balance: { lamports, bb }, network, slot }
+		blackbook_getProfile	POST JSON-RPC	Wallet profile	BB Extension â€” getProfile | BlackBook L1
+			â†’ Send: { method: "blackbook_getProfile", params: ["<pubkey>"] }
+			â† 200:  { registered, walletAddress, balance: { lamports, bb }, network, slot }
 
-	/grpc (port 50051)		Protocol: blackbook.L1Settlement — all require Ed25519 sig + timestamp replay protection
+	/grpc (port 50051)		Protocol: blackbook.L1Settlement â€” all require Ed25519 sig + timestamp replay protection
 
-		GetBalance	gRPC unary	L1 balance (available + locked)	gRPC — GetBalance | BlackBook L1
-			→ Send: BalanceRequest { address, signature, timestamp }
-			← OK:   BalanceResponse { success, address, available, locked, total }
+		GetBalance	gRPC unary	L1 balance (available + locked)	gRPC â€” GetBalance | BlackBook L1
+			â†’ Send: BalanceRequest { address, signature, timestamp }
+			â† OK:   BalanceResponse { success, address, available, locked, total }
 
-		SoftLock	gRPC unary	Lock funds for L2	gRPC — SoftLock | BlackBook L1
-			→ Send: SoftLockRequest { address, amount, lock_duration_secs, signature, timestamp }
-			← OK:   SoftLockResponse { success, lock_id, locked_amount, new_available, new_locked, expires_at }
+		SoftLock	gRPC unary	Lock funds for L2	gRPC â€” SoftLock | BlackBook L1
+			â†’ Send: SoftLockRequest { address, amount, lock_duration_secs, signature, timestamp }
+			â† OK:   SoftLockResponse { success, lock_id, locked_amount, new_available, new_locked, expires_at }
 
-		SettleBet	gRPC unary	Settle single bet	gRPC — SettleBet | BlackBook L1
-			→ Send: SettleBetRequest { user_address, dealer_address, amount, direction, bet_id, signature, timestamp }
-			← OK:   SettleBetResponse { success, tx_hash, user_balance, dealer_balance, user_pnl }
+		SettleBet	gRPC unary	Settle single bet	gRPC â€” SettleBet | BlackBook L1
+			â†’ Send: SettleBetRequest { user_address, dealer_address, amount, direction, bet_id, signature, timestamp }
+			â† OK:   SettleBetResponse { success, tx_hash, user_balance, dealer_balance, user_pnl }
 
-		BatchSettle	gRPC unary	Settle multiple bets	gRPC — BatchSettle | BlackBook L1
-			→ Send: BatchSettleRequest { settlements: [SettleBetRequest], batch_id, signature, timestamp }
-			← OK:   BatchSettleResponse { success, results[], total_settled }
+		BatchSettle	gRPC unary	Settle multiple bets	gRPC â€” BatchSettle | BlackBook L1
+			â†’ Send: BatchSettleRequest { settlements: [SettleBetRequest], batch_id, signature, timestamp }
+			â† OK:   BatchSettleResponse { success, results[], total_settled }
 
-		SubscribeBlocks	gRPC stream	Live block feed	gRPC — SubscribeBlocks | BlackBook L1
-			→ Send: SubscribeRequest { reader_id, start_slot }
-			← Stream: BlockData { slot, hash, previous_hash, transactions[], timestamp, leader, epoch }
+		SubscribeBlocks	gRPC stream	Live block feed	gRPC â€” SubscribeBlocks | BlackBook L1
+			â†’ Send: SubscribeRequest { reader_id, start_slot }
+			â† Stream: BlockData { slot, hash, previous_hash, transactions[], timestamp, leader, epoch }
 
 ---
 
@@ -329,16 +329,16 @@ curl "https://blackbook.id/ledger?page=1&limit=50"
 
 | Query Param | Type | Default | Max | Description |
 |-------------|------|---------|-----|-------------|
-| `page` | int | 1 | — | Page number |
+| `page` | int | 1 | â€” | Page number |
 | `limit` | int | 50 | 100 | Results per page |
 
-**Response:** `text/plain` — formatted table of transactions with sender, receiver, amount, slot, and timestamp.
+**Response:** `text/plain` â€” formatted table of transactions with sender, receiver, amount, slot, and timestamp.
 
 ---
 
 ### `POST /faucet`
 
-**Faucet — Free Test Tokens | BlackBook L1**
+**Faucet â€” Free Test Tokens | BlackBook L1**
 
 Mint free $BB tokens for testing. Rate-limited to 99,999 BB per epoch.
 
@@ -351,8 +351,8 @@ curl -X POST https://blackbook.id/faucet \
 **Request Body:**
 ```json
 {
-  "to": "string — recipient base58 address",
-  "amount": "float — amount of $BB to mint"
+  "to": "string â€” recipient base58 address",
+  "amount": "float â€” amount of $BB to mint"
 }
 ```
 
@@ -380,7 +380,7 @@ Three ways to move $BB tokens: signed, shard-authenticated, and session-based.
 
 ### `POST /transfer/simple`
 
-**Signed Transfer — Send $BB Tokens | BlackBook L1**
+**Signed Transfer â€” Send $BB Tokens | BlackBook L1**
 
 Submit an Ed25519-signed transfer. The client signs the payload offline; the server verifies the signature and executes the transfer atomically.
 
@@ -449,7 +449,7 @@ curl -X POST https://blackbook.id/transfer \
 | `from_wallet_id` | string | yes | Sender wallet ID |
 | `to_address` | string | yes | Recipient base58 address |
 | `amount` | float | yes | Amount of $BB |
-| `share_a` | string | yes | Share A — encrypted blob or raw hex |
+| `share_a` | string | yes | Share A â€” encrypted blob or raw hex |
 | `password` | string | if encrypted | Password to decrypt Share A |
 
 **Response:**
@@ -470,9 +470,9 @@ curl -X POST https://blackbook.id/transfer \
 
 ### `POST /transfer/session`
 
-**Session Transfer — Fast Path | BlackBook L1**
+**Session Transfer â€” Fast Path | BlackBook L1**
 
-Transfer using an active session token. No password, no Argon2id, no shard decryption — the seed is already in server memory.
+Transfer using an active session token. No password, no Argon2id, no shard decryption â€” the seed is already in server memory.
 
 ```bash
 curl -X POST https://blackbook.id/transfer/session \
@@ -612,7 +612,7 @@ curl https://blackbook.id/poh/tx/tx_abc123def/status
 
 **Tower BFT Consensus State | BlackBook L1**
 
-Full Tower BFT vote tower state — validators, stake, forks, supermajority.
+Full Tower BFT vote tower state â€” validators, stake, forks, supermajority.
 
 ```bash
 curl https://blackbook.id/consensus/tower
@@ -639,7 +639,7 @@ curl https://blackbook.id/consensus/tower
 
 **Turbine Shred Propagation | BlackBook L1**
 
-Turbine shred propagation stats — data shreds, FEC recovery, fanout topology.
+Turbine shred propagation stats â€” data shreds, FEC recovery, fanout topology.
 
 ```bash
 curl https://blackbook.id/turbine/status
@@ -667,7 +667,7 @@ curl https://blackbook.id/turbine/status
 
 ### `POST /sealevel/submit`
 
-**Sealevel — Submit Transaction | BlackBook L1**
+**Sealevel â€” Submit Transaction | BlackBook L1**
 
 Submit a transaction to Gulf Stream for Sealevel parallel execution. Transactions are pre-forwarded to the leader before the slot begins.
 
@@ -747,7 +747,7 @@ curl -X POST https://blackbook.id/credit/open \
 
 **Settle L2 Credit Session | BlackBook L1**
 
-Close an L2 session and return tokens ± net PnL.
+Close an L2 session and return tokens Â± net PnL.
 
 ```bash
 curl -X POST https://blackbook.id/credit/settle \
@@ -782,9 +782,9 @@ curl -X POST https://blackbook.id/credit/settle \
 
 The wallet system uses Shamir Secret Sharing with a 2-of-3 threshold. Three shares are created from the BIP-39 seed:
 
-- **Share A** — User-held (encrypted with password via Argon2id → AES-GCM)
-- **Share B** — Server-held (encrypted with `SERVER_MASTER_KEY`)
-- **Share C** — Cold backup (raw hex, stored offline)
+- **Share A** â€” User-held (encrypted with password via Argon2id â†’ AES-GCM)
+- **Share B** â€” Server-held (encrypted with `SERVER_MASTER_KEY`)
+- **Share C** â€” Cold backup (raw hex, stored offline)
 
 Any 2 of 3 shares reconstruct the Ed25519 signing key.
 
@@ -792,7 +792,7 @@ Any 2 of 3 shares reconstruct the Ed25519 signing key.
 
 ### `POST /wallet/create`
 
-**Create Wallet — SSS + BIP-39 | BlackBook L1**
+**Create Wallet â€” SSS + BIP-39 | BlackBook L1**
 
 Generate a new wallet with BIP-39 mnemonic, split into SSS 2-of-3 shares.
 
@@ -836,7 +836,7 @@ curl -X POST https://blackbook.id/wallet/create \
 
 ### `POST /wallet/login`
 
-**Wallet Login — Session Auth | BlackBook L1**
+**Wallet Login â€” Session Auth | BlackBook L1**
 
 Reconstruct the Ed25519 seed from any 2 shares and create an in-memory session.
 
@@ -877,7 +877,7 @@ curl -X POST https://blackbook.id/wallet/login \
 
 ### `POST /wallet/logout`
 
-**Wallet Logout — Revoke Session | BlackBook L1**
+**Wallet Logout â€” Revoke Session | BlackBook L1**
 
 Wipe the seed from server memory and revoke the session token.
 
@@ -965,7 +965,7 @@ curl -X POST https://blackbook.id/wallet/verify-sss \
   "wallet_id": "wallet_abc123",
   "derived_address": "5FHneW46...",
   "matches": true,
-  "message": "SSS reconstruction verified — derived address matches wallet"
+  "message": "SSS reconstruction verified â€” derived address matches wallet"
 }
 ```
 
@@ -1115,7 +1115,7 @@ curl -X POST https://blackbook.id/admin/wallet/migrate \
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `mappings` | array | — | `[{ name, old_address, new_address }]` |
+| `mappings` | array | â€” | `[{ name, old_address, new_address }]` |
 | `drain_old` | bool | true | Zero out old wallet after migration |
 | `migrate_shares` | bool | false | Also migrate SSS shard data |
 
@@ -1125,7 +1125,7 @@ curl -X POST https://blackbook.id/admin/wallet/migrate \
 
 ### `GET /admin/accounts`
 
-**Admin — All Accounts | BlackBook L1**
+**Admin â€” All Accounts | BlackBook L1**
 
 View every known account with balances, roles, and wallet version.
 
@@ -1156,7 +1156,7 @@ curl https://blackbook.id/admin/accounts
 
 ### `GET /admin/security/stats`
 
-**Admin — Security Stats | BlackBook L1**
+**Admin â€” Security Stats | BlackBook L1**
 
 Rate limiter, circuit breaker, and fee market status.
 
@@ -1405,7 +1405,7 @@ curl -X POST https://blackbook.id:8899 \
 | `blackbook_getProfile` | `[pubkey]` | `{ registered, walletAddress, balance, network, slot }` | Full wallet profile |
 | `blackbook_isRegistered` | `[pubkey]` | `bool` | Non-zero balance check |
 
-**Example — `blackbook_getProfile`:**
+**Example â€” `blackbook_getProfile`:**
 
 ```bash
 curl -X POST https://blackbook.id:8899 \
@@ -1436,14 +1436,14 @@ curl -X POST https://blackbook.id:8899 \
 
 ## 10. gRPC Settlement Service (Port 50051)
 
-Binary protocol for high-performance L2 ↔ L1 settlement. All methods require Ed25519 signature + timestamp replay protection.
+Binary protocol for high-performance L2 â†” L1 settlement. All methods require Ed25519 signature + timestamp replay protection.
 
 **Protocol:** `blackbook.L1Settlement`
 
 | RPC Method | Type | Description |
 |------------|------|-------------|
-| `GetBalance` | Unary | L1 balance — available + locked |
-| `GetVirtualBalance` | Unary | L1 ↔ L2 virtual balance |
+| `GetBalance` | Unary | L1 balance â€” available + locked |
+| `GetVirtualBalance` | Unary | L1 â†” L2 virtual balance |
 | `SoftLock` | Unary | Lock funds for L2 bet/session |
 | `ReleaseLock` | Unary | Release a soft lock |
 | `SettleBet` | Unary | Settle a single bet (idempotent) |
@@ -1457,10 +1457,10 @@ Binary protocol for high-performance L2 ↔ L1 settlement. All methods require E
 **Key Response Shapes:**
 
 ```
-BalanceResponse      → { success, address, available, locked, total }
-SoftLockResponse     → { success, lock_id, locked_amount, new_available, expires_at }
-SettleBetResponse    → { success, tx_hash, user_balance, dealer_balance, user_pnl }
-HealthResponse       → { healthy, version, block_height, uptime_seconds, active_locks }
+BalanceResponse      â†’ { success, address, available, locked, total }
+SoftLockResponse     â†’ { success, lock_id, locked_amount, new_available, expires_at }
+SettleBetResponse    â†’ { success, tx_hash, user_balance, dealer_balance, user_pnl }
+HealthResponse       â†’ { healthy, version, block_height, uptime_seconds, active_locks }
 ```
 
 ---
@@ -1473,19 +1473,19 @@ Block propagation between writer and reader nodes.
 
 | RPC Method | Type | Description |
 |------------|------|-------------|
-| `SubscribeBlocks` | Server-streaming | Live block feed from writer → reader |
+| `SubscribeBlocks` | Server-streaming | Live block feed from writer â†’ reader |
 | `CatchupBlocks` | Server-streaming | Historical block range for catch-up |
 | `ForwardTransaction` | Unary | Reader forwards tx to writer for inclusion |
 | `GetStatus` | Unary | Writer node status + connected readers |
 
-**Example — `SubscribeBlocks`:**
+**Example â€” `SubscribeBlocks`:**
 
 ```
 Request:  { reader_id: "reader-01", start_slot: 98700 }
 Stream:   BlockData { slot, hash, previous_hash, transactions, timestamp, leader, epoch }
 ```
 
-**Example — `ForwardTransaction`:**
+**Example â€” `ForwardTransaction`:**
 
 ```
 Request:  { reader_id: "reader-01", tx_json: "{...}" }
@@ -1494,7 +1494,7 @@ Response: { success: true, tx_id: "tx_abc123" }
 
 ---
 
-## Quick Reference — Full Endpoint Map
+## Quick Reference â€” Full Endpoint Map
 
 | # | Method | Path | Auth | Category |
 |---|--------|------|------|----------|
@@ -1533,8 +1533,86 @@ Response: { success: true, tx_id: "tx_abc123" }
 | 33 | GET | `/usdc/accounts/:address` | Public | USDC |
 
 **Ports:**
-- **8080** — REST API (all endpoints above)
-- **8899** — Solana JSON-RPC 2.0 (28 methods)
-- **50051** — gRPC Settlement + Validator Relay (15 methods)
+- **8080** â€” REST API (all endpoints above)
+- **8899** â€” Solana JSON-RPC 2.0 (28 methods)
+- **50051** â€” gRPC Settlement + Validator Relay (15 methods)
 
 **Total: 76 callable methods across 3 protocols.**
+
+
+---
+
+## Deposit Gateway
+
+### POST /deposit/request
+
+Register an intent to deposit stablecoin. The watcher uses the returned 	x_hash key to match the on-chain transfer.
+
+**Request body:**
+`json
+{
+  "wallet_address": "base58 BB wallet",
+  "source_chain": "solana | bsc",
+  "amount_stablecoin": 10.0
+}
+`
+
+**Response:**
+`json
+{ "tx_hash": "...", "wallet_address": "...", "amount_stablecoin": 10.0 }
+`
+
+---
+
+### GET /deposit/status/:tx_hash
+
+Poll the status of a deposit by its tx hash key.
+
+**Response:**
+`json
+{ "tx_hash": "...", "status": "pending | credited | failed", "bb_minted": 1.0, "created_at": 1720000000 }
+`
+
+---
+
+### POST /deposit/claim
+
+Claim an **unattributed deposit** — funds sent to the custody wallet without first calling /deposit/request and without a BB:<wallet> memo. Proves wallet ownership via Ed25519 to receive the BB.
+
+**Request body:**
+`json
+{
+  "wallet_address": "base58 BB wallet receiving the BB",
+  "external_tx_hash": "on-chain tx hash of the custody-wallet deposit",
+  "public_key": "hex-encoded Ed25519 pubkey (32 bytes = 64 hex chars)",
+  "signature": "hex-encoded Ed25519 signature (64 bytes = 128 hex chars)",
+  "timestamp": 1720000000,
+  "nonce": "random-string-for-replay-protection"
+}
+`
+
+**Signed message format:**
+`
+CLAIM_DEPOSIT:{wallet_address}:{external_tx_hash}:{timestamp}:{nonce}
+`
+
+**Success response (200):**
+`json
+{
+  "success": true,
+  "external_tx_hash": "...",
+  "wallet_address": "...",
+  "asset": "USDT",
+  "amount_stablecoin": 10.0,
+  "bb_minted": 1.0,
+  "new_balance": 1.0,
+  "mint_tx_id": "uuid"
+}
+`
+
+**Error codes:**
+- 400 — Bad request (missing fields, invalid address, expired timestamp)
+- 401 — Signature verification failed or pubkey/address mismatch
+- 404 — No unattributed deposit found for this tx hash
+- 409 — Deposit already claimed or nonce reused
+- 429 — Rate limited

@@ -234,7 +234,8 @@ impl GulfStreamService {
         if self.seen.contains_key(&tx.id) { return Ok(()); }
 
         let fwd = Forwarded {
-            priority: (tx.amount * 100.0) as u64,
+            // Priority proportional to lamports — higher-value txs get processed first
+            priority: tx.amount / 1_000,
             tx: tx.clone(),
             received_slot: slot,
         };

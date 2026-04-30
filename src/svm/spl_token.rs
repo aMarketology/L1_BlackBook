@@ -269,6 +269,36 @@ pub fn maxx_vault_address() -> String {
 }
 
 // ============================================================================
+// DECAY VAULT + TREASURY CONSTANTS ($DECAY value-recapture economy)
+// ============================================================================
+
+/// Seed for the wUSDT vault that holds backing for live $DECAY tokens.
+pub const DECAY_VAULT_SEED: &str = "BlackBook_DECAY_Vault_v1";
+
+/// Seed for the central treasury that captures leaked + recharge fees.
+pub const DECAY_TREASURY_SEED: &str = "BlackBook_DECAY_Treasury_v1";
+
+/// Get the deterministic $DECAY backing-vault pubkey bytes.
+pub fn decay_vault_bytes() -> [u8; 32] {
+    derive_mint_address(DECAY_VAULT_SEED)
+}
+
+/// $DECAY backing-vault address (base58).
+pub fn decay_vault_address() -> String {
+    bs58::encode(decay_vault_bytes()).into_string()
+}
+
+/// Get the deterministic $DECAY treasury pubkey bytes.
+pub fn decay_treasury_bytes() -> [u8; 32] {
+    derive_mint_address(DECAY_TREASURY_SEED)
+}
+
+/// $DECAY treasury address (base58).
+pub fn decay_treasury_address() -> String {
+    bs58::encode(decay_treasury_bytes()).into_string()
+}
+
+// ============================================================================
 // SPL TOKEN ENGINE — operates on SvmAccountsDB
 // ============================================================================
 
@@ -411,6 +441,63 @@ impl SplTokenEngine {
         );
 
         Ok(mint_address)
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // MINT AUTHORITY ROTATION
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Idempotently rotate the mint authority of an existing SPL Mint to
+    /// `new_authority`.
+    ///
+    /// SAFETY: Internal use only — MUST NOT be called from HTTP handlers.
+    /// This is exclusively for the startup bootstrap that migrates mint
+    /// authorities from the legacy dealer key to a PDA.
+    ///
+    /// Returns `Ok(true)` if the authority was updated, `Ok(false)` if it was
+    /// already set to `new_authority` (no-op).
+    pub fn set_mint_authority(
+        accounts_db: &SvmAccountsDB,
+        mint_bytes: &[u8; 32],
+        new_authority: &Pubkey,
+    ) -> Result<bool, SvmError> {
+        let mint_pubkey = Pubkey::new_from_array(*mint_bytes);
+
+        let mint_account = accounts_db
+            .get_account(&mint_pubkey)
+            .ok_or_else(|| SvmError::AccountNotFound(
+                format!("Mint {} not found — cannot rotate authority", bs58::encode(mint_bytes).into_string())
+            ))?;
+
+        let mut layout = MintLayout::from_bytes(mint_account.data())
+            .map_err(SvmError::SerializationError)?;
+
+        let new_bytes = new_authority.to_bytes();
+        if layout.mint_authority == new_bytes && layout.mint_authority_option == 1 {
+            // Already set — idempotent no-op
+            return Ok(false);
+        }
+
+        layout.mint_authority_option = 1;
+        layout.mint_authority = new_bytes;
+
+        let updated_account = AccountSharedData::from(Account {
+            lamports: mint_account.lamports(),
+            data: layout.to_bytes(),
+            owner: mint_account.owner().clone(),
+            executable: false,
+            rent_epoch: RENT_EPOCH_EXEMPT,
+        });
+
+        accounts_db.store_account(&mint_pubkey, updated_account);
+
+        tracing::info!(
+            mint  = %bs58::encode(mint_bytes).into_string(),
+            authority = %new_authority,
+            "🔐 Mint authority rotated → PDA"
+        );
+
+        Ok(true)
     }
 
     // ────────────────────────────────────────────────────────────────────────

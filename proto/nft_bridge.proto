@@ -1,0 +1,87 @@
+syntax = "proto3";
+package nft_bridge;
+
+// ============================================================================
+// BLACKBOOK L1 — NFT BRIDGE SERVICE (gRPC)
+// ============================================================================
+//
+// Three RPCs bridging L3 (NFT minting engine) ↔ L1 (this chain).
+// L3 mints NFTs with metadata; L1 anchors ownership + provenance on-chain.
+//
+// Transport: tonic gRPC on port 50053 (separate from settlement on 50052)
+// ============================================================================
+
+service NftBridgeService {
+    // Called by L3 after minting an NFT. Anchors the NFT on L1 with
+    // on-chain ownership, metadata hash, and collection lineage.
+    rpc AnchorNft(AnchorNftRequest) returns (AnchorNftResponse);
+
+    // Called by L3 or users to transfer NFT ownership on L1.
+    // Requires Ed25519 signature from the current owner.
+    rpc TransferNft(TransferNftRequest) returns (TransferNftResponse);
+
+    // Called by anyone to query NFT state from L1.
+    rpc GetNftState(NftStateRequest) returns (NftStateResponse);
+}
+
+// ── AnchorNft ─────────────────────────────────────────────────────────────────
+
+message AnchorNftRequest {
+    string  collection_id    =  1; // e.g. "bb_avatars_v1"
+    string  token_id         =  2; // unique within collection
+    string  owner_address    =  3; // base58 — initial owner
+    bytes   metadata_hash    =  4; // SHA-256 of the full metadata JSON (32 bytes)
+    string  metadata_uri     =  5; // IPFS/Arweave URI for the metadata
+    uint64  l3_block_number  =  6; // monotonic counter for replay protection
+    // Ed25519 signature from the L3 sequencer over:
+    //   collection_id_bytes ++ token_id_bytes ++ owner_bytes ++ metadata_hash[32]
+    bytes   sequencer_pubkey =  7; // 32 bytes
+    bytes   sequencer_sig    =  8; // 64 bytes
+}
+
+message AnchorNftResponse {
+    bool   success       = 1;
+    string l1_tx_hash    = 2;
+    uint64 l1_slot       = 3;
+    string error_message = 4;
+}
+
+// ── TransferNft ───────────────────────────────────────────────────────────────
+
+message TransferNftRequest {
+    string collection_id  = 1;
+    string token_id       = 2;
+    string from_address   = 3; // base58 — current owner
+    string to_address     = 4; // base58 — new owner
+    uint64 timestamp      = 5;
+    string nonce          = 6;
+    // Ed25519 signature from current owner over:
+    //   "NFT_TRANSFER:{collection}:{token}:{from}:{to}:{ts}:{nonce}"
+    bytes  owner_sig      = 7; // 64 bytes
+    bytes  owner_pubkey   = 8; // 32 bytes
+}
+
+message TransferNftResponse {
+    bool   success       = 1;
+    string l1_tx_hash    = 2;
+    string error_message = 3;
+}
+
+// ── GetNftState ───────────────────────────────────────────────────────────────
+
+message NftStateRequest {
+    string collection_id = 1;
+    string token_id      = 2;
+}
+
+message NftStateResponse {
+    bool   found           = 1;
+    string collection_id   = 2;
+    string token_id        = 3;
+    string owner_address   = 4;
+    bytes  metadata_hash   = 5; // 32 bytes
+    string metadata_uri    = 6;
+    uint64 minted_slot     = 7;
+    uint64 last_transfer   = 8;
+    uint32 transfer_count  = 9;
+}

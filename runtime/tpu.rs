@@ -51,8 +51,8 @@ pub struct TpuPacket {
     pub from: String,
     /// Recipient BS58 address
     pub to: String,
-    /// Amount in BB (must be > 0.0)
-    pub amount: f64,
+    /// Amount in lamports (1 BB = 100_000 lamports). Must be > 0.
+    pub amount: u64,
     /// Ed25519 public key of sender — hex-encoded 32 bytes
     pub public_key: String,
     /// Ed25519 signature over canonical message — hex-encoded 64 bytes
@@ -166,7 +166,7 @@ impl TpuService {
                     }
 
                     // ── 4. Basic field sanity ─────────────────────────────────
-                    if pkt.from.is_empty() || pkt.to.is_empty() || pkt.amount <= 0.0 {
+                    if pkt.from.is_empty() || pkt.to.is_empty() || pkt.amount == 0 {
                         warn!("⚠ TPU invalid fields from {}", peer);
                         continue;
                     }
@@ -183,20 +183,20 @@ impl TpuService {
                     }
 
                     // ── 6. Ed25519 signature verification ────────────────────
-                    // Reconstruct canonical message identical to HTTP handler
-                    let payload_json = match &pkt.tx_type {
-                        Some(t) => format!(
-                            "{{\"to\":\"{}\",\"amount\":{},\"tx_type\":\"{}\"}}",
-                            pkt.to, pkt.amount, t),
-                        None => format!(
-                            "{{\"to\":\"{}\",\"amount\":{}}}",
-                            pkt.to, pkt.amount),
-                    };
-                    let mut msg = vec![pkt.chain_id];
-                    msg.extend_from_slice(payload_json.as_bytes());
-                    msg.extend_from_slice(b"\n");
-                    msg.extend_from_slice(pkt.timestamp.to_string().as_bytes());
-                    msg.extend_from_slice(b"\n");
+                    // Canonical binary message (89 bytes, no JSON overhead):
+                    //   chain_id(1) || from_bs58_utf8(var) || to_bs58_utf8(var)
+                    //   || amount_le(8) || timestamp_le(8) || nonce_utf8(var)
+                    // Separated by '|' to avoid ambiguity between fields.
+                    let mut msg = Vec::with_capacity(128);
+                    msg.push(pkt.chain_id);
+                    msg.extend_from_slice(pkt.from.as_bytes());
+                    msg.push(b'|');
+                    msg.extend_from_slice(pkt.to.as_bytes());
+                    msg.push(b'|');
+                    msg.extend_from_slice(&pkt.amount.to_le_bytes());
+                    msg.push(b'|');
+                    msg.extend_from_slice(&pkt.timestamp.to_le_bytes());
+                    msg.push(b'|');
                     msg.extend_from_slice(pkt.nonce.as_bytes());
 
                     let pubkey_bytes = match hex::decode(&pkt.public_key) {
@@ -243,14 +243,16 @@ impl TpuService {
                     }
 
                     // ── 8. Balance check ──────────────────────────────────────
-                    let balance = bc.get_balance(&pkt.from);
-                    if balance < pkt.amount {
-                        warn!("⚠ TPU insufficient balance {:.5} < {:.5} for {}",
-                            balance, pkt.amount, pkt.from);
+                    let balance_lamports = bc.get_balance_lamports(&pkt.from);
+                    if balance_lamports < pkt.amount {
+                        warn!("⚠ TPU insufficient balance {} < {} lamports for {}",
+                            balance_lamports, pkt.amount, pkt.from);
                         continue;
                     }
 
                     // ── 9. Build & dispatch transaction ───────────────────────
+                    // pkt.amount is already u64 lamports — pass through directly
+
                     let tx_type = match pkt.tx_type.as_deref() {
                         Some("SwapUsdcForBb") => TransactionType::SwapUsdcForBb,
                         Some("SwapBbForUsdc") => TransactionType::SwapBbForUsdc,
@@ -272,12 +274,29 @@ impl TpuService {
                     );
                     let _ = pl.submit(packet).await;
 
-                    info!("✅ TPU {}…→{}… {:.5} BB via {}",
+                    info!("✅ TPU {}…→{}… {} lamports ({:.5} BB) via {}",
                         &pkt.from[..8.min(pkt.from.len())],
                         &pkt.to[..8.min(pkt.to.len())],
-                        pkt.amount, peer);
+                        pkt.amount, pkt.amount as f64 / 100_000.0, peer);
                 }
             });
         }
+
+        // ── Background nonce pruner ───────────────────────────────────────
+        // The used_nonces table is an unbounded DashMap that grows forever without
+        // this pruner. Drop any nonce entry inserted more than 120 seconds ago —
+        // well past the 60-second TTL, so no valid replay window is affected.
+        let nonces_prune = used_nonces.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                let cutoff = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(120);
+                nonces_prune.retain(|_, inserted_at| *inserted_at > cutoff);
+            }
+        });
     }
 }

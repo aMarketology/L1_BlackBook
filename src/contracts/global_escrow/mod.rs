@@ -6,6 +6,7 @@ use tracing::info;
 use std::sync::atomic::Ordering;
 use crate::AppState;
 use crate::storage::DepositRecord;
+use crate::svm::{escrow_vault_address, LAMPORTS_PER_BB};
 // ============================================================================
 // GLOBAL ESCROW SMART CONTRACT (Native Module)
 // ============================================================================
@@ -25,7 +26,8 @@ use crate::storage::DepositRecord;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum EscrowInstruction {
     Deposit {
-        amount: f64,
+        /// Amount in lamports (1 BB = 100_000 lamports)
+        amount: u64,
         wallet_address: String,
         timestamp: u64,
         nonce: String,
@@ -37,7 +39,8 @@ pub enum EscrowInstruction {
     },
     Withdraw {
         market_id: String,
-        amount: f64,
+        /// Amount in lamports (1 BB = 100_000 lamports)
+        amount: u64,
         wallet_address: String,
         merkle_proof: Vec<String>,
         timestamp: u64,
@@ -49,8 +52,8 @@ pub enum EscrowInstruction {
 pub struct EscrowDepositRequest {
     /// Wallet address depositing tokens
     wallet_address: String,
-    /// Amount of BB to lock in escrow
-    amount: f64,
+    /// Amount in lamports (1 BB = 100_000 lamports). Integer only — no floats.
+    amount: u64,
     /// Ed25519 public key (hex, 32 bytes)
     public_key: String,
     /// Ed25519 signature (hex, 64 bytes)
@@ -72,7 +75,7 @@ pub async fn escrow_deposit_handler(
     
 
     // ── VALIDATE ───────────────────────────────────────────────────────────
-    if req.wallet_address.is_empty() || req.amount <= 0.0 {
+    if req.wallet_address.is_empty() || req.amount == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid parameters" })));
     }
 
@@ -134,30 +137,31 @@ pub async fn escrow_deposit_handler(
         }
     }
 
-    // ── BALANCE CHECK ──────────────────────────────────────────────────────
-    let balance = state.blockchain.get_balance(&req.wallet_address);
-    if balance < req.amount {
+    // ── BALANCE CHECK (u64 lamports — no float) ─────────────────────────────
+    let balance_lamports = state.blockchain.get_balance_lamports(&req.wallet_address);
+    if balance_lamports < req.amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Insufficient balance: {} < {}", balance, req.amount),
+            "error": format!("Insufficient balance: {} < {} lamports", balance_lamports, req.amount),
         })));
     }
 
-    // ── EXECUTE: debit user → credit escrow ─────────────────────────────────
-    let escrow_addr = &state.escrow_address;
+    // ── EXECUTE: debit user → credit escrow PDA (u64 → f64 at API boundary) ─
+    let escrow_addr = escrow_vault_address();
+    let amount_bb = req.amount as f64 / LAMPORTS_PER_BB as f64;
 
-    if let Err(e) = state.blockchain.debit(&req.wallet_address, req.amount) {
+    if let Err(e) = state.blockchain.debit(&req.wallet_address, amount_bb) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Debit failed: {}", e) })));
     }
-    if let Err(e) = state.blockchain.credit(escrow_addr, req.amount) {
+    if let Err(e) = state.blockchain.credit(&escrow_addr, amount_bb) {
         // Rollback debit on credit failure
-        let _ = state.blockchain.credit(&req.wallet_address, req.amount);
+        let _ = state.blockchain.credit(&req.wallet_address, amount_bb);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Escrow credit failed: {}", e) })));
     }
 
-    let user_balance = state.blockchain.get_balance(&req.wallet_address);
-    let escrow_balance = state.blockchain.get_balance(escrow_addr);
+    let user_balance_lamports = state.blockchain.get_balance_lamports(&req.wallet_address);
+    let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_addr);
     let tx_hash = uuid::Uuid::new_v4().to_string();
-    info!("🔒 ESCROW DEPOSIT: {} BB from {} → escrow (tx: {})", req.amount, req.wallet_address, tx_hash);
+    info!("🔒 ESCROW DEPOSIT: {} lamports from {} → escrow (tx: {})", req.amount, req.wallet_address, tx_hash);
 
     // Record into PoH block
     {
@@ -168,8 +172,8 @@ pub async fn escrow_deposit_handler(
             from: req.wallet_address.clone(),
             timestamp: now,
             data: TxData::EscrowDeposit {
-                amount: (req.amount * 100_000.0) as u64,
-                escrow_address: escrow_addr.clone(),
+                amount: req.amount,
+                escrow_address: escrow_addr.to_string(),
             },
             signature: req.signature.clone(),
             signer_pubkey: req.public_key.clone(),
@@ -182,8 +186,9 @@ pub async fn escrow_deposit_handler(
         wallet_address: req.wallet_address.clone(),
         external_tx_hash: tx_hash.clone(),
         asset: "BB".to_string(),
-        amount_stablecoin: req.amount,
-        bb_to_mint: req.amount,
+        // req.amount is already u64 lamports — no conversion needed
+        amount_micro_stablecoin: req.amount,
+        bb_lamports: req.amount,
         status: "approved".to_string(),
         submitted_at: now,
         approved_at: Some(now),
@@ -198,12 +203,13 @@ pub async fn escrow_deposit_handler(
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
-        "deposited": req.amount,
+        "deposited_lamports": req.amount,
+        "deposited_bb": amount_bb,
         "tx_hash": tx_hash,
         "wallet_address": req.wallet_address,
-        "escrow_address": escrow_addr,
-        "user_balance": user_balance,
-        "escrow_balance": escrow_balance,
+        "escrow_address": &escrow_addr,
+        "user_balance_lamports": user_balance_lamports,
+        "escrow_balance_lamports": escrow_balance_lamports,
     })))
 }
 
@@ -225,6 +231,7 @@ pub struct EscrowSubmitStateRootRequest {
     /// Platform rake (SPL units). MUST equal total_deposited - total_payout.
     house_rake: u64,
     /// Number of unique winning addresses in the Merkle tree.
+    #[serde(default)]
     winner_count: u32,
 }
 
@@ -262,12 +269,22 @@ pub async fn escrow_submit_state_root_handler(
         })));
     }
 
-    // ── SEQUENCER Ed25519 VERIFICATION ─────────────────────────────────────
-    if state.l2_sequencer_pubkey.is_empty() {
+    // ── SEQUENCER Ed25519 VERIFICATION (allowlist) ─────────────────────────
+    // The signing key MUST be in state.l2_sequencer_allowlist (public keys —
+    // no secrets required). We verify the key is allowlisted BEFORE doing the
+    // expensive Ed25519 math, to fail fast on unknown signers.
+    if state.l2_sequencer_allowlist.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "L2_SEQUENCER_PUBKEY not configured — escrow not operational"
+            "error": "L2 sequencer allowlist is empty — set L2_SEQUENCER_PUBKEY or L2_SEQUENCER_ALLOWLIST"
         })));
     }
+    if req.signature.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Missing signature" })));
+    }
+
+    // The request must carry the sequencer's hex pubkey so we know which key signed
+    // (allowlist may have multiple sequencers). Use the first valid allowlisted key
+    // that verifies the signature.
 
     // Binary packed signed message (MUST match L2 settlement_bridge.rs):
     //   contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
@@ -285,34 +302,32 @@ pub async fn escrow_submit_state_root_handler(
     signed_message.extend_from_slice(&req.l2_block_number.to_le_bytes());
     signed_message.extend_from_slice(&root_bytes_for_sig);
 
-    let seq_pubkey_bytes = match hex::decode(&state.l2_sequencer_pubkey) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid configured L2_SEQUENCER_PUBKEY" }))),
-    };
     let sig_bytes = match hex::decode(&req.signature) {
         Ok(b) if b.len() == 64 => b,
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature (must be 64 bytes hex)" }))),
     };
-
-    let pubkey_arr: [u8; 32] = match seq_pubkey_bytes.as_slice().try_into() {
-        Ok(arr) => arr,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid L2 sequencer public key length" }))),
-    };
-    let verifying_key = match VerifyingKey::from_bytes(&pubkey_arr) {
-        Ok(k) => k,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Invalid L2 sequencer public key" }))),
-    };
-    let sig_arr = match sig_bytes.as_slice().try_into() {
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
         Ok(arr) => arr,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
     };
-    let signature = Signature::from_bytes(sig_arr);
+    let signature = Signature::from_bytes(&sig_arr);
 
-    if verifying_key.verify(&signed_message, &signature).is_err() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Sequencer signature verification failed — L1 trusts only the math"
-        })));
-    }
+    // Try each allowlisted key — accept on first successful verify
+    let verified_sequencer = state.l2_sequencer_allowlist.iter().find(|hex_pk| {
+        let Ok(pk_bytes) = hex::decode(hex_pk) else { return false; };
+        let Ok(arr) = pk_bytes.as_slice().try_into() else { return false; };
+        let Ok(vk) = VerifyingKey::from_bytes(arr) else { return false; };
+        vk.verify(&signed_message, &signature).is_ok()
+    });
+
+    let sequencer_key = match verified_sequencer {
+        Some(k) => k.clone(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Sequencer signature not valid for any allowlisted key — L1 trusts only the math"
+        }))),
+    };
+
+    info!("✅ State root verified — sequencer: {}…", &sequencer_key[..16.min(sequencer_key.len())]);
 
     // ── l2_block_number is carried in the signed message — replay-safe ─────
     // No timestamp window needed: the signature covers l2_block_number directly.
@@ -391,7 +406,7 @@ pub async fn escrow_submit_state_root_handler(
         use layer1::protocol::TxData;
         let tx = ProtoTx {
             hash: uuid::Uuid::new_v4().to_string(),
-            from: format!("L2_SEQUENCER:{}", &state.l2_sequencer_pubkey[..16]),
+            from: format!("L2_SEQUENCER:{}", &sequencer_key[..16.min(sequencer_key.len())]),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -401,7 +416,7 @@ pub async fn escrow_submit_state_root_handler(
                 merkle_root: req.merkle_root.clone(),
             },
             signature: req.signature.clone(),
-            signer_pubkey: state.l2_sequencer_pubkey.clone(),
+            signer_pubkey: sequencer_key.clone(),
         };
         state.block_producer.record_executed_transaction(tx);
     }
@@ -421,8 +436,8 @@ pub async fn escrow_submit_state_root_handler(
 pub struct EscrowWithdrawRequest {
     /// Market ID the withdrawal is for
     market_id: String,
-    /// Amount entitled to withdraw (must match merkle leaf)
-    amount: f64,
+    /// Amount in lamports (1 BB = 100_000 lamports). Must match merkle leaf.
+    amount: u64,
     /// Wallet address receiving the withdrawal
     wallet_address: String,
     /// Merkle proof path from leaf to root — array of 64-char hex sibling hashes.
@@ -453,7 +468,7 @@ pub async fn escrow_withdraw_handler(
     use sha2::{Sha256, Digest};
 
     // ── VALIDATE ───────────────────────────────────────────────────────────
-    if req.market_id.is_empty() || req.wallet_address.is_empty() || req.amount <= 0.0 {
+    if req.market_id.is_empty() || req.wallet_address.is_empty() || req.amount == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid parameters" })));
     }
 
@@ -565,8 +580,9 @@ pub async fn escrow_withdraw_handler(
             "error": "wallet_address must be a base58-encoded 32-byte Solana pubkey"
         }))),
     };
-    // 1 BB = 1_000_000 SPL units (6 decimals). Round to nearest unit.
-    let amount_spl: u64 = (req.amount * 1_000_000.0).round() as u64;
+    // Convert lamports (5 decimals, 100_000/BB) → SPL units (6 decimals, 1_000_000/BB).
+    // SPL = lamports × 10 (since 1_000_000 / 100_000 = 10).
+    let amount_spl: u64 = req.amount.saturating_mul(10);
     let mut leaf_hasher = Sha256::new();
     leaf_hasher.update(&pubkey_raw_32);
     leaf_hasher.update(&amount_spl.to_le_bytes());
@@ -605,21 +621,36 @@ pub async fn escrow_withdraw_handler(
         })));
     }
 
-    // ── EXECUTE: debit escrow → credit user ─────────────────────────────────
-    let escrow_addr = &state.escrow_address;
-    let escrow_balance = state.blockchain.get_balance(escrow_addr);
-    if escrow_balance < req.amount {
+    // ── DRAIN GUARD: cap per-market claims to total_deposited ─────────────
+    let amount_spl_this = req.amount.saturating_mul(10); // lamports → SPL
+    if let Some(contest) = state.contest_states.get(&req.market_id) {
+        let new_total = contest.total_claimed.saturating_add(amount_spl_this);
+        if new_total > contest.total_deposited {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "Withdrawal would exceed contest total_deposited",
+                "total_deposited": contest.total_deposited,
+                "total_claimed": contest.total_claimed,
+                "this_claim": amount_spl_this,
+            })));
+        }
+    }
+
+    // ── EXECUTE: debit escrow PDA → credit user (u64 lamports) ───────────────
+    let escrow_addr = escrow_vault_address();
+    let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_addr);
+    if escrow_balance_lamports < req.amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Insufficient escrow balance: {} < {}", escrow_balance, req.amount),
+            "error": format!("Insufficient escrow balance: {} < {} lamports", escrow_balance_lamports, req.amount),
         })));
     }
 
-    if let Err(e) = state.blockchain.debit(escrow_addr, req.amount) {
+    let amount_bb = req.amount as f64 / LAMPORTS_PER_BB as f64;
+    if let Err(e) = state.blockchain.debit(&escrow_addr, amount_bb) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Escrow debit failed: {}", e) })));
     }
-    if let Err(e) = state.blockchain.credit(&req.wallet_address, req.amount) {
+    if let Err(e) = state.blockchain.credit(&req.wallet_address, amount_bb) {
         // Rollback
-        let _ = state.blockchain.credit(escrow_addr, req.amount);
+        let _ = state.blockchain.credit(&escrow_addr, amount_bb);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("User credit failed: {}", e) })));
     }
 
@@ -633,7 +664,7 @@ pub async fn escrow_withdraw_handler(
     state.withdrawal_claims.insert(claim_key.clone(), true);
 
     // Update total_claimed on ContestState
-    let amount_spl_claimed = (req.amount * 1_000_000.0).round() as u64;
+    let amount_spl_claimed = req.amount.saturating_mul(10); // lamports → SPL units
     if let Some(contest_entry) = state.contest_states.get(&req.market_id) {
         let mut contest_snapshot = contest_entry.clone();
         contest_snapshot.total_claimed = contest_snapshot.total_claimed.saturating_add(amount_spl_claimed);
@@ -647,8 +678,8 @@ pub async fn escrow_withdraw_handler(
         }
     }
 
-    let new_balance = state.blockchain.get_balance(&req.wallet_address);
-    info!("ESCROW WITHDRAW: {} BB -> {} (market: {})", req.amount, req.wallet_address, req.market_id);
+    let new_balance_lamports = state.blockchain.get_balance_lamports(&req.wallet_address);
+    info!("ESCROW WITHDRAW: {} lamports -> {} (market: {})", req.amount, req.wallet_address, req.market_id);
 
     // Record into PoH block
     {
@@ -660,8 +691,8 @@ pub async fn escrow_withdraw_handler(
             timestamp: now,
             data: TxData::EscrowWithdraw {
                 market_id: req.market_id.clone(),
-                amount: (req.amount * 100_000.0) as u64,
-                escrow_address: escrow_addr.clone(),
+                amount: req.amount,
+                escrow_address: escrow_addr.to_string(),
             },
             signature: req.signature.clone(),
             signer_pubkey: req.public_key.clone(),
@@ -671,10 +702,11 @@ pub async fn escrow_withdraw_handler(
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
-        "withdrawn": req.amount,
+        "withdrawn_lamports": req.amount,
+        "withdrawn_bb": amount_bb,
         "market_id": req.market_id,
         "wallet_address": req.wallet_address,
-        "new_balance": new_balance,
+        "new_balance_lamports": new_balance_lamports,
     })))
 }
 
@@ -686,11 +718,13 @@ pub async fn escrow_withdraw_handler(
 pub async fn escrow_status_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let escrow_balance = state.blockchain.get_balance(&state.escrow_address);
+    // get_balance_lamports returns u64 lamports — 1 BB = 100_000 lamports
+    let escrow_addr = escrow_vault_address();
+    let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_addr);
 
     Json(serde_json::json!({
-        "escrow_address": state.escrow_address,
-        "escrow_balance_lamports": escrow_balance,
+        "escrow_address": &escrow_addr,
+        "escrow_balance_lamports": escrow_balance_lamports,
         "total_markets_settled": state.market_roots.len(),
         "l2_sequencer_configured": !state.l2_sequencer_pubkey.is_empty(),
     }))

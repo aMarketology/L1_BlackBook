@@ -23,6 +23,7 @@ pub mod accounts_db;
 pub mod runtime;
 pub mod spl_token;
 pub mod sigverify;
+pub mod pda;
 
 // Re-export the most-used types at the svm:: level for ergonomic imports.
 pub use types::{
@@ -48,4 +49,21 @@ pub use spl_token::{
     maxx_vault_bytes,
     MAXX_DECIMALS,
     MAXX_UNIT,
+    // DECAY ($DECAY) value-recapture token
+    decay_vault_address,
+    decay_vault_bytes,
+    decay_treasury_address,
+    decay_treasury_bytes,
+};
+
+// Re-export PDA helpers at the svm:: level
+pub use pda::{
+    swap_pool_pda,
+    swap_pool_address,
+    maxx_curve_pda,
+    maxx_curve_address,
+    escrow_vault_pda,
+    escrow_vault_address,
+    decay_treasury_pda,
+    decay_treasury_pda_address,
 };

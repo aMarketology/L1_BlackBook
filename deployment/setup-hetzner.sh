@@ -58,6 +58,7 @@ ufw default allow outgoing
 ufw allow 22/tcp    comment 'SSH'
 ufw allow 8080/tcp  comment 'BlackBook HTTP API'
 ufw allow 8899/tcp  comment 'Solana JSON-RPC'
+ufw allow 8003/udp  comment 'BlackBook TPU (binary transaction ingestion)'
 ufw allow 50051/tcp comment 'gRPC Validator Relay'
 echo "y" | ufw enable
 

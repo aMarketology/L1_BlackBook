@@ -117,6 +117,8 @@ struct UiTokenAmount {
 struct SignatureInfo {
     signature: String,
     err: Option<serde_json::Value>,
+    /// Solana memo program output (if any) — e.g. "BB:5YNmS1R9nNSCDzb5a7mMJ1dwK9uHeAAF4CmPEwKgVWr8"
+    memo: Option<String>,
 }
 
 // getTransaction
@@ -252,6 +254,8 @@ impl CustodyWatcher {
             usdc_bal, usdt_bal, total_stablecoin, total_stablecoin * 10.0);
 
         let bb_to_mint = total_stablecoin * 10.0;
+        let amount_micro_stablecoin = (total_stablecoin * crate::svm::USDC_UNIT as f64).round() as u64;
+        let bb_lamports_val = crate::svm::types::micro_stable_to_bb_lamports(amount_micro_stablecoin);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs();
@@ -262,8 +266,8 @@ impl CustodyWatcher {
             wallet_address: dealer_addr.clone(),
             external_tx_hash: tx_key.clone(),
             asset: "USDC+USDT".to_string(),
-            amount_stablecoin: total_stablecoin,
-            bb_to_mint,
+            amount_micro_stablecoin,
+            bb_lamports: bb_lamports_val,
             status: "pending".to_string(),
             submitted_at: now,
             approved_at: None,
@@ -272,8 +276,8 @@ impl CustodyWatcher {
         self.deposit_requests.insert(tx_key.clone(), record);
 
         // Mint BB
-        match self.blockchain.credit(&dealer_addr, bb_to_mint) {
-            Ok(_) => info!("🪙  Startup sync: {} BB → dealer {}", bb_to_mint, &dealer_addr[..8]),
+        match self.blockchain.credit_lamports(&dealer_addr, bb_lamports_val) {
+            Ok(_) => info!("🪙  Startup sync: {:.5} BB → dealer {}", bb_to_mint, &dealer_addr[..8]),
             Err(e) => { error!("❌ Startup sync BB mint failed: {}", e); return; }
         }
 
@@ -294,7 +298,7 @@ impl CustodyWatcher {
 
         // Mark as processed + update record
         let mint_tx_id = uuid::Uuid::new_v4().to_string();
-        let _ = self.blockchain.mark_bridge_tx_processed(&tx_key, &mint_tx_id);
+        let _ = self.blockchain.commit_bridge_tx(&tx_key, &mint_tx_id);
         if let Some(mut entry) = self.deposit_requests.get_mut(&tx_key) {
             entry.status = "approved".to_string();
             entry.approved_at = Some(now);
@@ -309,7 +313,7 @@ impl CustodyWatcher {
             from: format!("CUSTODY_WALLET:{}", self.custody_address),
             timestamp: now,
             data: TxData::DepositUsdt {
-                usdt_amount: bb_to_mint as u64,
+                usdt_amount: amount_micro_stablecoin,
                 external_tx_hash: Some(tx_key),
             },
             signature: "startup_sync".to_string(),
@@ -438,8 +442,6 @@ impl CustodyWatcher {
         let accounts = match resp.result { Some(v) => v, None => return };
         if accounts.is_empty() { return; }
 
-        let bb_per_usdc: f64 = 10.0;
-
         for pa in &accounts {
             // Decode base64 account data
             let raw = match pa.account.data.first()
@@ -478,15 +480,19 @@ impl CustodyWatcher {
                 raw[85..93].try_into().unwrap_or_default()
             );
             let usdc_amount = usdc_raw as f64 / 1_000_000.0; // 6 decimals
-            let bb_to_mint = usdc_amount * bb_per_usdc;
 
-            if bb_to_mint <= 0.0 { continue; }
+            if usdc_raw == 0 { continue; }
 
-            // Mint BB to the L1 wallet
-            match self.blockchain.credit(&l1_wallet, bb_to_mint) {
+            // Mint BB
+            let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(usdc_raw);
+            match self.blockchain.reserve_bridge_tx(&receipt_key) {
+                Err(e) => { warn!("⚠️  Bridge program reserve_bridge_tx ({}): {}", &receipt_key[..16.min(receipt_key.len())], e); continue; }
+                Ok(_) => {}
+            }
+            match self.blockchain.credit_lamports(&l1_wallet, bb_lamports) {
                 Ok(_) => {
                     let mint_tx_id = uuid::Uuid::new_v4().to_string();
-                    let _ = self.blockchain.mark_bridge_tx_processed(&receipt_key, &mint_tx_id);
+                    let _ = self.blockchain.commit_bridge_tx(&receipt_key, &mint_tx_id);
 
                     // Record in PoH
                     let now = std::time::SystemTime::now()
@@ -497,7 +503,7 @@ impl CustodyWatcher {
                         from: format!("BRIDGE_PROGRAM:{}", program_id),
                         timestamp: now,
                         data: TxData::DepositUsdt {
-                            usdt_amount: usdc_raw / 10, // USDC units / rate
+                            usdt_amount: usdc_raw,
                             external_tx_hash: Some(receipt_key.clone()),
                         },
                         signature: "bridge_program_scan".to_string(),
@@ -505,12 +511,15 @@ impl CustodyWatcher {
                     };
                     self.block_producer.record_executed_transaction(proto_tx);
 
-                    info!("✅ Bridge program: {:.6} USDC → {} BB for {} (receipt: {})",
-                        usdc_amount, bb_to_mint,
+                    info!("✅ Bridge program: {:.6} USDC → {:.5} BB for {} (receipt: {})",
+                        usdc_amount, bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
                         &l1_wallet[..8.min(l1_wallet.len())],
                         &receipt_key[..16.min(receipt_key.len())]);
                 }
-                Err(e) => warn!("⚠️  Bridge program mint failed ({}): {}", &receipt_key[..16.min(receipt_key.len())], e),
+                Err(e) => {
+                    self.blockchain.cancel_bridge_tx(&receipt_key);
+                    warn!("⚠️  Bridge program mint failed ({}): {}", &receipt_key[..16.min(receipt_key.len())], e);
+                }
             }
         }
     }
@@ -537,16 +546,100 @@ impl CustodyWatcher {
         { *self.last_signature.lock().await = Some(sigs[0].signature.clone()); }
 
         for sig in sigs.iter().filter(|s| s.err.is_none()) {
-            // Only act on TXs that have a matching pending deposit request
-            if !self.deposit_requests.contains_key(&sig.signature) { continue; }
+            // ── Tier 1: explicit /deposit/request exists ──────────────────────────────────
+            if self.deposit_requests.contains_key(&sig.signature) {
+                if !self.blockchain.is_bridge_tx_processed(&sig.signature) {
+                    match self.verify_and_approve(&sig.signature).await {
+                        Ok(bb) => info!("✅ Watcher auto-approved {} → {:.5} BB",
+                            &sig.signature[..16.min(sig.signature.len())], bb),
+                        Err(e) => warn!("⚠️  Auto-approve failed ({}): {}",
+                            &sig.signature[..16.min(sig.signature.len())], e),
+                    }
+                }
+                continue;
+            }
+
+            // Already committed from a previous watcher run
             if self.blockchain.is_bridge_tx_processed(&sig.signature) { continue; }
 
-            match self.verify_and_approve(&sig.signature).await {
-                Ok(bb) => info!("✅ Watcher auto-approved {} → {} BB",
-                    &sig.signature[..16.min(sig.signature.len())], bb),
-                Err(e) => warn!("⚠️  Auto-approve failed ({}): {}",
+            // Fetch the on-chain transfer details for Tier 2 / Tier 3 handling
+            let verified = match self.verify_transaction(&sig.signature).await {
+                Ok(v) => v,
+                Err(_) => continue, // not a stablecoin transfer to custody wallet
+            };
+            let micro = (verified.amount * crate::svm::USDC_UNIT as f64).round() as u64;
+            if micro == 0 { continue; }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+
+            // ── Tier 2: memo-based attribution ──────────────────────────────────────
+            if let Some(wallet) = Self::extract_wallet_from_memo(sig.memo.as_deref()) {
+                let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
+                let record = crate::storage::DepositRecord {
+                    wallet_address: wallet.clone(),
+                    external_tx_hash: sig.signature.clone(),
+                    asset: verified.asset.clone(),
+                    amount_micro_stablecoin: micro,
+                    bb_lamports,
+                    status: "pending".to_string(),
+                    submitted_at: now,
+                    approved_at: None,
+                };
+                let _ = self.blockchain.store_deposit_request(&record);
+                self.deposit_requests.insert(sig.signature.clone(), record);
+
+                // Mint (record is now in deposit_requests so verify_and_approve finds it)
+                match self.verify_and_approve(&sig.signature).await {
+                    Ok(bb) => info!("✅ Memo-attributed deposit: {} {:.6} → {:.5} BB (tx: {})",
+                        verified.asset,
+                        verified.amount,
+                        bb,
+                        &sig.signature[..16.min(sig.signature.len())]),
+                    Err(e) => warn!("⚠️  Memo-attributed mint failed ({}): {}",
+                        &sig.signature[..16.min(sig.signature.len())], e),
+                }
+                continue;
+            }
+
+            // ── Tier 3: no attribution — queue for manual /deposit/claim ────────────
+            let unattributed = crate::storage::UnattributedDeposit {
+                external_tx_hash: sig.signature.clone(),
+                asset: verified.asset.clone(),
+                amount_micro_stablecoin: micro,
+                observed_at: now,
+                claimed_by: None,
+            };
+            match self.blockchain.write_unattributed_deposit(&unattributed) {
+                Ok(_) => warn!(
+                    "📥 Unattributed deposit queued: {:.6} {} (tx: {}) — user must call /deposit/claim",
+                    verified.amount, verified.asset,
+                    &sig.signature[..16.min(sig.signature.len())]
+                ),
+                Err(e) => warn!("⚠️  Failed to write unattributed deposit ({}): {}",
                     &sig.signature[..16.min(sig.signature.len())], e),
             }
+        }
+    }
+
+    /// Extract a BB wallet from a Solana memo string.
+    ///
+    /// Expects the memo to be exactly `"BB:<base58_wallet>"` or a string
+    /// containing that prefix (Solana prepends program context sometimes).
+    /// The wallet must be a valid 32-byte base58 public key.
+    fn extract_wallet_from_memo(memo: Option<&str>) -> Option<String> {
+        let text = memo?;
+        // Handle both raw memo ("BB:...") and Memo-program-prefixed strings
+        let wallet = text.split_whitespace()
+            .find_map(|word| word.strip_prefix("BB:"))
+            .unwrap_or_else(|| text.strip_prefix("BB:").unwrap_or(""));
+        if wallet.is_empty() { return None; }
+        // Validate: must decode to exactly 32 bytes
+        if bs58::decode(wallet).into_vec().map(|v| v.len() == 32).unwrap_or(false) {
+            Some(wallet.to_string())
+        } else {
+            None
         }
     }
 
@@ -569,11 +662,12 @@ impl CustodyWatcher {
         let verified = self.verify_transaction(tx_hash).await?;
 
         // Amount must match within 1% tolerance (or $0.01 minimum)
-        let tolerance = (record.amount_stablecoin * 0.01_f64).max(0.01);
-        if (verified.amount - record.amount_stablecoin).abs() > tolerance {
+        let record_amount = record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64;
+        let tolerance = (record_amount * 0.01_f64).max(0.01);
+        if (verified.amount - record_amount).abs() > tolerance {
             return Err(format!(
                 "Amount mismatch: claimed {:.2} but chain shows {:.2} {}",
-                record.amount_stablecoin, verified.amount, verified.asset
+                record_amount, verified.amount, verified.asset
             ));
         }
         if verified.asset != record.asset {
@@ -583,16 +677,20 @@ impl CustodyWatcher {
             ));
         }
 
-        // ── Mint BB ───────────────────────────────────────────────────────
-        // BB is the sole asset minted on deposit. wUSDT stays in the dealer
-        // reserve pool; users acquire it only by explicitly swapping BB.
-        self.blockchain.credit(&record.wallet_address, record.bb_to_mint)
-            .map_err(|e| format!("BB mint failed: {}", e))?;
-
-        // ── Double-mint lock ──────────────────────────────────────────────
+        // ── Mint BB (Bug #2: reserve-before-mint) ────────────────────────────────
         let mint_tx_id = Uuid::new_v4().to_string();
-        if let Err(e) = self.blockchain.mark_bridge_tx_processed(tx_hash, &mint_tx_id) {
-            warn!("⚠️  mark_bridge_tx_processed: {}", e);
+        self.blockchain.reserve_bridge_tx(tx_hash)
+            .map_err(|e| format!("Reserve failed: {}", e))?;
+        match self.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
+            Ok(_) => {
+                if let Err(e) = self.blockchain.commit_bridge_tx(tx_hash, &mint_tx_id) {
+                    warn!("⚠️  commit_bridge_tx: {}", e);
+                }
+            }
+            Err(e) => {
+                self.blockchain.cancel_bridge_tx(tx_hash);
+                return Err(format!("BB mint failed: {}", e));
+            }
         }
 
         // ── Update status in DashMap + ReDB ──────────────────────────────
@@ -615,7 +713,7 @@ impl CustodyWatcher {
                 from: "DEPOSIT_GATEWAY".to_string(),
                 timestamp: now,
                 data: TxData::DepositUsdt {
-                    usdt_amount: (record.amount_stablecoin / 10.0) as u64,
+                    usdt_amount: record.amount_micro_stablecoin,
                     external_tx_hash: Some(tx_hash.to_string()),
                 },
                 signature: "auto_verified".to_string(),
@@ -624,12 +722,14 @@ impl CustodyWatcher {
             self.block_producer.record_executed_transaction(proto_tx);
         }
 
-        info!("✅ Auto-approved: {} {} → {} BB for {} (ext_tx: {})",
-            record.amount_stablecoin, record.asset, record.bb_to_mint,
+        info!("✅ Auto-approved: {:.6} {} → {:.5} BB for {} (ext_tx: {})",
+            record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,
+            record.asset,
+            record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
             &record.wallet_address[..8.min(record.wallet_address.len())],
             &tx_hash[..16.min(tx_hash.len())]);
 
-        Ok(record.bb_to_mint)
+        Ok(record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64)
     }
 
     /// Fetch and verify a specific Solana transaction, returning the asset and

@@ -8,11 +8,13 @@ use tracing::{error, info};
 use solana_sdk::pubkey::Pubkey;
 
 use crate::AppState;
+use crate::auth;
 use crate::storage::MAXX_TOKEN_MARKET;
 use crate::svm::{
     SplTokenEngine,
     usdc_mint_bytes, USDC_UNIT,
     maxx_mint_bytes, maxx_vault_bytes, MAXX_UNIT,
+    maxx_curve_pda,
 };
 
 const SLOPE: f64 = 0.00000005;
@@ -71,6 +73,15 @@ pub struct BuyMaxxRequest {
     /// Optional slippage guard — minimum picoMAXX expected out.
     #[serde(default)]
     pub min_out: Option<u128>,
+    // ── Auth fields (Ed25519 signed) ──────────────────────────────────
+    /// Hex-encoded 32-byte Ed25519 public key matching `from`.
+    pub public_key: String,
+    /// Hex-encoded 64-byte Ed25519 signature.
+    pub signature: String,
+    /// Unix epoch seconds when the client signed (must be within 60s).
+    pub timestamp: u64,
+    /// Random nonce to prevent replay attacks.
+    pub nonce: String,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +92,11 @@ pub struct SellMaxxRequest {
     /// Optional slippage guard — minimum microUSDT expected back.
     #[serde(default)]
     pub min_out: Option<u128>,
+    // ── Auth fields (Ed25519 signed) ──────────────────────────────────
+    pub public_key: String,
+    pub signature: String,
+    pub timestamp: u64,
+    pub nonce: String,
 }
 
 #[derive(Serialize)]
@@ -143,6 +159,26 @@ pub async fn buy_maxx_handler(
     State(state): State<AppState>,
     Json(req): Json<BuyMaxxRequest>,
 ) -> impl IntoResponse {
+    // ── Ed25519 authentication ──────────────────────────────────────
+    // Message: "MAXX_BUY:{from}:{amount}:{timestamp}:{nonce}"
+    if let Err((code, body)) = auth::verify_signed_action(
+        &state,
+        "MAXX_BUY",
+        &req.from,
+        &req.public_key,
+        &req.signature,
+        req.timestamp,
+        &req.nonce,
+        &req.amount.to_string(),
+    ) {
+        return (code, body).into_response();
+    }
+
+    // ── Per-wallet rate limiting ───────────────────────────────────────────
+    if let Err(msg) = state.throttler.check_transaction(&req.from, 0.0) {
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+
     if req.amount == 0 {
         return (StatusCode::BAD_REQUEST, "Amount must be > 0").into_response();
     }
@@ -158,7 +194,8 @@ pub async fn buy_maxx_handler(
     let svm = &state.blockchain.svm_accounts;
     let usdt_mint = usdc_mint_bytes();
     let maxx_mint = maxx_mint_bytes();
-    let vault_pk = Pubkey::new_from_array(maxx_vault_bytes());
+    // MAXX curve PDA — no private key; only this handler can debit the reserve
+    let vault_pk = maxx_curve_pda();
 
     // 1. Compute MAXX out from current SVM supply (source of truth)
     let current_supply_pico = SplTokenEngine::get_mint_supply(svm, &maxx_mint).unwrap_or(0) as u128;
@@ -207,6 +244,20 @@ pub async fn buy_maxx_handler(
     }
     write_manifest_toml(&new_state);
 
+    // ── CURVE INVARIANT CHECK (soft — warns on drift, does not abort) ────────
+    // Expected: vault_wusdt_whole ≈ (SLOPE / 2) × supply_whole²
+    {
+        let supply_whole = new_supply_pico as f64 / PICO_MAXX as f64;
+        let vault_whole  = vault_usdt as f64 / MICRO_USDT as f64;
+        let expected     = (SLOPE / 2.0) * supply_whole.powi(2);
+        if (vault_whole - expected).abs() > 1.0 {
+            tracing::warn!(
+                "⚠️  MAXX invariant drift after BUY: vault={:.6} wUSDT expected={:.6} (diff {:.6})",
+                vault_whole, expected, vault_whole - expected
+            );
+        }
+    }
+
     let user_maxx_balance = SplTokenEngine::get_token_balance(svm, &maxx_mint, &user_pk);
     let user_wusdt_balance = SplTokenEngine::get_token_balance(svm, &usdt_mint, &user_pk);
 
@@ -232,6 +283,26 @@ pub async fn sell_maxx_handler(
     State(state): State<AppState>,
     Json(req): Json<SellMaxxRequest>,
 ) -> impl IntoResponse {
+    // ── Ed25519 authentication ────────────────────────────────────────────
+    // Message: "MAXX_SELL:{from}:{amount}:{timestamp}:{nonce}"
+    if let Err((code, body)) = auth::verify_signed_action(
+        &state,
+        "MAXX_SELL",
+        &req.from,
+        &req.public_key,
+        &req.signature,
+        req.timestamp,
+        &req.nonce,
+        &req.amount.to_string(),
+    ) {
+        return (code, body).into_response();
+    }
+
+    // ── Per-wallet rate limiting ───────────────────────────────────────────
+    if let Err(msg) = state.throttler.check_transaction(&req.from, 0.0) {
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+
     if req.amount == 0 {
         return (StatusCode::BAD_REQUEST, "Amount must be > 0").into_response();
     }
@@ -247,7 +318,8 @@ pub async fn sell_maxx_handler(
     let svm = &state.blockchain.svm_accounts;
     let usdt_mint = usdc_mint_bytes();
     let maxx_mint = maxx_mint_bytes();
-    let vault_pk = Pubkey::new_from_array(maxx_vault_bytes());
+    // MAXX curve PDA — no private key; only this handler can debit the reserve
+    let vault_pk = maxx_curve_pda();
 
     // 1. Compute wUSDT return based on current SVM supply
     let current_supply_pico = SplTokenEngine::get_mint_supply(svm, &maxx_mint).unwrap_or(0) as u128;
@@ -306,6 +378,19 @@ pub async fn sell_maxx_handler(
         error!("Failed to save MAXX market state: {:?}", e);
     }
     write_manifest_toml(&new_state);
+
+    // ── CURVE INVARIANT CHECK (soft — warns on drift, does not abort) ────────
+    {
+        let supply_whole = new_supply_pico as f64 / PICO_MAXX as f64;
+        let vault_whole  = vault_usdt as f64 / MICRO_USDT as f64;
+        let expected     = (SLOPE / 2.0) * supply_whole.powi(2);
+        if (vault_whole - expected).abs() > 1.0 {
+            tracing::warn!(
+                "⚠️  MAXX invariant drift after SELL: vault={:.6} wUSDT expected={:.6} (diff {:.6})",
+                vault_whole, expected, vault_whole - expected
+            );
+        }
+    }
 
     let user_maxx_balance = SplTokenEngine::get_token_balance(svm, &maxx_mint, &user_pk);
     let user_wusdt_balance = SplTokenEngine::get_token_balance(svm, &usdt_mint, &user_pk);

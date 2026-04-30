@@ -1,0 +1,131 @@
+﻿cargo : warning: field `block_number` is never read
+At line:1 char:1
++ cargo build --features unsafe_admin 2>&1 | Out-File -FilePath build_o ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: field ...` is never read 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  --> src\watcher\bsc_watcher.rs:98:5
+   |
+93 | struct EthLog {
+   |        ------ field in this struct
+...
+98 |     block_number: String, // hex-encoded "0xΓÇª"
+   |     ^^^^^^^^^^^^
+   |
+   = note: `EthLog` has a derived impl for the trait `Clone`, but this is 
+intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layer1` (lib) generated 1 warning
+warning: unused import: `maxx_vault_bytes`
+  --> src\contracts\maxx_token\mod.rs:16:22
+   |
+16 |     maxx_mint_bytes, maxx_vault_bytes, MAXX_UNIT,
+   |                      ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `warn`
+  --> src\contracts\nft_bridge\mod.rs:17:21
+   |
+17 | use tracing::{info, warn};
+   |                     ^^^^
+
+warning: unused import: `maxx_mint_address`
+    --> src\main.rs:1572:65
+     |
+1572 |     use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, 
+maxx_mint_address, USDC_UNIT, MAXX_UNIT, LAMPORTS_PER_BB};
+     |                                                                 
+^^^^^^^^^^^^^^^^^
+
+warning: unused import: `redb::ReadableTable`
+   --> src\contracts\maxx_token\mod.rs:123:9
+    |
+123 |     use redb::ReadableTable;
+    |         ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `stream::StreamExt`
+  --> src\main.rs:22:20
+   |
+22 | use futures_util::{stream::StreamExt, SinkExt};
+   |                    ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SinkExt`
+  --> src\main.rs:22:39
+   |
+22 | use futures_util::{stream::StreamExt, SinkExt};
+   |                                       ^^^^^^^
+
+warning: enum `EscrowInstruction` is never used
+  --> src\contracts\global_escrow\mod.rs:27:10
+   |
+27 | pub enum EscrowInstruction {
+   |          ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `SwapInstruction` is never used
+  --> src\contracts\token_swap\mod.rs:24:10
+   |
+24 | pub enum SwapInstruction {
+   |          ^^^^^^^^^^^^^^^
+
+warning: struct `BetOrder` is never constructed
+  --> src\contracts\layer2_market\mod.rs:26:12
+   |
+26 | pub struct BetOrder {
+   |            ^^^^^^^^
+
+warning: struct `MatchedBet` is never constructed
+  --> src\contracts\layer2_market\mod.rs:39:12
+   |
+39 | pub struct MatchedBet {
+   |            ^^^^^^^^^^
+
+warning: struct `WinnerEntry` is never constructed
+  --> src\contracts\layer2_market\mod.rs:49:12
+   |
+49 | pub struct WinnerEntry {
+   |            ^^^^^^^^^^^
+
+warning: struct `MarketEngine` is never constructed
+  --> src\contracts\layer2_market\mod.rs:56:12
+   |
+56 | pub struct MarketEngine {
+   |            ^^^^^^^^^^^^
+
+warning: associated items `new`, `place_bet`, `compute_leaf`, 
+`combine_hashes`, and `settle_market_and_generate_root` are never used
+   --> src\contracts\layer2_market\mod.rs:61:12
+    |
+ 60 | impl MarketEngine {
+    | ----------------- associated items in this implementation
+ 61 |     pub fn new() -> Self {
+    |            ^^^
+...
+ 66 |     pub fn place_bet(&mut self, _order: BetOrder) -> Result<(), String> {
+    |            ^^^^^^^^^
+...
+ 75 |     fn compute_leaf(entry: &WinnerEntry) -> [u8; 32] {
+    |        ^^^^^^^^^^^^
+...
+ 93 |     fn combine_hashes(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    |        ^^^^^^^^^^^^^^
+...
+116 |     pub fn settle_market_and_generate_root(&self, winners: 
+&[WinnerEntry]) -> [u8; 32] {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `generate_merkle_proof` is never used
+   --> src\contracts\layer2_market\mod.rs:161:8
+    |
+161 | pub fn generate_merkle_proof(winners: &[WinnerEntry], target_wallet: 
+&str) -> Option<Vec<[u8; 32]>> {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `layer1` (bin "layer1") generated 14 warnings (run `cargo fix --bin 
+"layer1" -p layer1` to apply 3 suggestions)
+    Finished `dev` profile [optimized] target(s) in 0.49s

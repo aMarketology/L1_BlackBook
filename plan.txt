@@ -91,24 +91,22 @@ WHAT WE HAVE BUILT (Inventory)
 
   File                          Lines   Status    Purpose
   ---------------------------------------------------------------------------
-  src/main.rs                   2,626   LIVE      All HTTP handlers + router
+  src/main.rs                   3,599   LIVE      All HTTP handlers + router
   src/poh_blockchain.rs         1,355   LIVE      PoH chain, block producer, Merkle
+  src/storage/mod.rs            1,863   LIVE      ReDB storage (SSS dead code removed)
   src/solana_rpc/mod.rs         1,300   LIVE      Solana JSON-RPC 2.0 (port 8899)
-  src/storage/mod.rs            1,109   BLOAT     ReDB storage + dead wallet tables
   src/svm/spl_token.rs            610   LIVE      SPL/USDC token engine
   src/svm/accounts_db.rs          585   LIVE      SVM account state, flush to ReDB
   runtime/poh_service.rs          842   LIVE      PoH VDF clock
   runtime/core.rs                 713   LIVE      ParallelScheduler, block pipeline
   runtime/consensus.rs            640   LIVE      GulfStream, Tower BFT, LeaderSchedule
-  benchmarks/tps_benchmarks.rs    576   BROKEN    TPS bench referencing removed types
   src/svm/types.rs                361   LIVE      SvmError, TransactionExecutionResult
   src/relay/mod.rs                358   LIVE      gRPC writer->reader block relay
-  src/migration.rs                316   DEAD      One-time migration, already run
   src/svm/sigverify.rs            314   LIVE      Parallel Ed25519 batch verification
   src/reader/mod.rs               309   LIVE      Reader node, gRPC block subscriber
   src/svm/runtime.rs              306   LIVE      BlackBookSVM execution engine
   src/svm/sharded_state.rs        268   LIVE      256-shard DashMap account state
-  tests/sealevel_sigverify.rs     ~260  NEW       Integration: sign -> verify -> SVM
+  tests/sealevel_sigverify.rs     ~260  LIVE      Integration: sign -> verify -> SVM
 
 
 ================================================================================
@@ -146,38 +144,24 @@ WHAT WE DON'T HAVE YET (Missing for Production)
 COMPLEXITY TO REMOVE (Dead Code Audit)
 ================================================================================
 
-  PRIORITY 1 — Remove Immediately (no callers, pure dead weight):
+  PRIORITY 1 — ✅ COMPLETE (all removed):
 
-  src/storage/mod.rs:
-    - WALLET_SHARD_B table          SSS shard storage. wallet_unified is gone.
-    - WALLET_ED25519_PUBKEY table   SSS pubkey store. No callers.
-    - store_shard_b()               No callers in main.rs.
-    - get_shard_b()                 No callers.
-    - store_ed25519_pubkey()        No callers.
-    - get_ed25519_pubkey()          No callers.
-    - AuthType::SSS                 No callers.
-    - AuthType::SessionKey          No callers.
-    - AuthType::MasterKey           No callers (transfer() uses SystemInternal).
-    - AuthType::ZkProof             No callers.
-    - transfer_with_receipt()       Was wallet handler only. No callers.
-    Saves ~150 lines, removes 2 dormant ReDB tables from every DB file on disk.
-
-  src/migration.rs:
-    - 316 lines for a one-time operation that has already been run.
-    - Remove the file AND the /admin/wallet/migrate route from main.rs.
-
-  benchmarks/tps_benchmarks.rs:
-    - References types removed with wallet_unified. Will not compile.
-    - Delete for now; rewrite a clean benchmark once the API is stable.
+  src/storage/mod.rs:             ✅ SSS dead code removed (WALLET_SHARD_B,
+                                     AuthType::SSS/SessionKey/MasterKey/ZkProof,
+                                     transfer_with_receipt, store/get_shard_b,
+                                     store/get_ed25519_pubkey).
+  src/migration.rs:               ✅ Deleted (316-line one-time op already run).
+  benchmarks/tps_benchmarks.rs:   ✅ Deleted (orphaned, not in Cargo.toml).
+  code.replace, =:                ✅ Deleted (zero-byte orphan files).
 
 
-  PRIORITY 2 — Refactor (real code, but structurally overgrown):
+  PRIORITY 2 — TODO Refactor (real code, but structurally overgrown):
 
-  src/main.rs (2,626 lines):
+  src/main.rs (3,599 lines):
     - Every HTTP handler is inline in one file.
     - Split into: src/handlers/{transfer, escrow, admin, usdc, poh, ledger}.rs
     - No logic changes — pure structural split.
-    - Reduces main.rs from 2,626 lines to ~300 lines (just AppState + router).
+    - Reduces main.rs from 3,599 lines to ~300 lines (just AppState + router).
 
   src/solana_rpc/mod.rs (1,300 lines):
     - Phase 2B write methods (sendTransaction, getTransaction) are stubs.

@@ -43,6 +43,24 @@ use solana_sdk::pubkey::Pubkey;
 /// to human-readable BB only at display time.
 pub const LAMPORTS_PER_BB: u64 = 100_000;
 
+/// USDT has 6 decimal places. 1 USDT = 1_000_000 micro-USDT.
+pub const USDT_UNIT: u64 = 1_000_000;
+
+/// Fixed exchange rate: 1 USDT buys 10 BB at the dealer market rate.
+pub const BB_PER_USDT: u64 = 10;
+
+/// Convert micro-stablecoin (6 dec) → BB lamports (5 dec).
+///
+/// Formula: `bb_lamports = micro * LAMPORTS_PER_BB * BB_PER_USDT / USDT_UNIT`
+///          = micro * 100_000 * 10 / 1_000_000 = micro * 1 (identity at current rates)
+///
+/// Uses u128 intermediate to prevent overflow on deposits up to ~$18 trillion.
+/// A future rate change only requires editing `BB_PER_USDT`.
+pub fn micro_stable_to_bb_lamports(micro: u64) -> u64 {
+    ((micro as u128) * (LAMPORTS_PER_BB as u128) * (BB_PER_USDT as u128)
+        / (USDT_UNIT as u128)) as u64
+}
+
 /// Maximum u64 used as the rent_epoch sentinel that means "rent-exempt forever".
 ///
 /// Every account created on BlackBook L1 sets this field to RENT_EPOCH_EXEMPT.

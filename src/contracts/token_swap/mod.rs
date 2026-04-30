@@ -1,8 +1,8 @@
-﻿use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
+use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use crate::AppState;
-use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT, LAMPORTS_PER_BB, swap_pool_pda, swap_pool_address};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
@@ -10,30 +10,37 @@ use std::str::FromStr;
 // TOKEN SWAP / AMM SMART CONTRACT (Native Module)
 // ============================================================================
 //
-// Fixed-rate BB ↔ wUSDT swap backed by the dealer's on-chain liquidity.
-// The dealer holds both $BB and wUSDT and acts as the sole market maker.
+// Fixed-rate BB ↔ wUSDT swap backed by the swap pool PDA's on-chain liquidity.
+// The pool PDA (swap_pool_pda()) holds both $BB and wUSDT — no private key exists
+// for this address; only the swap handlers below can move funds from it.
 //
 // Rate: 10 BB = 1 wUSDT  (same as deposit gateway)
 // ============================================================================
 
-pub const BB_TO_USDC_RATE: f64 = 10.0; // 10 BB = 1 wUSDT
+/// 10 BB = 1 wUSDT (integer ratio)
+pub const BB_TO_USDC_RATE: u64 = 10;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SwapInstruction {
     SwapBbForUsdc {
-        bb_amount: f64,
+        /// BB amount in lamports (1 BB = 100_000 lamports)
+        bb_amount: u64,
         wallet_address: String,
     },
     SwapUsdcForBb {
-        usdc_amount: f64,
+        /// wUSDT amount in micro-units (1 wUSDT = 1_000_000 micro)
+        usdc_amount: u64,
         wallet_address: String,
     }
 }
 
 #[derive(Deserialize)]
 pub struct SwapBbToUsdcRequest {
+    #[serde(alias = "wallet")]
     pub wallet_address: String,
-    pub bb_amount: f64,
+    /// BB amount in lamports (1 BB = 100_000 lamports)
+    #[serde(alias = "amount")]
+    pub bb_amount: u64,
     pub timestamp: u64,
     pub nonce: String,
     pub public_key: String,
@@ -42,8 +49,11 @@ pub struct SwapBbToUsdcRequest {
 
 #[derive(Deserialize)]
 pub struct SwapUsdcToBbRequest {
+    #[serde(alias = "wallet")]
     pub wallet_address: String,
-    pub usdc_amount: f64,
+    /// wUSDT amount in micro-units (1 wUSDT = 1_000_000 micro)
+    #[serde(alias = "amount")]
+    pub usdc_amount: u64,
     pub timestamp: u64,
     pub nonce: String,
     pub public_key: String,
@@ -86,11 +96,8 @@ pub async fn swap_bb_for_usdc_handler(
     State(state): State<AppState>,
     Json(req): Json<SwapBbToUsdcRequest>,
 ) -> impl IntoResponse {
-    if req.wallet_address.is_empty() || req.bb_amount <= 0.0 {
+    if req.wallet_address.is_empty() || req.bb_amount == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid parameters" })));
-    }
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Swap not available: dealer not configured" })));
     }
 
     // ── REPLAY PROTECTION & TIMESTAMP ──
@@ -137,56 +144,80 @@ pub async fn swap_bb_for_usdc_handler(
         Ok(pk) => pk,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid wallet address (must be base58)" }))),
     };
-    let dealer_pubkey = match Pubkey::from_str(&state.dealer_address) {
-        Ok(pk) => pk,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Dealer address config error" }))),
-    };
+    let pool_pubkey  = swap_pool_pda();
+    let pool_address = swap_pool_address();
 
-    let bb_required = req.bb_amount;
-    let usdc_output = req.bb_amount / BB_TO_USDC_RATE;
-    let usdc_raw_output = (usdc_output * USDC_UNIT as f64) as u64;
+    // Integer math: bb_lamports / (LAMPORTS_PER_BB * RATE) * USDC_UNIT
+    // = bb_lamports * USDC_UNIT / (LAMPORTS_PER_BB * RATE)
+    let usdc_raw_output = (req.bb_amount as u128 * USDC_UNIT as u128
+        / (LAMPORTS_PER_BB as u128 * BB_TO_USDC_RATE as u128)) as u64;
+    if usdc_raw_output == 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Amount too small for swap" })));
+    }
 
-    // 1. Check user BB balance
-    let user_bb_balance = state.blockchain.get_balance(&req.wallet_address);
-    if user_bb_balance < bb_required {
+    // 1. Check user BB balance (u64 lamports)
+    let user_bb_lamports = state.blockchain.get_balance_lamports(&req.wallet_address);
+    if user_bb_lamports < req.bb_amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Insufficient BB balance" })));
     }
 
-    // 2. Check dealer wUSDT balance
+    // 2. Check pool wUSDT reserve
     let mint = usdc_mint_bytes();
-    let dealer_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &dealer_pubkey);
-    if dealer_usdc < usdc_raw_output {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient wUSDT liquidity" })));
+    let pre_pool_bb = state.blockchain.get_balance_lamports(&pool_address);
+    let pre_pool_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &pool_pubkey);
+    if pre_pool_usdc < usdc_raw_output {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient wUSDT liquidity in swap pool" })));
     }
 
     // 3. Execute swap atomically:
-    //    A) Debit user BB → Credit dealer BB
-    if let Err(e) = state.blockchain.debit(&req.wallet_address, bb_required) {
+    let bb_amount_f64 = req.bb_amount as f64 / LAMPORTS_PER_BB as f64;
+    //    A) Debit user BB → Credit pool BB
+    if let Err(e) = state.blockchain.debit(&req.wallet_address, bb_amount_f64) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB debit failed: {}", e) })));
     }
-    let _ = state.blockchain.credit(&state.dealer_address, bb_required);
+    let _ = state.blockchain.credit(&pool_address, bb_amount_f64);
 
-    //    B) Transfer wUSDT from dealer → user
+    //    B) Transfer wUSDT from pool → user
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
-        &dealer_pubkey,
+        &pool_pubkey,
         &wallet_pubkey,
         usdc_raw_output,
     ) {
         // Rollback BB
-        let _ = state.blockchain.debit(&state.dealer_address, bb_required);
-        let _ = state.blockchain.credit(&req.wallet_address, bb_required);
+        let _ = state.blockchain.debit(&pool_address, bb_amount_f64);
+        let _ = state.blockchain.credit(&req.wallet_address, bb_amount_f64);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT transfer failed: {}", e) })));
     }
 
-    info!("🔄 SWAP: {} swapped {} BB for {:.6} wUSDT", req.wallet_address, bb_required, usdc_output);
+    // ── POOL DELTA INVARIANT CHECK ────────────────────────────────────────
+    // After the swap, verify the pool balance changes exactly match the
+    // computed amounts. A mismatch indicates a double-apply bug or state
+    // corruption — rollback immediately before any funds escape.
+    let post_pool_bb   = state.blockchain.get_balance_lamports(&pool_address);
+    let post_pool_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &pool_pubkey);
+    let actual_bb_gained   = post_pool_bb.saturating_sub(pre_pool_bb);
+    let actual_usdc_lost   = pre_pool_usdc.saturating_sub(post_pool_usdc);
+    if actual_bb_gained != req.bb_amount || actual_usdc_lost != usdc_raw_output {
+        tracing::error!(
+            "🚨 POOL INVARIANT VIOLATED (BB→wUSDT): expected Δbb={} Δusdc={} got Δbb={} Δusdc={} — rolling back",
+            req.bb_amount, usdc_raw_output, actual_bb_gained, actual_usdc_lost
+        );
+        // Rollback: undo pool BB credit, undo user BB debit, undo wUSDT transfer
+        let _ = state.blockchain.debit(&pool_address, bb_amount_f64);
+        let _ = state.blockchain.credit(&req.wallet_address, bb_amount_f64);
+        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, &pool_pubkey, usdc_raw_output);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
+    }
+
+    info!("🔄 SWAP: {} swapped {} lamports BB for {} micro-wUSDT", req.wallet_address, req.bb_amount, usdc_raw_output);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
-        "message": "Swap executed",
-        "bb_debited": bb_required,
-        "wusdt_credited": usdc_output,
+        "bb_debited_lamports": req.bb_amount,
+        "wusdt_credited_micro": usdc_raw_output,
+        "pool_address": pool_address,
     })))
 }
 
@@ -195,11 +226,8 @@ pub async fn swap_usdc_for_bb_handler(
     State(state): State<AppState>,
     Json(req): Json<SwapUsdcToBbRequest>,
 ) -> impl IntoResponse {
-    if req.wallet_address.is_empty() || req.usdc_amount <= 0.0 {
+    if req.wallet_address.is_empty() || req.usdc_amount == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid parameters" })));
-    }
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Swap not available: dealer not configured" })));
     }
 
     // ── REPLAY PROTECTION & TIMESTAMP ──
@@ -246,54 +274,75 @@ pub async fn swap_usdc_for_bb_handler(
         Ok(pk) => pk,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid wallet address (must be base58)" }))),
     };
-    let dealer_pubkey = match Pubkey::from_str(&state.dealer_address) {
-        Ok(pk) => pk,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Dealer address config error" }))),
-    };
+    let pool_pubkey  = swap_pool_pda();
+    let pool_address = swap_pool_address();
 
-    let usdc_required = req.usdc_amount;
-    let usdc_raw_required = (usdc_required * USDC_UNIT as f64) as u64;
-    let bb_output = req.usdc_amount * BB_TO_USDC_RATE;
+    // Integer math: usdc_micro * LAMPORTS_PER_BB * RATE / USDC_UNIT
+    let bb_lamports_output = (req.usdc_amount as u128 * LAMPORTS_PER_BB as u128
+        * BB_TO_USDC_RATE as u128 / USDC_UNIT as u128) as u64;
+    if bb_lamports_output == 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Amount too small for swap" })));
+    }
 
     // 1. Check user wUSDT balance
     let mint = usdc_mint_bytes();
     let user_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
-    if user_usdc < usdc_raw_required {
+    if user_usdc < req.usdc_amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Insufficient wUSDT balance" })));
     }
 
-    // 2. Check dealer BB balance
-    let dealer_bb = state.blockchain.get_balance(&state.dealer_address);
-    if dealer_bb < bb_output {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient BB liquidity" })));
+    // 2. Check pool BB reserve (u64 lamports) and capture pre-swap state
+    let pre_pool_bb   = state.blockchain.get_balance_lamports(&pool_address);
+    let pre_pool_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &pool_pubkey);
+    if pre_pool_bb < bb_lamports_output {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "Insufficient BB liquidity in swap pool" })));
     }
 
     // 3. Execute swap atomically:
-    //    A) Transfer wUSDT from user → dealer
+    let bb_output_f64 = bb_lamports_output as f64 / LAMPORTS_PER_BB as f64;
+    //    A) Transfer wUSDT from user → pool
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
         &wallet_pubkey,
-        &dealer_pubkey,
-        usdc_raw_required,
+        &pool_pubkey,
+        req.usdc_amount,
     ) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT debit failed: {}", e) })));
     }
 
-    //    B) Transfer BB from dealer → user
-    if let Err(e) = state.blockchain.debit(&state.dealer_address, bb_output) {
+    //    B) Debit BB from pool → credit user
+    if let Err(e) = state.blockchain.debit(&pool_address, bb_output_f64) {
         // Rollback wUSDT
-        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &dealer_pubkey, &wallet_pubkey, usdc_raw_required);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB credit failed: {}", e) })));
+        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB debit from pool failed: {}", e) })));
     }
-    let _ = state.blockchain.credit(&req.wallet_address, bb_output);
+    let _ = state.blockchain.credit(&req.wallet_address, bb_output_f64);
 
-    info!("🔄 SWAP: {} swapped {:.6} wUSDT for {} BB", req.wallet_address, usdc_required, bb_output);
+    // ── POOL DELTA INVARIANT CHECK ───────────────────────────────────────────
+    // Verify pool gained exactly usdc_amount wUSDT and lost exactly bb_lamports_output BB.
+    let post_pool_bb   = state.blockchain.get_balance_lamports(&pool_address);
+    let post_pool_usdc = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &pool_pubkey);
+    let actual_bb_lost    = pre_pool_bb.saturating_sub(post_pool_bb);
+    let actual_usdc_gained = post_pool_usdc.saturating_sub(pre_pool_usdc);
+    if actual_bb_lost != bb_lamports_output || actual_usdc_gained != req.usdc_amount {
+        tracing::error!(
+            "🚨 POOL INVARIANT VIOLATED (wUSDT→BB): expected Δbb={} Δusdc={} got Δbb={} Δusdc={} — rolling back",
+            bb_lamports_output, req.usdc_amount, actual_bb_lost, actual_usdc_gained
+        );
+        // Rollback: undo pool BB debit, undo user credit, undo wUSDT transfer
+        let _ = state.blockchain.credit(&pool_address, bb_output_f64);
+        let _ = state.blockchain.debit(&req.wallet_address, bb_output_f64);
+        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
+    }
+
+    info!("🔄 SWAP: {} swapped {} micro-wUSDT for {} BB lamports", req.wallet_address, req.usdc_amount, bb_lamports_output);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
-        "message": "Swap executed",
-        "wusdt_debited": usdc_required,
-        "bb_credited": bb_output,
+        "wusdt_debited_micro": req.usdc_amount,
+        "bb_credited_lamports": bb_lamports_output,
+        "pool_address": pool_address,
     })))
 }

@@ -49,9 +49,6 @@ const TRANSFER_TOPIC: &str =
 /// Both Binance-Peg USDC and USDT have 18 decimals on BSC mainnet.
 const BSC_TOKEN_DECIMALS: u32 = 18;
 
-/// Exchange rate: 1 stablecoin = BB_PER_STABLECOIN BB tokens (same as Solana flow).
-const BB_PER_STABLECOIN: f64 = 10.0;
-
 /// Maximum block range per eth_getLogs call (BSC public nodes cap at ~5 000 blocks).
 const MAX_LOG_RANGE: u64 = 2_000;
 
@@ -322,10 +319,14 @@ impl BscWatcher {
             return;
         };
 
-        // Binance-Peg tokens: 18 decimals — 1e18 raw = 1.0 stablecoin
-        let amount_stablecoin = raw_amount as f64 / 1e18_f64;
-        let bb_to_mint = amount_stablecoin * BB_PER_STABLECOIN;
-        if bb_to_mint <= 0.0 {
+        // BSC Binance-Peg tokens have 18 decimals; normalise to 6-decimal micro-units
+        // then convert to BB lamports via the same integer math as the Solana path.
+        if raw_amount == 0 {
+            return;
+        }
+        let micro_stablecoin = (raw_amount / 1_000_000_000_000u128) as u64; // 18 → 6 dec
+        let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro_stablecoin);
+        if micro_stablecoin == 0 {
             return;
         }
 
@@ -338,8 +339,8 @@ impl BscWatcher {
             wallet_address: l1_wallet.clone(),
             external_tx_hash: tx_hash.clone(),
             asset: asset.to_string(),
-            amount_stablecoin,
-            bb_to_mint,
+            amount_micro_stablecoin: micro_stablecoin,
+            bb_lamports,
             status: "pending".to_string(),
             submitted_at: now,
             approved_at: None,
@@ -355,8 +356,8 @@ impl BscWatcher {
 
         match self.mint_and_record(&tx_hash, &record).await {
             Ok(bb) => info!(
-                "✅ BSC Bridge auto-minted: {:.4} {} → {:.4} BB for {} (tx: {})",
-                amount_stablecoin,
+                "✅ BSC Bridge auto-minted: {:.6} {} → {:.5} BB for {} (tx: {})",
+                micro_stablecoin as f64 / 1_000_000.0,
                 asset,
                 bb,
                 &l1_wallet[..8.min(l1_wallet.len())],
@@ -486,11 +487,12 @@ impl BscWatcher {
                 record.asset, verified.asset
             ));
         }
-        let tolerance = (record.amount_stablecoin * 0.01_f64).max(0.01);
-        if (verified.amount - record.amount_stablecoin).abs() > tolerance {
+        let tolerance = (record.amount_micro_stablecoin as f64 / 1_000_000.0 * 0.01_f64).max(0.01);
+        let record_amount = record.amount_micro_stablecoin as f64 / 1_000_000.0;
+        if (verified.amount - record_amount).abs() > tolerance {
             return Err(format!(
                 "Amount mismatch: declared {:.4} but log shows {:.4} {}",
-                record.amount_stablecoin, verified.amount, verified.asset
+                record_amount, verified.amount, verified.asset
             ));
         }
 
@@ -524,11 +526,12 @@ impl BscWatcher {
                 record.asset, verified.asset
             ));
         }
-        let tolerance = (record.amount_stablecoin * 0.01_f64).max(0.01);
-        if (verified.amount - record.amount_stablecoin).abs() > tolerance {
+        let tolerance = (record.amount_micro_stablecoin as f64 / 1_000_000.0 * 0.01_f64).max(0.01);
+        let record_amount = record.amount_micro_stablecoin as f64 / 1_000_000.0;
+        if (verified.amount - record_amount).abs() > tolerance {
             return Err(format!(
                 "Amount mismatch: declared {:.4} but receipt shows {:.4}",
-                record.amount_stablecoin, verified.amount
+                record_amount, verified.amount
             ));
         }
 
@@ -575,8 +578,12 @@ impl BscWatcher {
             if log.topics[2].to_lowercase() != to_padded { continue; }
 
             let hex_data = log.data.trim_start_matches("0x");
-            let raw = u128::from_str_radix(hex_data.trim_start_matches('0'), 16)
-                .unwrap_or(0);
+            let data_bytes = hex::decode(hex_data)
+                .unwrap_or_default();
+            if data_bytes.len() < 32 { continue; }
+            let raw = u128::from_be_bytes(
+                data_bytes[16..32].try_into().unwrap_or([0u8; 16])
+            );
             let divisor = 10u128.pow(BSC_TOKEN_DECIMALS);
             let amount = raw as f64 / divisor as f64;
             return Ok(VerifiedTransfer { asset: asset.to_string(), amount });
@@ -587,17 +594,21 @@ impl BscWatcher {
     /// Core mint-and-record logic used by both the background poller and the
     /// direct HTTP verification path.
     async fn mint_and_record(&self, tx_hash: &str, record: &crate::storage::DepositRecord) -> Result<f64, String> {
-        // Mint BB
-        // BB is the sole asset minted on deposit. wUSDT stays in the dealer
-        // reserve pool; users acquire it only by explicitly swapping BB.
-        self.blockchain
-            .credit(&record.wallet_address, record.bb_to_mint)
-            .map_err(|e| format!("BB mint failed: {}", e))?;
-
-        // Double-mint guard
+        // Bug #2: reserve-before-mint to eliminate the double-mint race window
         let mint_tx_id = Uuid::new_v4().to_string();
-        if let Err(e) = self.blockchain.mark_bridge_tx_processed(tx_hash, &mint_tx_id) {
-            info!("⚠️  mark_bridge_tx_processed: {}", e);
+        self.blockchain.reserve_bridge_tx(tx_hash)
+            .map_err(|e| format!("Reserve failed: {}", e))?;
+
+        match self.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
+            Ok(_) => {
+                if let Err(e) = self.blockchain.commit_bridge_tx(tx_hash, &mint_tx_id) {
+                    info!("⚠️  commit_bridge_tx: {}", e);
+                }
+            }
+            Err(e) => {
+                self.blockchain.cancel_bridge_tx(tx_hash);
+                return Err(format!("BB mint failed: {}", e));
+            }
         }
 
         // Update record
@@ -619,7 +630,7 @@ impl BscWatcher {
             from: format!("BSC_DEPOSIT:{}", self.custody_address),
             timestamp: now,
             data: TxData::DepositUsdt {
-                usdt_amount: (record.amount_stablecoin / BB_PER_STABLECOIN) as u64,
+                usdt_amount: record.amount_micro_stablecoin,
                 external_tx_hash: Some(tx_hash.to_string()),
             },
             signature: "bsc_verified".to_string(),
@@ -627,12 +638,14 @@ impl BscWatcher {
         };
         self.block_producer.record_executed_transaction(proto_tx);
 
-        info!("✅ BSC approved: {:.4} {} → {} BB for {} (tx: {})",
-            record.amount_stablecoin, record.asset, record.bb_to_mint,
+        info!("✅ BSC approved: {:.6} {} → {:.5} BB for {} (tx: {})",
+            record.amount_micro_stablecoin as f64 / 1_000_000.0,
+            record.asset,
+            record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
             &record.wallet_address[..8.min(record.wallet_address.len())],
             &tx_hash[..18.min(tx_hash.len())]);
 
-        Ok(record.bb_to_mint)
+        Ok(record.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64)
     }
 
     // ── Amount decoding ───────────────────────────────────────────────────────
@@ -649,13 +662,18 @@ impl BscWatcher {
             return Err(format!("Unknown contract: {}", log.address));
         };
 
-        // data field is "0x" followed by 64 hex chars (32-byte uint256)
+        // Bug #4: use hex::decode for bounds-checked binary decode (no string-slice panic)
         let hex_data = log.data.trim_start_matches("0x");
-        if hex_data.len() < 64 {
-            return Err(format!("Log data too short: {}", log.data));
+        let data_bytes = hex::decode(hex_data)
+            .map_err(|e| format!("Bad hex in log data: {}", e))?;
+        if data_bytes.len() < 32 {
+            return Err(format!("Transfer data too short: {} bytes (expected ≥32)", data_bytes.len()));
         }
-        let raw = u128::from_str_radix(&hex_data[hex_data.len() - 32..], 16)
-            .map_err(|e| format!("Amount parse error: {}", e))?;
+        // uint256 value is in the first 32 bytes (big-endian); take last 16 bytes as u128
+        let raw = u128::from_be_bytes(
+            data_bytes[16..32].try_into()
+                .map_err(|_| "Amount slice error".to_string())?
+        );
 
         let divisor = 10u128.pow(BSC_TOKEN_DECIMALS);
         let amount = raw as f64 / divisor as f64;

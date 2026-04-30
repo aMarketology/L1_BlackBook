@@ -105,8 +105,8 @@ pub struct PipelinePacket {
     pub from: String,
     /// Recipient address
     pub to: String,
-    /// Amount
-    pub amount: f64,
+    /// Amount in lamports (1 BB = 100_000 lamports)
+    pub amount: u64,
     /// Signature bytes
     pub signature: Vec<u8>,
     /// Timestamp when packet entered pipeline
@@ -114,7 +114,7 @@ pub struct PipelinePacket {
 }
 
 impl PipelinePacket {
-    pub fn new(tx_id: String, from: String, to: String, amount: f64) -> Self {
+    pub fn new(tx_id: String, from: String, to: String, amount: u64) -> Self {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Self {
             tx_id,
@@ -364,8 +364,8 @@ impl TransactionPipeline {
                     continue;
                 }
                 
-                // Basic validation (in real system, Sealevel parallel execution)
-                let success = verified.packet.amount >= 0.0;
+                // Basic validation
+                let success = verified.packet.amount > 0;
                 
                 let executed = ExecutedPacket {
                     packet: verified.packet,

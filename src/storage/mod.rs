@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // BLACKBOOK L1 — UNIFIED STORAGE LAYER (v2 — SVM-native)
 // ============================================================================
 //
@@ -92,6 +92,11 @@ pub const MERKLE_NODES: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::
 /// Durable record of every wUSDT/wUSDT → BB deposit request submitted by users.
 const DEPOSIT_REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deposit_requests");
 
+/// Unattributed deposits: external_tx_hash → UnattributedDeposit JSON (bytes)
+/// Records stablecoin transfers that arrived without a prior /deposit/request.
+/// Users claim them later via POST /deposit/claim with an Ed25519 signature.
+const UNATTRIBUTED_DEPOSITS: TableDefinition<&str, &[u8]> = TableDefinition::new("unattributed_deposits");
+
 /// Withdrawal gateway requests: withdrawal_id (UUID) → WithdrawalRecord JSON (bytes)
 /// Durable record of every wUSDT → real USDC withdrawal initiated by users.
 const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdrawals");
@@ -112,6 +117,16 @@ const COIN_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("coin_bal
 
 /// Maxx Token Market state: ticker → MaxxTokenState JSON (bytes)
 pub const MAXX_TOKEN_MARKET: TableDefinition<&str, &[u8]> = TableDefinition::new("maxx_token_market");
+
+/// $DECAY tokens: token_id (u64) → DecayToken JSON (bytes).
+/// Each $DECAY is an NFT-style per-instance object with its own backing & uses_count.
+pub const DECAY_TOKENS: TableDefinition<u64, &[u8]> = TableDefinition::new("decay_tokens");
+
+/// $DECAY owner index: owner address → JSON-serialized Vec<u64> of token IDs.
+pub const DECAY_OWNER_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("decay_owner_index");
+
+/// $DECAY metadata counters: "next_id" → next available token ID (u64).
+pub const DECAY_META: TableDefinition<&str, u64> = TableDefinition::new("decay_meta");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -420,6 +435,42 @@ pub struct ConcurrentBlockchain {
     pub account_nonces: Arc<DashMap<String, u64>>,
     /// This eliminates synchronous ReDB writes from the hot path.
     tx_log_buffer: Arc<Mutex<Vec<TransactionRecord>>>,
+
+    // ═══ ON-CHAIN VOLUME COUNTERS (lock-free AtomicU64) ═══
+    // All volume values are in lamports (1 BB = 100_000 lamports).
+    // Incremented atomically at log_transaction() — the single funnel
+    // through which every on-chain operation passes.
+
+    /// All-time aggregate volume across every transaction type (lamports).
+    vol_total_lamports: Arc<AtomicU64>,
+    /// All-time transaction count (every committed tx).
+    vol_total_tx_count: Arc<AtomicU64>,
+    /// Bridge-in (deposit) volume (lamports).
+    vol_deposit_lamports: Arc<AtomicU64>,
+    /// Bridge-in count.
+    vol_deposit_count: Arc<AtomicU64>,
+    /// Bridge-out (withdrawal / burn) volume (lamports).
+    vol_withdrawal_lamports: Arc<AtomicU64>,
+    /// Bridge-out count.
+    vol_withdrawal_count: Arc<AtomicU64>,
+    /// Swap volume (BB↔USDC) (lamports).
+    vol_swap_lamports: Arc<AtomicU64>,
+    /// Swap count.
+    vol_swap_count: Arc<AtomicU64>,
+    /// Transfer volume (P2P) (lamports).
+    vol_transfer_lamports: Arc<AtomicU64>,
+    /// Transfer count.
+    vol_transfer_count: Arc<AtomicU64>,
+    /// Mint volume (faucet, admin mint) (lamports).
+    vol_mint_lamports: Arc<AtomicU64>,
+    /// Mint count.
+    vol_mint_count: Arc<AtomicU64>,
+    /// Escrow lock/unlock volume (lamports).
+    vol_escrow_lamports: Arc<AtomicU64>,
+    /// Escrow lock/unlock count.
+    vol_escrow_count: Arc<AtomicU64>,
+    /// Unix timestamp (seconds) when the node started — used for TPS calculation.
+    started_at: Arc<AtomicU64>,
 }
 
 impl ConcurrentBlockchain {
@@ -601,6 +652,7 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
             let _ = write_txn.open_table(WITHDRAWALS)?;
             let _ = write_txn.open_table(CONTEST_STATES)?;
+            let _ = write_txn.open_table(UNATTRIBUTED_DEPOSITS)?;
 
             // SVM tables (behind feature flag)
             {
@@ -654,6 +706,11 @@ impl ConcurrentBlockchain {
         }
         info!(hydrated_accounts = hydrated, "DashMap cache hydrated from SVM hot_state");
 
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         Ok(Self {
             db: db_arc,
             cache,
@@ -663,6 +720,23 @@ impl ConcurrentBlockchain {
             svm_accounts,
             account_nonces: Arc::new(DashMap::new()),
             tx_log_buffer: Arc::new(Mutex::new(Vec::with_capacity(1024))),
+            // Volume counters — all start at zero; a future enhancement could
+            // rehydrate from a METADATA key on startup for cross-restart continuity.
+            vol_total_lamports: Arc::new(AtomicU64::new(0)),
+            vol_total_tx_count: Arc::new(AtomicU64::new(0)),
+            vol_deposit_lamports: Arc::new(AtomicU64::new(0)),
+            vol_deposit_count: Arc::new(AtomicU64::new(0)),
+            vol_withdrawal_lamports: Arc::new(AtomicU64::new(0)),
+            vol_withdrawal_count: Arc::new(AtomicU64::new(0)),
+            vol_swap_lamports: Arc::new(AtomicU64::new(0)),
+            vol_swap_count: Arc::new(AtomicU64::new(0)),
+            vol_transfer_lamports: Arc::new(AtomicU64::new(0)),
+            vol_transfer_count: Arc::new(AtomicU64::new(0)),
+            vol_mint_lamports: Arc::new(AtomicU64::new(0)),
+            vol_mint_count: Arc::new(AtomicU64::new(0)),
+            vol_escrow_lamports: Arc::new(AtomicU64::new(0)),
+            vol_escrow_count: Arc::new(AtomicU64::new(0)),
+            started_at: Arc::new(AtomicU64::new(now_secs)),
         })
     }
 
@@ -877,6 +951,40 @@ impl ConcurrentBlockchain {
         // Increment block height for next transaction
         self.block_height.fetch_add(1, Ordering::Relaxed);
 
+        // ═══ VOLUME COUNTERS — bump atomically (lock-free) ═══
+        let amount = tx_record.amount;
+        self.vol_total_lamports.fetch_add(amount, Ordering::Relaxed);
+        self.vol_total_tx_count.fetch_add(1, Ordering::Relaxed);
+
+        // Categorize by tx_type string (set by TxType::to_string())
+        match tx_record.tx_type.as_str() {
+            "TRANSFER" => {
+                self.vol_transfer_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_transfer_count.fetch_add(1, Ordering::Relaxed);
+            }
+            "MINT" => {
+                self.vol_mint_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_mint_count.fetch_add(1, Ordering::Relaxed);
+            }
+            "BURN" | "BRIDGE_OUT" => {
+                self.vol_withdrawal_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_withdrawal_count.fetch_add(1, Ordering::Relaxed);
+            }
+            "BRIDGE_IN" => {
+                self.vol_deposit_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_deposit_count.fetch_add(1, Ordering::Relaxed);
+            }
+            "SWAP_USDC_FOR_BB" | "SWAP_BB_FOR_USDC" => {
+                self.vol_swap_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_swap_count.fetch_add(1, Ordering::Relaxed);
+            }
+            "LOCK" | "UNLOCK" => {
+                self.vol_escrow_lamports.fetch_add(amount, Ordering::Relaxed);
+                self.vol_escrow_count.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {} // unknown category — still counted in totals
+        }
+
         // Push into the in-memory buffer — NO disk I/O here
         self.tx_log_buffer.lock().push(tx_record);
         
@@ -1080,11 +1188,36 @@ impl ConcurrentBlockchain {
     /// Get blockchain statistics
     pub fn stats(&self) -> BlockchainStats {
         let account_count = self.cache.len();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let uptime = now.saturating_sub(self.started_at.load(Ordering::Relaxed));
+        let total_txs = self.vol_total_tx_count.load(Ordering::Relaxed);
+        let tps = if uptime > 0 { total_txs as f64 / uptime as f64 } else { 0.0 };
+
         BlockchainStats {
             total_accounts: account_count as u64,
             block_count: self.block_height.load(Ordering::Relaxed),
             total_supply: self.total_supply(),
             cache_hit_rate: 0.99, // DashMap is extremely fast
+            // Volume stats
+            total_volume_lamports: self.vol_total_lamports.load(Ordering::Relaxed),
+            total_tx_count: total_txs,
+            deposit_volume_lamports: self.vol_deposit_lamports.load(Ordering::Relaxed),
+            deposit_count: self.vol_deposit_count.load(Ordering::Relaxed),
+            withdrawal_volume_lamports: self.vol_withdrawal_lamports.load(Ordering::Relaxed),
+            withdrawal_count: self.vol_withdrawal_count.load(Ordering::Relaxed),
+            swap_volume_lamports: self.vol_swap_lamports.load(Ordering::Relaxed),
+            swap_count: self.vol_swap_count.load(Ordering::Relaxed),
+            transfer_volume_lamports: self.vol_transfer_lamports.load(Ordering::Relaxed),
+            transfer_count: self.vol_transfer_count.load(Ordering::Relaxed),
+            mint_volume_lamports: self.vol_mint_lamports.load(Ordering::Relaxed),
+            mint_count: self.vol_mint_count.load(Ordering::Relaxed),
+            escrow_volume_lamports: self.vol_escrow_lamports.load(Ordering::Relaxed),
+            escrow_count: self.vol_escrow_count.load(Ordering::Relaxed),
+            uptime_secs: uptime,
+            avg_tps: tps,
         }
     }
 
@@ -1221,7 +1354,10 @@ impl ConcurrentBlockchain {
 
     /// Check if an external tx hash has already been minted (replay protection).
     pub fn is_bridge_tx_processed(&self, tx_hash: &str) -> bool {
-        self.processed_bridge_txs.contains_key(tx_hash)
+        // "reserved" is an in-flight sentinel — not yet committed
+        self.processed_bridge_txs.get(tx_hash)
+            .map(|v| v.value() != "reserved")
+            .unwrap_or(false)
     }
 
     /// Mark an external tx hash as processed and persist to ReDB.
@@ -1235,6 +1371,46 @@ impl ConcurrentBlockchain {
 
         self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
         Ok(())
+    }
+
+    /// Atomically claim a bridge-tx slot (Bug #2: reserve-before-mint pattern).
+    ///
+    /// Returns `Err` if the hash is already reserved by another thread or
+    /// already committed.  Uses `dashmap::Entry` — no TOCTOU race possible.
+    pub fn reserve_bridge_tx(&self, tx_hash: &str) -> Result<(), String> {
+        match self.processed_bridge_txs.entry(tx_hash.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(format!("tx {} already reserved or committed", tx_hash))
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert("reserved".to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Persist the reservation to ReDB and update the DashMap value.
+    /// Call only after `credit_lamports` succeeds.
+    pub fn commit_bridge_tx(&self, tx_hash: &str, mint_tx_id: &str) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(PROCESSED_BRIDGE_TXS).map_err(|e| e.to_string())?;
+            table.insert(tx_hash, mint_tx_id).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
+        Ok(())
+    }
+
+    /// Release a reservation without committing.  Call when credit fails.
+    pub fn cancel_bridge_tx(&self, tx_hash: &str) {
+        self.processed_bridge_txs.remove(tx_hash);
+    }
+
+    /// Credit a wallet using integer lamports (Bug #1: no f64 in financial logic).
+    pub fn credit_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
+        let bb = lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64;
+        self.credit(address, bb)
     }
 
     /// Persist a withdrawal record (insert or overwrite).
@@ -1398,6 +1574,46 @@ impl ConcurrentBlockchain {
         }
         Ok(results)
     }
+
+    // ========================================================================
+    // UNATTRIBUTED DEPOSIT STORAGE
+    // ========================================================================
+
+    /// Persist an unattributed deposit (insert only — keyed by external_tx_hash).
+    pub fn write_unattributed_deposit(&self, rec: &UnattributedDeposit) -> Result<(), String> {
+        let bytes = serde_json::to_vec(rec).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(UNATTRIBUTED_DEPOSITS).map_err(|e| e.to_string())?;
+            table.insert(rec.external_tx_hash.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Look up an unattributed deposit by its external tx hash.
+    pub fn get_unattributed_deposit(&self, tx_hash: &str) -> Result<Option<UnattributedDeposit>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read_txn.open_table(UNATTRIBUTED_DEPOSITS) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        match table.get(tx_hash).map_err(|e| e.to_string())? {
+            Some(v) => {
+                let rec = serde_json::from_slice::<UnattributedDeposit>(v.value())
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(rec))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Mark an unattributed deposit as claimed by `wallet` (overwrites existing record).
+    pub fn mark_unattributed_claimed(&self, tx_hash: &str, wallet: &str) -> Result<(), String> {
+        let mut rec = self.get_unattributed_deposit(tx_hash)?
+            .ok_or_else(|| format!("Unattributed deposit {} not found", tx_hash))?;
+        rec.claimed_by = Some(wallet.to_string());
+        self.write_unattributed_deposit(&rec)
+    }
 }
 
 // ============================================================================
@@ -1414,16 +1630,37 @@ pub struct DepositRecord {
     pub external_tx_hash: String,
     /// "USDC" or "USDT"
     pub asset: String,
-    /// Amount of stablecoin the user deposited to the custody wallet
-    pub amount_stablecoin: f64,
-    /// BB to mint: amount_stablecoin / 10  (10 USDC = 1 BB)
-    pub bb_to_mint: f64,
+    /// Amount of stablecoin the user deposited, in 6-decimal micro-units (e.g. 1 USDT = 1_000_000)
+    pub amount_micro_stablecoin: u64,
+    /// BB lamports to mint (5 dec; 1 BB = 100_000 lamports; 10 BB per 1 USDT)
+    pub bb_lamports: u64,
     /// "pending" | "approved" | "rejected"
     pub status: String,
     /// Unix timestamp of the original user request
     pub submitted_at: u64,
     /// Unix timestamp when the dealer approved (None if still pending)
     pub approved_at: Option<u64>,
+}
+
+// ============================================================================
+// UNATTRIBUTED DEPOSIT RECORD
+// ============================================================================
+
+/// A deposit that arrived on-chain without a prior `/deposit/request` and
+/// without a recognisable Solana memo (`BB:<wallet>`). Stored durably so the
+/// owner can later claim it via `POST /deposit/claim`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnattributedDeposit {
+    /// Transaction hash from the external chain (primary key)
+    pub external_tx_hash: String,
+    /// "USDC" or "USDT"
+    pub asset: String,
+    /// Amount in 6-decimal micro-units (normalised for BSC 18-dec tokens)
+    pub amount_micro_stablecoin: u64,
+    /// Unix timestamp when the watcher first observed this transfer
+    pub observed_at: u64,
+    /// BB wallet address that claimed this deposit (None = unclaimed)
+    pub claimed_by: Option<String>,
 }
 
 // ============================================================================
@@ -1441,7 +1678,7 @@ pub struct WithdrawalRecord {
     /// Solana wallet address (base58) where the dealer should send real USDC
     pub solana_destination: String,
     /// Amount of wUSDT burned (= amount of real USDC owed to user)
-    pub wusdt_amount: f64,
+    pub wusdt_amount_micro: u64,
     /// "pending" | "released" | "rejected"
     pub status: String,
     /// Unix timestamp of the original user request
@@ -1547,14 +1784,41 @@ pub struct CoinPoolState {
 // BLOCKCHAIN STATS
 // ============================================================================
 
-/// Statistics snapshot for the blockchain
+/// Statistics snapshot for the blockchain — includes on-chain volume counters.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BlockchainStats {
     pub total_accounts: u64,
-
     pub block_count: u64,
     pub total_supply: f64,
     pub cache_hit_rate: f64,
+
+    // ═══ ON-CHAIN VOLUME ═══
+    /// All-time aggregate volume across every transaction type (lamports).
+    pub total_volume_lamports: u64,
+    /// All-time transaction count.
+    pub total_tx_count: u64,
+    /// Bridge-in (deposit) volume (lamports).
+    pub deposit_volume_lamports: u64,
+    pub deposit_count: u64,
+    /// Bridge-out (withdrawal/burn) volume (lamports).
+    pub withdrawal_volume_lamports: u64,
+    pub withdrawal_count: u64,
+    /// Swap volume (BB↔USDC) (lamports).
+    pub swap_volume_lamports: u64,
+    pub swap_count: u64,
+    /// P2P transfer volume (lamports).
+    pub transfer_volume_lamports: u64,
+    pub transfer_count: u64,
+    /// Mint volume (faucet/admin) (lamports).
+    pub mint_volume_lamports: u64,
+    pub mint_count: u64,
+    /// Escrow lock/unlock volume (lamports).
+    pub escrow_volume_lamports: u64,
+    pub escrow_count: u64,
+    /// Node uptime in seconds since startup.
+    pub uptime_secs: u64,
+    /// Average TPS since startup.
+    pub avg_tps: f64,
 }
 
 // ============================================================================

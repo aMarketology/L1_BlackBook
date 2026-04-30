@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::poh_blockchain::BlockProducer;
 use crate::storage::{ConcurrentBlockchain, ContestState, ContestStatus};
+use crate::svm::escrow_vault_address;
 
 // Import generated protobuf types
 pub mod proto {
@@ -43,10 +44,9 @@ pub struct BlackBookSettlementService {
     pub contest_states: Arc<dashmap::DashMap<String, ContestState>>,
     pub current_slot: Arc<std::sync::atomic::AtomicU64>,
     pub l2_sequencer_pubkey: String,
-    pub escrow_address: String,
+    pub l2_sequencer_allowlist: std::collections::HashSet<String>,
     pub block_producer: Arc<BlockProducer>,
     pub deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
-    pub dealer_address: String,
     start_time: Instant,
 }
 
@@ -58,10 +58,9 @@ impl BlackBookSettlementService {
         contest_states: Arc<dashmap::DashMap<String, ContestState>>,
         current_slot: Arc<std::sync::atomic::AtomicU64>,
         l2_sequencer_pubkey: String,
-        escrow_address: String,
+        l2_sequencer_allowlist: std::collections::HashSet<String>,
         block_producer: Arc<BlockProducer>,
         deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
-        dealer_address: String,
     ) -> Self {
         Self {
             blockchain,
@@ -69,10 +68,9 @@ impl BlackBookSettlementService {
             contest_states,
             current_slot,
             l2_sequencer_pubkey,
-            escrow_address,
+            l2_sequencer_allowlist,
             block_producer,
             deposit_requests,
-            dealer_address,
             start_time: Instant::now(),
         }
     }
@@ -125,8 +123,8 @@ impl SettlementService for BlackBookSettlementService {
                 }))
             }
             Some(dep) => {
-                // Convert stablecoin amount -> SPL units (5 decimals, 1 BB = 100_000)
-                let actual_spl = (dep.amount_stablecoin * 100_000.0).round() as u64;
+                // bb_lamports is already in 5-decimal lamport units
+                let actual_spl = dep.bb_lamports;
 
                 // Amount check: if caller specified a non-zero expected_amount, verify it
                 if req.expected_amount > 0 && actual_spl != req.expected_amount {
@@ -189,8 +187,8 @@ impl SettlementService for BlackBookSettlementService {
             }
         }
 
-        // Convert SPL units -> BB (5 decimals)
-        let bb_amount = req.bb_reserve as f64 / 100_000.0;
+        // Convert SPL units → BB using the canonical constant (5 decimals)
+        let bb_amount = req.bb_reserve as f64 / crate::svm::LAMPORTS_PER_BB as f64;
 
         // Debit dealer → escrow
         if let Err(e) = self.blockchain.debit(&req.dealer_address, bb_amount) {
@@ -200,7 +198,8 @@ impl SettlementService for BlackBookSettlementService {
                 error_message: format!("Dealer debit failed: {} (balance check passed?)", e),
             }));
         }
-        if let Err(e) = self.blockchain.credit(&self.escrow_address, bb_amount) {
+        let escrow_addr = escrow_vault_address();
+        if let Err(e) = self.blockchain.credit(&escrow_addr, bb_amount) {
             // Rollback
             let _ = self.blockchain.credit(&req.dealer_address, bb_amount);
             return Ok(Response::new(InitContestReserveResponse {
@@ -281,17 +280,22 @@ impl SettlementService for BlackBookSettlementService {
             ));
         }
 
-        // ── Ed25519 signature verification ────────────────────────────────
-        // Signed message: contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
-        // (must match what L2 settlement_bridge.rs produces)
-        if !self.l2_sequencer_pubkey.is_empty() {
-            let seq_pubkey_bytes = match hex::decode(&self.l2_sequencer_pubkey) {
-                Ok(b) if b.len() == 32 => b,
-                _ => return Err(Status::internal("Invalid L2_SEQUENCER_PUBKEY on server")),
-            };
+        // ── Ed25519 signature verification (allowlist enforced) ────────────
+        // The submitted sequencer_pubkey must be in the allowlist.
+        let submitted_pubkey_hex = hex::encode(&req.sequencer_pubkey);
+        if !self.l2_sequencer_allowlist.is_empty()
+            && !self.l2_sequencer_allowlist.contains(&submitted_pubkey_hex)
+        {
+            return Err(Status::permission_denied(format!(
+                "Sequencer pubkey {} is not in the allowlist", submitted_pubkey_hex
+            )));
+        }
+
+        // Verify the Ed25519 signature over the canonical message
+        {
             let verifying_key = VerifyingKey::from_bytes(
-                seq_pubkey_bytes.as_slice().try_into()
-                    .map_err(|_| Status::internal("L2_SEQUENCER_PUBKEY must be 32 bytes"))?
+                req.sequencer_pubkey.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_pubkey must be 32 bytes"))?
             ).map_err(|e| Status::internal(format!("Bad sequencer key: {}", e)))?;
 
             let mut msg: Vec<u8> = Vec::with_capacity(req.contest_id.len() + 8 + 32);

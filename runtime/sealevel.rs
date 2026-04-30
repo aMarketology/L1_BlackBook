@@ -288,7 +288,6 @@ impl ParallelScheduler {
     fn execute_single_svm(tx: &Transaction, db: &crate::svm::SvmAccountsDB) -> TransactionResult {
         use sha2::{Sha256, Digest};
         use solana_sdk::pubkey::Pubkey;
-        use crate::svm::LAMPORTS_PER_BB;
 
         // Resolve an address string to a Pubkey using the same logic as 
         // `ConcurrentBlockchain::addr_to_pubkey`.
@@ -308,7 +307,8 @@ impl ParallelScheduler {
 
         let from_pk = addr_to_pk(&tx.from);
         let to_pk   = addr_to_pk(&tx.to);
-        let lamports = (tx.amount * LAMPORTS_PER_BB as f64) as u64;
+        // tx.amount is already lamports (u64)
+        let lamports = tx.amount;
 
         match db.system_transfer(&from_pk, &to_pk, lamports) {
             Ok(()) => TransactionResult { tx_id: tx.id.clone(), success: true, error: None },
@@ -336,10 +336,10 @@ impl ParallelScheduler {
         let from_pk = addr_to_pk(&tx.from);
         let to_pk = addr_to_pk(&tx.to);
 
-        let usdc_amount_f64 = tx.amount;
-        let usdc_raw = (usdc_amount_f64 * USDC_UNIT as f64) as u64;
-        let bb_amount_f64 = usdc_amount_f64 * 10.0;
-        let bb_lamports = (bb_amount_f64 * LAMPORTS_PER_BB as f64) as u64;
+        // tx.amount is microUSDT (u64) for SwapUsdcForBb
+        let usdc_raw = tx.amount;
+        // 1 wUSDT = 10 BB  →  (microUSDT / USDC_UNIT) * 10 * LAMPORTS_PER_BB
+        let bb_lamports = (usdc_raw as u128 * 10 * LAMPORTS_PER_BB as u128 / USDC_UNIT as u128) as u64;
         let mint = usdc_mint_bytes();
 
         // 1. Debit wUSDT from user, credit wUSDT to dealer
@@ -377,10 +377,10 @@ impl ParallelScheduler {
         let from_pk = addr_to_pk(&tx.from);
         let to_pk = addr_to_pk(&tx.to);
 
-        let bb_amount_f64 = tx.amount;
-        let bb_lamports = (bb_amount_f64 * LAMPORTS_PER_BB as f64) as u64;
-        let usdc_amount_f64 = bb_amount_f64 / 10.0;
-        let usdc_raw = (usdc_amount_f64 * USDC_UNIT as f64) as u64;
+        // tx.amount is lamports (u64) for SwapBbForUsdc
+        let bb_lamports = tx.amount;
+        // 1 wUSDT = 10 BB  →  (lamports / LAMPORTS_PER_BB / 10) * USDC_UNIT
+        let usdc_raw = (bb_lamports as u128 * USDC_UNIT as u128 / (LAMPORTS_PER_BB as u128 * 10)) as u64;
         let mint = usdc_mint_bytes();
 
         // 1. Debit BB from user, credit BB to dealer
@@ -445,9 +445,9 @@ mod tests {
     #[test]
     fn test_parallel_scheduling() {
         let scheduler = ParallelScheduler::new();
-        let tx1 = Transaction::new("alice".into(), "bob".into(), 100.0, TransactionType::Transfer);
-        let tx2 = Transaction::new("alice".into(), "carol".into(), 50.0, TransactionType::Transfer);
-        let tx3 = Transaction::new("dave".into(), "eve".into(), 25.0, TransactionType::Transfer);
+        let tx1 = Transaction::new("alice".into(), "bob".into(), 100u64, TransactionType::Transfer);
+        let tx2 = Transaction::new("alice".into(), "carol".into(), 50u64, TransactionType::Transfer);
+        let tx3 = Transaction::new("dave".into(), "eve".into(), 25u64, TransactionType::Transfer);
 
         let batches = scheduler.schedule_batch(&[tx1, tx2, tx3]);
         assert!(batches.len() >= 2); // tx1+tx2 conflict, tx3 is independent
