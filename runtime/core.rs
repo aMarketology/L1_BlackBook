@@ -367,6 +367,12 @@ impl CircuitBreaker {
         Ok(())
     }
 
+    /// Returns true if the circuit breaker is currently tripped (blocking traffic).
+    /// This implementation is stateless (threshold-only), so it never trips globally.
+    pub fn is_open(&self) -> bool {
+        false
+    }
+
     pub fn get_stats(&self) -> serde_json::Value {
         serde_json::json!({
             "exemptions": self.exemptions.len(),

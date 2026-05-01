@@ -23,6 +23,7 @@ use futures_util::{stream::StreamExt, SinkExt};
 use solana_sdk::account::ReadableAccount;
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::trace::TraceLayer;
+use axum::extract::DefaultBodyLimit;
 use serde::Deserialize;
 use clap::Parser;
 
@@ -254,7 +255,7 @@ pub struct AppState {
     pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
 
     // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
-    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, f64)>>,
+    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, u64)>>,
 
     // ===== Global Escrow Smart Contract =====
     /// Ed25519 public key of the authorized L2 sequencer (hex)
@@ -309,6 +310,10 @@ pub struct AppState {
     pub coin_pools: Arc<dashmap::DashMap<String, storage::CoinPoolState>>,
     /// User coin balances — "{ticker}:{wallet}" → coin units (6 decimals).
     pub coin_balances: Arc<dashmap::DashMap<String, u64>>,
+
+    // ===== Backup State =====
+    pub backup_last_at: Arc<AtomicU64>,
+    pub backup_last_size: Arc<AtomicU64>,
 }
 
 // ============================================================================
@@ -374,6 +379,104 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "pipeline": pipeline_stats.is_running,
         },
     }))
+}
+
+/// GET /live — Liveness probe. Always returns 200 while the process is running.
+async fn live_handler() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({ "status": "alive" })))
+}
+
+/// GET /ready — Readiness probe. Returns 503 if the node is stale (not producing blocks).
+async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+    let latest_block = state.block_producer.get_latest_block();
+    let block_age_s = latest_block.as_ref().map(|b| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(b.timestamp)
+    });
+    // Ready if block was produced in the last 30 s, or slot is still bootstrapping (< 10)
+    let is_ready = block_age_s.map(|age| age < 30).unwrap_or(current_slot < 10);
+    if is_ready {
+        (StatusCode::OK, Json(serde_json::json!({ "status": "ready", "slot": current_slot })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "status": "not_ready",
+            "reason": "block_production_stale",
+            "block_age_s": block_age_s,
+            "slot": current_slot,
+        })))
+    }
+}
+
+/// GET /metrics — Prometheus text exposition (no external crate).
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, escrow_vault_address};
+
+    let stats = state.blockchain.stats();
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+
+    // BB native supply
+    let bb_supply_lamports = state.blockchain.svm_accounts.total_lamports();
+    let bb_account_count   = stats.total_accounts as u64;
+
+    // wUSDT supply (raw micro-units)
+    let usdt_mint = usdc_mint_bytes();
+    let wusdt_supply_micro = SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &usdt_mint)
+        .unwrap_or(0);
+
+    // MAXX supply (raw pico-units)
+    let maxx_mint = maxx_mint_bytes();
+    let maxx_supply_pico = SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &maxx_mint)
+        .unwrap_or(0);
+
+    // Swap pool balances
+    let pool_address = svm::swap_pool_address();
+    let pool_pubkey  = svm::swap_pool_pda();
+    let pool_bb_lamports  = state.blockchain.get_balance_lamports(&pool_address);
+    let pool_wusdt_micro  = SplTokenEngine::get_token_balance(
+        &state.blockchain.svm_accounts, &usdt_mint, &pool_pubkey,
+    );
+
+    // Escrow vault BB balance
+    let escrow_address = escrow_vault_address();
+    let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_address);
+
+    // Circuit breaker
+    let cb_tripped: u64 = if state.circuit_breaker.is_open() { 1 } else { 0 };
+
+    // Withdrawal window
+    let withdrawal_window_total = state.withdrawal_window_total.load(Ordering::Relaxed);
+
+    let mut out = String::with_capacity(2048);
+    macro_rules! gauge {
+        ($name:expr, $help:expr, $val:expr) => {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n",
+                name = $name, help = $help, val = $val
+            ));
+        };
+    }
+
+    gauge!("bb_total_supply_lamports",      "Total BB supply in lamports",                         bb_supply_lamports);
+    gauge!("bb_account_count",              "Number of BB accounts",                               bb_account_count);
+    gauge!("bb_block_height",               "Current PoH slot (block height)",                     current_slot);
+    gauge!("bb_total_tx_count",             "Total transactions processed",                        stats.total_tx_count);
+    gauge!("wusdt_supply_micro",            "Total wUSDT supply in micro-units (6 dec)",           wusdt_supply_micro);
+    gauge!("maxx_supply_pico",              "Total MAXX supply in pico-units (12 dec)",            maxx_supply_pico);
+    gauge!("escrow_balance_lamports",       "Escrow vault BB balance in lamports",                 escrow_balance_lamports);
+    gauge!("pool_bb_lamports",              "Swap pool BB balance in lamports",                    pool_bb_lamports);
+    gauge!("pool_wusdt_micro",              "Swap pool wUSDT balance in micro-units",              pool_wusdt_micro);
+    gauge!("circuit_breaker_tripped",       "1 if circuit breaker is open (halted), else 0",       cb_tripped);
+    gauge!("withdrawal_window_total_micro", "wUSDT withdrawn in current 24h window (micro-units)", withdrawal_window_total);
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        out,
+    )
 }
 
 /// GET /stats
@@ -577,6 +680,18 @@ async fn signed_transfer_handler(
 
     if verifying_key.verify(&message, &signature).is_err() {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
+    }
+
+    // ── PUBKEY → ADDRESS BINDING ───────────────────────────────────────────
+    // The derived address from the public key MUST equal wallet_address.
+    // Without this check, an attacker could sign with their own key but claim
+    // wallet_address is a PDA or another account, draining arbitrary balances.
+    let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived_address != req.wallet_address {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "public_key does not match wallet_address",
+            "derived": derived_address,
+        })));
     }
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
@@ -1215,8 +1330,9 @@ async fn faucet_handler(
             let new_bal = state.blockchain.get_balance(&req.wallet_address);
             info!("🚰 FAUCET: {} BB → {} (Ed25519 verified)", amount, req.wallet_address);
 
-            // Record epoch claim for rate limiting
-            state.faucet_claims.insert(req.wallet_address.clone(), (current_epoch, amount));
+            // Record epoch claim for rate limiting (epoch, lamports)
+            let amount_lamports = (amount * crate::svm::types::LAMPORTS_PER_BB as f64) as u64;
+            state.faucet_claims.insert(req.wallet_address.clone(), (current_epoch, amount_lamports));
 
             // Record faucet mint into PoH block
             {
@@ -1369,6 +1485,44 @@ async fn security_stats_handler(State(state): State<AppState>) -> impl IntoRespo
     }))
 }
 
+#[cfg(feature = "unsafe_admin")]
+async fn backup_database_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Determine path based on REDB_PATH or default
+    let db_path = std::env::var("REDB_PATH").unwrap_or_else(|_| "blockchain_data/blockchain.redb".to_string());
+    let dest_path = format!("{}.bak", db_path);
+    
+    match state.blockchain.backup_database(&dest_path) {
+        Ok(size) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            state.backup_last_at.store(now, Ordering::Relaxed);
+            state.backup_last_size.store(size as u64, Ordering::Relaxed);
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "success",
+                "file": dest_path,
+                "size_bytes": size,
+                "timestamp": now
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Backup failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e })))
+        }
+    }
+}
+
+#[cfg(feature = "unsafe_admin")]
+async fn backup_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let last_at = state.backup_last_at.load(Ordering::Relaxed);
+    let last_size = state.backup_last_size.load(Ordering::Relaxed);
+    (StatusCode::OK, Json(serde_json::json!({
+        "last_backup_timestamp": last_at,
+        "last_backup_size_bytes": last_size,
+    })))
+}
+
 // ============================================================================
 // USDC SPL TOKEN ENDPOINTS
 // ============================================================================
@@ -1390,6 +1544,15 @@ struct UsdcTransferRequest {
     to: String,
     /// Amount in human USDC
     amount: f64,
+    // ── Auth fields (required for signature verification) ───────────────
+    /// Ed25519 public key (hex 32 bytes)
+    public_key: String,
+    /// Ed25519 signature (hex 64 bytes) over canonical message
+    signature: String,
+    /// Unix timestamp (seconds) — rejected if >60s old
+    timestamp: u64,
+    /// Unique nonce string — replay protection
+    nonce: String,
 }
 
 #[derive(Deserialize)]
@@ -1871,6 +2034,8 @@ async fn maxx_vault_handler(
 }
 
 /// POST /usdc/transfer - Direct REST transfer of USDC
+/// Canonical message: "USDC_TRANSFER:{from}:{to}:{amount}:{timestamp}:{nonce}"
+/// where {amount} is the raw micro-USDT integer (amount * USDC_UNIT), not the f64.
 async fn usdc_transfer_handler(
     State(state): State<AppState>,
     Json(req): Json<UsdcTransferRequest>,
@@ -1881,6 +2046,19 @@ async fn usdc_transfer_handler(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid parameters"
         })));
+    }
+
+    // ── Ed25519 signature verification ────────────────────────────────────
+    // Canonical body encodes the integer micro-USDT amount so floating-point
+    // ambiguity cannot be exploited to alter the effective transfer value.
+    let raw_amount_for_auth = (req.amount * USDC_UNIT as f64).round() as u64;
+    let body_str = format!("{}:{}:{}", req.from, req.to, raw_amount_for_auth);
+    if let Err((code, body)) = crate::auth::verify_signed_action(
+        &state, "USDC_TRANSFER", &req.from,
+        &req.public_key, &req.signature,
+        req.timestamp, &req.nonce, &body_str,
+    ) {
+        return (code, body);
     }
 
     // ── Per-wallet rate limiting ───────────────────────────────────────────
@@ -2420,6 +2598,9 @@ fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         // Public
         .route("/health", get(health_handler))
+        .route("/live", get(live_handler))
+        .route("/ready", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/ws", get(ws_handler))
         .route("/stats", get(stats_handler))
         .route("/chain/volume", get(chain_volume_handler))
@@ -2511,6 +2692,8 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/dealer/settle", post(dealer_settle_handler))
             .route("/admin/accounts", get(admin_accounts_handler))
             .route("/admin/security/stats", get(security_stats_handler))
+            .route("/admin/backup", post(backup_database_handler))
+            .route("/admin/backup/status", get(backup_status_handler))
             // Admin USDC
             .route("/admin/usdc/mint", post(usdc_mint_handler))
             .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
@@ -2523,6 +2706,7 @@ fn build_router(state: AppState) -> Router {
 
     router
         .with_state(state)
+        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MB — prevents JSON DoS
         .layer(TraceLayer::new_for_http())
         .layer(cors)
 }
@@ -2559,26 +2743,31 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() {
     // 0. Load Environment Variables (Load BEFORE any other initialization)
-    // Debug current directory and .env status
-    if let Ok(path) = std::env::current_dir() {
-        println!("Current working directory: {:?}", path);
-    }
-    match dotenv::dotenv() {
-        Ok(path) => println!(".env loaded from: {:?}", path),
-        Err(e) => println!("Failed to load .env: {:?}", e),
-    }
+    let dotenv_result = dotenv::dotenv();
+    let cwd_result = std::env::current_dir().ok();
 
     // 0b. Parse CLI arguments
     let config = NodeConfig::parse();
 
-    // 1. Logging
-    tracing_subscriber::registry()
+    // 1. Logging — set LOG_FORMAT=json for structured JSON output
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    let registry = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer()
-            .with_target(true)
-            .with_level(true))
-        .init();
+            .unwrap_or_else(|_| EnvFilter::new("info")));
+    if log_format.eq_ignore_ascii_case("json") {
+        registry
+            .with(tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_level(true))
+            .init();
+    } else {
+        registry
+            .with(tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_level(true))
+            .init();
+    }
 
     let (block_tx, _) = tokio::sync::broadcast::channel(256);
 
@@ -2596,6 +2785,15 @@ async fn main() {
     info!("║  Engine:    PoH + Sealevel + Gulf Stream             ║");
     info!("║  Auth:      Ed25519 Signature Verification           ║");
     info!("╚══════════════════════════════════════════════════════╝");
+
+    // Log dotenv/cwd results now that tracing is initialized
+    if let Some(path) = cwd_result {
+        info!("Working directory: {:?}", path);
+    }
+    match dotenv_result {
+        Ok(path) => info!(".env loaded from: {:?}", path),
+        Err(e) => warn!("Failed to load .env (using system env): {:?}", e),
+    }
 
     // Shared slot counter — PoH clock, BlockProducer, GulfStream, and the health
     // handler all read/write the same Arc<AtomicU64> so the slot is always in sync.
@@ -3200,6 +3398,8 @@ async fn main() {
         creator_coins: creator_coins_map,
         coin_pools: coin_pools_map,
         coin_balances: coin_balances_map,
+        backup_last_at: Arc::new(AtomicU64::new(0)),
+        backup_last_size: Arc::new(AtomicU64::new(0)),
     };
 
     // Start custody watcher background task (if custody wallet is configured)
@@ -3210,6 +3410,38 @@ async fn main() {
     // Start BSC watcher background task (if BSC custody wallet is configured)
     if let Some(w) = bsc_watcher_arc {
         w.start();
+    }
+
+    // Start background database backup task (every 6 hours)
+    {
+        let db_path = std::env::var("REDB_PATH").unwrap_or_else(|_| "blockchain_data/blockchain.redb".to_string());
+        let dest_path = format!("{}.bak", db_path);
+        let app_state = state.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60)); // 6 hours
+            // Skip the first immediate tick
+            interval.tick().await;
+            
+            loop {
+                interval.tick().await;
+                tracing::info!("Running scheduled ReDB background backup...");
+                match app_state.blockchain.backup_database(&dest_path) {
+                    Ok(size) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        app_state.backup_last_at.store(now, Ordering::Relaxed);
+                        app_state.backup_last_size.store(size as u64, Ordering::Relaxed);
+                        tracing::info!("Background backup completed successfully ({} bytes) to {}", size, dest_path);
+                    }
+                    Err(e) => {
+                        tracing::error!("Background ReDB backup failed: {}", e);
+                    }
+                }
+            }
+        });
     }
 
     // ── Startup wUSDT invariant reconcile (unconditional on every boot) ──────────
@@ -3467,8 +3699,17 @@ async fn main() {
     info!("🌐 gRPC: 0.0.0.0:{}", config.grpc_port);
     info!("");
 
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .expect("Failed to bind HTTP listener — port may be in use");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => {
+            info!("🌐 HTTP listener bound on {}", addr);
+            l
+        }
+        Err(e) => {
+            error!("❌ Failed to bind HTTP listener on {}: {}", addr, e);
+            error!("   Check that port {} is not already in use.", addr);
+            std::process::exit(1);
+        }
+    };
 
     // 11. Solana JSON-RPC server on port 8899 (Phase 2A+2B)
     {

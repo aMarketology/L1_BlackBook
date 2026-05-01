@@ -423,6 +423,8 @@ impl TransactionRecord {
 pub struct ConcurrentBlockchain {
     /// ReDB database handle (Arc allows sharing across threads)
     pub db: Arc<Database>,
+    /// Path to the ReDB file on disk — used for backup
+    db_path: Arc<String>,
     pub cache: Arc<DashMap<String, f64>>,
     #[allow(dead_code)]
     processed_bridge_txs: Arc<DashMap<String, String>>,
@@ -713,6 +715,7 @@ impl ConcurrentBlockchain {
 
         Ok(Self {
             db: db_arc,
+            db_path: Arc::new(db_file),
             cache,
             processed_bridge_txs,
             block_height: Arc::new(AtomicU64::new(0)),
@@ -1237,6 +1240,21 @@ impl ConcurrentBlockchain {
         write_txn.commit().map_err(|e| e.to_string())?;
         self.block_height.fetch_max(slot + 1, Ordering::Relaxed);
         Ok(())
+    }
+
+    // ========================================================================
+    // BACKUP (On-line live compaction)
+    // ========================================================================
+
+    /// Creates a hot backup of the ReDB database by copying the file.
+    /// Acquires a read transaction to ensure a consistent snapshot, then copies the .redb file.
+    pub fn backup_database(&self, dest_path: &str) -> Result<usize, String> {
+        // Hold a read transaction to prevent compaction or writes mid-copy
+        let _read_guard = self.db.begin_read().map_err(|e| format!("Backup: failed to begin read txn: {e}"))?;
+        std::fs::copy(self.db_path.as_str(), dest_path)
+            .map_err(|e| format!("Database backup failed: {e}"))?;
+        let meta = std::fs::metadata(dest_path).map_err(|e| e.to_string())?;
+        Ok(meta.len() as usize)
     }
 
     /// Load a FinalizedBlock from ReDB by slot number

@@ -38,7 +38,7 @@ export interface Keypair {
   /** hex-encoded 32-byte Ed25519 public key */
   publicKeyHex: string;
 }
-
+  
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /** 1 BB = 1,000,000 SPL units (6 decimals, same as USDC on Solana) */

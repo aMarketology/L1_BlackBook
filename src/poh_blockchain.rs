@@ -457,9 +457,11 @@ pub struct MerkleTree {
 }
 
 impl MerkleTree {
-    /// Build a merkle tree from account balances
-    /// Accounts are sorted by address for deterministic ordering
-    pub fn from_accounts(accounts: &BTreeMap<String, f64>) -> Self {
+    /// Build a merkle tree from account balances.
+    /// Balances are u64 lamports — hashed deterministically across architectures.
+    /// (f64 hashing is non-deterministic and lossy; never use it for state roots.)
+    /// Accounts are sorted by address for deterministic ordering.
+    pub fn from_accounts(accounts: &BTreeMap<String, u64>) -> Self {
         if accounts.is_empty() {
             return Self {
                 leaves: vec![],
@@ -467,13 +469,13 @@ impl MerkleTree {
             };
         }
 
-        // Create leaves: hash(address || balance)
+        // Create leaves: hash(address || lamports_le_bytes)
         let leaves: Vec<[u8; 32]> = accounts
             .iter()
-            .map(|(addr, balance)| {
+            .map(|(addr, lamports)| {
                 let mut hasher = Sha256::new();
                 hasher.update(addr.as_bytes());
-                hasher.update(balance.to_le_bytes());
+                hasher.update(lamports.to_le_bytes());
                 hasher.finalize().into()
             })
             .collect();
@@ -580,12 +582,13 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
-    /// Verify this proof against a leaf value
-    pub fn verify(&self, address: &str, balance: f64) -> bool {
+    /// Verify this proof against a leaf value.
+    /// `lamports` is the raw u64 balance — must match what was hashed in `from_accounts`.
+    pub fn verify(&self, address: &str, lamports: u64) -> bool {
         // Compute leaf hash
         let mut hasher = Sha256::new();
         hasher.update(address.as_bytes());
-        hasher.update(balance.to_le_bytes());
+        hasher.update(lamports.to_le_bytes());
         let mut current: [u8; 32] = hasher.finalize().into();
 
         // Walk up the tree using sorted hashing — is_left is ignored;
@@ -708,8 +711,8 @@ impl LeafCache {
     }
 
     /// Seed the cache from the SVM hot_state on a fresh start.
+    /// Hashes raw u64 lamports — must match `MerkleTree::from_accounts`.
     pub fn warm_from_hot_state(&self, hot_state: &crate::svm::SvmAccountsDB) {
-        use crate::svm::types::LAMPORTS_PER_BB;
         use solana_sdk::account::ReadableAccount;
         use sha2::Digest;
         let mut leaves = self.leaves.write();
@@ -717,10 +720,9 @@ impl LeafCache {
             let lamports = entry.value().lamports();
             if lamports > 0 {
                 let addr = entry.key().to_string();
-                let balance = lamports as f64 / LAMPORTS_PER_BB as f64;
                 let mut hasher = Sha256::new();
                 hasher.update(addr.as_bytes());
-                hasher.update(balance.to_le_bytes());
+                hasher.update(lamports.to_le_bytes());
                 let hash: [u8; 32] = hasher.finalize().into();
                 leaves.insert(addr, hash);
             }
@@ -735,24 +737,23 @@ impl LeafCache {
         deleted: &[[u8; 32]],    // pubkey byte arrays (DirtySet::deleted)
         hot_state: &crate::svm::SvmAccountsDB,
     ) -> String {
-        use crate::svm::types::LAMPORTS_PER_BB;
         use solana_sdk::account::ReadableAccount;
         use sha2::Digest;
         use solana_sdk::pubkey::Pubkey;
 
         let mut leaves = self.leaves.write();
 
-        // Update modified leaves — recompute only for changed accounts (O(dirty))
+        // Update modified leaves — recompute only for changed accounts (O(dirty)).
+        // Hashes raw u64 lamports for cross-architecture determinism.
         for key_bytes in modified {
             let pubkey = Pubkey::new_from_array(*key_bytes);
             let addr = pubkey.to_string();
             if let Some(account) = hot_state.hot_state.get(&pubkey) {
                 let lamports = account.lamports();
                 if lamports > 0 {
-                    let balance = lamports as f64 / LAMPORTS_PER_BB as f64;
                     let mut hasher = Sha256::new();
                     hasher.update(addr.as_bytes());
-                    hasher.update(balance.to_le_bytes());
+                    hasher.update(lamports.to_le_bytes());
                     let hash: [u8; 32] = hasher.finalize().into();
                     leaves.insert(addr, hash);
                 } else {
@@ -1182,9 +1183,12 @@ impl BlockProducer {
                 let tx_hash = external_tx_hash.as_deref().unwrap_or("internal");
                 info!("Tier1 deposit: {} deposited {} USDT (tx: {})", 
                     tx.from, usdt_amount, &tx_hash[..8.min(tx_hash.len())]);
-                // Credit $BB to user (at 1:10 ratio)
-                let bb_amount = usdt_amount * 10;
-                self.blockchain.credit(&tx.from, bb_amount as f64)
+                // Credit $BB to user (at 1:10 ratio) — stay in u64 lamports
+                let bb_amount = usdt_amount.checked_mul(10)
+                    .ok_or("BB amount overflow")?;
+                let lamports = bb_amount.checked_mul(crate::svm::types::LAMPORTS_PER_BB)
+                    .ok_or("Lamport amount overflow")?;
+                self.blockchain.credit_lamports(&tx.from, lamports)
             }
             
             // ========== Token Transfers ==========
@@ -1314,18 +1318,16 @@ impl BlockProducer {
 
     /// Get all accounts (for state root computation).
     /// Reads exclusively from SVM AccountsDB (the single source of truth)
-    /// and converts lamports → f64 BB for deterministic merkle hashing.
-    fn get_all_accounts(&self) -> BTreeMap<String, f64> {
-        use crate::svm::types::LAMPORTS_PER_BB;
+    /// and returns raw u64 lamports for deterministic merkle hashing.
+    fn get_all_accounts(&self) -> BTreeMap<String, u64> {
         use solana_sdk::account::ReadableAccount;
         let mut accounts = BTreeMap::new();
 
         for entry in self.blockchain.svm_accounts.hot_state.iter() {
             let lamports = entry.value().lamports();
             if lamports > 0 {
-                let bb_balance = lamports as f64 / LAMPORTS_PER_BB as f64;
                 let key = entry.key().to_string();
-                accounts.insert(key, bb_balance);
+                accounts.insert(key, lamports);
             }
         }
 
@@ -1547,7 +1549,7 @@ mod tests {
     #[test]
     fn test_merkle_tree_single() {
         let mut accounts = BTreeMap::new();
-        accounts.insert("alice".to_string(), 100.0);
+        accounts.insert("alice".to_string(), 100u64);
         
         let tree = MerkleTree::from_accounts(&accounts);
         assert!(!tree.root_hex().is_empty());
@@ -1557,17 +1559,17 @@ mod tests {
     #[test]
     fn test_merkle_tree_multiple() {
         let mut accounts = BTreeMap::new();
-        accounts.insert("alice".to_string(), 100.0);
-        accounts.insert("bob".to_string(), 200.0);
-        accounts.insert("charlie".to_string(), 300.0);
+        accounts.insert("alice".to_string(), 100u64);
+        accounts.insert("bob".to_string(), 200u64);
+        accounts.insert("charlie".to_string(), 300u64);
         
         let tree = MerkleTree::from_accounts(&accounts);
         assert!(!tree.root_hex().is_empty());
         
         // Generate and verify proof for bob
         let proof = tree.generate_proof(1).unwrap();
-        assert!(proof.verify("bob", 200.0));
-        assert!(!proof.verify("bob", 201.0)); // Wrong balance
+        assert!(proof.verify("bob", 200u64));
+        assert!(!proof.verify("bob", 201u64)); // Wrong balance
     }
 
     #[test]
