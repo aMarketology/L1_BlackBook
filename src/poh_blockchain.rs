@@ -530,7 +530,7 @@ impl MerkleTree {
         let mut current_level = self.leaves.clone();
 
         while current_level.len() > 1 {
-            let sibling_index = if current_index.is_multiple_of(2) {
+            let sibling_index = if current_index % 2 == 0 {
                 current_index + 1
             } else {
                 current_index - 1
