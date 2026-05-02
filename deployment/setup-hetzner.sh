@@ -60,7 +60,7 @@ ufw allow 8080/tcp  comment 'BlackBook HTTP API'
 ufw allow 8899/tcp  comment 'Solana JSON-RPC'
 ufw allow 8003/udp  comment 'BlackBook TPU (binary transaction ingestion)'
 # gRPC relay: only allow from trusted reader-node IP (set READER_NODE_IP env var before running)
-if [ -n "${READER_NODE_IP}" ]; then
+if [ -n "${READER_NODE_IP:-}" ]; then
     ufw allow from "${READER_NODE_IP}" to any port 50051 proto tcp comment 'gRPC Validator Relay (trusted reader)'
 else
     echo "[WARN] READER_NODE_IP not set — gRPC port 50051 is NOT opened. Set READER_NODE_IP and re-run to allow reader nodes."
