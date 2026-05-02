@@ -47,8 +47,8 @@ ENV REDB_PATH=/data/blockchain_data/blockchain.redb
 
 USER blackbook
 
-# Expose HTTP (8080) + JSON-RPC (8899) + gRPC relay (50051)
-EXPOSE 8080 8899 50051
+# Expose HTTP (8080) + JSON-RPC (8899) + UDP TPU (8003) + gRPC relay (50051)
+EXPOSE 8080 8899 8003/udp 50051
 
 # Health check — block production staleness < 10s
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \

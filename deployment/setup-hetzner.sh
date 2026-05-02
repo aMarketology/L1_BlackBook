@@ -111,7 +111,7 @@ fi
 # ── 7. Build and launch ──────────────────────────────────────
 echo "[7/7] Building and launching BlackBook L1..."
 cd "$APP_DIR"
-docker compose -f deploy/docker-compose.prod.yml up -d --build
+docker compose -f deployment/docker-compose.prod.yml up -d --build
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════╗"

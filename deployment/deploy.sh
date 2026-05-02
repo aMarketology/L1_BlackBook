@@ -75,7 +75,7 @@ ssh "$SSH_USER@$SERVER_IP" "cd $APP_DIR && git pull origin master"
 echo "[2/2] Building and restarting container..."
 ssh "$SSH_USER@$SERVER_IP" "
     cd $APP_DIR &&
-    docker compose -f deploy/docker-compose.prod.yml up -d --build 2>&1 | tail -20
+    docker compose -f deployment/docker-compose.prod.yml up -d --build 2>&1 | tail -20
 "
 
 echo ""
