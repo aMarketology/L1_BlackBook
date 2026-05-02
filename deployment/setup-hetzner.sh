@@ -72,7 +72,7 @@ echo "[5/7] Hardening SSH..."
 # Disable password auth (you should already have SSH keys)
 sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-systemctl restart sshd
+systemctl restart ssh || systemctl restart sshd || true
 
 # Enable automatic security updates
 dpkg-reconfigure -plow unattended-upgrades || true
