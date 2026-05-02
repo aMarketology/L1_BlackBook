@@ -19,7 +19,6 @@ COPY src/ src/
 COPY runtime/ runtime/
 COPY protocol/ protocol/
 COPY proto/ proto/
-COPY benchmarks/ benchmarks/
 COPY tests/ tests/
 COPY examples/ examples/
 
