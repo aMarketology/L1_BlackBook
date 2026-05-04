@@ -31,7 +31,7 @@ services:
       - "8080:8080"    # HTTP API (wallet, escrow, admin)
       - "8899:8899"    # Solana JSON-RPC (Phantom, OneKey, agents)
       - "8003:8003/udp" # UDP TPU (binary transaction ingestion)
-      - "127.0.0.1:50051:50051"  # gRPC relay (writer → reader only, localhost)
+      - "50051:50051"  # gRPC relay (writer → reader nodes)
 
     volumes:
       - blackbook-data:/data

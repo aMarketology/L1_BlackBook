@@ -54,4 +54,4 @@ EXPOSE 8080 8899 8003/udp 50051
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["/app/layer1"]
+CMD ["/app/layer1", "--mode", "writer", "--identity", "genesis_validator"]

@@ -54,15 +54,15 @@ impl std::fmt::Display for NodeMode {
 #[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
 pub struct NodeConfig {
     /// Node mode: writer (block producer) or reader (block consumer)
-    #[arg(long, default_value = "writer", value_enum)]
+    #[arg(long, default_value = "reader", value_enum)]
     pub mode: NodeMode,
 
     /// Validator identity name (used in leader schedule + logs)
-    #[arg(long, default_value = "genesis_validator")]
+    #[arg(long, default_value = "local_dev")]
     pub identity: String,
 
     /// Address of the writer node's gRPC relay (reader mode only)
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    #[arg(long, default_value = "http://layer1.blackbook.id:50051")]
     pub writer_addr: String,
 
     /// Port for the gRPC relay service (writer) or gRPC client target (reader)
@@ -310,6 +310,10 @@ pub struct AppState {
     pub coin_pools: Arc<dashmap::DashMap<String, storage::CoinPoolState>>,
     /// User coin balances — "{ticker}:{wallet}" → coin units (6 decimals).
     pub coin_balances: Arc<dashmap::DashMap<String, u64>>,
+
+    // ===== Vault Gateway (KMS / local Ed25519 claim signer) =====
+    /// Signs outbound USDT claim attestations. None if no signer is configured.
+    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
 
     // ===== Backup State =====
     pub backup_last_at: Arc<AtomicU64>,
@@ -2660,6 +2664,8 @@ fn build_router(state: AppState) -> Router {
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
+        // Vault Gateway — outbound claim attestations
+        .route("/vault/claim-attestation", post(contracts::vault_gateway::claim_attestation_handler))
         // Swap
         .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
         .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
@@ -3398,6 +3404,7 @@ async fn main() {
         creator_coins: creator_coins_map,
         coin_pools: coin_pools_map,
         coin_balances: coin_balances_map,
+        vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
     };
