@@ -1,3 +1,6 @@
+// The global escrow HTTP endpoints intentionally use the legacy global vault PDA
+// (for backward-compat with existing SDK/dealer code). The gRPC path uses per-contest PDAs.
+#![allow(deprecated)]
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use serde::{Deserialize, Serialize};
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
@@ -23,6 +26,7 @@ use crate::svm::{escrow_vault_address, LAMPORTS_PER_BB};
 
 /// Represents the raw Instruction Data, identical to how eBPF programs
 /// receive byte-serialized commands.
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum EscrowInstruction {
     Deposit {
@@ -192,6 +196,7 @@ pub async fn escrow_deposit_handler(
         status: "approved".to_string(),
         submitted_at: now,
         approved_at: Some(now),
+        contest_id: None,
     };
     if let Err(e) = state.blockchain.store_deposit_request(&deposit_record) {
         tracing::error!("Failed to persist escrow deposit record to ReDB: {}", e);
@@ -377,6 +382,8 @@ pub async fn escrow_submit_state_root_handler(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        vault_pda: crate::svm::escrow_vault_address_for(&req.market_id),
+        house_rake_swept_tx: None,
     };
 
     // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────────

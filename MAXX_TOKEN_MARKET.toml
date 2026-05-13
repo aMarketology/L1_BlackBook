@@ -1,7 +1,7 @@
 [MAXX_TOKEN_MARKET]
 ticker = "$XX"
-spot_price = 0.0016
-total_supply = 31091.18
-vault_reserve = 24.17
+spot_price = 0.0018
+total_supply = 35720.25
+vault_reserve = 31.90
 reserve_currency = "wUSDT"
-last_update_height = 398978
+last_update_height = 544769

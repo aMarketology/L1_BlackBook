@@ -20,6 +20,7 @@ use std::str::FromStr;
 /// 10 BB = 1 wUSDT (integer ratio)
 pub const BB_TO_USDC_RATE: u64 = 10;
 
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SwapInstruction {
     SwapBbForUsdc {

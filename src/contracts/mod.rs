@@ -6,3 +6,4 @@ pub mod withdrawal_gateway;
 pub mod maxx_token;
 pub mod decay_token;
 pub mod nft_bridge;
+pub mod oracle;

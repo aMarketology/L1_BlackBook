@@ -183,6 +183,7 @@ pub async fn deposit_request_handler(
         status: "pending".to_string(),
         submitted_at: now,
         approved_at: None,
+        contest_id: None,
     };
 
     // Persist to ReDB + hot DashMap

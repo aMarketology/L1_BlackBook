@@ -25,6 +25,11 @@ service SettlementService {
     // Submits the 32-byte Merkle root so users can claim winnings on L1.
     rpc SubmitMerkleRoot(MerkleRootSubmission) returns (MerkleRootResponse);
 
+    // NEW (Step 2): Optimistic oracle path.
+    // L2 dealer submits a pending root that enters a 2h dispute window before
+    // being committed to ESCROW_MARKET_ROOTS. Anyone can challenge with $XX stake.
+    rpc SubmitPendingRoot(SubmitPendingRootRequest) returns (SubmitPendingRootResponse);
+
     // Called by L2 to query live contest state from L1.
     rpc GetContestStatus(ContestStatusRequest) returns (ContestStatusResponse);
 
@@ -92,7 +97,41 @@ message MerkleRootResponse {
     string error_message      = 4;
 }
 
-// ── GetContestStatus ──────────────────────────────────────────────────────────
+// ── SubmitPendingRoot ─────────────────────────────────────────────────────────
+// Optimistic oracle path: root enters a 2h dispute window before finalization.
+// Canonical signed message:
+//   contest_id_bytes ++ l2_block_number.le_bytes(8) ++ merkle_root[32] ++ outcome_bytes
+
+message SubmitPendingRootRequest {
+    string contest_id          =  1;
+    bytes  merkle_root         =  2; // exactly 32 bytes
+    uint32 winner_count        =  3;
+    uint64 total_deposited     =  4; // SPL units
+    uint64 total_payout        =  5; // SPL units
+    uint64 house_rake          =  6; // SPL units
+    string winning_outcome     =  7; // e.g. "Yes" or "Manchester City"
+    int64  resolved_at         =  8; // Unix timestamp
+    uint64 l2_block_number     =  9; // monotonic counter
+    // Canonical msg: contest_id_bytes ++ l2_block_number_le8 ++ merkle_root[32] ++ winning_outcome_bytes
+    bytes  sequencer_pubkey    = 10; // Ed25519 verifying key, 32 bytes
+    bytes  sequencer_sig       = 11; // Ed25519 signature over canonical message, 64 bytes
+    // Optional oracle committee attestation signatures (Step 3 enforces M-of-N)
+    repeated OracleAttestationSig oracle_sigs = 12;
+}
+
+message OracleAttestationSig {
+    string pubkey_hex = 1;
+    string sig_hex    = 2;
+}
+
+message SubmitPendingRootResponse {
+    bool   success           = 1;
+    string market_id         = 2;
+    uint64 finalize_at_slot  = 3; // slot at which root auto-finalizes if undisputed
+    string error_message     = 4;
+}
+
+
 
 message ContestStatusRequest {
     string contest_id = 1;

@@ -15,6 +15,7 @@ pub mod relay;
 pub mod settlement;
 pub mod reader;
 pub mod watcher;
+pub mod kms;
 
 // Infrastructure
 #[path = "../protocol/mod.rs"]

@@ -57,6 +57,7 @@ pub use spl_token::{
 };
 
 // Re-export PDA helpers at the svm:: level
+#[allow(deprecated)]
 pub use pda::{
     swap_pool_pda,
     swap_pool_address,
@@ -64,6 +65,12 @@ pub use pda::{
     maxx_curve_address,
     escrow_vault_pda,
     escrow_vault_address,
+    escrow_vault_pda_for,
+    escrow_vault_address_for,
+    contest_state_pda,
+    contest_state_pda_address,
     decay_treasury_pda,
     decay_treasury_pda_address,
+    house_treasury_pda,
+    house_treasury_pda_address,
 };

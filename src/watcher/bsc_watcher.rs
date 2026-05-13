@@ -95,6 +95,7 @@ struct EthLog {
     topics: Vec<String>,
     data: String,
     transaction_hash: String,
+    #[allow(dead_code)]
     block_number: String, // hex-encoded "0x…"
 }
 
@@ -344,6 +345,7 @@ impl BscWatcher {
             status: "pending".to_string(),
             submitted_at: now,
             approved_at: None,
+            contest_id: None,
         };
 
         // Insert into hot-cache (no-op if the custodial path already registered this tx)

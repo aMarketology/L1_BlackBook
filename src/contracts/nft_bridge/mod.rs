@@ -14,7 +14,7 @@
 //!   - `transfer_nft` — signed by the current owner
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 // ─────────────────────────── On-Chain NFT State ──────────────────────────────
 

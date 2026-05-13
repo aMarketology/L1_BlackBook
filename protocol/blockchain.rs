@@ -72,5 +72,32 @@ pub enum TxData {
         amount: u64,
         escrow_address: String,
     },
+
+    // ========== Vault Gateway — Cross-Chain Bridge ==========
+
+    /// User burns $BB (supply ↓) and receives wUSDT (supply ↑) in equal measure.
+    /// This is the first step of the outbound bridge.
+    /// INVARIANT: wusdt_credited == bb_burned (1:1 at micro/lamport scale).
+    VaultBurn {
+        /// Lamports of $BB destroyed — removed from total supply permanently.
+        bb_burned: u64,
+        /// Micro-units of wUSDT created — exactly equal to bb_burned.
+        wusdt_credited: u64,
+        /// PoH slot used as the BurnRecord primary key.
+        poh_slot: u64,
+    },
+
+    /// Expired contest house rake swept to the house treasury PDA.
+    /// Fires once per contest after claim_deadline_slot elapses and
+    /// house_rake_swept_tx is None. Only the platform cut (house_rake)
+    /// is moved — unclaimed winner payouts are left accessible.
+    EscrowSweep {
+        /// Contest whose rake is being recovered.
+        contest_id: String,
+        /// Lamports of house_rake transferred to house treasury.
+        rake_lamports: u64,
+        /// Base58 address of the house treasury PDA that received the funds.
+        treasury_address: String,
+    },
 }
 

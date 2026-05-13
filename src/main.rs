@@ -19,7 +19,7 @@ use axum::{
     response::IntoResponse,
     http::StatusCode,
 };
-use futures_util::{stream::StreamExt, SinkExt};
+
 use solana_sdk::account::ReadableAccount;
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::trace::TraceLayer;
@@ -54,15 +54,15 @@ impl std::fmt::Display for NodeMode {
 #[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
 pub struct NodeConfig {
     /// Node mode: writer (block producer) or reader (block consumer)
-    #[arg(long, default_value = "reader", value_enum)]
+    #[arg(long, default_value = "writer", value_enum)]
     pub mode: NodeMode,
 
     /// Validator identity name (used in leader schedule + logs)
-    #[arg(long, default_value = "local_dev")]
+    #[arg(long, default_value = "genesis_validator")]
     pub identity: String,
 
     /// Address of the writer node's gRPC relay (reader mode only)
-    #[arg(long, default_value = "http://layer1.blackbook.id:50051")]
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
     pub writer_addr: String,
 
     /// Port for the gRPC relay service (writer) or gRPC client target (reader)
@@ -311,10 +311,6 @@ pub struct AppState {
     /// User coin balances — "{ticker}:{wallet}" → coin units (6 decimals).
     pub coin_balances: Arc<dashmap::DashMap<String, u64>>,
 
-    // ===== Vault Gateway (KMS / local Ed25519 claim signer) =====
-    /// Signs outbound USDT claim attestations. None if no signer is configured.
-    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
-
     // ===== Backup State =====
     pub backup_last_at: Arc<AtomicU64>,
     pub backup_last_size: Arc<AtomicU64>,
@@ -417,6 +413,7 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /metrics — Prometheus text exposition (no external crate).
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    #[allow(deprecated)]
     use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, escrow_vault_address};
 
     let stats = state.blockchain.stats();
@@ -445,6 +442,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     );
 
     // Escrow vault BB balance
+    #[allow(deprecated)]
     let escrow_address = escrow_vault_address();
     let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_address);
 
@@ -1745,7 +1743,7 @@ async fn admin_seed_swap_pool_handler(
 async fn dealer_balances_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, maxx_mint_address, USDC_UNIT, MAXX_UNIT, LAMPORTS_PER_BB};
+    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, USDC_UNIT, MAXX_UNIT, LAMPORTS_PER_BB};
     use contracts::decay_token::get_owner_tokens;
 
     if state.dealer_address.is_empty() {
@@ -2664,8 +2662,6 @@ fn build_router(state: AppState) -> Router {
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
-        // Vault Gateway — outbound claim attestations
-        .route("/vault/claim-attestation", post(contracts::vault_gateway::claim_attestation_handler))
         // Swap
         .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
         .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
@@ -2687,7 +2683,12 @@ fn build_router(state: AppState) -> Router {
         // L3 NFT Bridge (on-chain anchoring + transfers)
         .route("/nft/:collection_id/:token_id", get(contracts::nft_bridge::get_nft_handler))
         .route("/nft/:collection_id/:token_id/owner", get(contracts::nft_bridge::get_nft_owner_handler))
-        .route("/nft/transfer", post(contracts::nft_bridge::transfer_nft_handler));
+        .route("/nft/transfer", post(contracts::nft_bridge::transfer_nft_handler))
+        // Oracle
+        .route("/oracle/nodes", get(contracts::oracle::list_oracle_nodes_handler))
+        .route("/oracle/event/:market_id", get(contracts::oracle::oracle_event_handler))
+        .route("/oracle/dispute", post(contracts::oracle::oracle_dispute_handler))
+        .route("/oracle/vote", post(contracts::oracle::oracle_vote_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {
@@ -2704,6 +2705,8 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/usdc/mint", post(usdc_mint_handler))
             .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
             .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
+            // Oracle (admin-only registration)
+            .route("/oracle/register", post(contracts::oracle::register_oracle_handler))
             // Deposit Gateway (admin approve)
             .route("/admin/deposit/approve", post(contracts::deposit_gateway::deposit_approve_handler))
             // Withdrawal Gateway (admin release)
@@ -2833,7 +2836,11 @@ async fn main() {
 
     // ── Global Escrow: PDA is now computed on demand via escrow_vault_address() ──
     // No longer stored in AppState. All escrow code calls svm::escrow_vault_address() directly.
-    info!("🔐 Escrow PDA: {} (bb_escrow_vault_v1)", crate::svm::escrow_vault_address());
+    {
+        #[allow(deprecated)]
+        let addr = crate::svm::escrow_vault_address();
+        info!("🔐 Escrow PDA: {} (bb_escrow_vault_v1)", addr);
+    }
     let l2_sequencer_pubkey = std::env::var("L2_SEQUENCER_PUBKEY")
         .unwrap_or_else(|_| {
             warn!("⚠️  L2_SEQUENCER_PUBKEY not set — using dev default");
@@ -3404,7 +3411,6 @@ async fn main() {
         creator_coins: creator_coins_map,
         coin_pools: coin_pools_map,
         coin_balances: coin_balances_map,
-        vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
     };
@@ -3450,6 +3456,17 @@ async fn main() {
             }
         });
     }
+
+    // Start oracle finalize task (polls every 30s for dispute window expiry)
+    contracts::oracle::finalize::spawn_finalize_task(state.clone());
+
+    // Start expired-contest sweep task (default 60s interval, configurable via SWEEP_INTERVAL_SECS)
+    settlement::sweep::spawn_sweep_task(
+        state.blockchain.clone(),
+        state.contest_states.clone(),
+        state.current_slot.clone(),
+        state.block_producer.clone(),
+    );
 
     // ── Startup wUSDT invariant reconcile (unconditional on every boot) ──────────
     // If BB supply exceeds wUSDT supply × 10 (legacy chain or first upgrade after

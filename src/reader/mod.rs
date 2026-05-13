@@ -297,11 +297,13 @@ impl ReaderNode {
                     self.blockchain.svm_accounts.store_account(&pk, acct);
                     self.blockchain.mirror_balance_to_cache(&otx.tx.from, new_lam);
                 }
-                // Escrow transactions are state-managed by the writer node;
-                // reader nodes replay balance effects only, not escrow state.
+                // Escrow and vault transactions are state-managed by the writer node;
+                // reader nodes replay balance effects only, not contract state.
                 crate::protocol::blockchain::TxData::EscrowDeposit { .. }
                 | crate::protocol::blockchain::TxData::EscrowStateRoot { .. }
-                | crate::protocol::blockchain::TxData::EscrowWithdraw { .. } => {}
+                | crate::protocol::blockchain::TxData::EscrowWithdraw { .. }
+                | crate::protocol::blockchain::TxData::VaultBurn { .. }
+                | crate::protocol::blockchain::TxData::EscrowSweep { .. } => {}
             }
         }
     }

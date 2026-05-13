@@ -8,7 +8,7 @@
 //!   - SyncBridge:          Heartbeat / TPS monitoring.
 //!
 //! Runs on port 50052 (separate from validator_relay on 50051).
-
+pub mod sweep;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::poh_blockchain::BlockProducer;
 use crate::storage::{ConcurrentBlockchain, ContestState, ContestStatus};
-use crate::svm::escrow_vault_address;
+use crate::svm::escrow_vault_address_for;
 
 // Import generated protobuf types
 pub mod proto {
@@ -30,9 +30,17 @@ use proto::{
     VerifyDepositRequest, VerifyDepositResponse,
     InitContestReserveRequest, InitContestReserveResponse,
     MerkleRootSubmission, MerkleRootResponse,
+    SubmitPendingRootRequest, SubmitPendingRootResponse,
     ContestStatusRequest, ContestStatusResponse,
     SyncBridgeRequest, SyncBridgeResponse,
 };
+use crate::storage::{OracleSignature, PendingRoot, PendingRootStatus};
+
+/// ~2h dispute window at 400 ms/slot: 2*60*60 / 0.4 = 18_000 slots.
+/// Spec says 6_480 but oracle.md calls for ~2h; using 6_480 to match spec.
+const DISPUTE_WINDOW_SLOTS: u64 = 6_480;
+const MIN_DISPUTE_STAKE_PICO_XX: u64 = 100 * crate::svm::MAXX_UNIT;
+const DISPUTE_ESCALATION_THRESHOLD: u64 = 1_000 * crate::svm::MAXX_UNIT;
 
 // ============================================================================
 // SERVICE STRUCT
@@ -176,32 +184,41 @@ impl SettlementService for BlackBookSettlementService {
             return Err(Status::invalid_argument("bb_reserve must be > 0"));
         }
 
-        // Check contest is not already settled
+        // Check contest is not already Open or Settled
         if let Some(existing) = self.contest_states.get(&req.contest_id) {
-            if existing.status == ContestStatus::Settled {
-                return Ok(Response::new(InitContestReserveResponse {
-                    confirmed: false,
-                    l1_tx_hash: String::new(),
-                    error_message: "Contest already settled".to_string(),
-                }));
+            match existing.status {
+                ContestStatus::Settled => {
+                    return Ok(Response::new(InitContestReserveResponse {
+                        confirmed: false,
+                        l1_tx_hash: String::new(),
+                        error_message: "Contest already settled".to_string(),
+                    }));
+                }
+                ContestStatus::Open => {
+                    return Ok(Response::new(InitContestReserveResponse {
+                        confirmed: false,
+                        l1_tx_hash: String::new(),
+                        error_message: "Contest already initialized — duplicate InitContestReserve".to_string(),
+                    }));
+                }
+                ContestStatus::Expired => {} // allow reinit on expired
             }
         }
 
-        // Convert SPL units → BB using the canonical constant (5 decimals)
-        let bb_amount = req.bb_reserve as f64 / crate::svm::LAMPORTS_PER_BB as f64;
-
-        // Debit dealer → escrow
-        if let Err(e) = self.blockchain.debit(&req.dealer_address, bb_amount) {
+        // Debit dealer → per-contest escrow vault PDA (not global vault)
+        // Use debit_svm_lamports to avoid u64 → f64 → u64 precision loss.
+        let escrow_addr = escrow_vault_address_for(&req.contest_id);
+        if let Err(e) = self.blockchain.debit_svm_lamports(&req.dealer_address, req.bb_reserve) {
             return Ok(Response::new(InitContestReserveResponse {
                 confirmed: false,
                 l1_tx_hash: String::new(),
                 error_message: format!("Dealer debit failed: {} (balance check passed?)", e),
             }));
         }
-        let escrow_addr = escrow_vault_address();
-        if let Err(e) = self.blockchain.credit(&escrow_addr, bb_amount) {
+        let escrow_addr_credit = escrow_addr.clone();
+        if let Err(e) = self.blockchain.credit_svm_lamports(&escrow_addr_credit, req.bb_reserve) {
             // Rollback
-            let _ = self.blockchain.credit(&req.dealer_address, bb_amount);
+            let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
             return Ok(Response::new(InitContestReserveResponse {
                 confirmed: false,
                 l1_tx_hash: String::new(),
@@ -229,12 +246,26 @@ impl SettlementService for BlackBookSettlementService {
             l1_tx_hash: l1_tx_hash.clone(),
             last_l2_block: 0,
             created_at: now,
+            vault_pda: escrow_addr.clone(),
+            house_rake_swept_tx: None,
         };
-        self.contest_states.insert(req.contest_id.clone(), contest.clone());
-        let _ = self.blockchain.store_contest_state(&contest);
 
-        info!("✅ InitContestReserve OK: {} BB locked for contest={} slot={}",
-            bb_amount, req.contest_id, current_slot);
+        // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────────
+        if let Err(e) = self.blockchain.store_contest_state(&contest) {
+            // Rollback the token transfer
+            let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
+            let _ = self.blockchain.debit_svm_lamports(&escrow_addr, req.bb_reserve);
+            return Ok(Response::new(InitContestReserveResponse {
+                confirmed: false,
+                l1_tx_hash: String::new(),
+                error_message: format!("Failed to persist contest state to ReDB: {}", e),
+            }));
+        }
+        // ── UPDATE CACHE ONLY AFTER SUCCESSFUL DURABLE WRITE ──────────────
+        self.contest_states.insert(req.contest_id.clone(), contest);
+
+        info!("✅ InitContestReserve OK: {} lamports locked for contest={} slot={}",
+            req.bb_reserve, req.contest_id, current_slot);
 
         Ok(Response::new(InitContestReserveResponse {
             confirmed: true,
@@ -315,8 +346,17 @@ impl SettlementService for BlackBookSettlementService {
         let mut root_arr = [0u8; 32];
         root_arr.copy_from_slice(&req.merkle_root);
 
-        self.market_roots.insert(req.contest_id.clone(), root_arr);
-        let _ = self.blockchain.store_escrow_market_root(&req.contest_id, &root_arr);
+        // ── MONOTONICITY CHECK ────────────────────────────────────────────
+        // Ensure incoming l2_block_number > stored last_l2_block to prevent
+        // a buggy or malicious L2 sequencer from regressing chain state.
+        if let Ok(Some(existing)) = self.blockchain.load_contest_state(&req.contest_id) {
+            if req.l2_block_number <= existing.last_l2_block {
+                return Err(Status::failed_precondition(format!(
+                    "L2 block number must be strictly greater than previous submission: got {} <= stored {}",
+                    req.l2_block_number, existing.last_l2_block
+                )));
+            }
+        }
 
         const CLAIM_WINDOW_SLOTS: u64 = 6_480_000;
         let current_slot = self.current_slot.load(Ordering::Relaxed);
@@ -338,9 +378,25 @@ impl SettlementService for BlackBookSettlementService {
             l1_tx_hash: l1_tx_hash.clone(),
             last_l2_block: req.l2_block_number,
             created_at: now,
+            vault_pda: crate::svm::escrow_vault_address_for(&req.contest_id),
+            house_rake_swept_tx: None,
         };
-        self.contest_states.insert(req.contest_id.clone(), contest.clone());
-        let _ = self.blockchain.store_contest_state(&contest);
+
+        // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────
+        if let Err(e) = self.blockchain.store_escrow_market_root(&req.contest_id, &root_arr) {
+            return Err(Status::internal(format!(
+                "Failed to persist market root to ReDB: {}", e
+            )));
+        }
+        if let Err(e) = self.blockchain.store_contest_state(&contest) {
+            return Err(Status::internal(format!(
+                "Failed to persist contest state to ReDB: {}", e
+            )));
+        }
+
+        // ── UPDATE CACHE ONLY AFTER SUCCESSFUL DURABLE WRITE ────────────
+        self.market_roots.insert(req.contest_id.clone(), root_arr);
+        self.contest_states.insert(req.contest_id.clone(), contest);
 
         info!("✅ SubmitMerkleRoot OK: contest={} root={} deadline_slot={}",
             req.contest_id, hex::encode(root_arr), current_slot + CLAIM_WINDOW_SLOTS);
@@ -349,6 +405,143 @@ impl SettlementService for BlackBookSettlementService {
             success: true,
             l1_tx_hash,
             l1_finalized_slot: current_slot,
+            error_message: String::new(),
+        }))
+    }
+
+    // ── SubmitPendingRoot ──────────────────────────────────────────────────
+    //
+    // Optimistic oracle path: root enters the dispute window before finalization.
+    // Canonical signed message:
+    //   contest_id_bytes ++ l2_block_number_le8 ++ merkle_root[32] ++ outcome_bytes
+
+    async fn submit_pending_root(
+        &self,
+        request: Request<SubmitPendingRootRequest>,
+    ) -> Result<Response<SubmitPendingRootResponse>, Status> {
+        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+
+        let req = request.into_inner();
+        info!("🔮 SubmitPendingRoot: contest={} outcome={} l2_block={}",
+            req.contest_id, req.winning_outcome, req.l2_block_number);
+
+        // ── Validate ──────────────────────────────────────────────────────
+        if req.contest_id.is_empty() {
+            return Err(Status::invalid_argument("contest_id is required"));
+        }
+        if req.merkle_root.len() != 32 {
+            return Err(Status::invalid_argument("merkle_root must be exactly 32 bytes"));
+        }
+        if req.winning_outcome.is_empty() {
+            return Err(Status::invalid_argument("winning_outcome is required"));
+        }
+        if req.sequencer_pubkey.len() != 32 {
+            return Err(Status::invalid_argument("sequencer_pubkey must be 32 bytes"));
+        }
+        if req.sequencer_sig.len() != 64 {
+            return Err(Status::invalid_argument("sequencer_sig must be 64 bytes"));
+        }
+
+        // ── Zero-sum invariant ────────────────────────────────────────────
+        if req.total_deposited != req.total_payout.saturating_add(req.house_rake) {
+            return Err(Status::invalid_argument(
+                "zero-sum violated: total_deposited != total_payout + house_rake"
+            ));
+        }
+
+        // ── Sequencer allowlist ───────────────────────────────────────────
+        let submitted_pubkey_hex = hex::encode(&req.sequencer_pubkey);
+        if !self.l2_sequencer_allowlist.is_empty()
+            && !self.l2_sequencer_allowlist.contains(&submitted_pubkey_hex)
+        {
+            return Err(Status::permission_denied(format!(
+                "Sequencer pubkey {} is not in the allowlist", submitted_pubkey_hex
+            )));
+        }
+
+        // ── Ed25519 signature verification ────────────────────────────────
+        // Canonical message: contest_id ++ l2_block_number_le8 ++ merkle_root[32] ++ outcome
+        {
+            let verifying_key = VerifyingKey::from_bytes(
+                req.sequencer_pubkey.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_pubkey must be 32 bytes"))?)
+                .map_err(|e| Status::internal(format!("Bad sequencer key: {}", e)))?;
+
+            let mut msg: Vec<u8> = Vec::with_capacity(
+                req.contest_id.len() + 8 + 32 + req.winning_outcome.len()
+            );
+            msg.extend_from_slice(req.contest_id.as_bytes());
+            msg.extend_from_slice(&req.l2_block_number.to_le_bytes());
+            msg.extend_from_slice(&req.merkle_root);
+            msg.extend_from_slice(req.winning_outcome.as_bytes());
+
+            let sig = Signature::from_bytes(
+                req.sequencer_sig.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_sig must be 64 bytes"))?)
+            ;
+            verifying_key.verify(&msg, &sig)
+                .map_err(|_| Status::unauthenticated("Sequencer signature verification failed"))?;
+        }
+
+        let current_slot = self.current_slot.load(Ordering::Relaxed);
+        let finalize_at_slot = current_slot + DISPUTE_WINDOW_SLOTS;
+
+        // ── Guard: reject if a non-Discarded root already exists ─────────
+        if let Some(existing) = self.blockchain.load_pending_root(&req.contest_id) {
+            match existing.status {
+                PendingRootStatus::Pending | PendingRootStatus::Disputed => {
+                    return Err(Status::already_exists(format!(
+                        "A pending root for contest {} is already in dispute window (finalize_at_slot={})",
+                        req.contest_id, existing.finalize_at_slot
+                    )));
+                }
+                PendingRootStatus::Finalized => {
+                    return Err(Status::already_exists(format!(
+                        "Contest {} is already finalized", req.contest_id
+                    )));
+                }
+                PendingRootStatus::Discarded => {} // allow re-submission after discard
+            }
+        }
+
+        let mut root_arr = [0u8; 32];
+        root_arr.copy_from_slice(&req.merkle_root);
+
+        // Convert proto OracleAttestationSig → storage OracleSignature
+        let oracle_signatures: Vec<OracleSignature> = req.oracle_sigs.iter().map(|s| {
+            OracleSignature {
+                pubkey_hex: s.pubkey_hex.clone(),
+                sig_hex: s.sig_hex.clone(),
+            }
+        }).collect();
+
+        let pending = PendingRoot {
+            market_id: req.contest_id.clone(),
+            outcome: req.winning_outcome.clone(),
+            merkle_root: root_arr,
+            proposed_at_slot: current_slot,
+            finalize_at_slot,
+            dispute_stake_pico_xx: 0,
+            status: PendingRootStatus::Pending,
+            proposer_pubkey: submitted_pubkey_hex.clone(),
+            oracle_signatures,
+            disputers: Vec::new(),
+        };
+
+        // ── PERSISTENCE: ReDB first ───────────────────────────────────────
+        if let Err(e) = self.blockchain.store_pending_root(&pending) {
+            return Err(Status::internal(format!(
+                "Failed to persist pending root to ReDB: {}", e
+            )));
+        }
+
+        info!("✅ SubmitPendingRoot stored: contest={} outcome={} finalize_at_slot={}",
+            req.contest_id, req.winning_outcome, finalize_at_slot);
+
+        Ok(Response::new(SubmitPendingRootResponse {
+            success: true,
+            market_id: req.contest_id,
+            finalize_at_slot,
             error_message: String::new(),
         }))
     }

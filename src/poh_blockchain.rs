@@ -1220,6 +1220,22 @@ impl BlockProducer {
                 // Already executed by the handler (debit escrow + credit user)
                 Ok(())
             }
+
+            // ========== Vault Gateway — Cross-Chain Bridge ==========
+
+            TxData::VaultBurn { bb_burned, wusdt_credited, poh_slot } => {
+                info!("Vault burn: {} destroyed {} BB lamports, credited {} microUSDT (slot {})",
+                    tx.from, bb_burned, wusdt_credited, poh_slot);
+                // Already executed atomically by burn_handler (debit BB + mint wUSDT + store BurnRecord)
+                Ok(())
+            }
+
+            TxData::EscrowSweep { contest_id, rake_lamports, treasury_address } => {
+                info!("Escrow sweep: contest={} rake={} lamports → treasury={}",
+                    contest_id, rake_lamports, &treasury_address[..16.min(treasury_address.len())]);
+                // Already executed by sweep task (debit vault + credit treasury + update ContestState)
+                Ok(())
+            }
         }
     }
 

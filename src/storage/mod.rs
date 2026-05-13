@@ -106,6 +106,15 @@ const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdraw
 /// and claim deadline per BB market.
 const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("contest_states");
 
+/// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
+/// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
+/// (pro-rata return to known depositors) and for VerifyDeposit replay protection.
+pub const ESCROW_DEPOSITORS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors");
+
+/// Index from contest_id → JSON Vec<deposit_tx_sig> (String).
+/// Allows O(depositors_in_contest) iteration without scanning the full ESCROW_DEPOSITORS table.
+pub const ESCROW_DEPOSITORS_BY_CONTEST: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors_by_contest");
+
 /// Layer 5 creator coin registry: ticker → CreatorCoinRecord JSON (bytes)
 const CREATOR_COINS: TableDefinition<&str, &[u8]> = TableDefinition::new("creator_coins");
 
@@ -127,6 +136,14 @@ pub const DECAY_OWNER_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new
 
 /// $DECAY metadata counters: "next_id" → next available token ID (u64).
 pub const DECAY_META: TableDefinition<&str, u64> = TableDefinition::new("decay_meta");
+
+/// Oracle node registry: pubkey_hex → OracleNode JSON (bytes).
+const ORACLE_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("oracle_nodes");
+
+/// Pending oracle roots: market_id → PendingRoot JSON (bytes).
+/// Step 2 of the optimistic oracle — populated when oracle submits a root,
+/// consumed when finalized or discarded after the dispute window.
+const PENDING_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_roots");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -192,6 +209,72 @@ impl std::fmt::Display for AuthType {
             AuthType::Ed25519 => write!(f, "ED25519"),
         }
     }
+}
+
+// ============================================================================
+// ORACLE TYPES
+// ============================================================================
+
+/// A registered oracle committee node.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OracleNode {
+    /// Ed25519 public key, 64 hex chars (32 bytes).
+    pub pubkey_hex: String,
+    pub name: String,
+    pub registered_at_slot: u64,
+    pub active: bool,
+    pub total_resolutions: u64,
+    pub correct_resolutions: u64,
+    /// Slashable $XX bond in pico-MAXX (12 decimals).
+    pub slash_balance_pico_xx: u64,
+}
+
+/// Lifecycle state of a pending oracle root during the dispute window.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PendingRootStatus {
+    Pending,
+    Disputed,
+    Finalized,
+    Discarded,
+}
+
+/// A single oracle node's signature over an attestation message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OracleSignature {
+    /// Ed25519 public key hex (64 chars).
+    pub pubkey_hex: String,
+    /// Ed25519 signature hex (128 chars).
+    pub sig_hex: String,
+}
+
+/// A disputer who staked $XX against a pending root.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Disputer {
+    pub wallet: String,
+    pub stake_pico_xx: u64,
+}
+
+/// An oracle-submitted market root awaiting the dispute window.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingRoot {
+    pub market_id: String,
+    pub outcome: String,
+    pub merkle_root: [u8; 32],
+    pub proposed_at_slot: u64,
+    /// Slot after which the root auto-finalizes if not disputed.
+    pub finalize_at_slot: u64,
+    /// $XX staked by disputers (pico-MAXX).
+    pub dispute_stake_pico_xx: u64,
+    pub status: PendingRootStatus,
+    /// L2 sequencer (or oracle committee) that proposed this root.
+    #[serde(default)]
+    pub proposer_pubkey: String,
+    /// Oracle committee attestation signatures (M-of-N, enforced in Step 3).
+    #[serde(default)]
+    pub oracle_signatures: Vec<OracleSignature>,
+    /// Wallets that have staked $XX against this root.
+    #[serde(default)]
+    pub disputers: Vec<Disputer>,
 }
 
 // ============================================================================
@@ -1431,6 +1514,50 @@ impl ConcurrentBlockchain {
         self.credit(address, bb)
     }
 
+    /// Credit lamports directly — zero f64 conversion.
+    ///
+    /// Use this everywhere an amount is already in u64 lamports (e.g. from
+    /// a proto field or a SPL unit already in the 5-decimal system) to avoid
+    /// the `u64 → f64 → u64` precision-loss round-trip in `credit()`.
+    pub fn credit_svm_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
+        if lamports == 0 {
+            return Err("Amount must be > 0 lamports".to_string());
+        }
+        let pk = Self::addr_to_pubkey(address);
+        let current = self.svm_accounts.get_lamports(&pk);
+        let new_lamports = current.checked_add(lamports)
+            .ok_or("Balance overflow")?;
+        let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
+        self.svm_accounts.store_account(&pk, account);
+        self.mirror_balance_to_cache(address, new_lamports);
+        self.total_supply.fetch_add(lamports, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Debit lamports directly — zero f64 conversion.
+    ///
+    /// Use this everywhere an amount is already in u64 lamports to avoid
+    /// the `u64 → f64 → u64` precision-loss round-trip in `debit()`.
+    pub fn debit_svm_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
+        if lamports == 0 {
+            return Err("Amount must be > 0 lamports".to_string());
+        }
+        let pk = Self::addr_to_pubkey(address);
+        let current = self.svm_accounts.get_lamports(&pk);
+        if current < lamports {
+            return Err(format!(
+                "Insufficient funds: have {} lamports, need {} lamports",
+                current, lamports
+            ));
+        }
+        let new_lamports = current - lamports;
+        let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
+        self.svm_accounts.store_account(&pk, account);
+        self.mirror_balance_to_cache(address, new_lamports);
+        self.total_supply.fetch_sub(lamports, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Persist a withdrawal record (insert or overwrite).
     pub fn store_withdrawal(&self, record: &WithdrawalRecord) -> Result<(), String> {
         let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
@@ -1498,6 +1625,132 @@ impl ConcurrentBlockchain {
             }
         }
         Ok(results)
+    }
+
+    // ========================================================================
+    // ESCROW DEPOSITOR LEDGER (per-contest, ReDB-backed)
+    // ========================================================================
+
+    fn depositor_key(contest_id: &str, sig: &str) -> String {
+        format!("{}:{}", contest_id, sig)
+    }
+
+    /// Persist a depositor entry and update the per-contest index in a single
+    /// ReDB write transaction (atomic w.r.t. crash recovery).
+    pub fn store_depositor_entry(&self, entry: &EscrowDepositorEntry) -> Result<(), String> {
+        let bytes = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
+        let key = Self::depositor_key(&entry.contest_id, &entry.deposit_tx_sig);
+
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn
+                .open_table(ESCROW_DEPOSITORS)
+                .map_err(|e| e.to_string())?;
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+
+            // Update the contest-id index. Read current Vec<sig>, append if new, write back.
+            let mut idx_table = write_txn
+                .open_table(ESCROW_DEPOSITORS_BY_CONTEST)
+                .map_err(|e| e.to_string())?;
+            let mut sigs: Vec<String> = match idx_table
+                .get(entry.contest_id.as_str())
+                .map_err(|e| e.to_string())?
+            {
+                Some(g) => serde_json::from_slice(g.value()).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if !sigs.iter().any(|s| s == &entry.deposit_tx_sig) {
+                sigs.push(entry.deposit_tx_sig.clone());
+                let idx_bytes = serde_json::to_vec(&sigs).map_err(|e| e.to_string())?;
+                idx_table
+                    .insert(entry.contest_id.as_str(), idx_bytes.as_slice())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn load_depositor_entry(
+        &self,
+        contest_id: &str,
+        deposit_tx_sig: &str,
+    ) -> Result<Option<EscrowDepositorEntry>, String> {
+        let key = Self::depositor_key(contest_id, deposit_tx_sig);
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = match read_txn.open_table(ESCROW_DEPOSITORS) {
+            Ok(t) => t,
+            Err(_) => return Ok(None), // table not yet created
+        };
+        match table.get(key.as_str()).map_err(|e| e.to_string())? {
+            None => Ok(None),
+            Some(g) => serde_json::from_slice::<EscrowDepositorEntry>(g.value())
+                .map(Some)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Mark a depositor entry as `used = true`. Errors if not found.
+    pub fn mark_depositor_used(
+        &self,
+        contest_id: &str,
+        deposit_tx_sig: &str,
+    ) -> Result<(), String> {
+        let mut entry = self
+            .load_depositor_entry(contest_id, deposit_tx_sig)?
+            .ok_or_else(|| format!("depositor entry not found: {}:{}", contest_id, deposit_tx_sig))?;
+        if entry.used {
+            return Ok(()); // idempotent
+        }
+        entry.used = true;
+        self.store_depositor_entry(&entry)
+    }
+
+    /// Mark a depositor entry as `refunded = true`. Errors if not found.
+    pub fn mark_depositor_refunded(
+        &self,
+        contest_id: &str,
+        deposit_tx_sig: &str,
+    ) -> Result<(), String> {
+        let mut entry = self
+            .load_depositor_entry(contest_id, deposit_tx_sig)?
+            .ok_or_else(|| format!("depositor entry not found: {}:{}", contest_id, deposit_tx_sig))?;
+        if entry.refunded {
+            return Ok(()); // idempotent
+        }
+        entry.refunded = true;
+        self.store_depositor_entry(&entry)
+    }
+
+    /// List every depositor entry for a contest, in insertion order.
+    pub fn list_depositors_for_contest(
+        &self,
+        contest_id: &str,
+    ) -> Result<Vec<EscrowDepositorEntry>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let idx_table = match read_txn.open_table(ESCROW_DEPOSITORS_BY_CONTEST) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let sigs: Vec<String> = match idx_table.get(contest_id).map_err(|e| e.to_string())? {
+            Some(g) => serde_json::from_slice(g.value()).unwrap_or_default(),
+            None => return Ok(Vec::new()),
+        };
+        let table = match read_txn.open_table(ESCROW_DEPOSITORS) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::with_capacity(sigs.len());
+        for sig in sigs {
+            let key = Self::depositor_key(contest_id, &sig);
+            if let Some(g) = table.get(key.as_str()).map_err(|e| e.to_string())? {
+                if let Ok(rec) = serde_json::from_slice::<EscrowDepositorEntry>(g.value()) {
+                    out.push(rec);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Load all claims from ReDB (startup recovery)
@@ -1658,6 +1911,10 @@ pub struct DepositRecord {
     pub submitted_at: u64,
     /// Unix timestamp when the dealer approved (None if still pending)
     pub approved_at: Option<u64>,
+    /// Optional contest_id if this deposit is destined for a per-contest escrow vault.
+    /// `None` for plain bridge-in deposits that just credit the user's BB balance.
+    #[serde(default)]
+    pub contest_id: Option<String>,
 }
 
 // ============================================================================
@@ -1750,6 +2007,41 @@ pub struct ContestState {
     pub last_l2_block: u64,
     /// Unix timestamp (seconds) when the contest was first opened.
     pub created_at: u64,
+    /// Per-contest vault PDA (base58). Empty string for legacy/global-vault contests
+    /// migrated from v1; new contests must populate this on InitContest.
+    #[serde(default)]
+    pub vault_pda: String,
+    /// L1 transaction hash of the house-rake sweep performed at SubmitMerkleRoot.
+    /// `None` until the rake transfer is committed; idempotent — set exactly once.
+    #[serde(default)]
+    pub house_rake_swept_tx: Option<String>,
+}
+
+// ============================================================================
+// ESCROW DEPOSITOR LEDGER
+// ============================================================================
+
+/// One row per (contest, deposit-tx) — the canonical record that a wallet's
+/// funds entered a per-contest vault PDA.  Used for:
+///   * VerifyDeposit replay protection (each `deposit_tx_sig` consumed at most once),
+///   * pro-rata refund-on-expiry (we know exactly who is owed how much), and
+///   * audit / explorer surfaces.
+///
+/// `amount_lamports` is BB lamports (5 decimals, `LAMPORTS_PER_BB = 100_000`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EscrowDepositorEntry {
+    pub contest_id: String,
+    pub wallet: String,
+    /// Primary key fragment — unique per L1 transaction that funded this contest.
+    pub deposit_tx_sig: String,
+    pub amount_lamports: u64,
+    pub deposited_at: u64,
+    /// Set true once the entry has been consumed by a successful VerifyDeposit.
+    #[serde(default)]
+    pub used: bool,
+    /// Set true once a refund has been issued for this entry (expired contest sweep).
+    #[serde(default)]
+    pub refunded: bool,
 }
 
 // ============================================================================
@@ -1840,6 +2132,76 @@ pub struct BlockchainStats {
 }
 
 // ============================================================================
+// ORACLE STORAGE — ConcurrentBlockchain methods
+// ============================================================================
+
+impl ConcurrentBlockchain {
+    // ── Oracle node registry ─────────────────────────────────────────────────
+
+    /// Persist (insert or overwrite) an oracle node record, keyed by pubkey_hex.
+    pub fn store_oracle_node(&self, node: &OracleNode) -> Result<(), String> {
+        let bytes = serde_json::to_vec(node).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(ORACLE_NODES).map_err(|e| e.to_string())?;
+            table.insert(node.pubkey_hex.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load a single oracle node by pubkey_hex. Returns None if not registered.
+    pub fn load_oracle_node(&self, pubkey_hex: &str) -> Option<OracleNode> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(ORACLE_NODES).ok()?;
+        let guard = table.get(pubkey_hex).ok()??;
+        serde_json::from_slice(guard.value()).ok()
+    }
+
+    /// Load all registered oracle nodes (for list endpoints and startup recovery).
+    pub fn load_all_oracle_nodes(&self) -> Vec<OracleNode> {
+        let Ok(read_txn) = self.db.begin_read() else { return Vec::new(); };
+        let Ok(table) = read_txn.open_table(ORACLE_NODES) else { return Vec::new(); };
+        let Ok(iter) = table.iter() else { return Vec::new(); };
+        iter.filter_map(|entry| {
+            let (_k, v) = entry.ok()?;
+            serde_json::from_slice::<OracleNode>(v.value()).ok()
+        }).collect()
+    }
+
+    // ── Pending roots (optimistic dispute window) ────────────────────────────
+
+    /// Load the pending root for a market. Returns None if not present.
+    pub fn load_pending_root(&self, market_id: &str) -> Option<PendingRoot> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(PENDING_ROOTS).ok()?;
+        let guard = table.get(market_id).ok()??;
+        serde_json::from_slice(guard.value()).ok()
+    }
+
+    /// Load all pending roots (for the finalize background task).
+    pub fn load_all_pending_roots(&self) -> Vec<PendingRoot> {
+        let Ok(read_txn) = self.db.begin_read() else { return Vec::new(); };
+        let Ok(table) = read_txn.open_table(PENDING_ROOTS) else { return Vec::new(); };
+        let Ok(iter) = table.iter() else { return Vec::new(); };
+        iter.filter_map(|entry| {
+            let (_k, v) = entry.ok()?;
+            serde_json::from_slice::<PendingRoot>(v.value()).ok()
+        }).collect()
+    }
+
+    /// Persist (insert or overwrite) a pending root for a market.
+    pub fn store_pending_root(&self, root: &PendingRoot) -> Result<(), String> {
+        let bytes = serde_json::to_vec(root).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(PENDING_ROOTS).map_err(|e| e.to_string())?;
+            table.insert(root.market_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+}
+
+// ============================================================================
 // TESTS
 // ============================================================================
 
@@ -1876,5 +2238,96 @@ mod tests {
 
         assert_eq!(bc.get_balance("alice"), 60.0);
         assert_eq!(bc.get_balance("bob"), 40.0);
+    }
+
+    fn mk_entry(contest: &str, sig: &str, wallet: &str, amount: u64) -> EscrowDepositorEntry {
+        EscrowDepositorEntry {
+            contest_id: contest.to_string(),
+            wallet: wallet.to_string(),
+            deposit_tx_sig: sig.to_string(),
+            amount_lamports: amount,
+            deposited_at: 1_700_000_000,
+            used: false,
+            refunded: false,
+        }
+    }
+
+    #[test]
+    fn depositor_entry_round_trip() {
+        let dir = tempdir().unwrap();
+        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+
+        let e = mk_entry("contest_A", "sig_1", "alice", 500_000);
+        bc.store_depositor_entry(&e).unwrap();
+
+        let loaded = bc.load_depositor_entry("contest_A", "sig_1").unwrap().unwrap();
+        assert_eq!(loaded.wallet, "alice");
+        assert_eq!(loaded.amount_lamports, 500_000);
+        assert!(!loaded.used);
+        assert!(!loaded.refunded);
+
+        // Unknown key returns None
+        assert!(bc.load_depositor_entry("contest_A", "nope").unwrap().is_none());
+        assert!(bc.load_depositor_entry("other_contest", "sig_1").unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_used_then_refunded_persists() {
+        let dir = tempdir().unwrap();
+        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+
+        let e = mk_entry("contest_B", "sig_x", "bob", 1_000_000);
+        bc.store_depositor_entry(&e).unwrap();
+
+        bc.mark_depositor_used("contest_B", "sig_x").unwrap();
+        let after_used = bc.load_depositor_entry("contest_B", "sig_x").unwrap().unwrap();
+        assert!(after_used.used);
+        assert!(!after_used.refunded);
+
+        // Idempotent
+        bc.mark_depositor_used("contest_B", "sig_x").unwrap();
+
+        bc.mark_depositor_refunded("contest_B", "sig_x").unwrap();
+        let after_refund = bc.load_depositor_entry("contest_B", "sig_x").unwrap().unwrap();
+        assert!(after_refund.used);
+        assert!(after_refund.refunded);
+
+        // Idempotent
+        bc.mark_depositor_refunded("contest_B", "sig_x").unwrap();
+
+        // Missing entry yields error
+        assert!(bc.mark_depositor_used("contest_B", "missing").is_err());
+        assert!(bc.mark_depositor_refunded("contest_B", "missing").is_err());
+    }
+
+    #[test]
+    fn list_depositors_returns_only_target_contest() {
+        let dir = tempdir().unwrap();
+        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+
+        bc.store_depositor_entry(&mk_entry("c1", "s1", "alice", 100)).unwrap();
+        bc.store_depositor_entry(&mk_entry("c1", "s2", "bob", 200)).unwrap();
+        bc.store_depositor_entry(&mk_entry("c2", "s3", "carol", 300)).unwrap();
+
+        let c1 = bc.list_depositors_for_contest("c1").unwrap();
+        assert_eq!(c1.len(), 2);
+        assert!(c1.iter().any(|e| e.wallet == "alice"));
+        assert!(c1.iter().any(|e| e.wallet == "bob"));
+        assert!(c1.iter().all(|e| e.contest_id == "c1"));
+
+        let c2 = bc.list_depositors_for_contest("c2").unwrap();
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].wallet, "carol");
+
+        // Re-storing the same (contest, sig) does not duplicate index entries
+        bc.store_depositor_entry(&mk_entry("c1", "s1", "alice", 999)).unwrap();
+        let c1_again = bc.list_depositors_for_contest("c1").unwrap();
+        assert_eq!(c1_again.len(), 2);
+        // Latest write wins for the entry value
+        let alice = c1_again.iter().find(|e| e.wallet == "alice").unwrap();
+        assert_eq!(alice.amount_lamports, 999);
+
+        // Unknown contest yields empty Vec, not error
+        assert!(bc.list_depositors_for_contest("nope").unwrap().is_empty());
     }
 }

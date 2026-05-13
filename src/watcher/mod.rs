@@ -1,5 +1,6 @@
 ﻿pub mod bsc_watcher;
 pub use bsc_watcher::{BscWatcher, BSC_USDC_CONTRACT, BSC_USDT_CONTRACT};
+pub mod mayan;
 
 // ============================================================================
 // CUSTODY WALLET WATCHER
@@ -126,6 +127,7 @@ struct SignatureInfo {
 #[serde(rename_all = "camelCase")]
 struct SolanaTx {
     meta: Option<TxMeta>,
+    transaction: Option<SolTxBody>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +135,31 @@ struct TxMeta {
     err: Option<serde_json::Value>,
     pre_token_balances: Option<Vec<TxTokenBalance>>,
     post_token_balances: Option<Vec<TxTokenBalance>>,
+    /// CPI calls — Mayan's final USDT delivery may be inside a CPI
+    inner_instructions: Option<Vec<SolInnerInstructionGroup>>,
+}
+
+/// Outer transaction body — holds the message with top-level instructions.
+#[derive(Deserialize)]
+struct SolTxBody {
+    message: SolTxMessage,
+}
+#[derive(Deserialize)]
+struct SolTxMessage {
+    instructions: Vec<SolRawInstruction>,
+}
+/// A single instruction deserialized loosely.
+/// Parsed instructions (SPL token etc) have no `data` field — we ignore them.
+/// Raw Mayan / Wormhole instructions have a base58-encoded `data` field.
+#[derive(Deserialize)]
+struct SolRawInstruction {
+    /// Base58-encoded instruction data (absent on `jsonParsed` SPL instructions).
+    data: Option<String>,
+}
+/// A group of inner (CPI) instructions keyed by the outer instruction index.
+#[derive(Deserialize)]
+struct SolInnerInstructionGroup {
+    instructions: Vec<SolRawInstruction>,
 }
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +186,9 @@ struct ProgramAccountBody {
 pub struct VerifiedDeposit {
     pub asset: String,
     pub amount: f64,
+    /// L1 BB wallet decoded from a Mayan `customPayload` embedded in the transaction.
+    /// `None` if no valid 0xBB01 payload was found in any instruction of this tx.
+    pub mayan_wallet: Option<String>,
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -271,6 +301,7 @@ impl CustodyWatcher {
             status: "pending".to_string(),
             submitted_at: now,
             approved_at: None,
+            contest_id: None,
         };
         let _ = self.blockchain.store_deposit_request(&record);
         self.deposit_requests.insert(tx_key.clone(), record);
@@ -562,7 +593,7 @@ impl CustodyWatcher {
             // Already committed from a previous watcher run
             if self.blockchain.is_bridge_tx_processed(&sig.signature) { continue; }
 
-            // Fetch the on-chain transfer details for Tier 2 / Tier 3 handling
+            // Fetch the on-chain transfer details for Tier 2 / 2.5 / 3 handling
             let verified = match self.verify_transaction(&sig.signature).await {
                 Ok(v) => v,
                 Err(_) => continue, // not a stablecoin transfer to custody wallet
@@ -573,6 +604,41 @@ impl CustodyWatcher {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs();
+
+            // ── Tier 2.5: Mayan customPayload attribution ─────────────────────────
+            // Highest-priority unattended path: the React frontend embedded the
+            // user's BB wallet address inside the swap's customPayload so the
+            // watcher can attribute funds with zero user friction.
+            if let Some(wallet) = verified.mayan_wallet.as_ref() {
+                let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
+                let record = crate::storage::DepositRecord {
+                    wallet_address: wallet.clone(),
+                    external_tx_hash: sig.signature.clone(),
+                    asset: verified.asset.clone(),
+                    amount_micro_stablecoin: micro,
+                    bb_lamports,
+                    status: "pending".to_string(),
+                    submitted_at: now,
+                    approved_at: None,
+                    contest_id: None,
+                };
+                let _ = self.blockchain.store_deposit_request(&record);
+                self.deposit_requests.insert(sig.signature.clone(), record);
+
+                match self.verify_and_approve(&sig.signature).await {
+                    Ok(bb) => info!(
+                        "✅ Mayan payload deposit: {} {:.6} → {:.5} BB for {} (tx: {})",
+                        verified.asset, verified.amount, bb,
+                        &wallet[..8.min(wallet.len())],
+                        &sig.signature[..16.min(sig.signature.len())]
+                    ),
+                    Err(e) => warn!(
+                        "⚠️  Mayan payload mint failed ({}): {}",
+                        &sig.signature[..16.min(sig.signature.len())], e
+                    ),
+                }
+                continue;
+            }
 
             // ── Tier 2: memo-based attribution ──────────────────────────────────────
             if let Some(wallet) = Self::extract_wallet_from_memo(sig.memo.as_deref()) {
@@ -586,6 +652,7 @@ impl CustodyWatcher {
                     status: "pending".to_string(),
                     submitted_at: now,
                     approved_at: None,
+                    contest_id: None,
                 };
                 let _ = self.blockchain.store_deposit_request(&record);
                 self.deposit_requests.insert(sig.signature.clone(), record);
@@ -734,6 +801,9 @@ impl CustodyWatcher {
 
     /// Fetch and verify a specific Solana transaction, returning the asset and
     /// amount of stablecoin received by the custody wallet.
+    ///
+    /// Also scans every instruction (outer + CPI) for a Mayan `customPayload`
+    /// `[0xBB, 0x01, <32-byte pubkey>]` and returns it in `mayan_wallet`.
     pub async fn verify_transaction(&self, tx_sig: &str) -> Result<VerifiedDeposit, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
@@ -754,11 +824,12 @@ impl CustodyWatcher {
             return Err("Transaction failed on-chain".to_string());
         }
 
-        let pre  = meta.pre_token_balances.unwrap_or_default();
-        let post = meta.post_token_balances.unwrap_or_default();
+        let pre  = meta.pre_token_balances.as_deref().unwrap_or_default();
+        let post = meta.post_token_balances.as_deref().unwrap_or_default();
 
         // Find the custody wallet's incoming balance change for USDC or USDT
-        for post_entry in &post {
+        let mut found: Option<VerifiedDeposit> = None;
+        for post_entry in post {
             let owner = match &post_entry.owner { Some(o) => o.as_str(), None => continue };
             if owner != self.custody_address { continue; }
 
@@ -774,11 +845,75 @@ impl CustodyWatcher {
 
             let received = post_amount - pre_amount;
             if received > 0.0 {
-                return Ok(VerifiedDeposit { asset: asset.to_string(), amount: received });
+                found = Some(VerifiedDeposit {
+                    asset: asset.to_string(),
+                    amount: received,
+                    mayan_wallet: None, // filled below
+                });
+                break;
             }
         }
 
-        Err("No incoming USDC/USDT transfer to custody wallet found in this transaction".to_string())
+        let mut deposit = found.ok_or_else(|| {
+            "No incoming USDC/USDT transfer to custody wallet found in this transaction".to_string()
+        })?;
+
+        // ── Scan every instruction for Mayan customPayload [0xBB, 0x01, <pubkey>] ──
+        deposit.mayan_wallet = Self::scan_tx_instructions_for_mayan_payload(
+            tx.transaction.as_ref(),
+            meta.inner_instructions.as_deref(),
+        );
+
+        Ok(deposit)
+    }
+
+    /// Scan all outer instructions and CPI inner instructions for the BlackBook
+    /// Mayan payload magic `[0xBB, 0x01]` followed by a 32-byte Ed25519 pubkey.
+    ///
+    /// Mayan embeds the caller's `customPayload` inside its program instruction
+    /// data when it finalises a cross-chain swap on Solana (via Wormhole VAA or
+    /// Swift fulfil call). The payload may appear at any byte offset inside the
+    /// instruction data, so we use `scan_for_payload` which searches all offsets.
+    fn scan_tx_instructions_for_mayan_payload(
+        tx_body: Option<&SolTxBody>,
+        inner_groups: Option<&[SolInnerInstructionGroup]>,
+    ) -> Option<String> {
+        use mayan::scan_for_payload;
+
+        let try_decode = |raw: &[u8]| -> Option<String> {
+            scan_for_payload(raw).map(|p| p.l1_wallet)
+        };
+
+        // Outer instructions
+        if let Some(body) = tx_body {
+            for ix in &body.message.instructions {
+                if let Some(data_b58) = &ix.data {
+                    if let Ok(raw) = bs58::decode(data_b58).into_vec() {
+                        if let Some(wallet) = try_decode(&raw) {
+                            return Some(wallet);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inner (CPI) instructions — Mayan's Swift/MCTP finalisation often
+        // uses CPI into the Wormhole core bridge, which carries the VAA payload.
+        if let Some(groups) = inner_groups {
+            for group in groups {
+                for ix in &group.instructions {
+                    if let Some(data_b58) = &ix.data {
+                        if let Ok(raw) = bs58::decode(data_b58).into_vec() {
+                            if let Some(wallet) = try_decode(&raw) {
+                                return Some(wallet);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     // ── Internal: HTTP helper ────────────────────────────────────────────────

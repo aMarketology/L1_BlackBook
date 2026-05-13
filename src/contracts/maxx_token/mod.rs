@@ -13,7 +13,7 @@ use crate::storage::MAXX_TOKEN_MARKET;
 use crate::svm::{
     SplTokenEngine,
     usdc_mint_bytes, USDC_UNIT,
-    maxx_mint_bytes, maxx_vault_bytes, MAXX_UNIT,
+    maxx_mint_bytes, MAXX_UNIT,
     maxx_curve_pda,
 };
 
@@ -120,7 +120,6 @@ fn parse_pubkey(s: &str) -> Result<Pubkey, &'static str> {
 }
 
 pub fn get_maxx_state(db: &redb::Database) -> Option<MaxxTokenState> {
-    use redb::ReadableTable;
     let read_txn = db.begin_read().ok()?;
     let table = read_txn.open_table(MAXX_TOKEN_MARKET).ok()?;
     let val = table.get(MAXX_TICKER).ok()??;

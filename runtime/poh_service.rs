@@ -506,7 +506,7 @@ impl PoHService {
         let genesis_hash = Self::compute_genesis_hash();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         
-        println!("⏰ PoH Service initialized with genesis hash: {}...", &genesis_hash[..16]);
+        println!("⏰ PoH genesis: {}…", &genesis_hash[..16]);
         
         Self {
             current_hash: genesis_hash,
@@ -745,9 +745,16 @@ pub async fn run_poh_clock(poh_service: SharedPoHService) {
                     // Log every 10 slots to avoid console spam
                     if new_slot.saturating_sub(last_slot_log) >= 10 {
                         let poh = poh_service.read();
+                        let hash_tip = &poh.current_hash[..12];
+                        let pending = poh.pending_tx_mix.len();
+                        let pending_str = if pending > 0 {
+                            format!(" | {} pending tx", pending)
+                        } else {
+                            String::new()
+                        };
                         println!(
-                            "🎟️ PoH: Slot {} | Epoch {} | {} hashes | {} entries",
-                            new_slot, poh.current_epoch, poh.num_hashes, poh.current_entries.len()
+                            "⛓  slot={} epoch={} hash={}…{}",
+                            new_slot, poh.current_epoch, hash_tip, pending_str
                         );
                         last_slot_log = new_slot;
                     }

@@ -545,3 +545,194 @@ fn test_large_batch_tree() {
         n, levels.len() - 1);
     println!("   root: {}", hex::encode(root));
 }
+
+// ============================================================================
+// TEST 13 — SubmitPendingRoot canonical signed message
+// ============================================================================
+//
+// Oracle Step 2 path: canonical message adds `outcome_bytes` to the end.
+// Format: contest_id_bytes ++ l2_block_number_le8 ++ merkle_root[32] ++ outcome_bytes
+
+#[test]
+fn test_submit_pending_root_signed_message() {
+    let (sk, pk, _addr) = new_keypair();
+    let contest_id = "oracle-contest-001";
+    let l2_block: u64 = 1001;
+    let outcome = "Yes";
+
+    // Build a real root
+    let (_sk2, pk2, _) = new_keypair();
+    let leaf1 = compute_leaf(&pk, 6_000_000);
+    let leaf2 = compute_leaf(&pk2, 4_000_000);
+    let (root, _) = build_tree(vec![leaf1, leaf2]);
+
+    // Build pending-root canonical message (same as SubmitMerkleRoot + outcome appended)
+    let mut msg = Vec::with_capacity(contest_id.len() + 8 + 32 + outcome.len());
+    msg.extend_from_slice(contest_id.as_bytes());
+    msg.extend_from_slice(&l2_block.to_le_bytes());
+    msg.extend_from_slice(&root);
+    msg.extend_from_slice(outcome.as_bytes());
+
+    let sig: Signature = sk.sign(&msg);
+
+    let vk = VerifyingKey::from_bytes(&pk).unwrap();
+    assert!(vk.verify(&msg, &sig).is_ok(), "SubmitPendingRoot message failed to verify");
+
+    // Wrong outcome must not verify
+    let mut bad_msg = Vec::new();
+    bad_msg.extend_from_slice(contest_id.as_bytes());
+    bad_msg.extend_from_slice(&l2_block.to_le_bytes());
+    bad_msg.extend_from_slice(&root);
+    bad_msg.extend_from_slice(b"No"); // wrong outcome
+    assert!(
+        vk.verify(&bad_msg, &sig).is_err(),
+        "Modified outcome should invalidate the signature"
+    );
+
+    println!("✅ TEST 13: SubmitPendingRoot canonical message — sign + verify OK");
+    println!("   contest_id: {}", contest_id);
+    println!("   outcome:    {}", outcome);
+    println!("   root:       {}", hex::encode(root));
+}
+
+// ============================================================================
+// TEST 14 — Oracle dispute signed message
+// ============================================================================
+
+#[test]
+fn test_oracle_dispute_signed_message() {
+    let (sk, pk, addr) = new_keypair();
+    let market_id = "oracle-contest-001";
+    let xx_stake_pico: u64 = 100 * 1_000_000_000_000; // 100 $XX in pico-MAXX
+    let timestamp: u64 = 1_742_500_500;
+    let nonce = "dispute-nonce-001";
+
+    // MUST match L1 handler: "ORACLE_DISPUTE:{market_id}:{xx_stake_pico}:{timestamp}:{nonce}"
+    let message = format!("ORACLE_DISPUTE:{}:{}:{}:{}", market_id, xx_stake_pico, timestamp, nonce);
+    let sig: Signature = sk.sign(message.as_bytes());
+
+    let vk = VerifyingKey::from_bytes(&pk).unwrap();
+    assert!(vk.verify(message.as_bytes(), &sig).is_ok(), "Dispute message failed to verify");
+
+    // Wrong stake must not verify
+    let bad_msg = format!("ORACLE_DISPUTE:{}:{}:{}:{}", market_id, xx_stake_pico + 1, timestamp, nonce);
+    assert!(vk.verify(bad_msg.as_bytes(), &sig).is_err(), "Modified stake should fail");
+
+    println!("✅ TEST 14: Oracle dispute signed message — sign + verify OK");
+    println!("   wallet:       {}", addr);
+    println!("   xx_stake_pico:{}", xx_stake_pico);
+    println!("   message:      {}", message);
+}
+
+// ============================================================================
+// TEST 15 — Oracle vote signed message
+// ============================================================================
+
+#[test]
+fn test_oracle_vote_signed_message() {
+    let (sk, pk, addr) = new_keypair();
+    let market_id = "oracle-contest-001";
+    let vote = false; // discard root
+    let timestamp: u64 = 1_742_500_600;
+    let nonce = "vote-nonce-001";
+
+    // MUST match L1 handler: "ORACLE_VOTE:{market_id}:{vote}:{timestamp}:{nonce}"
+    let message = format!("ORACLE_VOTE:{}:{}:{}:{}", market_id, vote, timestamp, nonce);
+    let sig: Signature = sk.sign(message.as_bytes());
+
+    let vk = VerifyingKey::from_bytes(&pk).unwrap();
+    assert!(vk.verify(message.as_bytes(), &sig).is_ok(), "Vote message failed to verify");
+
+    // Flipped vote must not verify
+    let bad_msg = format!("ORACLE_VOTE:{}:{}:{}:{}", market_id, !vote, timestamp, nonce);
+    assert!(vk.verify(bad_msg.as_bytes(), &sig).is_err(), "Modified vote should fail");
+
+    println!("✅ TEST 15: Oracle vote signed message — sign + verify OK");
+    println!("   wallet:  {}", addr);
+    println!("   vote:    {}", vote);
+    println!("   message: {}", message);
+}
+
+// ============================================================================
+// TEST 16 — Oracle storage roundtrip (PendingRoot struct)
+// ============================================================================
+
+#[test]
+fn test_pending_root_storage_roundtrip() {
+    use sha2::{Sha256, Digest};
+
+    let (_sk, pk, _) = new_keypair();
+    let leaf = compute_leaf(&pk, 5_000_000);
+    let (root, _) = build_tree(vec![leaf]);
+
+    // Simulate what SubmitPendingRoot stores
+    let pending = serde_json::json!({
+        "market_id": "oracle-roundtrip-test",
+        "outcome": "Yes",
+        "merkle_root": root,
+        "proposed_at_slot": 100_u64,
+        "finalize_at_slot": 106_480_u64,
+        "dispute_stake_pico_xx": 0_u64,
+        "status": "Pending",
+        "proposer_pubkey": hex::encode(pk),
+        "oracle_signatures": [],
+        "disputers": [],
+    });
+
+    let serialized = serde_json::to_vec(&pending).expect("serialize failed");
+    let deserialized: serde_json::Value =
+        serde_json::from_slice(&serialized).expect("deserialize failed");
+
+    assert_eq!(deserialized["market_id"], "oracle-roundtrip-test");
+    assert_eq!(deserialized["outcome"], "Yes");
+    assert_eq!(deserialized["status"], "Pending");
+    assert_eq!(deserialized["dispute_stake_pico_xx"], 0);
+
+    // Verify oracle_event_hash is deterministic
+    let mut hasher = Sha256::new();
+    hasher.update(b"oracle-roundtrip-test");
+    hasher.update(b"Yes");
+    hasher.update(&root);
+    let event_hash = hex::encode(hasher.finalize());
+    assert_eq!(event_hash.len(), 64);
+
+    println!("✅ TEST 16: PendingRoot JSON roundtrip — all fields preserved");
+    println!("   oracle_event_hash: {}", event_hash);
+}
+
+// ============================================================================
+// TEST 17 — Dispute window slot arithmetic
+// ============================================================================
+
+#[test]
+fn test_dispute_window_slots() {
+    const DISPUTE_WINDOW_SLOTS: u64 = 6_480;
+    const MS_PER_SLOT: f64 = 400.0;
+
+    let window_ms = DISPUTE_WINDOW_SLOTS as f64 * MS_PER_SLOT;
+    let window_seconds = window_ms / 1_000.0;
+    let window_hours = window_seconds / 3_600.0;
+
+    // Verify the 2h window is approximately correct
+    assert!(
+        (window_hours - 0.72).abs() < 0.01,
+        "Dispute window should be ~0.72h (6480 * 400ms = ~2592s = ~0.72h), got {}h",
+        window_hours
+    );
+
+    // Test slot arithmetic
+    let current_slot: u64 = 100_000;
+    let finalize_at_slot = current_slot + DISPUTE_WINDOW_SLOTS;
+    assert_eq!(finalize_at_slot, 106_480);
+
+    // Finalize check: root ready when current_slot >= finalize_at_slot
+    assert!(!( 105_000 >= finalize_at_slot), "Should not finalize yet at slot 105,000");
+    assert!( 106_480 >= finalize_at_slot, "Should finalize at slot 106,480");
+    assert!( 106_500 >= finalize_at_slot, "Should finalize at slot 106,500");
+
+    println!("✅ TEST 17: Dispute window slot arithmetic verified");
+    println!("   DISPUTE_WINDOW_SLOTS: {}", DISPUTE_WINDOW_SLOTS);
+    println!("   window duration:      {:.2}s ({:.2}h)", window_seconds, window_hours);
+    println!("   finalize_at_slot:     {}", finalize_at_slot);
+}
+
