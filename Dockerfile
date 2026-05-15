@@ -1,12 +1,12 @@
 # ============================================================================
 # BlackBook L1 — Production Docker Image (Multi-Stage)
 # ============================================================================
-# Stage 1: Build  (rust:1.82-slim → ~1.2GB build layer, discarded)
+# Stage 1: Build  (rust:1.88-slim → ~1.2GB build layer, discarded)
 # Stage 2: Runtime (debian:bookworm-slim → ~80MB final image)
 # ============================================================================
 
 # ── Stage 1: Builder ──────────────────────────────────────────
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev protobuf-compiler \
