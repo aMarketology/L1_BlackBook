@@ -1,5 +1,7 @@
 mod contracts;
 mod auth;
+#[path = "watcher/webhook.rs"]
+mod watcher_webhook;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2659,6 +2661,9 @@ fn build_router(state: AppState) -> Router {
         .route("/deposit/request", post(contracts::deposit_gateway::deposit_request_handler))
         .route("/deposit/status/:tx_hash", get(contracts::deposit_gateway::deposit_status_handler))
         .route("/deposit/claim", post(contracts::deposit_gateway::deposit_claim_handler))
+        // Deposit webhooks — Helius (Solana) and Alchemy (BSC) push notifications
+        .route("/deposit/webhook/helius", post(watcher_webhook::helius_webhook_handler))
+        .route("/deposit/webhook/alchemy", post(watcher_webhook::alchemy_webhook_handler))
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))

@@ -1,6 +1,8 @@
 ﻿pub mod bsc_watcher;
 pub use bsc_watcher::{BscWatcher, BSC_USDC_CONTRACT, BSC_USDT_CONTRACT};
 pub mod mayan;
+pub mod solana_ws;
+pub mod bsc_ws;
 
 // ============================================================================
 // CUSTODY WALLET WATCHER
@@ -221,19 +223,48 @@ impl CustodyWatcher {
         }
     }
 
-    /// Spawn a detached tokio background task that polls every `poll_interval_secs`.
-    /// On first boot, runs a startup balance sync before entering the regular poll loop.
+    /// Spawn background tasks for deposit detection.
+    ///
+    /// **Event-driven mode** (when `SOLANA_WS_URL` is set):
+    ///   - Spawns a persistent `logsSubscribe` WebSocket subscriber for real-time detection.
+    ///   - Runs a slow fallback poll (default 300 s, override via `WATCHER_FALLBACK_POLL_SECS`)
+    ///     that catches any events the WebSocket may have missed (e.g. during a reconnect
+    ///     window) and scans the Bridge program for non-custodial deposits.
+    ///
+    /// **Legacy polling mode** (when `SOLANA_WS_URL` is absent):
+    ///   - Falls back to the original `poll_interval_secs`-second polling loop.
     pub fn start(self: Arc<Self>) {
         tokio::spawn(async move {
-            info!("👀 Custody watcher started — {} every {}s",
-                self.custody_address, self.poll_interval_secs);
-            // Immediate startup sync — picks up any USDC/USDT already sitting in
-            // the custody wallet before the first timed poll fires.
+            info!("👀 Custody watcher started — {}", self.custody_address);
             self.startup_balance_sync().await;
-            let mut interval = tokio::time::interval(Duration::from_secs(self.poll_interval_secs));
-            loop {
-                interval.tick().await;
-                self.poll_once().await;
+
+            let ws_url = std::env::var("SOLANA_WS_URL")
+                .ok()
+                .filter(|s| s.starts_with("wss://"));
+
+            if let Some(url) = ws_url {
+                // Event-driven: WebSocket subscriber handles real-time events;
+                // slow fallback poll catches anything missed during reconnects.
+                let fallback_secs = std::env::var("WATCHER_FALLBACK_POLL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(300);
+                info!("👀 Solana WS mode active — fallback poll every {}s", fallback_secs);
+                solana_ws::start_solana_ws(Arc::clone(&self), url);
+                let mut interval = tokio::time::interval(Duration::from_secs(fallback_secs));
+                loop {
+                    interval.tick().await;
+                    self.poll_once().await;
+                }
+            } else {
+                // Legacy polling mode (no SOLANA_WS_URL configured).
+                info!("👀 Solana polling mode — interval {}s", self.poll_interval_secs);
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(self.poll_interval_secs));
+                loop {
+                    interval.tick().await;
+                    self.poll_once().await;
+                }
             }
         });
     }
@@ -580,116 +611,122 @@ impl CustodyWatcher {
         { *self.last_signature.lock().await = Some(sigs[0].signature.clone()); }
 
         for sig in sigs.iter().filter(|s| s.err.is_none()) {
-            // ── Tier 1: explicit /deposit/request exists ──────────────────────────────────
-            if self.deposit_requests.contains_key(&sig.signature) {
-                if !self.blockchain.is_bridge_tx_processed(&sig.signature) {
-                    match self.verify_and_approve(&sig.signature).await {
-                        Ok(bb) => info!("✅ Watcher auto-approved {} → {:.5} BB",
-                            &sig.signature[..16.min(sig.signature.len())], bb),
-                        Err(e) => warn!("⚠️  Auto-approve failed ({}): {}",
-                            &sig.signature[..16.min(sig.signature.len())], e),
-                    }
+            self.dispatch_signature(&sig.signature, sig.memo.as_deref()).await;
+        }
+    }
+
+    /// Core per-signature deposit pipeline — shared by the WebSocket subscriber,
+    /// the polling fallback, and webhook receivers.
+    ///
+    /// `memo` is the Solana memo string from `getSignaturesForAddress`.  The
+    /// WebSocket and webhook paths pass `None` because their notifications do not
+    /// include the memo; the slow fallback poller passes the real value.  Tier 2
+    /// (memo-based attribution) is only reached when `memo` is `Some`.
+    pub async fn dispatch_signature(&self, sig: &str, memo: Option<&str>) {
+        // ── Tier 1: explicit /deposit/request was registered for this tx hash ────
+        if self.deposit_requests.contains_key(sig) {
+            if !self.blockchain.is_bridge_tx_processed(sig) {
+                match self.verify_and_approve(sig).await {
+                    Ok(bb) => info!("✅ Watcher auto-approved {} → {:.5} BB",
+                        &sig[..16.min(sig.len())], bb),
+                    Err(e) => warn!("⚠️  Auto-approve failed ({}): {}",
+                        &sig[..16.min(sig.len())], e),
                 }
-                continue;
             }
+            return;
+        }
 
-            // Already committed from a previous watcher run
-            if self.blockchain.is_bridge_tx_processed(&sig.signature) { continue; }
+        // Already committed from a previous run — idempotency guard.
+        if self.blockchain.is_bridge_tx_processed(sig) { return; }
 
-            // Fetch the on-chain transfer details for Tier 2 / 2.5 / 3 handling
-            let verified = match self.verify_transaction(&sig.signature).await {
-                Ok(v) => v,
-                Err(_) => continue, // not a stablecoin transfer to custody wallet
-            };
-            let micro = (verified.amount * crate::svm::USDC_UNIT as f64).round() as u64;
-            if micro == 0 { continue; }
+        // Fetch the full on-chain transfer details for Tiers 2 / 2.5 / 3.
+        let verified = match self.verify_transaction(sig).await {
+            Ok(v) => v,
+            Err(_) => return, // not a stablecoin transfer to the custody wallet
+        };
+        let micro = (verified.amount * crate::svm::USDC_UNIT as f64).round() as u64;
+        if micro == 0 { return; }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
 
-            // ── Tier 2.5: Mayan customPayload attribution ─────────────────────────
-            // Highest-priority unattended path: the React frontend embedded the
-            // user's BB wallet address inside the swap's customPayload so the
-            // watcher can attribute funds with zero user friction.
-            if let Some(wallet) = verified.mayan_wallet.as_ref() {
-                let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
-                let record = crate::storage::DepositRecord {
-                    wallet_address: wallet.clone(),
-                    external_tx_hash: sig.signature.clone(),
-                    asset: verified.asset.clone(),
-                    amount_micro_stablecoin: micro,
-                    bb_lamports,
-                    status: "pending".to_string(),
-                    submitted_at: now,
-                    approved_at: None,
-                    contest_id: None,
-                };
-                let _ = self.blockchain.store_deposit_request(&record);
-                self.deposit_requests.insert(sig.signature.clone(), record);
-
-                match self.verify_and_approve(&sig.signature).await {
-                    Ok(bb) => info!(
-                        "✅ Mayan payload deposit: {} {:.6} → {:.5} BB for {} (tx: {})",
-                        verified.asset, verified.amount, bb,
-                        &wallet[..8.min(wallet.len())],
-                        &sig.signature[..16.min(sig.signature.len())]
-                    ),
-                    Err(e) => warn!(
-                        "⚠️  Mayan payload mint failed ({}): {}",
-                        &sig.signature[..16.min(sig.signature.len())], e
-                    ),
-                }
-                continue;
-            }
-
-            // ── Tier 2: memo-based attribution ──────────────────────────────────────
-            if let Some(wallet) = Self::extract_wallet_from_memo(sig.memo.as_deref()) {
-                let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
-                let record = crate::storage::DepositRecord {
-                    wallet_address: wallet.clone(),
-                    external_tx_hash: sig.signature.clone(),
-                    asset: verified.asset.clone(),
-                    amount_micro_stablecoin: micro,
-                    bb_lamports,
-                    status: "pending".to_string(),
-                    submitted_at: now,
-                    approved_at: None,
-                    contest_id: None,
-                };
-                let _ = self.blockchain.store_deposit_request(&record);
-                self.deposit_requests.insert(sig.signature.clone(), record);
-
-                // Mint (record is now in deposit_requests so verify_and_approve finds it)
-                match self.verify_and_approve(&sig.signature).await {
-                    Ok(bb) => info!("✅ Memo-attributed deposit: {} {:.6} → {:.5} BB (tx: {})",
-                        verified.asset,
-                        verified.amount,
-                        bb,
-                        &sig.signature[..16.min(sig.signature.len())]),
-                    Err(e) => warn!("⚠️  Memo-attributed mint failed ({}): {}",
-                        &sig.signature[..16.min(sig.signature.len())], e),
-                }
-                continue;
-            }
-
-            // ── Tier 3: no attribution — queue for manual /deposit/claim ────────────
-            let unattributed = crate::storage::UnattributedDeposit {
-                external_tx_hash: sig.signature.clone(),
+        // ── Tier 2.5: Mayan customPayload attribution ──────────────────────────
+        if let Some(wallet) = verified.mayan_wallet.as_ref() {
+            let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
+            let record = crate::storage::DepositRecord {
+                wallet_address: wallet.clone(),
+                external_tx_hash: sig.to_string(),
                 asset: verified.asset.clone(),
                 amount_micro_stablecoin: micro,
-                observed_at: now,
-                claimed_by: None,
+                bb_lamports,
+                status: "pending".to_string(),
+                submitted_at: now,
+                approved_at: None,
+                contest_id: None,
             };
-            match self.blockchain.write_unattributed_deposit(&unattributed) {
-                Ok(_) => warn!(
-                    "📥 Unattributed deposit queued: {:.6} {} (tx: {}) — user must call /deposit/claim",
-                    verified.amount, verified.asset,
-                    &sig.signature[..16.min(sig.signature.len())]
+            let _ = self.blockchain.store_deposit_request(&record);
+            self.deposit_requests.insert(sig.to_string(), record);
+            match self.verify_and_approve(sig).await {
+                Ok(bb) => info!(
+                    "✅ Mayan payload deposit: {} {:.6} → {:.5} BB for {} (tx: {})",
+                    verified.asset, verified.amount, bb,
+                    &wallet[..8.min(wallet.len())], &sig[..16.min(sig.len())]
                 ),
-                Err(e) => warn!("⚠️  Failed to write unattributed deposit ({}): {}",
-                    &sig.signature[..16.min(sig.signature.len())], e),
+                Err(e) => warn!(
+                    "⚠️  Mayan payload mint failed ({}): {}",
+                    &sig[..16.min(sig.len())], e
+                ),
             }
+            return;
+        }
+
+        // ── Tier 2: memo-based attribution ─────────────────────────────────────
+        if let Some(wallet) = Self::extract_wallet_from_memo(memo) {
+            let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(micro);
+            let record = crate::storage::DepositRecord {
+                wallet_address: wallet.clone(),
+                external_tx_hash: sig.to_string(),
+                asset: verified.asset.clone(),
+                amount_micro_stablecoin: micro,
+                bb_lamports,
+                status: "pending".to_string(),
+                submitted_at: now,
+                approved_at: None,
+                contest_id: None,
+            };
+            let _ = self.blockchain.store_deposit_request(&record);
+            self.deposit_requests.insert(sig.to_string(), record);
+            match self.verify_and_approve(sig).await {
+                Ok(bb) => info!(
+                    "✅ Memo-attributed deposit: {} {:.6} → {:.5} BB (tx: {})",
+                    verified.asset, verified.amount, bb, &sig[..16.min(sig.len())]
+                ),
+                Err(e) => warn!(
+                    "⚠️  Memo-attributed mint failed ({}): {}",
+                    &sig[..16.min(sig.len())], e
+                ),
+            }
+            return;
+        }
+
+        // ── Tier 3: no attribution — queue for manual /deposit/claim ───────────
+        let unattributed = crate::storage::UnattributedDeposit {
+            external_tx_hash: sig.to_string(),
+            asset: verified.asset.clone(),
+            amount_micro_stablecoin: micro,
+            observed_at: now,
+            claimed_by: None,
+        };
+        match self.blockchain.write_unattributed_deposit(&unattributed) {
+            Ok(_) => warn!(
+                "📥 Unattributed deposit queued: {:.6} {} (tx: {}) — user must call /deposit/claim",
+                verified.amount, verified.asset, &sig[..16.min(sig.len())]
+            ),
+            Err(e) => warn!(
+                "⚠️  Failed to write unattributed deposit ({}): {}",
+                &sig[..16.min(sig.len())], e
+            ),
         }
     }
 
