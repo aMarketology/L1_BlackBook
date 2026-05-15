@@ -43,7 +43,7 @@ pub const BSC_USDC_CONTRACT: &str = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
 pub const BSC_USDT_CONTRACT: &str = "0x55d398326f99059fF775485246999027B3197955";
 
 /// ERC-20 / BEP-20 Transfer event topic (keccak256 of "Transfer(address,address,uint256)").
-const TRANSFER_TOPIC: &str =
+pub const TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /// Both Binance-Peg USDC and USDT have 18 decimals on BSC mainnet.
@@ -58,13 +58,13 @@ pub struct BscWatcher {
     /// BSC JSON-RPC endpoint URL.
     rpc_url: String,
     /// Checksummed "0x…" EVM custody wallet address.
-    custody_address: String,
+    pub custody_address: String,
     /// Lower-cased address without "0x" prefix — used to build the topics[2] filter.
-    custody_lower: String,
+    pub custody_lower: String,
     /// BEP-20 USDC contract address (checksummed).
-    usdc_contract: String,
+    pub usdc_contract: String,
     /// BEP-20 USDT contract address (checksummed).
-    usdt_contract: String,
+    pub usdt_contract: String,
     /// Poll interval in seconds.
     poll_interval_secs: u64,
     /// BlackBook L1 storage layer.
@@ -87,16 +87,17 @@ struct RpcEnvelope<T> {
     error: Option<serde_json::Value>,
 }
 
-/// A single decoded eth_getLogs entry.
+/// A single decoded eth_getLogs / eth_subscription log entry.
+/// `pub` so that `bsc_ws.rs` can deserialize WS push notifications directly.
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct EthLog {
-    address: String,
-    topics: Vec<String>,
-    data: String,
-    transaction_hash: String,
+pub struct EthLog {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+    pub transaction_hash: String,
     #[allow(dead_code)]
-    block_number: String, // hex-encoded "0x…"
+    pub block_number: String, // hex-encoded "0x…"
 }
 
 /// Stripped result of a receipt-level token transfer verification.
@@ -141,24 +142,49 @@ impl BscWatcher {
         }
     }
 
-    /// Spawn a detached background task.
+    /// Spawn background tasks for BSC deposit detection.
+    ///
+    /// **Event-driven mode** (when `BSC_WS_URL` is set):
+    ///   - Spawns a persistent `eth_subscribe("logs")` WebSocket subscriber.
+    ///   - Runs a slow fallback poll (default 300 s, override via
+    ///     `BSC_WATCHER_FALLBACK_POLL_SECS`) for bridge-contract deposits and
+    ///     any events missed during WS reconnects.
+    ///
+    /// **Legacy polling mode** (when `BSC_WS_URL` is absent):
+    ///   - Falls back to the original `poll_interval_secs`-second block-range poll.
     pub fn start(self: Arc<Self>) {
         tokio::spawn(async move {
-            info!(
-                "⛓️  BSC watcher started — {} every {}s",
-                self.custody_address, self.poll_interval_secs
-            );
+            info!("⛓️  BSC watcher started — {}", self.custody_address);
             // Seed last_block from current chain tip so we don't replay old history.
             if let Ok(tip) = self.get_latest_block().await {
                 *self.last_block.lock().await = Some(tip.saturating_sub(50));
                 info!("⛓️  BSC watcher seeded at block {}", tip.saturating_sub(50));
             }
 
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(self.poll_interval_secs));
-            loop {
-                interval.tick().await;
-                self.poll_once().await;
+            let ws_url = std::env::var("BSC_WS_URL")
+                .ok()
+                .filter(|s| s.starts_with("wss://"));
+
+            if let Some(url) = ws_url {
+                let fallback_secs = std::env::var("BSC_WATCHER_FALLBACK_POLL_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(300);
+                info!("⛓️  BSC WS mode active — fallback poll every {}s", fallback_secs);
+                super::bsc_ws::start_bsc_ws(Arc::clone(&self), url);
+                let mut interval = tokio::time::interval(Duration::from_secs(fallback_secs));
+                loop {
+                    interval.tick().await;
+                    self.poll_once().await;
+                }
+            } else {
+                info!("⛓️  BSC polling mode — interval {}s", self.poll_interval_secs);
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(self.poll_interval_secs));
+                loop {
+                    interval.tick().await;
+                    self.poll_once().await;
+                }
             }
         });
     }
@@ -437,6 +463,13 @@ impl BscWatcher {
     }
 
     // ── Log processing ────────────────────────────────────────────────────────
+
+    /// Process a single Transfer log — called by both the polling loop and the
+    /// WebSocket subscriber.  Idempotent: no-op if already processed or if no
+    /// matching deposit request exists for the custodial path.
+    pub async fn dispatch_log(&self, log: EthLog) {
+        self.process_log(&log).await;
+    }
 
     async fn process_log(&self, log: &EthLog) {
         let tx_hash = log.transaction_hash.to_lowercase();
