@@ -613,17 +613,20 @@ impl BscWatcher {
             }
         }
 
-        // Update record
+        // Update record: ReDB FIRST, then DashMap cache
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Some(mut entry) = self.deposit_requests.get_mut(tx_hash) {
-            entry.status = "approved".to_string();
-            entry.approved_at = Some(now);
-        }
-        if let Some(updated) = self.deposit_requests.get(tx_hash) {
-            let _ = self.blockchain.store_deposit_request(&*updated);
+        if let Some(existing) = self.deposit_requests.get(tx_hash) {
+            let mut updated = existing.clone();
+            drop(existing);
+            updated.status = "approved".to_string();
+            updated.approved_at = Some(now);
+            if let Err(e) = self.blockchain.store_deposit_request(&updated) {
+                warn!("⚠️  Failed to persist deposit status update to ReDB: {}", e);
+            }
+            self.deposit_requests.insert(tx_hash.to_string(), updated);
         }
 
         // PoH record
