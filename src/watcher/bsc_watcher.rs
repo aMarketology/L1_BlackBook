@@ -171,7 +171,7 @@ impl BscWatcher {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(300);
                 info!("⛓️  BSC WS mode active — fallback poll every {}s", fallback_secs);
-                super::bsc_ws::start_bsc_ws(Arc::clone(&self), url);
+                crate::watcher::bsc_ws::start_bsc_ws(Arc::clone(&self), url);
                 let mut interval = tokio::time::interval(Duration::from_secs(fallback_secs));
                 loop {
                     interval.tick().await;

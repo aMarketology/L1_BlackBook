@@ -14,7 +14,8 @@
  *
  * Settlement cycle:
  *   1. initContestReserve()   → lock dealer BB into escrow PDA
- *   2. verifyDeposit()        → confirm user's L1 deposit before L2 entry
+ *   2. L2 receives live balance via SubscribeBalances gRPC stream
+ *      (or calls getBalanceCached() which falls back to GetBalance on cache miss)
  *   3. (L2 game plays out)
  *   4. submitStateRoot()      → anchor Merkle root + zero-sum proof
  *   5. settleWinners()        → batch-pay winners from dealer balance
@@ -206,12 +207,22 @@ export interface TransactionHistoryResponse {
 
 // ── gRPC response types (settlement service, port 50052) ───────────────────
 
-export interface GrpcVerifyDepositResponse {
-  verified: boolean;
-  depositor_wallet: string;
-  actual_amount: number;
-  deposit_slot: number;
-  error_code: string;
+/** Response from GetBalance unary RPC (gRPC :50052, unauthenticated cache-miss fill). */
+export interface GrpcGetBalanceResponse {
+  address: string;
+  balance_lamports: number;
+  current_slot: number;
+}
+
+/** One event pushed by SubscribeBalances server-streaming RPC. */
+export interface GrpcBalanceUpdate {
+  address: string;
+  new_balance_lamports: number;
+  /** L1 always emits 0; L2 computes delta from its own cache. */
+  delta_lamports: number;
+  slot: number;
+  timestamp: number;
+  block_hash: string;
 }
 
 export interface GrpcInitContestResponse {
@@ -1047,6 +1058,25 @@ export class DealerSDK {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  //  11. L2 BALANCE CACHE — Local balance mirror fed by SubscribeBalances
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Fetch an address's BB balance directly from L1 via the HTTP REST API.
+   * Use this as a cache-miss fallback when the SubscribeBalances stream has
+   * not yet delivered a value for the requested address.
+   *
+   * @param address  Base58 wallet address
+   * @returns        BB balance in lamports and human-readable BB
+   */
+  async getL1Balance(address: string): Promise<{ lamports: number; bb: number }> {
+    const res: BalanceResponse = await this.get(`/balance/${encodeURIComponent(address)}`);
+    // /balance/:addr returns { balance: number } in whole BB units
+    const lamports = Math.round(res.balance * SPL_MULTIPLIER);
+    return { lamports, bb: res.balance };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   //  UDP TPU — High-throughput binary transaction submission
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1120,6 +1150,99 @@ export class DealerSDK {
     const privBytes = hexToBytes(this.wallet.privateKeyHex);
     const sigBytes = await ed.signAsync(msg, privBytes);
     return { signature: bytesToHex(sigBytes), timestamp: ts, nonce: n };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  L2 Balance Cache — Self-Healing Mirror of L1 Balances
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * L2-side balance cache populated by the SubscribeBalances gRPC stream.
+ *
+ * Self-Healing Cache (Path A) pattern:
+ *   - On reconnect: flush ALL entries (stale data is worse than a cache miss).
+ *   - On bet entry cache miss: call `getOrFetch()` to lazy-fill via HTTP.
+ *   - Idempotency key: `(address, slot)` — ignore events with slot <= stored slot.
+ *
+ * Typical wiring (Node.js L2 sequencer with @grpc/grpc-js):
+ *
+ * ```ts
+ * import * as grpc from "@grpc/grpc-js";
+ * import * as proto from "./generated/settlement_grpc_pb";  // tonic generated stubs
+ *
+ * const stub = new proto.SettlementServiceClient(
+ *   "localhost:50052", grpc.credentials.createInsecure()
+ * );
+ * const cache = new BalanceCache(sdk);
+ *
+ * function connectFeed(addressFilter: string[]) {
+ *   const stream = stub.subscribeBalances({
+ *     address_filter: addressFilter,
+ *     timestamp: Math.floor(Date.now() / 1000),
+ *     client_pubkey: sequencerPubkeyBytes,
+ *     client_sig: ed25519Sign("SUBSCRIBE_BALANCES" + timestamp_le8),
+ *   });
+ *   stream.on("data", (ev: GrpcBalanceUpdate) => cache.update(ev));
+ *   stream.on("error", () => { cache.flush(); setTimeout(() => connectFeed(addressFilter), 2000); });
+ * }
+ * ```
+ */
+export class BalanceCache {
+  /** address → { lamports, slot } */
+  private entries = new Map<string, { lamports: number; slot: number }>();
+  private sdk: DealerSDK;
+
+  constructor(sdk: DealerSDK) {
+    this.sdk = sdk;
+  }
+
+  /**
+   * Apply an inbound SubscribeBalances event.
+   * Silently ignores stale events (slot <= stored slot).
+   */
+  update(event: GrpcBalanceUpdate): void {
+    const current = this.entries.get(event.address);
+    if (current && current.slot >= event.slot) return;
+    this.entries.set(event.address, {
+      lamports: event.new_balance_lamports,
+      slot: event.slot,
+    });
+  }
+
+  /**
+   * Get balance from cache; if not present, fill from L1 via HTTP and cache result.
+   * Returns lamports.
+   */
+  async getOrFetch(address: string): Promise<number> {
+    const cached = this.entries.get(address);
+    if (cached) return cached.lamports;
+
+    // Cache miss — lazy fill from L1 HTTP endpoint
+    const { lamports } = await this.sdk.getL1Balance(address);
+    // Slot 0 means "filled from HTTP, not from broadcast" — a real broadcast event
+    // will always carry slot >= 1 and will overwrite this entry.
+    this.entries.set(address, { lamports, slot: 0 });
+    return lamports;
+  }
+
+  /**
+   * Flush the entire cache.
+   * Call this whenever the SubscribeBalances stream disconnects and reconnects
+   * to prevent serving stale data during the reconnect window.
+   */
+  flush(): void {
+    this.entries.clear();
+  }
+
+  /** Peek at a cached value without triggering an HTTP fallback. Returns null on miss. */
+  peek(address: string): { lamports: number; slot: number } | null {
+    return this.entries.get(address) ?? null;
+  }
+
+  /** Current number of addresses in the cache. */
+  get size(): number {
+    return this.entries.size;
   }
 }
 

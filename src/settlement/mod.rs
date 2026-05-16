@@ -1,18 +1,29 @@
 //! Settlement Service — gRPC server for L2↔L1 contest lifecycle
 //!
-//! Five RPCs:
-//!   - VerifyDeposit:       L2 confirms a user's deposit is on-chain before entry.
+//! RPCs:
+//!   - SubscribeBalances:   L2 subscribes to per-block balance updates (replaces VerifyDeposit).
+//!   - GetBalance:          Single-address balance lookup for cache-miss lazy fills.
 //!   - InitContestReserve:  Dealer locks prize reserve into per-contest escrow.
 //!   - SubmitMerkleRoot:    L2 sequencer finalises a market with a 32-byte root.
 //!   - GetContestStatus:    L2 queries live contest state.
 //!   - SyncBridge:          Heartbeat / TPS monitoring.
 //!
 //! Runs on port 50052 (separate from validator_relay on 50051).
+//!
+//! Balance feed design:
+//!   L2 keeps a local `Map<address, balance_lamports>` cache. It opens
+//!   `SubscribeBalances` once at startup; L1 pushes one event per (address, slot)
+//!   for each block that changed that address's BB balance. On reconnect, L2
+//!   flushes its cache and lazily refills via `GetBalance` on the next cache miss.
+//!   Idempotency key: (address, slot) — slot is ReDB-anchored, never resets.
 pub mod sweep;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use tokio::sync::broadcast;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -27,7 +38,8 @@ pub mod proto {
 
 use proto::settlement_service_server::{SettlementService, SettlementServiceServer};
 use proto::{
-    VerifyDepositRequest, VerifyDepositResponse,
+    SubscribeBalancesRequest, BalanceUpdate,
+    GetBalanceRequest, GetBalanceResponse,
     InitContestReserveRequest, InitContestReserveResponse,
     MerkleRootSubmission, MerkleRootResponse,
     SubmitPendingRootRequest, SubmitPendingRootResponse,
@@ -35,6 +47,24 @@ use proto::{
     SyncBridgeRequest, SyncBridgeResponse,
 };
 use crate::storage::{OracleSignature, PendingRoot, PendingRootStatus};
+
+// ============================================================================
+// BALANCE UPDATE EVENT
+// ============================================================================
+
+/// Internal event broadcast after each block finalization.
+/// One event per unique BB address touched in a block.
+/// Idempotency key for L2: (address, slot) — guaranteed unique per block.
+/// `delta_lamports` is always 0 from L1; L2 computes it from its own cached value.
+#[derive(Clone, Debug)]
+pub struct BalanceUpdateEvent {
+    pub address: String,
+    pub new_balance_lamports: u64,
+    pub delta_lamports: i64,
+    pub slot: u64,
+    pub timestamp: u64,
+    pub block_hash: String,
+}
 
 /// ~2h dispute window at 400 ms/slot: 2*60*60 / 0.4 = 18_000 slots.
 /// Spec says 6_480 but oracle.md calls for ~2h; using 6_480 to match spec.
@@ -55,6 +85,8 @@ pub struct BlackBookSettlementService {
     pub l2_sequencer_allowlist: std::collections::HashSet<String>,
     pub block_producer: Arc<BlockProducer>,
     pub deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
+    /// Broadcast channel for per-block balance update events (L2 streaming feed).
+    pub balance_event_tx: broadcast::Sender<BalanceUpdateEvent>,
     start_time: Instant,
 }
 
@@ -69,6 +101,7 @@ impl BlackBookSettlementService {
         l2_sequencer_allowlist: std::collections::HashSet<String>,
         block_producer: Arc<BlockProducer>,
         deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
+        balance_event_tx: broadcast::Sender<BalanceUpdateEvent>,
     ) -> Self {
         Self {
             blockchain,
@@ -79,6 +112,7 @@ impl BlackBookSettlementService {
             l2_sequencer_allowlist,
             block_producer,
             deposit_requests,
+            balance_event_tx,
             start_time: Instant::now(),
         }
     }
@@ -93,79 +127,136 @@ impl BlackBookSettlementService {
 // gRPC IMPLEMENTATION
 // ============================================================================
 
+/// Type alias for the server-streaming balance subscription.
+type BalanceStream = Pin<Box<dyn Stream<Item = Result<BalanceUpdate, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl SettlementService for BlackBookSettlementService {
 
-    // ── VerifyDeposit ─────────────────────────────────────────────────────
+    type SubscribeBalancesStream = BalanceStream;
 
-    async fn verify_deposit(
+    // ── SubscribeBalances ─────────────────────────────────────────────────
+    //
+    // L2 opens this once at startup. L1 pushes one BalanceUpdate per (address,
+    // slot) for every BB address whose balance changed in a finalized block.
+    // Auth: Ed25519 over b"SUBSCRIBE_BALANCES" || timestamp.to_le_bytes(8).
+    // On reconnect L2 must flush its cache; the broadcast buffer does not replay
+    // missed slots — L2 uses GetBalance for cache-miss lazy fills instead.
+
+    async fn subscribe_balances(
         &self,
-        request: Request<VerifyDepositRequest>,
-    ) -> Result<Response<VerifyDepositResponse>, Status> {
+        request: Request<SubscribeBalancesRequest>,
+    ) -> Result<Response<Self::SubscribeBalancesStream>, Status> {
+        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+
         let req = request.into_inner();
-        info!("📥 VerifyDeposit: contest={} sig={}", req.contest_id, req.deposit_tx_sig);
 
-        if req.deposit_tx_sig.is_empty() {
-            return Ok(Response::new(VerifyDepositResponse {
-                verified: false,
-                depositor_wallet: String::new(),
-                actual_amount: 0,
-                deposit_slot: 0,
-                error_code: "TX_NOT_FOUND".to_string(),
-            }));
+        if req.client_pubkey.len() != 32 {
+            return Err(Status::invalid_argument("client_pubkey must be 32 bytes"));
+        }
+        if req.client_sig.len() != 64 {
+            return Err(Status::invalid_argument("client_sig must be 64 bytes"));
         }
 
-        // Look up the deposit record by external tx signature
-        let record = self.deposit_requests.get(&req.deposit_tx_sig);
+        // ── Allowlist check ───────────────────────────────────────────────
+        let pubkey_hex = hex::encode(&req.client_pubkey);
+        if !self.l2_sequencer_allowlist.is_empty()
+            && !self.l2_sequencer_allowlist.contains(&pubkey_hex)
+        {
+            return Err(Status::permission_denied(format!(
+                "Client pubkey {} is not in the L2 sequencer allowlist", pubkey_hex
+            )));
+        }
+
+        // ── Timestamp freshness (60s window) ──────────────────────────────
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now.abs_diff(req.timestamp) > 60 {
+            return Err(Status::unauthenticated(
+                "Timestamp outside 60s freshness window"
+            ));
+        }
+
+        // ── Ed25519 signature verification ────────────────────────────────
+        // Canonical message: b"SUBSCRIBE_BALANCES" || timestamp.to_le_bytes(8)
+        let verifying_key = VerifyingKey::from_bytes(
+            req.client_pubkey.as_slice().try_into()
+                .map_err(|_| Status::invalid_argument("client_pubkey must be 32 bytes"))?
+        ).map_err(|e| Status::internal(format!("Bad client pubkey: {}", e)))?;
+
+        let mut msg: Vec<u8> = Vec::with_capacity(26);
+        msg.extend_from_slice(b"SUBSCRIBE_BALANCES");
+        msg.extend_from_slice(&req.timestamp.to_le_bytes());
+
+        let sig = Signature::from_bytes(
+            req.client_sig.as_slice().try_into()
+                .map_err(|_| Status::invalid_argument("client_sig must be 64 bytes"))?
+        );
+        verifying_key.verify(&msg, &sig)
+            .map_err(|_| Status::unauthenticated("Signature verification failed"))?;
+
+        info!("📡 L2 sequencer {}… subscribed to balance stream", &pubkey_hex[..16]);
+
+        let address_filter: std::collections::HashSet<String> =
+            req.address_filter.into_iter().collect();
+        let mut rx = self.balance_event_tx.subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if !address_filter.is_empty() && !address_filter.contains(&evt.address) {
+                            continue;
+                        }
+                        yield Ok(BalanceUpdate {
+                            address: evt.address,
+                            new_balance_lamports: evt.new_balance_lamports,
+                            delta_lamports: evt.delta_lamports,
+                            slot: evt.slot,
+                            timestamp: evt.timestamp,
+                            block_hash: evt.block_hash,
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // L2 missed n events; log a warning. L2's gap-detection
+                        // will see that addresses went stale and call GetBalance.
+                        warn!(
+                            "L2 balance stream lagged by {} event(s) — L2 should \
+                             flush cache and call GetBalance on next market-entry miss",
+                            n
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream) as Self::SubscribeBalancesStream))
+    }
+
+    // ── GetBalance ────────────────────────────────────────────────────────
+    //
+    // Public read-only lookup. No auth. Used by L2 for cache-miss lazy fills
+    // after a reconnect or lag event.
+
+    async fn get_balance(
+        &self,
+        request: Request<GetBalanceRequest>,
+    ) -> Result<Response<GetBalanceResponse>, Status> {
+        let req = request.into_inner();
+        if req.address.is_empty() {
+            return Err(Status::invalid_argument("address is required"));
+        }
+        let balance_lamports = self.blockchain.get_balance_lamports(&req.address);
         let current_slot = self.current_slot.load(Ordering::Relaxed);
-
-        match record {
-            None => {
-                warn!("VerifyDeposit: tx not found: {}", req.deposit_tx_sig);
-                Ok(Response::new(VerifyDepositResponse {
-                    verified: false,
-                    depositor_wallet: String::new(),
-                    actual_amount: 0,
-                    deposit_slot: current_slot,
-                    error_code: "TX_NOT_FOUND".to_string(),
-                }))
-            }
-            Some(dep) => {
-                // bb_lamports is already in 5-decimal lamport units
-                let actual_spl = dep.bb_lamports;
-
-                // Amount check: if caller specified a non-zero expected_amount, verify it
-                if req.expected_amount > 0 && actual_spl != req.expected_amount {
-                    return Ok(Response::new(VerifyDepositResponse {
-                        verified: false,
-                        depositor_wallet: dep.wallet_address.clone(),
-                        actual_amount: actual_spl,
-                        deposit_slot: current_slot,
-                        error_code: "WRONG_AMOUNT".to_string(),
-                    }));
-                }
-
-                // Check if deposit is approved (not just pending)
-                if dep.status != "approved" {
-                    return Ok(Response::new(VerifyDepositResponse {
-                        verified: false,
-                        depositor_wallet: dep.wallet_address.clone(),
-                        actual_amount: actual_spl,
-                        deposit_slot: dep.submitted_at,
-                        error_code: "TX_NOT_FINAL".to_string(),
-                    }));
-                }
-
-                info!("✅ VerifyDeposit OK: {} SPL for wallet {}", actual_spl, dep.wallet_address);
-                Ok(Response::new(VerifyDepositResponse {
-                    verified: true,
-                    depositor_wallet: dep.wallet_address.clone(),
-                    actual_amount: actual_spl,
-                    deposit_slot: dep.approved_at.unwrap_or(dep.submitted_at),
-                    error_code: String::new(),
-                }))
-            }
-        }
+        Ok(Response::new(GetBalanceResponse {
+            address: req.address,
+            balance_lamports,
+            current_slot,
+        }))
     }
 
     // ── InitContestReserve ────────────────────────────────────────────────

@@ -185,7 +185,8 @@ pub async fn escrow_deposit_handler(
         state.block_producer.record_executed_transaction(tx);
     }
 
-    // Insert into deposit_requests so VerifyDeposit gRPC can find this deposit
+    // Insert into deposit_requests DashMap so GetBalance gRPC can return it
+    // and so the deposit gateway double-mint guard can check it.
     let deposit_record = DepositRecord {
         wallet_address: req.wallet_address.clone(),
         external_tx_hash: tx_hash.clone(),

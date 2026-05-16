@@ -5,17 +5,31 @@ package settlement;
 // BLACKBOOK L1 — SETTLEMENT SERVICE (gRPC)
 // ============================================================================
 //
-// Five RPCs bridging L2 (BlackBook game server) ↔ L1 (this chain).
-// All balance fields use SPL token units: 1 BB = 1,000,000 SPL units (6 decimals).
+// RPCs bridging L2 (BlackBook game server) ↔ L1 (this chain).
+// All BB balance fields use lamport units: 1 BB = 100,000 lamports (5 decimals).
 //
 // Transport: tonic gRPC on port 50052 (separate from validator_relay on 50051)
+//
+// Balance feed (replaces the old VerifyDeposit round-trip):
+//   L2 subscribes to SubscribeBalances once and caches balances locally.
+//   Market entry checks the local cache — zero L1 round-trip required.
+//   On reconnect, L2 flushes its cache; misses are lazily filled via GetBalance.
+//   Idempotency key: (address, slot) — slot is ReDB-anchored, survives restarts.
 // ============================================================================
 
 service SettlementService {
-    // Called by L2 on every user entry into a BB market.
-    // L2 MUST use the returned depositor_wallet as canonical identity — never
-    // the user's self-reported wallet.
-    rpc VerifyDeposit(VerifyDepositRequest) returns (VerifyDepositResponse);
+    // L2 opens this stream once at startup and keeps it open.
+    // L1 emits one BalanceUpdate per (address, slot) for every BB address whose
+    // balance changed in a finalized block. Auth: Ed25519 over
+    // b"SUBSCRIBE_BALANCES" || timestamp.to_le_bytes(8); client_pubkey must be
+    // in the L2 sequencer allowlist.
+    // On reconnect, L2 must flush its balance cache and rely on GetBalance for
+    // cache-miss lazy fills — the broadcast buffer does not replay past events.
+    rpc SubscribeBalances(SubscribeBalancesRequest) returns (stream BalanceUpdate);
+
+    // Single-address balance lookup for cache-miss lazy fills.
+    // No auth required (public read-only, equivalent to GET /balance/:address).
+    rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
 
     // Called by dealer before opening a BB market.
     // Locks the dealer's prize reserve into the per-contest escrow vault.
@@ -25,9 +39,7 @@ service SettlementService {
     // Submits the 32-byte Merkle root so users can claim winnings on L1.
     rpc SubmitMerkleRoot(MerkleRootSubmission) returns (MerkleRootResponse);
 
-    // NEW (Step 2): Optimistic oracle path.
-    // L2 dealer submits a pending root that enters a 2h dispute window before
-    // being committed to ESCROW_MARKET_ROOTS. Anyone can challenge with $XX stake.
+    // Optimistic oracle path: root enters a 2h dispute window before finalization.
     rpc SubmitPendingRoot(SubmitPendingRootRequest) returns (SubmitPendingRootResponse);
 
     // Called by L2 to query live contest state from L1.
@@ -37,22 +49,47 @@ service SettlementService {
     rpc SyncBridge(SyncBridgeRequest) returns (SyncBridgeResponse);
 }
 
-// ── VerifyDeposit ─────────────────────────────────────────────────────────────
+// ── SubscribeBalances ─────────────────────────────────────────────────────────
+//
+// Canonical signed message (Ed25519):
+//   b"SUBSCRIBE_BALANCES" || timestamp.to_le_bytes(8)
+// Signed by client_pubkey (must be in L2 sequencer allowlist).
+// timestamp must be within 60 seconds of L1 wall clock at time of request.
 
-message VerifyDepositRequest {
-    string contest_id       = 1;
-    string deposit_tx_sig   = 2; // external tx signature (base58 Solana sig or hex)
-    uint64 expected_amount  = 3; // SPL units — 0 means "any amount, just verify"
+message SubscribeBalancesRequest {
+    // Restrict events to specific addresses. Empty = all BB balance changes.
+    repeated string address_filter = 1;
+    // Unix seconds. Must be within 60s of L1's wall clock.
+    uint64          timestamp      = 2;
+    // Ed25519 verifying key of the L2 sequencer, 32 bytes.
+    bytes           client_pubkey  = 3;
+    // Ed25519 sig over b"SUBSCRIBE_BALANCES" || timestamp.to_le_bytes(8), 64 bytes.
+    bytes           client_sig     = 4;
 }
 
-message VerifyDepositResponse {
-    bool   verified          = 1;
-    string depositor_wallet  = 2; // base58 — L2 uses this as canonical identity
-    uint64 actual_amount     = 3; // SPL units
-    uint64 deposit_slot      = 4; // L1 slot at time of verification
-    // "TX_NOT_FOUND" | "WRONG_CONTEST" | "WRONG_AMOUNT" | "ALREADY_USED"
-    // | "CONTEST_CLOSED" | "TX_NOT_FINAL"
-    string error_code        = 5;
+// One event per (address, slot). Guaranteed: at most one event per address per slot.
+// L2 idempotency key: (address, slot).
+// NOTE: delta_lamports is informational only (set to 0 by L1). L2 should compute
+// delta as new_balance_lamports - its own cached value.
+message BalanceUpdate {
+    string address              = 1; // base58 BB wallet
+    uint64 new_balance_lamports = 2; // authoritative post-block balance (u64 lamports)
+    int64  delta_lamports       = 3; // informational; always 0 from L1 — compute client-side
+    uint64 slot                 = 4; // L1 PoH slot (ReDB-anchored, restart-safe)
+    uint64 timestamp            = 5; // Unix seconds of block finalization
+    string block_hash           = 6; // hex SHA-256 for cross-referencing
+}
+
+// ── GetBalance ────────────────────────────────────────────────────────────────
+
+message GetBalanceRequest {
+    string address = 1;
+}
+
+message GetBalanceResponse {
+    string address          = 1;
+    uint64 balance_lamports = 2; // authoritative balance (u64 lamports)
+    uint64 current_slot     = 3; // L1 slot at time of read
 }
 
 // ── InitContestReserve ────────────────────────────────────────────────────────

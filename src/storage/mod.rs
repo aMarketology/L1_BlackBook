@@ -108,7 +108,7 @@ const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("conte
 
 /// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
 /// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
-/// (pro-rata return to known depositors) and for VerifyDeposit replay protection.
+/// (pro-rata return to known depositors) and for deposit double-mint protection.
 pub const ESCROW_DEPOSITORS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors");
 
 /// Index from contest_id → JSON Vec<deposit_tx_sig> (String).
@@ -2023,7 +2023,7 @@ pub struct ContestState {
 
 /// One row per (contest, deposit-tx) — the canonical record that a wallet's
 /// funds entered a per-contest vault PDA.  Used for:
-///   * VerifyDeposit replay protection (each `deposit_tx_sig` consumed at most once),
+///   * deposit double-mint protection (each `deposit_tx_sig` consumed at most once),
 ///   * pro-rata refund-on-expiry (we know exactly who is owed how much), and
 ///   * audit / explorer surfaces.
 ///
@@ -2036,7 +2036,7 @@ pub struct EscrowDepositorEntry {
     pub deposit_tx_sig: String,
     pub amount_lamports: u64,
     pub deposited_at: u64,
-    /// Set true once the entry has been consumed by a successful VerifyDeposit.
+    /// Set true once this entry's deposit has been processed (e.g. approved or refunded).
     #[serde(default)]
     pub used: bool,
     /// Set true once a refund has been issued for this entry (expired contest sweep).

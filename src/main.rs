@@ -251,6 +251,8 @@ pub struct AppState {
     pub throttler: Arc<NetworkThrottler>,
     pub ws_subscriptions: Arc<WsSubscriptions>,
     pub block_tx: tokio::sync::broadcast::Sender<FinalizedBlock>,
+    /// Broadcast channel for per-block BB balance update events pushed to L2 subscribers.
+    pub balance_event_tx: tokio::sync::broadcast::Sender<settlement::BalanceUpdateEvent>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub fee_market: Arc<LocalizedFeeMarket>,
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
@@ -2784,6 +2786,10 @@ async fn main() {
     }
 
     let (block_tx, _) = tokio::sync::broadcast::channel(256);
+    // Balance update feed for L2 SubscribeBalances stream. Capacity 4096 so that
+    // a briefly-lagging L2 does not lose events during a high-throughput burst.
+    // Lagged subscribers receive a RecvError::Lagged and should call GetBalance.
+    let (balance_event_tx, _) = tokio::sync::broadcast::channel::<settlement::BalanceUpdateEvent>(4096);
 
     let mode_label = match config.mode {
         NodeMode::Writer => "WRITER (Block Producer)",
@@ -3106,6 +3112,7 @@ async fn main() {
                 l2_sequencer_allowlist.clone(),
                 block_producer.clone(),
                 deposit_requests.clone(),
+                balance_event_tx.clone(),
             );
             tokio::spawn(async move {
                 let addr: std::net::SocketAddr = match format!("0.0.0.0:{}", settlement_port).parse() {
@@ -3131,6 +3138,8 @@ async fn main() {
             let tower = tower_bft.clone();
             let ls = leader_schedule.clone();
             let vid = validator_id_for_loop;
+            let balance_event_tx_loop = balance_event_tx.clone();
+            let balance_event_blockchain = blockchain.clone();
             tokio::spawn(async move {
                 info!("🏭 Block production loop started (400ms slots)");
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS));
@@ -3180,6 +3189,51 @@ async fn main() {
                             // Turbine propagation tree (single-node for now)
                             let validators = vec![vid.clone()];
                             let _tree = TurbinePropagator::calculate_tree(&validators, &vid);
+
+                            // Emit per-block BB balance updates for L2's SubscribeBalances.
+                            // One event per unique address touched; idempotency key: (address, slot).
+                            // We iterate before relay_tx.send because send consumes `block`.
+                            if block.tx_count > 0 {
+                                use crate::protocol::blockchain::TxData;
+                                use std::collections::HashSet;
+                                let mut touched: HashSet<String> = HashSet::new();
+                                for otx in &block.transactions {
+                                    match &otx.tx.data {
+                                        TxData::TransferBb { to, .. } => {
+                                            touched.insert(otx.tx.from.clone());
+                                            touched.insert(to.clone());
+                                        }
+                                        TxData::DepositUsdt { .. }
+                                        | TxData::EscrowDeposit { .. }
+                                        | TxData::EscrowWithdraw { .. }
+                                        | TxData::VaultBurn { .. } => {
+                                            touched.insert(otx.tx.from.clone());
+                                        }
+                                        TxData::EscrowSweep { treasury_address, .. } => {
+                                            touched.insert(treasury_address.clone());
+                                        }
+                                        TxData::EscrowStateRoot { .. } => {}
+                                    }
+                                }
+                                let slot = block.slot;
+                                let timestamp = block.timestamp;
+                                let block_hash = block.hash.clone();
+                                for addr in touched {
+                                    let new_balance =
+                                        balance_event_blockchain.get_balance_lamports(&addr);
+                                    // delta_lamports = 0: L2 computes from cached vs new value.
+                                    let _ = balance_event_tx_loop.send(
+                                        crate::settlement::BalanceUpdateEvent {
+                                            address: addr,
+                                            new_balance_lamports: new_balance,
+                                            delta_lamports: 0,
+                                            slot,
+                                            timestamp,
+                                            block_hash: block_hash.clone(),
+                                        },
+                                    );
+                                }
+                            }
 
                             // Stream block to connected reader nodes via relay
                             let _ = relay_tx.send(block);
@@ -3385,6 +3439,7 @@ async fn main() {
         throttler,
         ws_subscriptions: Arc::new(WsSubscriptions::new()),
         block_tx: block_tx.clone(),
+        balance_event_tx: balance_event_tx.clone(),
         circuit_breaker,
         fee_market,
         account_metadata,
