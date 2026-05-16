@@ -26,7 +26,7 @@ use tracing::{info, warn, error};
 use crate::storage::ConcurrentBlockchain;
 use super::consensus::GulfStreamService;
 use super::core::{Transaction as RuntimeTx, TransactionType};
-use super::poh_service::{TransactionPipeline, PipelinePacket};
+use super::poh_service::{TransactionPipeline, PipelinePacket, SharedPoHService};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -83,6 +83,8 @@ pub struct TpuService {
     pipeline: Arc<TransactionPipeline>,
     blockchain: ConcurrentBlockchain,
     used_nonces: Arc<DashMap<String, u64>>,
+    /// Shared PoH service — used to stamp tx IDs into the hash chain BEFORE execution.
+    poh: SharedPoHService,
 }
 
 impl TpuService {
@@ -91,8 +93,9 @@ impl TpuService {
         pipeline: Arc<TransactionPipeline>,
         blockchain: ConcurrentBlockchain,
         used_nonces: Arc<DashMap<String, u64>>,
+        poh: SharedPoHService,
     ) -> Self {
-        Self { gulf_stream, pipeline, blockchain, used_nonces }
+        Self { gulf_stream, pipeline, blockchain, used_nonces, poh }
     }
 
     /// Bind the UDP socket and spin up NUM_WORKERS parallel receiver tasks.
@@ -115,6 +118,7 @@ impl TpuService {
         let pipeline    = Arc::clone(&self.pipeline);
         let blockchain  = Arc::new(self.blockchain);
         let used_nonces = self.used_nonces;
+        let poh_shared  = self.poh;
 
         for _ in 0..NUM_WORKERS {
             let sock    = socket.clone();
@@ -123,6 +127,7 @@ impl TpuService {
             let pl      = pipeline.clone();
             let bc      = blockchain.clone();
             let nn      = used_nonces.clone();
+            let poh     = poh_shared.clone();
 
             tokio::spawn(async move {
                 let mut buf = [0u8; MAX_PACKET_SIZE];
@@ -268,6 +273,10 @@ impl TpuService {
                         warn!("⚠ TPU GulfStream submit error for {}: {}", pkt.from, e);
                         continue;
                     }
+
+                    // Stamp tx_id into PoH BEFORE execution — ordering invariant.
+                    // The tx_id is recorded in the hash chain now; the SVM executes it later.
+                    poh.write().queue_transaction(tx_id.clone());
 
                     let packet = PipelinePacket::new(
                         tx_id, pkt.from.clone(), pkt.to.clone(), pkt.amount

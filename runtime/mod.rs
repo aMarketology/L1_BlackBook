@@ -13,12 +13,14 @@ pub mod sealevel;
 pub mod consensus;
 pub mod poh_service;
 pub mod tpu;
+pub mod turbine;
 
 // PoH Service
 pub use poh_service::{
     SharedPoHService, create_poh_service, create_poh_service_with_slot, run_poh_clock,
     TransactionPipeline,
     PipelinePacket,
+    TickShred,
     CONFIRMATIONS_REQUIRED, ConfirmationStatus,
 };
 
