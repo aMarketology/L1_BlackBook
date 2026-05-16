@@ -24,6 +24,7 @@ use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use serde::Serialize;
+use tracing::warn;
 
 use super::{PoHConfig, PoHEntry};
 
@@ -142,6 +143,20 @@ pub struct VerifiedPacket {
 pub struct ExecutedPacket {
     pub packet: PipelinePacket,
     pub success: bool,
+}
+
+/// Per-tick PoH broadcast packet streamed from Writer to Reader nodes via UDP (port 8004).
+/// Readers re-derive the SHA-256 chain from each shred in real-time.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TickShred {
+    /// Slot this tick belongs to.
+    pub slot: u64,
+    /// Tick index within the slot (0 .. ticks_per_slot - 1).
+    pub tick_index: u32,
+    /// PoHEntry produced by this tick: final hash + cumulative num_hashes + any mixed tx IDs.
+    pub entry: PoHEntry,
+    /// True on the final tick of the slot — Readers use this to trigger block verification.
+    pub is_slot_end: bool,
 }
 
 /// Result of commit stage
@@ -584,7 +599,25 @@ impl PoHService {
     pub fn queue_transaction(&mut self, tx_id: String) {
         self.pending_tx_mix.push(tx_id);
     }
-    
+
+    /// Fast-forward the slot counter to `target_slot` if it is ahead of the current slot.
+    ///
+    /// Called when clock drift is detected — VM hypervisor suspension, gRPC stream
+    /// gap, or TowerBFT reconcile. Updates epoch cache and clears stale PoH entries.
+    /// Returns the number of slots skipped (0 if already at or past `target_slot`).
+    pub fn fast_forward_to(&mut self, target_slot: u64) -> u64 {
+        let current = self.current_slot.load(Ordering::Relaxed);
+        if target_slot <= current {
+            return 0;
+        }
+        let skipped = target_slot - current;
+        self.current_slot.fetch_max(target_slot, Ordering::Relaxed);
+        self.total_slots_produced += skipped;
+        self.current_epoch = target_slot / self.config.slots_per_epoch.max(1);
+        self.current_entries.clear(); // stale entries belong to the old slot
+        skipped
+    }
+
     /// Advance to next slot
     pub fn advance_slot(&mut self) -> u64 {
         let new_slot = self.current_slot.fetch_add(1, Ordering::Relaxed) + 1;
@@ -703,12 +736,26 @@ pub fn create_poh_service_with_slot(config: PoHConfig, slot: Arc<AtomicU64>) -> 
 /// Each tick computes 12,500 SHA-256 hashes — CPU-bound work that must never
 /// run on a shared async worker. The spawned thread uses `std::thread::sleep`
 /// for sub-millisecond precision timing and runs until the process exits.
-pub async fn run_poh_clock(poh_service: SharedPoHService) {
-    // Compute tick interval (milliseconds) before handing ownership to thread.
+///
+/// **Hypervisor suspension recovery**: if the host VM is suspended by its
+/// hypervisor (live migration, snapshot, OOM pause) the OS thread's sleep also
+/// pauses. On resume, we compare actual wall-clock elapsed time against the
+/// expected slot duration. If the gap exceeds 1.5× a slot, we fast-forward the
+/// shared `Arc<AtomicU64>` slot counter to match wall-clock reality so the rest
+/// of the network does not see stale slots.
+pub async fn run_poh_clock(
+    poh_service: SharedPoHService,
+    tick_tx: Option<mpsc::Sender<TickShred>>,
+) {
+    // Compute tick interval and slot duration before handing ownership to thread.
     let tick_interval = {
         let poh = poh_service.read();
         let interval_ms = poh.config.slot_duration_ms / poh.config.ticks_per_slot.max(1);
         Duration::from_millis(interval_ms.max(1))
+    };
+    let slot_duration = {
+        let poh = poh_service.read();
+        Duration::from_millis(poh.config.slot_duration_ms)
     };
 
     std::thread::Builder::new()
@@ -723,22 +770,84 @@ pub async fn run_poh_clock(poh_service: SharedPoHService) {
 
             let mut tick_count = 0u64;
             let mut last_slot_log = 0u64;
+            // Count of dropped tick shreds due to full channel — logged periodically.
+            let mut drop_count: u64 = 0;
+            // Wall-clock anchor for hypervisor-suspension detection.
+            // Reset every time we successfully advance a slot.
+            let mut last_advance_wall_time = Instant::now();
 
             loop {
                 let tick_start = Instant::now();
 
-                let (_current_slot, should_advance) = {
+                let (_current_slot, should_advance, tick_shred) = {
                     let mut poh = poh_service.write();
                     poh.tick();
                     tick_count += 1;
-                    poh.mix_pending_transactions();
+                    // mix_pending_transactions() stamps queued tx IDs into the hash
+                    // BEFORE execution reaches them — this is the ordering fix.
+                    let mixed_entry = poh.mix_pending_transactions();
                     let should_advance = tick_count % poh.config.ticks_per_slot == 0;
-                    (poh.current_slot.load(Ordering::Relaxed), should_advance)
+                    let slot = poh.current_slot.load(Ordering::Relaxed);
+                    let shred = TickShred {
+                        slot,
+                        tick_index: ((tick_count - 1) % poh.config.ticks_per_slot) as u32,
+                        entry: PoHEntry {
+                            hash: poh.current_hash.clone(),
+                            num_hashes: poh.num_hashes,
+                            // Carry mixed tx IDs so Readers can reproduce the hash exactly.
+                            transactions: mixed_entry
+                                .map(|e| e.transactions)
+                                .unwrap_or_default(),
+                        },
+                        is_slot_end: should_advance,
+                    };
+                    (slot, should_advance, shred)
                 };
+
+                // Broadcast tick shred to Reader nodes.
+                // Bounded channel + try_send: if the channel is full we DROP the
+                // shred and log — the PoH OS thread NEVER blocks and NEVER OOMs.
+                if let Some(ref tx) = tick_tx {
+                    if tx.try_send(tick_shred).is_err() {
+                        drop_count += 1;
+                        if drop_count % 1_000 == 1 {
+                            eprintln!(
+                                "⚠️  poh-clock: tick shred channel full — {} shreds \
+                                 dropped (total). TurbineTickService may be stalled.",
+                                drop_count
+                            );
+                        }
+                    }
+                }
 
                 if should_advance {
                     let new_slot = {
                         let mut poh = poh_service.write();
+
+                        // ── Hypervisor suspension detection ────────────────────
+                        // If more than 1.5 slot-durations have elapsed since the
+                        // last advance, the VM was suspended.  Calculate how many
+                        // slots the wall clock moved while we were paused and
+                        // fast-forward the shared slot counter to compensate.
+                        let wall_elapsed = last_advance_wall_time.elapsed();
+                        if wall_elapsed > slot_duration.mul_f64(1.5) {
+                            let missed = (wall_elapsed.as_millis() as u64
+                                / poh.config.slot_duration_ms)
+                                .saturating_sub(1);
+                            if missed > 0 {
+                                warn!(
+                                    "⚡ Hypervisor suspension detected: \
+                                     wall_elapsed={:.2}s, fast-forwarding {} missed slots",
+                                    wall_elapsed.as_secs_f64(),
+                                    missed
+                                );
+                                let target = poh.current_slot.load(Ordering::Relaxed) + missed;
+                                poh.fast_forward_to(target);
+                            }
+                        }
+                        last_advance_wall_time = Instant::now();
+                        // ── end suspension detection ───────────────────────────
+
                         poh.advance_slot()
                     };
 

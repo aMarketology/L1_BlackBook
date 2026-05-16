@@ -179,6 +179,37 @@ impl ReaderNode {
 
         while let Some(block_data) = stream.message().await? {
             let block = proto_to_block(&block_data);
+
+            // ── Clock drift detection ──────────────────────────────────────
+            // The Writer's broadcast ring-buffer is lossy (RecvError::Lagged).
+            // If we receive block N but our local slot is < N-1, we missed at
+            // least one block.  We cannot verify the gap, so we:
+            //   1. Reset our hash-chain anchor to the incoming block's declared
+            //      `previous_hash` so chain verification continues from here.
+            //   2. Fast-forward the slot counter to N so GulfStream / pipeline
+            //      downstream all see the correct slot immediately.
+            let local_slot = self.current_slot.load(Ordering::Relaxed);
+            if block.slot > local_slot + 1 {
+                let delta = block.slot.saturating_sub(local_slot + 1);
+                warn!(
+                    "⚡ Clock drift: local_slot={local_slot}, received slot={}, \
+                     {delta} slot(s) missed — resetting chain anchor and fast-forwarding",
+                    block.slot
+                );
+                // Reset chain anchor to the incoming block's declared parent.
+                // The next block after this one will be verified against block.hash
+                // as normal.
+                {
+                    let mut h = self.latest_hash.write();
+                    *h = block.previous_hash.clone();
+                }
+                // Advance slot counter to the incoming block's slot.
+                // fetch_max: safe against a concurrent normal advance.
+                // process_block will store slot + 1 after verification.
+                self.current_slot.fetch_max(block.slot, Ordering::Relaxed);
+            }
+            // ── end drift detection ────────────────────────────────────────
+
             match self.process_block(block, "live") {
                 Ok(()) => {}
                 Err(e) => {

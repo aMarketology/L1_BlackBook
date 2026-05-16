@@ -318,6 +318,11 @@ pub struct AppState {
     // ===== Backup State =====
     pub backup_last_at: Arc<AtomicU64>,
     pub backup_last_size: Arc<AtomicU64>,
+
+    // ===== Turbine Tick Streaming =====
+    /// Registered Reader nodes for per-tick PoH shred broadcasting.
+    /// node_id → ReaderRecord { udp_addr, last_seen }
+    pub turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>>,
 }
 
 // ============================================================================
@@ -764,6 +769,9 @@ async fn signed_transfer_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Gulf Stream: {}", e) })));
     }
 
+    // Stamp tx_id into PoH BEFORE execution — correct ordering invariant.
+    state.poh.write().queue_transaction(tx_id.clone());
+
     let packet = PipelinePacket::new(tx_id.clone(), from.clone(), payload.to.clone(), amount_lamports);
     let _ = state.pipeline.submit(packet).await;
 
@@ -887,6 +895,51 @@ async fn tower_bft_handler(
         "current_slot": current_slot,
         "best_fork": best_fork.map(|(s, h)| serde_json::json!({"slot": s, "hash": h})),
     }))
+}
+
+// ── Turbine Tick Streaming HTTP handlers ─────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct TurbineRegisterRequest {
+    node_id: String,
+    udp_addr: String,
+}
+
+/// POST /turbine/register — Reader registers its UDP address for tick shred delivery.
+async fn turbine_register_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TurbineRegisterRequest>,
+) -> impl IntoResponse {
+    let addr: std::net::SocketAddr = match req.udp_addr.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid udp_addr" }))).into_response();
+        }
+    };
+    let rec = runtime::turbine::ReaderRecord {
+        udp_addr: addr,
+        last_seen: runtime::turbine::now_unix_secs(),
+    };
+    state.turbine_readers.insert(req.node_id, rec);
+    Json(serde_json::json!({ "registered": true, "reader_count": state.turbine_readers.len() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TurbineHeartbeatRequest {
+    node_id: String,
+}
+
+/// POST /turbine/heartbeat — Reader refreshes its TTL in the registry.
+async fn turbine_heartbeat_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TurbineHeartbeatRequest>,
+) -> impl IntoResponse {
+    if let Some(mut rec) = state.turbine_readers.get_mut(&req.node_id) {
+        rec.last_seen = runtime::turbine::now_unix_secs();
+        Json(serde_json::json!({ "ok": true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not registered" }))).into_response()
+    }
 }
 
 /// GET /turbine/status — Turbine shred propagation status
@@ -1051,6 +1104,9 @@ async fn gulf_stream_submit_handler(
     if let Err(e) = state.gulf_stream.submit(tx.clone()) {
         return Json(serde_json::json!({ "error": format!("Gulf Stream: {}", e) }));
     }
+
+    // Stamp tx_id into PoH BEFORE execution — correct ordering invariant.
+    state.poh.write().queue_transaction(tx_id.clone());
 
     let packet = PipelinePacket::new(tx_id.clone(), req.from, req.to, amount_raw);
     let _ = state.pipeline.submit(packet).await;
@@ -2648,6 +2704,8 @@ fn build_router(state: AppState) -> Router {
         .route("/consensus/tower", get(tower_bft_handler))
         // Turbine
         .route("/turbine/status", get(turbine_status_handler))
+        .route("/turbine/register", post(turbine_register_handler))
+        .route("/turbine/heartbeat", post(turbine_heartbeat_handler))
         // Sealevel
         .route("/sealevel/submit", post(gulf_stream_submit_handler))
         // Global Escrow Smart Contract
@@ -2828,8 +2886,15 @@ async fn main() {
         slots_per_epoch: POH_SLOTS_PER_EPOCH,
     };
     let poh_service: SharedPoHService = create_poh_service_with_slot(poh_config, current_slot.clone());
+    // Bounded tick broadcast channel — drops shreds when TurbineTickService stalls (never OOM).
+    let (tick_tx_for_clock, tick_rx_for_service) = if config.mode == NodeMode::Writer {
+        let (tx, rx) = tokio::sync::mpsc::channel::<runtime::TickShred>(runtime::turbine::TICK_CHANNEL_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let poh_runner = poh_service.clone();
-    tokio::spawn(async move { run_poh_clock(poh_runner).await; });
+    tokio::spawn(async move { run_poh_clock(poh_runner, tick_tx_for_clock).await; });
     info!("🕐 PoH clock started ({}ms slots)", POH_SLOT_DURATION_MS);
 
     // 3. Blockchain (ReDB)
@@ -3069,6 +3134,11 @@ async fn main() {
         });
     }
 
+    // Turbine reader registry — shared with HTTP handlers and TurbineTickService.
+    // Initialized early so the Writer mode block can reference it.
+    let turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>> =
+        Arc::new(dashmap::DashMap::new());
+
     // 4b. Block Production Loop + Relay (WRITER MODE ONLY)
     // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
     let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if config.mode == NodeMode::Writer {
@@ -3132,6 +3202,14 @@ async fn main() {
 
         let validator_id_for_loop = validator_id.clone();
         let relay_tx = block_sender.clone();
+
+        // ── Turbine Tick Streaming service (Writer mode only) ──────────────────
+        if let Some(tick_rx) = tick_rx_for_service {
+            let svc = runtime::turbine::TurbineTickService::new(tick_rx, turbine_readers.clone());
+            tokio::spawn(svc.run());
+            runtime::turbine::spawn_reader_pruner(turbine_readers.clone());
+            info!("📡 Turbine tick service started on UDP port {}", runtime::turbine::TURBINE_TICK_PORT);
+        }
         {
             let bp = block_producer.clone();
             let ft = finality_tracker.clone();
@@ -3160,6 +3238,12 @@ async fn main() {
                                 }
                                 Err(e) => tracing::debug!("🗼 Vote skip slot {}: {}", block.slot, e),
                             }
+
+                            // TowerBFT clock reconciliation — if any peer vote has moved the
+                            // heaviest fork ahead of our local PoH clock (e.g. after a
+                            // leader hand-off or a brief VM suspension), fast-forward now
+                            // so the next block is produced at the correct slot.
+                            tower.reconcile_clock();
 
                             // Epoch rotation
                             let epoch = block.slot / POH_SLOTS_PER_EPOCH;
@@ -3367,6 +3451,45 @@ async fn main() {
             reader_node.run().await;
         });
         info!("📖 Reader sync task started → {}", config.writer_addr);
+
+        // ── Turbine Tick Receiver — verify PoH chain in real-time from Writer ───
+        let genesis_hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"LAYER1_POH_GENESIS_2024_CONTINUOUS_PROOF_OF_HISTORY");
+            format!("{:x}", h.finalize())
+        };
+        let tick_listen: std::net::SocketAddr =
+            format!("0.0.0.0:{}", runtime::turbine::TURBINE_TICK_PORT)
+                .parse()
+                .expect("valid turbine listen addr");
+        let tick_recv = runtime::turbine::TurbineTickReceiver::new(
+            tick_listen, genesis_hash, POH_HASHES_PER_TICK,
+        );
+        tokio::spawn(tick_recv.run());
+        // Register this Reader with the Writer's /turbine/register endpoint
+        let writer_http = config.writer_addr.replace(":50051", ":8080");
+        let my_udp_addr = std::env::var("TURBINE_MY_UDP_ADDR")
+            .unwrap_or_else(|_| format!("0.0.0.0:{}", runtime::turbine::TURBINE_TICK_PORT));
+        let reg_body = serde_json::json!({ "node_id": validator_id.clone(), "udp_addr": my_udp_addr });
+        let writer_url = format!("http://{}/turbine/register", writer_http);
+        tokio::spawn(async move {
+            for attempt in 1u64..=5 {
+                match reqwest::Client::new().post(&writer_url).json(&reg_body).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        info!("✅ Registered with Writer Turbine at {}", writer_url);
+                        break;
+                    }
+                    _ => {
+                        if attempt < 5 {
+                            tokio::time::sleep(std::time::Duration::from_secs(attempt * 2)).await;
+                        } else {
+                            warn!("⚠️  Failed to register with Writer Turbine after 5 attempts");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // ── Custody Watcher — Solana RPC balance poller + auto-approver ───────────
@@ -3473,6 +3596,7 @@ async fn main() {
         coin_balances: coin_balances_map,
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
+        turbine_readers: turbine_readers.clone(),
     };
 
     // Start custody watcher background task (if custody wallet is configured)
@@ -3862,6 +3986,7 @@ async fn main() {
         state.pipeline.clone(),
         state.blockchain.clone(),
         state.used_nonces.clone(),
+        state.poh.clone(),
     );
     tokio::spawn(async move {
         tpu_service.run(tpu_addr).await;

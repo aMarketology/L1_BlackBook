@@ -29,7 +29,7 @@ use parking_lot::RwLock;
 use borsh::{BorshSerialize, BorshDeserialize};
 use dashmap::DashMap;
 use sha2::{Sha256, Digest};
-use tracing::info;
+use tracing::{info, warn};
 use crate::runtime::core::Transaction;
 
 // ============================================================================
@@ -577,6 +577,57 @@ impl TowerBFT {
             }
         }
         best.map(|(s, h, _)| (s, h))
+    }
+
+    /// Returns the highest slot on the heaviest fork (most accumulated stake weight).
+    ///
+    /// Used by Reader nodes and the Writer's suspension-recovery path to detect when
+    /// the local `Arc<AtomicU64>` slot counter has fallen behind the network's voted
+    /// tip.  Unlike `select_fork()`, this returns only the slot number so callers
+    /// can compare against their local clock cheaply without holding any extra locks.
+    pub fn heaviest_confirmed_slot(&self) -> Option<u64> {
+        let root = self.global_root();
+        self.forks
+            .iter()
+            .filter(|e| e.slot >= root && e.vote_count >= MIN_FORK_VOTES)
+            .max_by(|a, b| {
+                a.stake
+                    .partial_cmp(&b.stake)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|e| e.slot)
+    }
+
+    /// Reconcile the shared slot clock against the heaviest confirmed slot.
+    ///
+    /// If the network's heaviest voted slot is **ahead** of `current_slot`, this
+    /// atomically fast-forwards the counter using `fetch_max` (safe against races
+    /// with the normal PoH advance).
+    ///
+    /// Returns the number of slots skipped, or `None` if the clock was already
+    /// at or past the network tip.
+    ///
+    /// # When to call
+    /// - Reader node: after processing a batch of incoming `Vote` gossip messages.
+    /// - Writer node: inside the block-production loop as a sanity check after
+    ///   receiving out-of-order blocks during leader hand-off.
+    pub fn reconcile_clock(&self) -> Option<u64> {
+        let heaviest = self.heaviest_confirmed_slot()?;
+        let local = self.current_slot.load(Ordering::Relaxed);
+        if heaviest > local {
+            // fetch_max: atomically advance only if heaviest > current.
+            // Returns the *previous* value — if it changed we really did fast-forward.
+            let prev = self.current_slot.fetch_max(heaviest, Ordering::Relaxed);
+            if heaviest > prev {
+                let delta = heaviest - prev;
+                warn!(
+                    "⚡ TowerBFT clock reconcile: \
+                     local_slot={prev} → network_heaviest={heaviest} (+{delta} slots skipped)"
+                );
+                return Some(delta);
+            }
+        }
+        None
     }
 
     pub fn get_stats(&self) -> TowerBFTStats {
