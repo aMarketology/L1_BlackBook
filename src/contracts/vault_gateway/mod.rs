@@ -143,10 +143,9 @@ pub async fn burn_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid wallet pubkey" }))),
     };
 
-    // ── ATOMIC: Destroy BB, Create wUSDT ─────────────────────────────────
-    // Step A: Debit BB (permanently destroys from supply — NOT to a pool)
-    let bb_amount_f64 = req.bb_lamports as f64 / LAMPORTS_PER_BB as f64;
-    if let Err(e) = state.blockchain.debit(&req.wallet_address, bb_amount_f64) {
+    // ── ATOMIC: Destroy BB, Create wUSDT ──────────────────────────────────
+    // Step A: Debit BB lamports (permanently destroys from supply — no f64)
+    if let Err(e) = state.blockchain.debit_svm_lamports(&req.wallet_address, req.bb_lamports) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("BB burn failed: {}", e)
         })));
@@ -156,7 +155,7 @@ pub async fn burn_handler(
     let mint = usdc_mint_bytes();
     if let Err(e) = SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, wusdt_micro) {
         // Rollback: restore user's BB
-        if let Err(re) = state.blockchain.credit(&req.wallet_address, bb_amount_f64) {
+        if let Err(re) = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_lamports) {
             error!("CRITICAL: wUSDT mint failed AND BB rollback failed for wallet {}: mint_err={} rollback_err={}", req.wallet_address, e, re);
         } else {
             warn!("wUSDT mint failed, BB rollback successful: {}", e);

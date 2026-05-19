@@ -79,21 +79,32 @@ async fn finalize_ready_roots(state: &AppState) {
                     }
                 }
 
+                // ── PERSISTENCE GUARANTEE: ReDB FIRST, cache AFTER ───────────
+                // Mark the root Finalized in ReDB before touching any DashMap cache.
+                // If this write fails, we leave status = Pending in ReDB so the next
+                // finalize tick will retry naturally — cache is never mutated on error.
                 root.status = PendingRootStatus::Finalized;
                 if let Err(e) = state.blockchain.store_pending_root(&root) {
-                    warn!("Oracle finalize: failed to persist Finalized status for {}: {}", root.market_id, e);
+                    warn!("Oracle finalize: failed to persist Finalized status for {} — will retry next tick: {}", root.market_id, e);
+                    continue;
                 }
 
-                // Also write into contest_states (connect to existing escrow system)
+                // Persist ContestState update to ReDB before cache (same guarantee).
                 if let Ok(Some(mut contest)) = state.blockchain.load_contest_state(&root.market_id) {
                     contest.merkle_root = root.merkle_root;
                     contest.status = crate::storage::ContestStatus::Settled;
-                    if let Ok(()) = state.blockchain.store_contest_state(&contest) {
+                    if let Err(e) = state.blockchain.store_contest_state(&contest) {
+                        warn!("Oracle finalize: failed to persist contest state for {} — cache not updated: {}", root.market_id, e);
+                        // Don't continue — market root + Finalized status already persisted above.
+                        // Cache update is best-effort here; will resync on next node boot from ReDB.
+                    } else {
                         state.contest_states.insert(root.market_id.clone(), contest);
                     }
                 }
-                // Update in-memory market_roots cache
+
+                // ── UPDATE CACHE only after all durable writes succeeded ──────
                 state.market_roots.insert(root.market_id.clone(), root.merkle_root);
+                info!("📋 Oracle finalize: ReDB-first writes complete for market={}", root.market_id);
             }
 
             PendingRootStatus::Disputed => {

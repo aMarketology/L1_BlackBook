@@ -171,12 +171,11 @@ pub async fn swap_bb_for_usdc_handler(
     }
 
     // 3. Execute swap atomically:
-    let bb_amount_f64 = req.bb_amount as f64 / LAMPORTS_PER_BB as f64;
-    //    A) Debit user BB → Credit pool BB
-    if let Err(e) = state.blockchain.debit(&req.wallet_address, bb_amount_f64) {
+    //    A) Debit user BB → Credit pool BB (u64 lamports — no f64)
+    if let Err(e) = state.blockchain.debit_svm_lamports(&req.wallet_address, req.bb_amount) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB debit failed: {}", e) })));
     }
-    let _ = state.blockchain.credit(&pool_address, bb_amount_f64);
+    let _ = state.blockchain.credit_svm_lamports(&pool_address, req.bb_amount);
 
     //    B) Transfer wUSDT from pool → user
     if let Err(e) = SplTokenEngine::transfer_tokens(
@@ -187,8 +186,8 @@ pub async fn swap_bb_for_usdc_handler(
         usdc_raw_output,
     ) {
         // Rollback BB
-        let _ = state.blockchain.debit(&pool_address, bb_amount_f64);
-        let _ = state.blockchain.credit(&req.wallet_address, bb_amount_f64);
+        let _ = state.blockchain.debit_svm_lamports(&pool_address, req.bb_amount);
+        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT transfer failed: {}", e) })));
     }
 
@@ -206,8 +205,8 @@ pub async fn swap_bb_for_usdc_handler(
             req.bb_amount, usdc_raw_output, actual_bb_gained, actual_usdc_lost
         );
         // Rollback: undo pool BB credit, undo user BB debit, undo wUSDT transfer
-        let _ = state.blockchain.debit(&pool_address, bb_amount_f64);
-        let _ = state.blockchain.credit(&req.wallet_address, bb_amount_f64);
+        let _ = state.blockchain.debit_svm_lamports(&pool_address, req.bb_amount);
+        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_amount);
         let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, &pool_pubkey, usdc_raw_output);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
     }
@@ -300,8 +299,7 @@ pub async fn swap_usdc_for_bb_handler(
     }
 
     // 3. Execute swap atomically:
-    let bb_output_f64 = bb_lamports_output as f64 / LAMPORTS_PER_BB as f64;
-    //    A) Transfer wUSDT from user → pool
+    //    A) Transfer wUSDT from user → pool (u64 micro-units — always integer)
     if let Err(e) = SplTokenEngine::transfer_tokens(
         &state.blockchain.svm_accounts,
         &mint,
@@ -312,13 +310,13 @@ pub async fn swap_usdc_for_bb_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("wUSDT debit failed: {}", e) })));
     }
 
-    //    B) Debit BB from pool → credit user
-    if let Err(e) = state.blockchain.debit(&pool_address, bb_output_f64) {
+    //    B) Debit BB from pool → credit user (u64 lamports — no f64)
+    if let Err(e) = state.blockchain.debit_svm_lamports(&pool_address, bb_lamports_output) {
         // Rollback wUSDT
         let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB debit from pool failed: {}", e) })));
     }
-    let _ = state.blockchain.credit(&req.wallet_address, bb_output_f64);
+    let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, bb_lamports_output);
 
     // ── POOL DELTA INVARIANT CHECK ───────────────────────────────────────────
     // Verify pool gained exactly usdc_amount wUSDT and lost exactly bb_lamports_output BB.
@@ -332,8 +330,8 @@ pub async fn swap_usdc_for_bb_handler(
             bb_lamports_output, req.usdc_amount, actual_bb_lost, actual_usdc_gained
         );
         // Rollback: undo pool BB debit, undo user credit, undo wUSDT transfer
-        let _ = state.blockchain.credit(&pool_address, bb_output_f64);
-        let _ = state.blockchain.debit(&req.wallet_address, bb_output_f64);
+        let _ = state.blockchain.credit_svm_lamports(&pool_address, bb_lamports_output);
+        let _ = state.blockchain.debit_svm_lamports(&req.wallet_address, bb_lamports_output);
         let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
     }

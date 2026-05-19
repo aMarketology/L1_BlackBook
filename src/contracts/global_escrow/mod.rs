@@ -149,16 +149,15 @@ pub async fn escrow_deposit_handler(
         })));
     }
 
-    // ── EXECUTE: debit user → credit escrow PDA (u64 → f64 at API boundary) ─
+    // ── EXECUTE: debit user → credit escrow PDA (u64 lamports — no f64) ──────
     let escrow_addr = escrow_vault_address();
-    let amount_bb = req.amount as f64 / LAMPORTS_PER_BB as f64;
 
-    if let Err(e) = state.blockchain.debit(&req.wallet_address, amount_bb) {
+    if let Err(e) = state.blockchain.debit_svm_lamports(&req.wallet_address, req.amount) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Debit failed: {}", e) })));
     }
-    if let Err(e) = state.blockchain.credit(&escrow_addr, amount_bb) {
+    if let Err(e) = state.blockchain.credit_svm_lamports(&escrow_addr, req.amount) {
         // Rollback debit on credit failure
-        let _ = state.blockchain.credit(&req.wallet_address, amount_bb);
+        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Escrow credit failed: {}", e) })));
     }
 
@@ -210,7 +209,7 @@ pub async fn escrow_deposit_handler(
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "deposited_lamports": req.amount,
-        "deposited_bb": amount_bb,
+        "deposited_bb": req.amount as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         "tx_hash": tx_hash,
         "wallet_address": req.wallet_address,
         "escrow_address": &escrow_addr,
@@ -643,7 +642,7 @@ pub async fn escrow_withdraw_handler(
         }
     }
 
-    // ── EXECUTE: debit escrow PDA → credit user (u64 lamports) ───────────────
+    // ── EXECUTE: debit escrow PDA → credit user (u64 lamports — no f64) ─────
     let escrow_addr = escrow_vault_address();
     let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_addr);
     if escrow_balance_lamports < req.amount {
@@ -652,13 +651,12 @@ pub async fn escrow_withdraw_handler(
         })));
     }
 
-    let amount_bb = req.amount as f64 / LAMPORTS_PER_BB as f64;
-    if let Err(e) = state.blockchain.debit(&escrow_addr, amount_bb) {
+    if let Err(e) = state.blockchain.debit_svm_lamports(&escrow_addr, req.amount) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Escrow debit failed: {}", e) })));
     }
-    if let Err(e) = state.blockchain.credit(&req.wallet_address, amount_bb) {
+    if let Err(e) = state.blockchain.credit_svm_lamports(&req.wallet_address, req.amount) {
         // Rollback
-        let _ = state.blockchain.credit(&escrow_addr, amount_bb);
+        let _ = state.blockchain.credit_svm_lamports(&escrow_addr, req.amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("User credit failed: {}", e) })));
     }
 
@@ -711,7 +709,7 @@ pub async fn escrow_withdraw_handler(
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "withdrawn_lamports": req.amount,
-        "withdrawn_bb": amount_bb,
+        "withdrawn_bb": req.amount as f64 / crate::svm::LAMPORTS_PER_BB as f64,
         "market_id": req.market_id,
         "wallet_address": req.wallet_address,
         "new_balance_lamports": new_balance_lamports,

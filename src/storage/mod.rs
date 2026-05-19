@@ -281,8 +281,27 @@ pub struct PendingRoot {
 // ENHANCED TRANSACTION RECORD (Full Blockchain Integrity)
 // ============================================================================
 
+/// Lenient deserializer: accepts both JSON integers *and* JSON floats for u64 fields.
+///
+/// Pre-migration ReDB records may have stored `amount`, `gas_fee`, and balance
+/// fields as `f64` (e.g. `"amount": 10.0`).  The current struct uses `u64`.
+/// This helper prevents those records from silently failing `serde_json::from_slice`.
+fn deser_u64_compat<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AnyNum { Int(u64), Float(f64) }
+    match AnyNum::deserialize(d)? {
+        AnyNum::Int(n)   => Ok(n),
+        AnyNum::Float(f) => Ok(f as u64),
+    }
+}
+
 /// Enhanced transaction record with full blockchain integrity fields
-/// 
+///
 /// This structure provides:
 /// - Chain Integrity: block_height, tx_hash, prev_tx_hash, merkle_root
 /// - Auth & ZK: zk_proof_ref, session_id, auth_type, gas_fee
@@ -294,6 +313,7 @@ pub struct TransactionRecord {
     pub tx_type: String,  // "transfer", "mint", "burn", "bridge_out", "bridge_in"
     pub from_address: String,
     pub to_address: String,
+    #[serde(deserialize_with = "deser_u64_compat")]
     pub amount: u64,
     pub timestamp: u64,  // Unix timestamp (seconds)
     pub status: String,  // "completed", "failed", "pending", "finalized"
@@ -323,7 +343,7 @@ pub struct TransactionRecord {
     #[serde(default)]
     pub auth_type: String,
     /// Gas/computational fee (0 for users, tracked for health)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u64_compat")]
     pub gas_fee: u64,
     
     // === STATE VALIDATION (The Health Check) ===
@@ -331,13 +351,13 @@ pub struct TransactionRecord {
     #[serde(default)]
     pub nonce: u64,
     /// Sender's balance before transaction
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u64_compat")]
     pub balance_before: u64,
     /// Sender's balance after transaction
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u64_compat")]
     pub balance_after: u64,
     /// Recipient's balance after transaction
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u64_compat")]
     pub recipient_balance_after: u64,
     /// Validator's Ed25519 signature (hex)
     #[serde(default)]
@@ -872,6 +892,13 @@ impl ConcurrentBlockchain {
     ///
     /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
     /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
+    ///
+    /// # Deprecated
+    /// Prefer `credit_svm_lamports(address, lamports)` for all new code.
+    /// f64 → u64 conversion is lossy for balances above 2^53 lamports.
+    /// This wrapper is kept for backward compatibility with the public HTTP
+    /// API boundary (faucet, admin) where the amount arrives as a float.
+    #[deprecated(note = "use credit_svm_lamports(address, lamports: u64) to avoid f64 precision loss")]
     pub fn credit(&self, address: &str, amount: f64) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
@@ -962,6 +989,11 @@ impl ConcurrentBlockchain {
     ///
     /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
     /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
+    ///
+    /// # Deprecated
+    /// Prefer `debit_svm_lamports(address, lamports)` for all new code.
+    /// f64 → u64 conversion is lossy for balances above 2^53 lamports.
+    #[deprecated(note = "use debit_svm_lamports(address, lamports: u64) to avoid f64 precision loss")]
     pub fn debit(&self, address: &str, amount: f64) -> Result<(), String> {
         if amount <= 0.0 {
             return Err("Amount must be positive".to_string());
@@ -1508,10 +1540,11 @@ impl ConcurrentBlockchain {
         self.processed_bridge_txs.remove(tx_hash);
     }
 
-    /// Credit a wallet using integer lamports (Bug #1: no f64 in financial logic).
+    /// Credit a wallet using integer lamports — zero f64 conversion.
+    ///
+    /// Delegates to `credit_svm_lamports`. Kept for call-site naming convenience.
     pub fn credit_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
-        let bb = lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64;
-        self.credit(address, bb)
+        self.credit_svm_lamports(address, lamports)
     }
 
     /// Credit lamports directly — zero f64 conversion.
@@ -1550,7 +1583,11 @@ impl ConcurrentBlockchain {
                 current, lamports
             ));
         }
-        let new_lamports = current - lamports;
+        let new_lamports = current.checked_sub(lamports)
+            .ok_or_else(|| format!(
+                "Arithmetic underflow: have {} lamports, tried to sub {}",
+                current, lamports
+            ))?;
         let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
         self.svm_accounts.store_account(&pk, account);
         self.mirror_balance_to_cache(address, new_lamports);

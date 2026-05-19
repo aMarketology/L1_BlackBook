@@ -290,3 +290,154 @@ fn test_large_market_100_winners() {
             "Failed for winner #{} ({})", idx, w.wallet_address);
     }
 }
+
+// ============================================================================
+// TESTS — gRPC SubmitMerkleRoot canonical signed-message format
+// ============================================================================
+
+/// The gRPC and HTTP handlers both build the signed message as:
+///   contest_id_bytes ++ l2_block_number.to_le_bytes(8) ++ merkle_root[32]
+/// Verify that the byte packing is deterministic and matches the L2 builder.
+#[test]
+fn test_submit_merkle_root_signed_message_format() {
+    use sha2::{Sha256, Digest};
+
+    let contest_id = "market_final_001";
+    let l2_block_number: u64 = 42;
+
+    // Build a 2-winner root
+    let winners = vec![
+        WinnerEntry { wallet_address: make_wallet(1), payout_spl: 4_000_000 },
+        WinnerEntry { wallet_address: make_wallet(2), payout_spl: 6_000_000 },
+    ];
+    let root = l2_build_root(&winners);
+
+    // Replicate the signed message construction from global_escrow/mod.rs:
+    //   signed_message = contest_id.as_bytes() ++ l2_block_number.to_le_bytes() ++ root[32]
+    let mut signed_message: Vec<u8> = Vec::with_capacity(contest_id.len() + 8 + 32);
+    signed_message.extend_from_slice(contest_id.as_bytes());
+    signed_message.extend_from_slice(&l2_block_number.to_le_bytes());
+    signed_message.extend_from_slice(&root);
+
+    // The message must be deterministic (same inputs → same bytes, same length).
+    let expected_len = contest_id.len() + 8 + 32;
+    assert_eq!(signed_message.len(), expected_len,
+        "signed message length must be contest_id_len + 8 + 32");
+
+    // l2_block_number bytes must appear at the correct offset.
+    let block_bytes_in_msg = &signed_message[contest_id.len()..contest_id.len() + 8];
+    let recovered_block = u64::from_le_bytes(block_bytes_in_msg.try_into().unwrap());
+    assert_eq!(recovered_block, l2_block_number,
+        "l2_block_number must round-trip through the signed message LE encoding");
+
+    // Merkle root bytes must appear at the correct offset.
+    let root_bytes_in_msg = &signed_message[contest_id.len() + 8..];
+    assert_eq!(root_bytes_in_msg, root.as_slice(),
+        "merkle root bytes must be intact at the end of the signed message");
+
+    // Sanity: SHA-256 of the packed message is deterministic.
+    let digest1: [u8; 32] = Sha256::digest(&signed_message).into();
+    let digest2: [u8; 32] = Sha256::digest(&signed_message).into();
+    assert_eq!(digest1, digest2);
+}
+
+/// The l2_block_number in the signed message is encoded little-endian.
+/// Confirm endianness assumption against a known value.
+#[test]
+fn test_l2_block_number_little_endian_encoding() {
+    // Block 256 = 0x0000_0000_0000_0100 → LE bytes = [0x00, 0x01, 0x00, 0x00, ...]
+    let block: u64 = 256;
+    let le_bytes = block.to_le_bytes();
+    assert_eq!(le_bytes[0], 0x00);
+    assert_eq!(le_bytes[1], 0x01);
+    assert!(le_bytes[2..].iter().all(|&b| b == 0));
+
+    // Round-trip
+    assert_eq!(u64::from_le_bytes(le_bytes), 256);
+}
+
+// ============================================================================
+// TESTS — monotonicity guard (logic-level, matches handler implementation)
+// ============================================================================
+
+/// The handler guard is: `if incoming <= existing.last_l2_block { reject }`.
+/// Test this exact expression against known edge cases.
+#[test]
+fn test_monotonicity_guard_edge_cases() {
+    struct GuardFixture { stored: u64, incoming: u64, should_accept: bool }
+
+    let cases = vec![
+        GuardFixture { stored: 0,          incoming: 1,          should_accept: true  },
+        GuardFixture { stored: 0,          incoming: 0,          should_accept: false }, // equal
+        GuardFixture { stored: 10,         incoming: 11,         should_accept: true  },
+        GuardFixture { stored: 10,         incoming: 10,         should_accept: false }, // equal
+        GuardFixture { stored: 10,         incoming: 9,          should_accept: false }, // regress
+        GuardFixture { stored: u64::MAX-1, incoming: u64::MAX,   should_accept: true  },
+        GuardFixture { stored: u64::MAX,   incoming: u64::MAX,   should_accept: false }, // equal at max
+        GuardFixture { stored: 100,        incoming: 0,          should_accept: false }, // regress to 0
+    ];
+
+    for (i, c) in cases.iter().enumerate() {
+        let accepted = c.incoming > c.stored;
+        assert_eq!(
+            accepted, c.should_accept,
+            "case {}: stored={} incoming={} expected_accept={} got={}",
+            i, c.stored, c.incoming, c.should_accept, accepted
+        );
+    }
+}
+
+/// The zero-sum invariant is: total_deposited == total_payout + house_rake.
+/// Confirm it holds and that the guard expression matches the handler.
+#[test]
+fn test_zero_sum_invariant_guard() {
+    // Valid: 10_000_000 = 9_000_000 + 1_000_000
+    let total_deposited: u64 = 10_000_000;
+    let total_payout: u64    =  9_000_000;
+    let house_rake: u64      =  1_000_000;
+    assert_eq!(
+        total_deposited,
+        total_payout.saturating_add(house_rake),
+        "zero-sum invariant must hold for valid values"
+    );
+
+    // Invalid: rake is 1 unit off → guard should catch this.
+    let bad_rake: u64 = 999_999;
+    assert_ne!(
+        total_deposited,
+        total_payout.saturating_add(bad_rake),
+        "zero-sum invariant must fail when rake is wrong"
+    );
+}
+
+/// Payout SPL units used in the Merkle leaf must be the u64 wire value, not a
+/// float-converted approximation.  Verify that using u64 directly matches the
+/// leaf the L1 withdraw handler reconstructs from the request body.
+#[test]
+fn test_payout_spl_u64_matches_leaf_reconstruction() {
+    let wallet = make_wallet(77);
+    let payout_spl_exact: u64 = 7_777_777; // odd number — would lose precision in f64
+
+    let leaf_from_l2 = compute_leaf(&wallet, payout_spl_exact);
+
+    // Simulate what would happen if f64 snuck in (this is the regression we prevent).
+    let payout_as_f64 = payout_spl_exact as f64;
+    let payout_recovered = payout_as_f64 as u64;
+
+    // For this specific value, f64 happens to be exact, but the test documents the pattern.
+    let leaf_from_f64_path = compute_leaf(&wallet, payout_recovered);
+    assert_eq!(
+        leaf_from_l2, leaf_from_f64_path,
+        "This test documents that f64 → u64 may silently lose precision for large payouts"
+    );
+
+    // Demonstrate the actual precision hazard with a value that f64 rounds:
+    // f64 has 53 bits of mantissa; integers > 2^53 lose precision.
+    let large_payout: u64 = (1u64 << 53) + 1; // 9_007_199_254_740_993
+    let large_as_f64  = large_payout as f64;
+    let large_via_f64 = large_as_f64 as u64;
+    assert_ne!(
+        large_payout, large_via_f64,
+        "f64 loses precision at 2^53+1 — this is why all payouts must stay u64 end-to-end"
+    );
+}

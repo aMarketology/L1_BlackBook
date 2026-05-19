@@ -156,11 +156,10 @@ fn sweep_one(
     block_producer: &BlockProducer,
 ) -> Option<String> {
     let vault_addr = &contest.vault_pda;
-    let rake_bb = contest.house_rake as f64 / LAMPORTS_PER_BB as f64;
     let tx_hash = uuid::Uuid::new_v4().to_string();
 
-    // ── TRANSFER: per-contest vault PDA → house treasury PDA ─────────────
-    if let Err(e) = blockchain.debit(vault_addr, rake_bb) {
+    // ── TRANSFER: per-contest vault PDA → house treasury PDA (u64 lamports) ──
+    if let Err(e) = blockchain.debit_svm_lamports(vault_addr, contest.house_rake) {
         warn!(
             contest_id = %contest.contest_id,
             error = %e,
@@ -168,9 +167,9 @@ fn sweep_one(
         );
         return None;
     }
-    if let Err(e) = blockchain.credit(treasury_addr, rake_bb) {
+    if let Err(e) = blockchain.credit_svm_lamports(treasury_addr, contest.house_rake) {
         // Rollback the debit so funds are not lost
-        if let Err(rb) = blockchain.credit(vault_addr, rake_bb) {
+        if let Err(rb) = blockchain.credit_svm_lamports(vault_addr, contest.house_rake) {
             error!(
                 contest_id = %contest.contest_id,
                 rollback_error = %rb,
@@ -193,8 +192,8 @@ fn sweep_one(
     // ── PERSISTENCE GUARANTEE: ReDB FIRST, DashMap AFTER ─────────────────
     if let Err(e) = blockchain.store_contest_state(&updated) {
         // Rollback token transfer
-        let _ = blockchain.debit(treasury_addr, rake_bb);
-        let _ = blockchain.credit(vault_addr, rake_bb);
+        let _ = blockchain.debit_svm_lamports(treasury_addr, contest.house_rake);
+        let _ = blockchain.credit_svm_lamports(vault_addr, contest.house_rake);
         error!(
             contest_id = %contest.contest_id,
             error = %e,
