@@ -14,10 +14,10 @@ use std::str::FromStr;
 // The pool PDA (swap_pool_pda()) holds both $BB and wUSDT — no private key exists
 // for this address; only the swap handlers below can move funds from it.
 //
-// Rate: 10 BB = 1 wUSDT  (same as deposit gateway)
+// Rate: 1 BB = 1 wUSDT  ($BB is a 1:1 USD stablecoin)
 // ============================================================================
 
-/// 10 BB = 1 wUSDT (integer ratio)
+/// 1 wUSDT = 10 BB ($0.10 per BB — dealer fixed rate)
 pub const BB_TO_USDC_RATE: u64 = 10;
 
 #[allow(dead_code)]

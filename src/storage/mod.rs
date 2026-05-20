@@ -1940,7 +1940,7 @@ pub struct DepositRecord {
     pub asset: String,
     /// Amount of stablecoin the user deposited, in 6-decimal micro-units (e.g. 1 USDT = 1_000_000)
     pub amount_micro_stablecoin: u64,
-    /// BB lamports to mint (5 dec; 1 BB = 100_000 lamports; 10 BB per 1 USDT)
+    /// BB lamports to mint (5 dec; 1 BB = 100_000 lamports; 1 BB per 1 USDT)
     pub bb_lamports: u64,
     /// "pending" | "approved" | "rejected"
     pub status: String,

@@ -47,7 +47,7 @@ pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Solana mainnet USDT SPL token mint.
 pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
-/// Exchange rate between stablecoins and BB (1 USDC = 10 BB).
+/// Exchange rate between stablecoins and BB (1 USDC = 10 BB — $0.10/BB).
 #[allow(dead_code)]
 const BB_PER_STABLECOIN: f64 = 10.0;
 
@@ -405,14 +405,14 @@ impl CustodyWatcher {
             Err(_) => 0.0,
         };
 
-        // Expected wUSDT = total BB supply / 10
+        // Expected wUSDT = total BB supply / 10 (10 BB per wUSDT)
         let total_bb = self.blockchain.total_supply();
         let expected_wusdt = total_bb / 10.0;
         let missing_wusdt = expected_wusdt - current_wusdt_supply;
 
         if missing_wusdt <= 0.000_001 {
             info!("✅ Invariant OK — {:.6} BB backed by {:.6} wUSDT (ratio {:.2})",
-                total_bb, current_wusdt_supply, if current_wusdt_supply > 0.0 { total_bb / current_wusdt_supply } else { 0.0 });
+                total_bb, current_wusdt_supply, if current_wusdt_supply > 0.0 { total_bb / current_wusdt_supply } else { 10.0 });
             return;
         }
 

@@ -11,7 +11,7 @@
 //      the BOLT11 string to the user. They pay it from any LN wallet.
 //   4. When the invoice settles, BTCPayServer POSTs to /lightning/webhook
 //      with HMAC-SHA256 signature. We verify, then mint BB at the locked
-//      USD price (10 BB per USD) and mark the invoice "settled".
+//      USD price (10 BB per USD — $0.10/BB) and mark the invoice "settled".
 //   5. The invoice_id is recorded in the bridge-tx table as `ln:{invoice_id}`
 //      — same double-mint protection as Solana / BSC deposits.
 //

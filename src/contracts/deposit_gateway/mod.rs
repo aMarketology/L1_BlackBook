@@ -18,11 +18,11 @@ use crate::storage::DepositRecord;
 //        - the stablecoin amount
 //        - an Ed25519 signature proving they own the BB wallet
 //   3. Dealer calls POST /admin/deposit/approve with the tx hash
-//        - L1 mints BB at the fixed 10:1 ratio (10 USDC = 1 BB)
+//        - L1 mints BB at the fixed 10:1 ratio (1 USDC = 10 BB — $0.10/BB)
 //        - The external tx hash is permanently recorded as processed
 //          (double-mint protection via PROCESSED_BRIDGE_TXS table)
 //
-// Rate: 1 USDC/USDT = 10 BB  (BB_PER_STABLECOIN = 10.0)
+// Rate: 1 USDC/USDT = 1 BB  (BB is a 1:1 USD stablecoin)
 //
 // This module is intentionally minimal. Future upgrades:
 //   - Oracle verification of the external tx (on-chain proof)

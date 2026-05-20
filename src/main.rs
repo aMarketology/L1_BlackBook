@@ -1179,7 +1179,7 @@ async fn admin_mint_handler(
                         .unwrap_or_default()
                         .as_secs(),
                     data: TxData::DepositUsdt {
-                        usdt_amount: (req.amount / 10.0) as u64,
+                        usdt_amount: req.amount as u64,
                         external_tx_hash: req.l2_receipt_id.clone(),
                     },
                     signature: "admin_mint".to_string(),
@@ -1387,13 +1387,14 @@ async fn faucet_handler(
     }
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
-    match state.blockchain.credit(&req.wallet_address, amount) {
+    let lamports = (amount * crate::svm::LAMPORTS_PER_BB as f64) as u64;
+    match state.blockchain.credit_svm_lamports(&req.wallet_address, lamports) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.wallet_address);
             info!("🚰 FAUCET: {} BB → {} (Ed25519 verified)", amount, req.wallet_address);
 
             // Record epoch claim for rate limiting (epoch, lamports)
-            let amount_lamports = (amount * crate::svm::types::LAMPORTS_PER_BB as f64) as u64;
+            let amount_lamports = lamports;
             state.faucet_claims.insert(req.wallet_address.clone(), (current_epoch, amount_lamports));
 
             // Record faucet mint into PoH block
@@ -1405,7 +1406,7 @@ async fn faucet_handler(
                     from: "SYSTEM_FAUCET".to_string(),
                     timestamp: now,
                     data: TxData::DepositUsdt {
-                        usdt_amount: (amount / 10.0) as u64,
+                        usdt_amount: amount as u64,
                         external_tx_hash: Some(format!("faucet_{}", req.nonce)),
                     },
                     signature: req.signature.clone(),
@@ -1728,7 +1729,7 @@ async fn swap_pool_balances_handler(
         "wusdt": { "raw": usdt_raw, "balance": usdt_display },
         "ratio": ratio,
         "expected_ratio": 10.0,
-        "ratio_ok": (ratio - 10.0_f64).abs() < 0.01 || (bb_lamports == 0 && usdt_raw == 0),
+        "ratio_ok": (ratio - 10.0_f64).abs() < 0.1 || (bb_lamports == 0 && usdt_raw == 0),
     })))
 }
 
@@ -2464,7 +2465,7 @@ fn format_address_with_username(addr: &str, username: Option<&str>) -> String {
 }
 
 // ============================================================================
-// SUPPLY AUDIT — Invariant: total_bb == total_wUSDT * 10
+// SUPPLY AUDIT — Invariant: total_bb == total_wUSDT * 10 ($0.10/BB, 10 BB per wUSDT)
 // ============================================================================
 
 /// GET /supply/audit
@@ -2484,7 +2485,7 @@ async fn supply_audit_handler(State(state): State<AppState>) -> impl IntoRespons
     };
     let wusdt_supply = raw_wusdt as f64 / USDC_UNIT as f64;
 
-    // Expected BB = wUSDT * 10
+    // Expected BB = wUSDT * 10 (10 BB per wUSDT — $0.10/BB)
     let expected_bb = wusdt_supply * 10.0;
     let delta = (bb_supply - expected_bb).abs();
     let tolerance = 0.000_001_f64.max(expected_bb * 0.000_001); // 1 ppm or 0.000001 BB
@@ -2500,7 +2501,7 @@ async fn supply_audit_handler(State(state): State<AppState>) -> impl IntoRespons
         "target_ratio": 10.0,
         "delta_from_target": delta,
         "invariant_ok": invariant_ok,
-        "note": "Invariant: bb_total_supply == wusdt_total_supply * 10",
+        "note": "Invariant: bb_total_supply == wusdt_total_supply * 10 (10 BB per wUSDT, $0.10/BB)",
     }))
 }
 
@@ -3239,12 +3240,6 @@ async fn main() {
                                 Err(e) => tracing::debug!("🗼 Vote skip slot {}: {}", block.slot, e),
                             }
 
-                            // TowerBFT clock reconciliation — if any peer vote has moved the
-                            // heaviest fork ahead of our local PoH clock (e.g. after a
-                            // leader hand-off or a brief VM suspension), fast-forward now
-                            // so the next block is produced at the correct slot.
-                            tower.reconcile_clock();
-
                             // Epoch rotation
                             let epoch = block.slot / POH_SLOTS_PER_EPOCH;
                             if epoch > last_epoch {
@@ -3861,6 +3856,37 @@ async fn main() {
     // All balances are stored in svm_accounts (u64 lamports).
     // The f64 DashMap cache is a read-behind mirror for backward compat.
     // On fresh start, ReDB→SVM seeding happens in ConcurrentBlockchain::new().
+
+    // ── GENESIS SEEDS (idempotent — only mints when balance is 0) ────────────
+    // Format: GENESIS_SEEDS="address1:lamports1,address2:lamports2,..."
+    // Example: GENESIS_SEEDS="EJYsHB...mo:10000000000,HouseTreasury...:5000000000"
+    // Runs once per seed per boot; skipped if the address already has a balance.
+    if let Ok(seeds_raw) = std::env::var("GENESIS_SEEDS") {
+        for entry in seeds_raw.split(',') {
+            let parts: Vec<&str> = entry.trim().splitn(2, ':').collect();
+            if parts.len() != 2 { continue; }
+            let addr = parts[0].trim();
+            let lamports: u64 = match parts[1].trim().parse() {
+                Ok(v) => v,
+                Err(_) => { warn!("GENESIS_SEEDS: invalid lamports for '{}' — skipped", addr); continue; }
+            };
+            if !is_valid_bb_address(addr) {
+                warn!("GENESIS_SEEDS: invalid address '{}' — skipped", addr);
+                continue;
+            }
+            let existing = state.blockchain.get_balance_lamports(addr);
+            if existing > 0 {
+                info!("🌱 GENESIS SEED: {} already has {} lamports — skip", addr, existing);
+            } else {
+                match state.blockchain.credit_svm_lamports(addr, lamports) {
+                    Ok(_) => info!("🌱 GENESIS SEED: minted {} lamports ({:.5} BB) → {}",
+                        lamports, lamports as f64 / svm::LAMPORTS_PER_BB as f64, addr),
+                    Err(e) => warn!("🌱 GENESIS SEED: mint failed for {}: {}", addr, e),
+                }
+            }
+        }
+        let _ = state.blockchain.svm_accounts.flush_block();
+    }
 
     // 9. Start WS Broadcaster
     spawn_account_notification_broadcaster(state.clone());

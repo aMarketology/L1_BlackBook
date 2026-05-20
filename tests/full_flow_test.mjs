@@ -7,8 +7,8 @@ import * as ed from '@noble/ed25519';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 import bs58 from 'bs58';
 
-const API = 'http://localhost:8080';
-const RPC = 'http://localhost:8899';
+const API = process.env.API_URL || 'http://localhost:8080';
+const RPC = process.env.RPC_URL || 'http://localhost:8899';
 let passed = 0, failed = 0, warnings = 0;
 
 // ── Test keys ──
@@ -220,18 +220,15 @@ await test('Alice faucet claim', async () => {
   const amount = 0.1;
   const message = `FAUCET:${kp.address}:${amount}:${timestamp}:${nonce}`;
   const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
-  const result = await apiPost('/faucet', {
-    wallet_address: kp.address,
-    amount,
-    public_key: kp.publicKeyHex,
-    signature: bytesToHex(sigBytes),
-    timestamp,
-    nonce,
+  const res = await fetch(`${API}/faucet`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ wallet_address: kp.address, amount, public_key: kp.publicKeyHex, signature: bytesToHex(sigBytes), timestamp, nonce }),
   });
-  if (result.success) {
-    ok('Alice faucet', `minted=${result.minted} BB, new_balance=${result.new_balance}`);
+  const result = await res.json();
+  if (res.status === 429 || !result.success) {
+    warn('Alice faucet', 'Rate limited or already claimed this epoch -- expected');
   } else {
-    warn('Alice faucet', 'Rate limited or already claimed this epoch — expected');
+    ok('Alice faucet', `minted=${result.minted} BB, new_balance=${result.new_balance}`);
   }
 });
 
@@ -242,18 +239,15 @@ await test('Bob faucet claim', async () => {
   const amount = 0.1;
   const message = `FAUCET:${kp.address}:${amount}:${timestamp}:${nonce}`;
   const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
-  const result = await apiPost('/faucet', {
-    wallet_address: kp.address,
-    amount,
-    public_key: kp.publicKeyHex,
-    signature: bytesToHex(sigBytes),
-    timestamp,
-    nonce,
+  const res = await fetch(`${API}/faucet`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ wallet_address: kp.address, amount, public_key: kp.publicKeyHex, signature: bytesToHex(sigBytes), timestamp, nonce }),
   });
-  if (result.success) {
-    ok('Bob faucet', `minted=${result.minted} BB, new_balance=${result.new_balance}`);
+  const result = await res.json();
+  if (res.status === 429 || !result.success) {
+    warn('Bob faucet', 'Rate limited or already claimed this epoch -- expected');
   } else {
-    warn('Bob faucet', 'Rate limited or already claimed this epoch — expected');
+    ok('Bob faucet', `minted=${result.minted} BB, new_balance=${result.new_balance}`);
   }
 });
 
@@ -366,7 +360,7 @@ await test('Alice escrow deposit 0.01 BB', async () => {
   const kp = alice;
   const timestamp = nowSecs();
   const nonce = randomNonce();
-  const amount = 0.01;
+  const amount = 1000; // 0.01 BB in lamports (1 BB = 100_000 lamports)
   const message = `ESCROW_DEPOSIT:${kp.address}:${amount}:${timestamp}:${nonce}`;
   const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
 
@@ -393,7 +387,7 @@ await test('Alice swap BB→USDC', async () => {
   const kp = alice;
   const timestamp = nowSecs();
   const nonce = randomNonce();
-  const bbAmount = 0.01;
+  const bbAmount = 1000; // 0.01 BB in lamports (1 BB = 100_000 lamports)
   const message = `SWAP_BB_USDC:${kp.address}:${bbAmount}:${timestamp}:${nonce}`;
   const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
 
@@ -418,7 +412,7 @@ await test('Alice swap USDC→BB', async () => {
   const kp = alice;
   const timestamp = nowSecs();
   const nonce = randomNonce();
-  const usdcAmount = 0.05;
+  const usdcAmount = 50000; // 0.05 wUSDT in micro-units (1 wUSDT = 1_000_000)
   const message = `SWAP_USDC_BB:${kp.address}:${usdcAmount}:${timestamp}:${nonce}`;
   const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
 

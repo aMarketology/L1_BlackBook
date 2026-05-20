@@ -36,8 +36,8 @@ use solana_sdk::pubkey::Pubkey;
 
 /// 1 BB token = 100,000 lamports (5 decimals).
 ///
-/// At $0.10/BB the smallest unit (1 lamport) = $0.000001 — practical for
-/// micro-transactions without sub-cent precision bloat.
+/// At $1.00/BB the smallest unit (1 lamport) = $0.00001 — practical for
+/// micro-transactions with cent-level precision.
 ///
 /// NEVER divide to get a fractional BB — always work in lamports and convert
 /// to human-readable BB only at display time.
@@ -46,13 +46,13 @@ pub const LAMPORTS_PER_BB: u64 = 100_000;
 /// USDT has 6 decimal places. 1 USDT = 1_000_000 micro-USDT.
 pub const USDT_UNIT: u64 = 1_000_000;
 
-/// Fixed exchange rate: 1 USDT buys 10 BB at the dealer market rate.
+/// Fixed exchange rate: 1 USDT buys 10 BB at the dealer market rate ($0.10/BB).
 pub const BB_PER_USDT: u64 = 10;
 
 /// Convert micro-stablecoin (6 dec) → BB lamports (5 dec).
 ///
 /// Formula: `bb_lamports = micro * LAMPORTS_PER_BB * BB_PER_USDT / USDT_UNIT`
-///          = micro * 100_000 * 10 / 1_000_000 = micro * 1 (identity at current rates)
+///          = micro * 100_000 * 10 / 1_000_000 = micro (1 lamport per micro)
 ///
 /// Uses u128 intermediate to prevent overflow on deposits up to ~$18 trillion.
 /// A future rate change only requires editing `BB_PER_USDT`.

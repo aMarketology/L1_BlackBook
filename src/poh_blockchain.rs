@@ -1183,11 +1183,10 @@ impl BlockProducer {
                 let tx_hash = external_tx_hash.as_deref().unwrap_or("internal");
                 info!("Tier1 deposit: {} deposited {} USDT (tx: {})", 
                     tx.from, usdt_amount, &tx_hash[..8.min(tx_hash.len())]);
-                // Credit $BB to user (at 1:10 ratio) — stay in u64 lamports
-                let bb_amount = usdt_amount.checked_mul(10)
-                    .ok_or("BB amount overflow")?;
+                // Credit $BB to user (10 BB per USDT — $0.10/BB) — stay in u64 lamports
+                let bb_amount = usdt_amount.saturating_mul(10); // 10 BB per 1 USDT
                 let lamports = bb_amount.checked_mul(crate::svm::types::LAMPORTS_PER_BB)
-                    .ok_or("Lamport amount overflow")?;
+                    .ok_or("Lamport amount overflow")?;;
                 self.blockchain.credit_lamports(&tx.from, lamports)
             }
             

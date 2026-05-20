@@ -1,7 +1,7 @@
 //! BlackBook L1 — PURE SIGNATURE-VERIFYING BLOCKCHAIN
 //!
 //! Two Core Jobs (see MANIFESTO.md):
-//!   1. GATEKEEPER: USDT → $BB at 1:10 ratio (vault solvency)
+//!   1. GATEKEEPER: USDT → $BB at 10:1 ratio (vault solvency)
 //!   2. INVISIBLE SECURITY: Ed25519 signature verification
 //!
 //! Engine: Solana-style PoH + Sealevel parallel execution

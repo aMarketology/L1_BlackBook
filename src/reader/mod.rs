@@ -312,7 +312,7 @@ impl ReaderNode {
                     self.blockchain.mirror_balance_to_cache(to, to_new);
                 }
                 crate::protocol::blockchain::TxData::DepositUsdt { usdt_amount, .. } => {
-                    // Mint: credit recipient at 1:10 ratio
+                    // Mint: credit recipient at 10:1 ratio (10 BB per USDT)
                     let bb_amount = *usdt_amount * 10;
                     let add_lamports = bb_amount * LAMPORTS_PER_BB;
 
