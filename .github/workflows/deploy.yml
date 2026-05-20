@@ -1,65 +1,139 @@
 # ============================================================================
-# BlackBook L1 — Auto-Deploy to Hetzner on push to master
+# BlackBook L1 — CI/CD: Build on GitHub Actions → Deploy pre-built to Hetzner
 # ============================================================================
-# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+# HOW IT WORKS (hot upgrade — no Rust compile on Hetzner):
+#   [build job]  GitHub Actions runner (ubuntu-latest, 2-core) compiles Rust
+#                and builds a Docker image with layer caching via GitHub Cache.
+#                Pushes image to GitHub Container Registry (GHCR).
+#   [deploy job] SSH to Hetzner: pulls the pre-built image (~30 s), tags it
+#                as the local compose image, restarts the container, polls /live.
+#
+# DEPLOY TIMES:
+#   First push   — ~15 min  (cold compile, no cache)
+#   Subsequent   — ~3-5 min (incremental, Docker layer cache restored from GHA)
+#   Hetzner step — ~30-60 s (just docker pull + restart, no compile)
+#
+# REQUIRED GITHUB SECRETS  (Settings → Secrets and variables → Actions):
 #   HETZNER_HOST      — VPS IP, e.g. 91.98.196.34
 #   HETZNER_USER      — SSH user, e.g. root
-#   HETZNER_SSH_KEY   — Private SSH key that can reach HETZNER_HOST
+#   HETZNER_SSH_KEY   — Full private SSH key (including -----BEGIN/END----- lines)
 #
-# What this does on every push to master:
-#   1. SSH into Hetzner
-#   2. git pull latest code
-#   3. docker compose up --build  (multi-stage: builder + slim runtime)
-#   4. Health-poll until /live returns 200
-#   5. Print the running version/slot so you know the deploy succeeded
+# GHCR auth uses the automatic GITHUB_TOKEN — no extra secrets needed.
+# The image is private by default (same visibility as the repo).
+# To make it public: https://github.com/orgs/aMarketology/packages → Change visibility
 # ============================================================================
 
-name: Deploy to Hetzner
+name: CI/CD → Hetzner
 
 on:
   push:
     branches: [master]
+  workflow_dispatch:   # allow manual trigger from the Actions tab
 
-  # Allow manual trigger from the Actions tab
-  workflow_dispatch:
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/l1-blackbook
 
 jobs:
-  deploy:
-    name: Build & Deploy
+  # ── Job 1: Build Docker image on GitHub's runner ──────────────────────────
+  build:
+    name: Build & Push Image
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # Docker + Rust compile can take ~15 min
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write   # push to GHCR using GITHUB_TOKEN
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (with GitHub Actions layer cache)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Tag with both :latest and the commit SHA for rollback ability
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          # GitHub Actions cache: restores layers from previous runs.
+          # mode=max caches all intermediate layers, not just the final stage.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Job 2: Pull pre-built image on Hetzner and restart ────────────────────
+  deploy:
+    name: Deploy to Hetzner
+    runs-on: ubuntu-latest
+    needs: build          # only run after image is pushed
+    timeout-minutes: 10
+    permissions:
+      packages: read      # read GHCR using GITHUB_TOKEN
 
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Pass GITHUB_TOKEN + actor into the SSH session so Hetzner can
+          # authenticate to GHCR (the token is valid for the duration of this job).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+          IMAGE_REF: ${{ env.IMAGE }}:${{ github.sha }}
         with:
           host: ${{ secrets.HETZNER_HOST }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          command_timeout: 28m   # stay under the job timeout
+          envs: GH_TOKEN,GH_ACTOR,IMAGE_REF
+          command_timeout: 8m
           script: |
             set -euo pipefail
             APP_DIR="/opt/blackbook"
 
             echo ""
             echo "╔══════════════════════════════════════════╗"
-            echo "║   BlackBook L1 — GitHub Auto-Deploy      ║"
+            echo "║   BlackBook L1 — Hot Upgrade Deploy      ║"
             echo "╚══════════════════════════════════════════╝"
             echo ""
+            echo "Image: $IMAGE_REF"
+            echo ""
 
-            # ── 1. Pull latest code ────────────────────────
-            echo "[1/3] Pulling latest code..."
+            # ── 1. Pull the pre-built image from GHCR ─────
+            echo "[1/4] Authenticating to GHCR..."
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+
+            echo "[2/4] Pulling pre-built image (no Rust compile needed)..."
+            docker pull "$IMAGE_REF"
+
+            # Tag it as the name docker-compose.prod.yml expects after a local build.
+            # Docker Compose names the image "<project>-<service>" where project
+            # comes from the directory name of the compose file → "deployment-blackbook".
+            docker tag "$IMAGE_REF" deployment-blackbook:latest
+
+            # ── 2. Sync latest compose / config files ─────
+            echo "[3/4] Syncing repo config files..."
             cd "$APP_DIR"
             git fetch origin master
             git reset --hard origin/master
-            echo "Deployed commit: $(git log -1 --oneline)"
+            echo "Config at commit: $(git log -1 --oneline)"
 
-            # ── 2. Rebuild image & restart container ───────
-            echo "[2/3] Building Docker image and restarting..."
-            docker compose -f deployment/docker-compose.prod.yml up -d --build 2>&1 | tail -40
+            # ── 3. Restart the container (no --build) ─────
+            # docker compose will use the existing deployment-blackbook:latest image
+            # that we just tagged — it will NOT recompile anything.
+            docker compose -f deployment/docker-compose.prod.yml up -d
 
-            # ── 3. Health check ────────────────────────────
-            echo "[3/3] Waiting for node to come up..."
+            # ── 4. Health check ───────────────────────────
+            echo "[4/4] Waiting for node to become healthy..."
             ELAPSED=0
             until curl -sf http://localhost:8080/live >/dev/null 2>&1; do
               sleep 5; ELAPSED=$((ELAPSED + 5))
@@ -71,9 +145,9 @@ jobs:
               echo "  ... waiting (${ELAPSED}s)"
             done
 
-            echo "✅ Node is live!"
             echo ""
-            echo "── Status ────────────────────────────────"
+            echo "✅ Hot upgrade complete!"
+            echo "── PoH Status ──────────────────────────────"
             curl -s http://localhost:8080/poh/status | python3 -m json.tool 2>/dev/null \
               || curl -s http://localhost:8080/poh/status
             echo ""
