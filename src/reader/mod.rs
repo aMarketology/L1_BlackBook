@@ -283,9 +283,11 @@ impl ReaderNode {
         for otx in &block.transactions {
             match &otx.tx.data {
                 crate::protocol::blockchain::TxData::TransferBb { to, amount } => {
-                    let lamports = *amount * LAMPORTS_PER_BB;
+                    // amount is stored in lamports by the Writer (Sealevel encodes tx.amount directly)
+                    let lamports = *amount;
 
-                    // Debit sender via SVM
+                    // Debit sender via SVM (if sender is SYSTEM_FAUCET or other virtual address,
+                    // get_account returns None → cur=0 → saturating_sub=0, no harm done)
                     let from_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&otx.tx.from);
                     let from_cur = self.blockchain.svm_accounts
                         .get_account(&from_pk)

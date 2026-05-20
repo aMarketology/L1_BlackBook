@@ -1,0 +1,79 @@
+# ============================================================================
+# BlackBook L1 — Auto-Deploy to Hetzner on push to master
+# ============================================================================
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   HETZNER_HOST      — VPS IP, e.g. 91.98.196.34
+#   HETZNER_USER      — SSH user, e.g. root
+#   HETZNER_SSH_KEY   — Private SSH key that can reach HETZNER_HOST
+#
+# What this does on every push to master:
+#   1. SSH into Hetzner
+#   2. git pull latest code
+#   3. docker compose up --build  (multi-stage: builder + slim runtime)
+#   4. Health-poll until /live returns 200
+#   5. Print the running version/slot so you know the deploy succeeded
+# ============================================================================
+
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [master]
+
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30          # Docker + Rust compile can take ~15 min
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          command_timeout: 28m   # stay under the job timeout
+          script: |
+            set -euo pipefail
+            APP_DIR="/opt/blackbook"
+
+            echo ""
+            echo "╔══════════════════════════════════════════╗"
+            echo "║   BlackBook L1 — GitHub Auto-Deploy      ║"
+            echo "╚══════════════════════════════════════════╝"
+            echo ""
+
+            # ── 1. Pull latest code ────────────────────────
+            echo "[1/3] Pulling latest code..."
+            cd "$APP_DIR"
+            git fetch origin master
+            git reset --hard origin/master
+            echo "Deployed commit: $(git log -1 --oneline)"
+
+            # ── 2. Rebuild image & restart container ───────
+            echo "[2/3] Building Docker image and restarting..."
+            docker compose -f deployment/docker-compose.prod.yml up -d --build 2>&1 | tail -40
+
+            # ── 3. Health check ────────────────────────────
+            echo "[3/3] Waiting for node to come up..."
+            ELAPSED=0
+            until curl -sf http://localhost:8080/live >/dev/null 2>&1; do
+              sleep 5; ELAPSED=$((ELAPSED + 5))
+              if [ "$ELAPSED" -ge 120 ]; then
+                echo "❌ Node did not become healthy after 120s"
+                docker logs --tail 50 blackbook-l1 || true
+                exit 1
+              fi
+              echo "  ... waiting (${ELAPSED}s)"
+            done
+
+            echo "✅ Node is live!"
+            echo ""
+            echo "── Status ────────────────────────────────"
+            curl -s http://localhost:8080/poh/status | python3 -m json.tool 2>/dev/null \
+              || curl -s http://localhost:8080/poh/status
+            echo ""

@@ -78,6 +78,12 @@ pub struct NodeConfig {
     /// Solana JSON-RPC port
     #[arg(long, default_value_t = 8899)]
     pub rpc_port: u16,
+
+    /// Override the ReDB database path (defaults to REDB_PATH env var)
+    /// Useful for running a Reader node alongside a local Writer without
+    /// sharing the same database file.
+    #[arg(long)]
+    pub redb_path: Option<String>,
 }
 
 // ============================================================================
@@ -1397,7 +1403,10 @@ async fn faucet_handler(
             let amount_lamports = lamports;
             state.faucet_claims.insert(req.wallet_address.clone(), (current_epoch, amount_lamports));
 
-            // Record faucet mint into PoH block
+            // Record faucet mint into PoH block.
+            // Encoded as TransferBb from "SYSTEM_FAUCET" so the Reader can apply it:
+            //   - debit "SYSTEM_FAUCET" (virtual addr, balance=0, saturating_sub → no-op)
+            //   - credit req.wallet_address with the correct lamport amount
             {
                 use protocol::Transaction as ProtoTx;
                 use protocol::TxData;
@@ -1405,9 +1414,9 @@ async fn faucet_handler(
                     hash: uuid::Uuid::new_v4().to_string(),
                     from: "SYSTEM_FAUCET".to_string(),
                     timestamp: now,
-                    data: TxData::DepositUsdt {
-                        usdt_amount: amount as u64,
-                        external_tx_hash: Some(format!("faucet_{}", req.nonce)),
+                    data: TxData::TransferBb {
+                        to: req.wallet_address.clone(),
+                        amount: lamports, // already in lamports, consistent with Sealevel encoding
                     },
                     signature: req.signature.clone(),
                     signer_pubkey: req.public_key.clone(),
@@ -2900,10 +2909,10 @@ async fn main() {
 
     // 3. Blockchain (ReDB)
     let blockchain = {
-        // REDB_PATH env var: used in Docker (set to /data/blockchain_data/blockchain.redb)
-        // Falls back to ./blockchain_data for local dev
-        let redb_path = std::env::var("REDB_PATH")
-            .unwrap_or_else(|_| REDB_DATA_PATH_DEFAULT.to_string());
+        // Priority: --redb-path CLI flag > REDB_PATH env var > default
+        let redb_path = config.redb_path.clone()
+            .or_else(|| std::env::var("REDB_PATH").ok())
+            .unwrap_or_else(|| REDB_DATA_PATH_DEFAULT.to_string());
         info!("🗄️  Initializing ReDB at {}", redb_path);
         match ConcurrentBlockchain::new(&redb_path) {
             Ok(bc) => { info!("✅ Blockchain initialized"); bc }
