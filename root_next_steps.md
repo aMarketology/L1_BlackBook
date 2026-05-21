@@ -194,11 +194,12 @@
 
 | # | Task | Status | Effort |
 |---|------|--------|--------|
-| 1 | **Deploy Writer node to Railway/Hetzner** — `railway up` or `deploy.sh` on Hetzner. `railway.toml` is already configured. Production binary = `cargo build --release` (no unsafe_admin). | ❌ TODO | 1 hour |
+| 1 | **Deploy Writer node to Hetzner** — `docker compose -f deployment/docker-compose.prod.yml up -d --build`. Production binary (no unsafe_admin). Running on `91.98.196.34`. | ✅ DONE | — |
+| CI | **Hot-upgrade CI/CD** — GitHub Actions: build Docker image on GHA runner (with layer cache) → push to `ghcr.io/amarketology/l1-blackbook` → SSH to Hetzner → `docker pull` + restart. Every push to `master` auto-deploys in ~3-5 min. Secrets: `HETZNER_HOST`, `HETZNER_USER`, `HETZNER_SSH_KEY`. | ✅ DONE | — |
 | 2 | **TLS + custom domain** — point `blackbook.id` (or your domain) at the node. Use Railway's auto-TLS or Caddy reverse proxy on Hetzner. Required before wallets can connect from browsers (HTTPS). | ❌ TODO | 1 hour |
 | 3 | **Lock CORS to production origins** — change `allow_origin(Any)` in `src/main.rs` to allow only your wallet domain (e.g. `https://wallet.blackbook.id`). Wildcard is fine for a public read API but tighten before launch. | ❌ TODO | 15 min |
 | 4 | **Set env vars in production** — `L2_SEQUENCER_PUBKEY`, `L2_SEQUENCER_ALLOWLIST`, `USDC_MINT_AUTHORITY` (or let it auto-generate). Set `REDB_PATH` to a persistent volume. | ❌ TODO | 15 min |
-| 5 | **Verify `/health` returns 200** on live node before pointing any clients at it. | ❌ TODO | 5 min |
+| 5 | **Verify `/health` returns 200** on live node before pointing any clients at it. | ✅ DONE | — |
 
 ---
 

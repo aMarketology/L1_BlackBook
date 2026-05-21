@@ -1,6 +1,94 @@
-# L1 BlackBook Escrow — 7-Day Build Plan (Session)
+# L1 BlackBook — Session Log
 
-> **Goal:** Finish §2 of [docs/L1_SMART_CONTRACT_SPEC.md](docs/L1_SMART_CONTRACT_SPEC.md). Replace the single global `escrow_vault_pda()` with **per-contest vault + state PDAs**, add a per-contest depositor ledger, wire the gRPC surface end-to-end (`InitContest`, `VerifyDeposit`, `SubmitMerkleRoot`, `ClaimWinnings`, `GetContestStatus`, new `RegisterSequencer`), execute on-settle house-rake sweep, and add a periodic **pro-rata refund sweep** for expired contests.
+---
+
+## Session: 2026-05-20 — Reader Sync Fixes + CI/CD Hot-Upgrade
+
+> **Goal:** Fix two Reader sync bugs causing balance parity failures, verify both nodes agree on state, and set up automatic hot-upgrade CI/CD so every `git push` to `master` auto-deploys to Hetzner.
+
+### Status: ✅ Complete
+
+### What Was Done
+
+| Item | Result |
+|------|--------|
+| Fixed Reader double-multiply bug (`let lamports = *amount` — was `* LAMPORTS_PER_BB`) | ✅ `src/reader/mod.rs` |
+| Fixed faucet encoding wrong TxData (`TransferBb` not `DepositUsdt`) | ✅ `src/main.rs` |
+| Committed + pushed both fixes as `d3ff2ec` | ✅ |
+| Rebuilt Hetzner Docker container from `d3ff2ec` | ✅ ~9 min compile |
+| Restarted local Reader from genesis (`reader.redb` wiped) | ✅ |
+| Verified parity: Bob = 0.105 BB on **both** nodes (exact match) | ✅ |
+| CI/CD: two-job GitHub Actions pipeline (build on GHA → GHCR → pull on Hetzner) | ✅ `.github/workflows/deploy.yml` |
+| First successful CI/CD end-to-end deploy confirmed | ✅ commit `a8ef9ad` |
+
+### Issues Found & Resolved
+
+| Issue | Fix |
+|-------|-----|
+| Reader was treating `TransferBb.amount` as BB units, multiplying by `LAMPORTS_PER_BB` again (double-multiply) | `let lamports = *amount;` (amount is already lamports) |
+| Faucet recorded `DepositUsdt { usdt_amount: 0 }` (f64→u64 truncation) — Reader credited zero | Changed faucet to `TxData::TransferBb { to: wallet, amount: lamports }` |
+| GitHub Actions image tag `ghcr.io/aMarketology/...` uppercase — Docker rejected it | Hardcoded `ghcr.io/amarketology/l1-blackbook` (lowercase) in `env.IMAGE` |
+| GitHub secret `HETZNER_SSH_KEY` pasted with Windows `\r\n` line endings — SSH auth failed | Re-copied key with `(Get-Content ~/.ssh/id_ed25519 -Raw) -replace "\`r\`n", "\`n"` |
+
+### Known Gaps (Not Regressions)
+
+| Gap | Location | Detail |
+|-----|----------|--------|
+| Swap transactions not recorded in blocks | `src/contracts/token_swap/mod.rs` | Reader permanently blind to BB↔wUSDT swaps — Alice Reader=0.095 vs Hetzner=0.075 (0.02 BB = one swap). Fix: add `SwapBbForUsdc { user, bb_lamports, usdc_micro }` variant to `TxData`. |
+
+---
+
+## Next Session Priorities
+
+1. **Swap block recording** — add `SwapBbForUsdc` / `SwapUsdcForBb` variants to `protocol/blockchain.rs::TxData`, record in `token_swap/mod.rs` handlers, handle in `src/reader/mod.rs::apply_block_balances`
+2. **Phase 6 launch prep** — see root_next_steps.md Phase 6.1–6.6
+3. **UptimeRobot** — ping `/health` every 60s on Hetzner (free tier, 15 min setup)
+4. **ReDB backup** — cron job on Hetzner to snapshot `blockchain_data/blockchain.redb` daily
+
+---
+
+## Session: 2026-05-19 — Dual-Node Testing & Stability
+
+> **Goal:** Run the node, validate all BB functionality against both live nodes (localhost + Hetzner), confirm tests pass, identify remaining issues.
+
+### Status: ✅ Complete
+
+### What Was Done
+
+| Item | Result |
+|------|--------|
+| Local node running (`cargo run --features unsafe_admin`) | ✅ Slot ~869k, epoch 1, 12,694 accounts, 2.26M BB supply |
+| Hetzner node (`layer1.blackbook.id`) live | ✅ Slot ~3.73M, epoch 0, 3 accounts (empty/fresh) |
+| `node tests/full_flow_test.mjs` → localhost | ✅ **47/47 passed** — faucet, transfers, escrow, swaps, USDC, RPC, security |
+| `smoke.ps1` → localhost | ✅ **12/12 passed** — health, balance, admin mint, faucet auth, Turbine UDP 8004, USDC |
+| `smoke.ps1` → Hetzner | ✅ **12/12 passed** — admin mint correctly 404 (prod build, no unsafe_admin) |
+| Phase A/B/C commit `aff8378` pushed | ✅ f64→u64 migration, persistence ordering, monotonicity tests, nginx POST fix, smoke.ps1 |
+| `cargo check` — zero errors | ✅ Warnings only (unused imports, 1 deprecated `credit(f64)` in faucet) |
+
+### Issues Found
+
+| Issue | Location | Severity | Status |
+|-------|----------|----------|--------|
+| Deprecated `credit(f64)` still used in faucet handler | `src/main.rs:1390` | Low | Pending |
+| Hetzner node is empty — no test accounts seeded | `layer1.blackbook.id` | Medium | Pending |
+| `full_flow_test.mjs` hardcoded to `localhost:8080` — can't target Hetzner | `tests/full_flow_test.mjs` | Low | Pending |
+| `Invoke-WebRequest` in smoke.ps1 triggers security prompt (needs `-UseBasicParsing`) | `tests/smoke.ps1` | Low | Pending |
+
+---
+
+## Next Session Priorities
+
+1. **Faucet credit fix** — swap `credit(f64)` at `main.rs:1390` → `credit_svm_lamports(u64)`
+2. **Seed Hetzner** — run admin mint / faucet against live node to bootstrap test wallets
+3. **Parameterize full_flow_test** — accept `API_URL` env var so it can run against any node
+4. **PDA onboarding ramp** — anon custodial wallet: user deposits → gets BB (deposit_gateway flow review)
+5. **Per-contest escrow PDAs** — Phase 1 from the 7-day plan below (pda.rs, storage.rs, depositor ledger)
+
+---
+
+## Original 7-Day Build Plan (Per-Contest Escrow PDAs)
+
+> **Goal:** Finish §2 of the smart contract spec. Replace the single global `escrow_vault_pda()` with **per-contest vault + state PDAs**, add a per-contest depositor ledger, wire the gRPC surface end-to-end (`InitContest`, `VerifyDeposit`, `SubmitMerkleRoot`, `ClaimWinnings`, `GetContestStatus`, new `RegisterSequencer`), execute on-settle house-rake sweep, and add a periodic **pro-rata refund sweep** for expired contests.
 >
 > Outcome: real $BB liquidity on testnet, trustless winner claims via Merkle proof on our custom L1, verifiable settlement that mirrors Polymarket's on-chain redemption — secured by the $BB chain.
 
