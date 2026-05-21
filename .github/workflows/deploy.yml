@@ -32,7 +32,7 @@ on:
   workflow_dispatch:   # allow manual trigger from the Actions tab
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/l1-blackbook
+  IMAGE: ghcr.io/amarketology/l1-blackbook
 
 jobs:
   # ── Job 1: Build Docker image on GitHub's runner ──────────────────────────
