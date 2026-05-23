@@ -2659,6 +2659,30 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, who: std::net::Sock
     }
 }
 
+/// Middleware: block all write requests (POST/PUT/DELETE/PATCH) when running in Reader mode.
+/// This makes it mathematically impossible for a Reader node to mutate chain state via HTTP.
+/// GET, HEAD, and OPTIONS pass through unchanged so balance queries and health checks work normally.
+async fn reader_write_guard(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+    if state.node_mode == NodeMode::Reader
+        && !matches!(req.method(), &Method::GET | &Method::HEAD | &Method::OPTIONS)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Node is in read-only mode. Submit write transactions to the Writer node.",
+                "writer_url": "https://layer1.blackbook.id",
+                "hint": "This node mirrors the canonical chain but cannot process transactions."
+            }))
+        ).into_response();
+    }
+    next.run(req).await
+}
+
 fn build_router(state: AppState) -> Router {
 
     let cors = CorsLayer::new()
@@ -2789,6 +2813,7 @@ fn build_router(state: AppState) -> Router {
     }
 
     router
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), reader_write_guard))
         .with_state(state)
         .layer(DefaultBodyLimit::max(1_048_576)) // 1 MB — prevents JSON DoS
         .layer(TraceLayer::new_for_http())

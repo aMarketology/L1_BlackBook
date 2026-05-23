@@ -81,12 +81,14 @@ Write-Host ""
 Write-Host "  Press Ctrl+C to stop."
 Write-Host ""
 
-# Set local port overrides so Reader doesn't clash with any other local process
-$env:HTTP_PORT  = $HttpPort
-$env:RPC_PORT   = $RpcPort
-$env:GRPC_PORT  = $GrpcPort
+# Use a separate DB for the Reader so it never touches the local Writer's blockchain.redb.
+# Pass as a CLI flag (--redb-path) so it takes priority over any REDB_PATH in .env.
+$ReaderDb = Join-Path $RepoRoot "blockchain_data\reader.redb"
 
-# Use a separate local DB so the Reader doesn't clobber a local Writer DB
-$env:REDB_PATH  = Join-Path $RepoRoot "blockchain_data\reader.redb"
-
-& $BinPath --mode reader --writer-addr "http://$WriterIP`:50051"
+& $BinPath `
+    --mode reader `
+    --writer-addr "http://$WriterIP`:50051" `
+    --http-port $HttpPort `
+    --rpc-port $RpcPort `
+    --grpc-port $GrpcPort `
+    --redb-path $ReaderDb
