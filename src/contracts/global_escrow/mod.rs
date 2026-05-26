@@ -9,7 +9,7 @@ use tracing::info;
 use std::sync::atomic::Ordering;
 use crate::AppState;
 use crate::storage::DepositRecord;
-use crate::svm::{escrow_vault_address, LAMPORTS_PER_BB};
+use crate::svm::escrow_vault_address;
 // ============================================================================
 // GLOBAL ESCROW SMART CONTRACT (Native Module)
 // ============================================================================

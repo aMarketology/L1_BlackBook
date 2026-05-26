@@ -1186,7 +1186,7 @@ impl BlockProducer {
                 // Credit $BB to user (10 BB per USDT — $0.10/BB) — stay in u64 lamports
                 let bb_amount = usdt_amount.saturating_mul(10); // 10 BB per 1 USDT
                 let lamports = bb_amount.checked_mul(crate::svm::types::LAMPORTS_PER_BB)
-                    .ok_or("Lamport amount overflow")?;;
+                    .ok_or("Lamport amount overflow")?;
                 self.blockchain.credit_lamports(&tx.from, lamports)
             }
             

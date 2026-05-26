@@ -20,17 +20,15 @@ custom-implemented:
 
 ---
 
-## Three-Token Economy
+## Token Economy
 
 | Token | Decimals | Unit Constant | Purpose |
 |-------|----------|---------------|---------|
-| `$BB` | 5 | `LAMPORTS_PER_BB = 100_000` | Native gas token, betting collateral |
-| `wUSDT` | 6 | `USDC_UNIT = 1_000_000` | Wrapped stablecoin, bonding curve reserve |
-| `$XX` / MAXXCOIN | 12 | `MAXX_UNIT = 1_000_000_000_000` | Bonding curve governance token |
-| `$DECAY` | NFT-like | per-instance | Value-recapture token, premium access |
+| `$BB` | 5 | `LAMPORTS_PER_BB = 100_000` | Native gas token, betting collateral, oracle staking |
+| `wUSDT` | 6 | `USDC_UNIT = 1_000_000` | Wrapped stablecoin, swap reserve |
 
-**Bonding curve**: `P(s) = SLOPE × s` where `SLOPE = 5×10⁻⁸`, s = total $XX supply in whole units.
 **BB ↔ wUSDT fixed rate**: 10 BB = 1 wUSDT (dealer market maker, not AMM).
+**MAXX / DECAY / OZ**: removed from L1. Archived in `archive/contracts/`. Do NOT add them back.
 
 ---
 
@@ -42,7 +40,7 @@ custom-implemented:
    for financial logic.
 3. **`TpuPacket.amount` is `u64` lamports** (NOT BB floats). Divide by `100_000.0` only at
    RuntimeTx/PipelinePacket dispatch.
-4. **SPL token amounts** are always raw micro-units: `u64` for wUSDT, `u64` for $XX picoMAXX.
+4. **SPL token amounts** are always raw micro-units: `u64` for wUSDT.
 5. **`TransactionRecord::with_id()`** — all amount/balance params are `u64`. Never pass `f64`.
 
 ---
@@ -58,11 +56,13 @@ Canonical message format: `"ACTION:{from}:{body}:{timestamp}:{nonce}"`
 
 Specific formats:
 - Transfer: `"TRANSFER:{from}:{to}:{amount}:{ts}:{nonce}"`
-- MAXX buy: `"MAXX_BUY:{from}:{microUsdt}:{ts}:{nonce}"`
-- MAXX sell: `"MAXX_SELL:{from}:{picoMaxx}:{ts}:{nonce}"`
-- DECAY mint: `"DECAY_MINT:{from}:{backing_usdt}:{ts}:{nonce}"`
 - Swap BB→wUSDT: `"SWAP_BB_USDC:{wallet}:{bb_amount}:{ts}:{nonce}"`
 - Faucet: `"FAUCET:{addr}:{amount}:{ts}:{nonce}"`
+- Rollup lock BB: `"ROLLUP_LOCK_BB:{rollup_id}:{wallet}:{bb_lamports}:{symbol_hint}:{ts}:{nonce}"`
+- Rollup consume lock: `"CONSUME_LOCK:{rollup_id}:{lock_id}:{ts}"`
+- Rollup submit root: `"ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{ts}"`
+- Rollup exit BB: `"ROLLUP_EXIT:{rollup_id}:BB:{address}:{batch_id}:{ts}:{nonce}"`
+- Rollup exit NFT: `"ROLLUP_EXIT:{rollup_id}:NFT:{address}:{batch_id}:{ts}:{nonce}"`
 
 Rate limiting follows auth: `state.throttler.check_transaction(&wallet, 0.0)` → HTTP 429.
 
@@ -76,17 +76,22 @@ src/
   auth.rs                      — Shared Ed25519 verify helper
   svm/
     spl_token.rs               — SPL Token engine (mint, burn, transfer, ATA)
-    types.rs                   — LAMPORTS_PER_BB, USDC_UNIT, MAXX_UNIT, MAXX_DECIMALS
-    mod.rs                     — Re-exports all svm symbols
+    types.rs                   — LAMPORTS_PER_BB, USDC_UNIT
+    pda.rs                     — PDA derivation: rollup_vault_address(rollup_id)
+    mod.rs                     — Re-exports: SplTokenEngine, usdc_*, LAMPORTS_PER_BB
   contracts/
-    maxx_token/mod.rs          — $XX bonding curve buy/sell handlers
-    decay_token/mod.rs         — $DECAY mint/use/recharge/stake handlers
     token_swap/mod.rs          — BB ↔ wUSDT fixed-rate swap handlers
     global_escrow/mod.rs       — L2 prediction market escrow + Merkle settlement
     deposit_gateway/mod.rs     — Bridge-in: deposit stablecoin → mint BB
     withdrawal_gateway/mod.rs  — Bridge-out: burn BB → release stablecoin
     layer2_market/mod.rs       — Merkle tree root generation for L2 settlements
+    oracle/mod.rs              — Oracle node registration, dispute ($BB staking), vote
+    oracle/finalize.rs         — Background task: auto-finalize expired roots
+    rollup/mod.rs              — Universal Rollup Hub: lock_bb, submit_root, exit (BB+NFT)
+    nft_bridge/mod.rs          — L3 NFT anchoring on L1 (put_nft, get_nft, AnchoredNft)
   storage/mod.rs               — ConcurrentBlockchain, TransactionRecord, ReDB ops
+
+archive/contracts/             — ARCHIVED: maxx_token, decay_token, oz_token (do not restore)
 
 runtime/
   core.rs                      — NetworkThrottler, CircuitBreaker, RuntimeTx, TransactionType
@@ -100,7 +105,6 @@ sdk/
 
 blackbook-wallet/
   src/                         — React + TypeScript frontend wallet
-  test_scripts/test_xx_bb.ts   — Integration test: full BB + $XX lifecycle
 ```
 
 ---
@@ -124,6 +128,14 @@ cargo build --release
 
 **MAXX/wUSDT mints bootstrap automatically** at startup using a deterministic genesis
 authority if `USDC_MINT_AUTHORITY` env var is not set. Always idempotent.
+
+**Required env vars for Universal Rollup Hub:**
+- `L2_SEQUENCER_PUBKEY` — 64-char hex Ed25519 pubkey for the L2 sequencer
+- `L3_SEQUENCER_PUBKEY` — 64-char hex Ed25519 pubkey for the L3 sequencer
+- `L5_SEQUENCER_PUBKEY` — 64-char hex Ed25519 pubkey for the L5 sequencer
+
+If a sequencer env var is not set, that rollup's `submit_root` and `consume_lock`
+endpoints return HTTP 503 (sequencer disabled), but `lock_bb` and `exit` still work.
 
 ---
 
@@ -149,6 +161,35 @@ L2 bets → Dealer aggregates → settle_market_and_generate_root(winners)
 
 Merkle leaf: `SHA256(address_utf8 || payout_u64_le)`
 Merkle combine: `SHA256(min(a,b) || max(a,b))` (sorted to be deterministic)
+
+---
+
+## Universal Rollup Hub (L2 / L3 / L5)
+
+URL shape: `/rollup/:rollup_id/<action>` where `:rollup_id` is `"L2"`, `"L3"`, or `"L5"`.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /rollup/:rollup_id/lock_bb` | User locks $BB into the per-rollup vault PDA |
+| `GET  /rollup/:rollup_id/locks/:lock_id` | Sequencer reads a lock record |
+| `POST /rollup/:rollup_id/locks/:lock_id/consume` | Sequencer marks lock as spent |
+| `POST /rollup/:rollup_id/submit_root` | Sequencer anchors a new Merkle state root |
+| `POST /rollup/:rollup_id/exit` | User exits assets back to L1 with Merkle proof |
+
+**Canonical Merkle leaf encoding (sequencer must match exactly):**
+```
+BB leaf:   SHA-256( "{rollup_id}:BB:{address}:{balance_lamports}" )
+NFT leaf:  SHA-256( "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}" )
+```
+
+**Exit `asset_type`**: `"BB"` releases lamports from vault → user. `"NFT"` calls `nft_bridge::put_nft()` to mint on L1.
+
+**ReDB tables:**
+- `ROLLUP_STATE_ROOTS: &str → &[u8]` — key: `"{rollup_id}:{batch_id:020}"` (zero-padded monotonic)
+- `ROLLUP_CONSUMED_EXITS: &str → u64` — key: `SHA256("{rollup_id}:{batch_id}:{asset_type}:{address|collection:token}")` — permanent double-spend seal
+- `ROLLUP_LOCKS: &str → &[u8]` — key: lock UUID → `RollupLockRecord` JSON
+
+**AppState field:** `authorized_sequencers: Arc<DashMap<String, String>>` maps `rollup_id` → 64-char hex pubkey.
 
 ---
 

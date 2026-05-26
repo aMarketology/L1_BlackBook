@@ -16,8 +16,6 @@ use sha2::{Sha256, Digest};
 // Token economy:
 //   - $BB      — native gas token; used for bet deposits
 //   - wUSDT    — stablecoin settlement; used for prize payouts
-//   - $MAXX    — bonding-curve governance token; traded on L2 markets
-//   - $DECAY   — NFT-style access pass; each use unlocks a premium bet slot
 // ============================================================================
 
 /// A single bet order placed by a user on the L2.

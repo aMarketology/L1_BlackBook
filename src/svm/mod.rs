@@ -42,18 +42,6 @@ pub use spl_token::{
     usdc_mint_bytes,
     USDC_DECIMALS,
     USDC_UNIT,
-    // MAXX ($XX) bonding-curve token
-    maxx_mint_address,
-    maxx_mint_bytes,
-    maxx_vault_address,
-    maxx_vault_bytes,
-    MAXX_DECIMALS,
-    MAXX_UNIT,
-    // DECAY ($DECAY) value-recapture token
-    decay_vault_address,
-    decay_vault_bytes,
-    decay_treasury_address,
-    decay_treasury_bytes,
 };
 
 // Re-export PDA helpers at the svm:: level
@@ -61,16 +49,12 @@ pub use spl_token::{
 pub use pda::{
     swap_pool_pda,
     swap_pool_address,
-    maxx_curve_pda,
-    maxx_curve_address,
     escrow_vault_pda,
     escrow_vault_address,
     escrow_vault_pda_for,
     escrow_vault_address_for,
     contest_state_pda,
     contest_state_pda_address,
-    decay_treasury_pda,
-    decay_treasury_pda_address,
     house_treasury_pda,
     house_treasury_pda_address,
 };

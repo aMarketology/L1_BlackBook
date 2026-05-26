@@ -4,12 +4,14 @@ use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Jso
 use tracing::{info, warn};
 
 use crate::AppState;
-use crate::storage::{OracleNode, PendingRootStatus, Disputer};
-use crate::svm::{SplTokenEngine, maxx_mint_bytes, MAXX_UNIT};
+use crate::storage::{PendingRootStatus, Disputer, OracleNode};
+use crate::svm::LAMPORTS_PER_BB;
 
-// ── ORACLE CONSTANTS ──────────────────────────────────────────────────────────
-const MIN_DISPUTE_STAKE_PICO_XX: u64 = 100 * MAXX_UNIT;
-const DISPUTE_ESCALATION_THRESHOLD: u64 = 1_000 * MAXX_UNIT;
+// ── ORACLE CONSTANTS ─────────────────────────────────────────────────────────────────────────
+/// Minimum $BB lamports to open a dispute (100 BB = $10).
+const MIN_DISPUTE_STAKE_BB_LAMPORTS: u64 = 100 * LAMPORTS_PER_BB;
+/// Escalation threshold in $BB lamports (1 000 BB = $100).
+const DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_BB;
 
 // ============================================================================
 // ORACLE SYSTEM — Step 1: Registry + Read Endpoints
@@ -33,9 +35,9 @@ pub struct RegisterOracleRequest {
     pub pubkey_hex: String,
     /// Human-readable label, e.g. "oracle-node-1". Max 64 chars.
     pub name: String,
-    /// $XX bond in pico-MAXX (12 decimals). Min 1,000 $XX = 1_000 * MAXX_UNIT.
+    /// $BB bond in lamports. Min 1,000 BB = 1_000 * LAMPORTS_PER_BB.
     /// The bond is slashable if the oracle signs a wrong outcome.
-    pub bond_pico_xx: u64,
+    pub bond_bb_lamports: u64,
 }
 
 /// POST /oracle/register  (unsafe_admin feature only)
@@ -59,9 +61,9 @@ pub async fn register_oracle_handler(
             "error": "name must be 1–64 chars"
         })));
     }
-    if req.bond_pico_xx == 0 {
+    if req.bond_bb_lamports == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "bond_pico_xx must be > 0"
+            "error": "bond_bb_lamports must be > 0"
         })));
     }
 
@@ -80,7 +82,7 @@ pub async fn register_oracle_handler(
         active: true,
         total_resolutions: 0,
         correct_resolutions: 0,
-        slash_balance_pico_xx: req.bond_pico_xx,
+        slash_balance_bb_lamports: req.bond_bb_lamports,
     };
 
     match state.blockchain.store_oracle_node(&node) {
@@ -153,7 +155,7 @@ pub async fn oracle_event_handler(
             "merkle_root": hex::encode(root.merkle_root),
             "proposed_at_slot": root.proposed_at_slot,
             "finalize_at_slot": root.finalize_at_slot,
-            "dispute_stake_pico_xx": root.dispute_stake_pico_xx.to_string(),
+            "dispute_stake_bb_lamports": root.dispute_stake_bb_lamports.to_string(),
             "oracle_event_hash": oracle_event_hash,
         })));
     }
@@ -195,16 +197,16 @@ fn compute_oracle_event_hash(market_id: &str, outcome: &str, merkle_root: &[u8; 
 
 /// POST /oracle/dispute
 ///
-/// Any user can stake $XX to challenge a pending root during the dispute window.
-/// Canonical signed message: `ORACLE_DISPUTE:{market_id}:{xx_stake_pico}:{timestamp}:{nonce}`
+/// Any user can stake $BB to challenge a pending root during the dispute window.
+/// Canonical signed message: `ORACLE_DISPUTE:{market_id}:{bb_stake_lamports}:{timestamp}:{nonce}`
 ///
-/// If total staked $XX reaches DISPUTE_ESCALATION_THRESHOLD, the root moves to
-/// `Disputed` status and awaits a $XX governance vote (Step 3).
+/// If total staked $BB reaches DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS, the root
+/// moves to `Disputed` status.
 #[derive(serde::Deserialize)]
 pub struct DisputeRequest {
     pub market_id: String,
-    /// $XX stake in pico-MAXX (12 decimals). Min 100 $XX = 100 * MAXX_UNIT.
-    pub xx_stake_pico: u64,
+    /// $BB stake in lamports. Min 100 BB = 100 * LAMPORTS_PER_BB.
+    pub bb_stake_lamports: u64,
     /// Hex-encoded Ed25519 public key (64 chars, 32 bytes) of the disputer.
     pub public_key: String,
     /// Hex-encoded Ed25519 signature (128 chars, 64 bytes).
@@ -223,9 +225,9 @@ pub async fn oracle_dispute_handler(
             "error": "market_id is required"
         })));
     }
-    if req.xx_stake_pico < MIN_DISPUTE_STAKE_PICO_XX {
+    if req.bb_stake_lamports < MIN_DISPUTE_STAKE_BB_LAMPORTS {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("xx_stake_pico must be >= {} pico-MAXX (100 $XX)", MIN_DISPUTE_STAKE_PICO_XX)
+            "error": format!("bb_stake_lamports must be >= {} lamports ({} BB)", MIN_DISPUTE_STAKE_BB_LAMPORTS, MIN_DISPUTE_STAKE_BB_LAMPORTS / LAMPORTS_PER_BB)
         })));
     }
 
@@ -255,11 +257,11 @@ pub async fn oracle_dispute_handler(
     };
 
     // ── Ed25519 signature verification ──────────────────────────────────────
-    // Canonical message: "ORACLE_DISPUTE:{market_id}:{xx_stake_pico}:{timestamp}:{nonce}"
+    // Canonical message: "ORACLE_DISPUTE:{market_id}:{bb_stake_lamports}:{timestamp}:{nonce}"
     {
         use ed25519_dalek::{VerifyingKey, Signature, Verifier};
         let msg = format!("ORACLE_DISPUTE:{}:{}:{}:{}",
-            req.market_id, req.xx_stake_pico, req.timestamp, req.nonce);
+            req.market_id, req.bb_stake_lamports, req.timestamp, req.nonce);
         let vk = match VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap_or(&[0u8;32])) {
             Ok(k) => k,
             Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -329,28 +331,26 @@ pub async fn oracle_dispute_handler(
         })));
     }
 
-    // ── Debit disputer's $XX → dispute pool address ──────────────────────────
-    let svm = &state.blockchain.svm_accounts;
-    let maxx_mint = maxx_mint_bytes();
-    let disputer_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&wallet);
+    // ── Debit disputer's $BB → dispute pool address (native lamports) ───────
     // Dispute pool: deterministic address per market_id ("oracle_dispute_pool_{market_id}")
     let pool_addr = format!("oracle_dispute_pool_{}", req.market_id);
-    let pool_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&pool_addr);
 
-    if let Err(e) = SplTokenEngine::transfer_tokens(svm, &maxx_mint, &disputer_pk, &pool_pk, req.xx_stake_pico) {
+    if let Err(e) = state.blockchain.debit_svm_lamports(&wallet, req.bb_stake_lamports) {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
-            "error": format!("Failed to lock $XX stake: {}", e)
+            "error": format!("Failed to lock $BB stake: {}", e)
         })));
     }
+    // Credit to dispute pool (best-effort; debit already succeeded)
+    let _ = state.blockchain.credit_svm_lamports(&pool_addr, req.bb_stake_lamports);
 
     // ── Update PendingRoot ───────────────────────────────────────────────────
-    pending.dispute_stake_pico_xx = pending.dispute_stake_pico_xx.saturating_add(req.xx_stake_pico);
+    pending.dispute_stake_bb_lamports = pending.dispute_stake_bb_lamports.saturating_add(req.bb_stake_lamports);
     pending.disputers.push(Disputer {
         wallet: wallet.clone(),
-        stake_pico_xx: req.xx_stake_pico,
+        stake_bb_lamports: req.bb_stake_lamports,
     });
 
-    let escalated = pending.dispute_stake_pico_xx >= DISPUTE_ESCALATION_THRESHOLD
+    let escalated = pending.dispute_stake_bb_lamports >= DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS
         && pending.status != PendingRootStatus::Disputed;
     if escalated {
         pending.status = PendingRootStatus::Disputed;
@@ -358,20 +358,21 @@ pub async fn oracle_dispute_handler(
 
     // ── ReDB first, then respond ─────────────────────────────────────────────
     if let Err(e) = state.blockchain.store_pending_root(&pending) {
-        // Roll back the $XX transfer
-        let _ = SplTokenEngine::transfer_tokens(svm, &maxx_mint, &pool_pk, &disputer_pk, req.xx_stake_pico);
+        // Roll back the $BB transfer
+        let _ = state.blockchain.debit_svm_lamports(&pool_addr, req.bb_stake_lamports);
+        let _ = state.blockchain.credit_svm_lamports(&wallet, req.bb_stake_lamports);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("Failed to persist dispute: {}", e)
         })));
     }
 
-    info!("⚖️  Dispute filed: market={} wallet={} stake={} total_stake={} escalated={}",
-        req.market_id, wallet, req.xx_stake_pico, pending.dispute_stake_pico_xx, escalated);
+    info!("⚖️  Dispute filed: market={} wallet={} stake={} lamports total_stake={} escalated={}",
+        req.market_id, wallet, req.bb_stake_lamports, pending.dispute_stake_bb_lamports, escalated);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "market_id": req.market_id,
-        "total_dispute_stake_pico_xx": pending.dispute_stake_pico_xx.to_string(),
+        "total_dispute_stake_bb_lamports": pending.dispute_stake_bb_lamports.to_string(),
         "escalated_to_vote": escalated,
         "disputer_count": pending.disputers.len(),
     })))
@@ -484,19 +485,16 @@ pub async fn oracle_vote_handler(
         })));
     }
 
-    // ── Check voter has any $XX ──────────────────────────────────────────────
-    let svm = &state.blockchain.svm_accounts;
-    let maxx_mint = maxx_mint_bytes();
-    let voter_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&wallet);
-    let voter_xx_balance = SplTokenEngine::get_token_balance(svm, &maxx_mint, &voter_pk);
-    if voter_xx_balance == 0 {
+    // ── Check voter has minimum $BB balance to participate ───────────────────────
+    let voter_bb_balance = state.blockchain.get_balance_lamports(&wallet);
+    if voter_bb_balance < MIN_DISPUTE_STAKE_BB_LAMPORTS {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "error": "No $XX balance — must hold $XX to vote"
+            "error": format!("Insufficient $BB balance — must hold at least {} BB to vote", MIN_DISPUTE_STAKE_BB_LAMPORTS / LAMPORTS_PER_BB)
         })));
     }
 
     // ── Step 2 vote logic: discard if any "false" vote (conservative).
-    // Step 3 will replace with $XX-weighted supermajority.
+    // Step 3 will replace with $BB-weighted supermajority.
     // ────────────────────────────────────────────────────────────────────────
     if !req.vote {
         pending.status = PendingRootStatus::Discarded;
@@ -505,28 +503,27 @@ pub async fn oracle_vote_handler(
                 "error": format!("Failed to persist vote: {}", e)
             })));
         }
-        // Return disputer stakes (best-effort; Step 3 will add slash logic)
+        // Return disputer stakes in $BB (best-effort; Step 3 will add slash logic)
         let pool_addr = format!("oracle_dispute_pool_{}", req.market_id);
-        let pool_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&pool_addr);
         for d in &pending.disputers {
-            let d_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&d.wallet);
-            let _ = SplTokenEngine::transfer_tokens(svm, &maxx_mint, &pool_pk, &d_pk, d.stake_pico_xx);
+            let _ = state.blockchain.debit_svm_lamports(&pool_addr, d.stake_bb_lamports);
+            let _ = state.blockchain.credit_svm_lamports(&d.wallet, d.stake_bb_lamports);
         }
-        info!("🗳️  Vote DISCARD: market={} voter={} xx_weight={}", req.market_id, wallet, voter_xx_balance);
+        info!("🗳️  Vote DISCARD: market={} voter={} bb_balance={}", req.market_id, wallet, voter_bb_balance);
         return (StatusCode::OK, Json(serde_json::json!({
             "success": true,
             "market_id": req.market_id,
             "outcome": "Discarded",
-            "voter_xx_weight": voter_xx_balance.to_string(),
+            "voter_bb_balance_lamports": voter_bb_balance.to_string(),
         })));
     }
 
     // Uphold vote — root stays Disputed until finalize_at_slot
-    info!("🗳️  Vote UPHOLD: market={} voter={} xx_weight={}", req.market_id, wallet, voter_xx_balance);
+    info!("🗳️  Vote UPHOLD: market={} voter={} bb_balance={}", req.market_id, wallet, voter_bb_balance);
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "market_id": req.market_id,
         "outcome": "Uphold recorded — root remains in dispute window",
-        "voter_xx_weight": voter_xx_balance.to_string(),
+        "voter_bb_balance_lamports": voter_bb_balance.to_string(),
     })))
 }

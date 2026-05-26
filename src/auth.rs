@@ -1,8 +1,7 @@
 //! Ed25519 signature verification + replay protection for action endpoints.
 //!
-//! Every state-changing endpoint (MAXX buy/sell, DECAY mint/use/recharge/stake)
-//! uses the same message construction and replay-protection scheme as
-//! `/transfer/simple` and `/faucet`.
+//! Every state-changing endpoint uses the same message construction and
+//! replay-protection scheme as `/transfer/simple` and `/faucet`.
 //!
 //! # Message format
 //! ```text
@@ -40,7 +39,7 @@ pub type AuthError = (StatusCode, Json<Value>);
 ///
 /// # Parameters
 /// - `state`      — app state (used_nonces DashMap access)
-/// - `action`     — action label string (e.g. "MAXX_BUY")
+/// - `action`     — action label string (e.g. "TRANSFER")
 /// - `from`       — base58 address from the request body
 /// - `public_key` — hex-encoded 32-byte Ed25519 public key
 /// - `signature`  — hex-encoded 64-byte Ed25519 signature

@@ -19,7 +19,6 @@ use tracing::{info, warn};
 
 use crate::AppState;
 use crate::storage::PendingRootStatus;
-use crate::svm::{SplTokenEngine, maxx_mint_bytes};
 
 /// How often the finalize loop checks for ready-to-finalize roots (seconds).
 const FINALIZE_POLL_SECS: u64 = 30;
@@ -112,15 +111,12 @@ async fn finalize_ready_roots(state: &AppState) {
                 warn!("⚠️  Oracle discard (timeout): market={} slot={}",
                     root.market_id, current_slot);
 
-                // Return disputer stakes (best-effort, no slash in Step 2)
-                let svm = &state.blockchain.svm_accounts;
-                let maxx_mint = maxx_mint_bytes();
+                // Return disputer stakes in $BB (best-effort, no slash in Step 2)
                 let pool_addr = format!("oracle_dispute_pool_{}", root.market_id);
-                let pool_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&pool_addr);
                 for d in &root.disputers {
-                    let d_pk = crate::storage::ConcurrentBlockchain::addr_to_pubkey(&d.wallet);
-                    if let Err(e) = SplTokenEngine::transfer_tokens(svm, &maxx_mint, &pool_pk, &d_pk, d.stake_pico_xx) {
-                        warn!("Oracle discard: failed to return stake to {}: {}", d.wallet, e);
+                    let _ = state.blockchain.debit_svm_lamports(&pool_addr, d.stake_bb_lamports);
+                    if let Err(e) = state.blockchain.credit_svm_lamports(&d.wallet, d.stake_bb_lamports) {
+                        warn!("Oracle discard: failed to return BB stake to {}: {}", d.wallet, e);
                     }
                 }
 

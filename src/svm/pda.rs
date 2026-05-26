@@ -15,9 +15,8 @@
 //
 // AUTHORITY MODEL:
 //   swap_pool_pda()      → wUSDT mint authority + BB/wUSDT swap liquidity pool
-//   maxx_curve_pda()     → MAXX ($XX) mint authority + bonding curve reserve
 //   escrow_vault_pda()   → Global L2 prediction market collateral vault
-//   decay_treasury_pda() → $DECAY recharge treasury
+//   house_treasury_pda() → Platform rake treasury (expired contest sweeps)
 //
 // ============================================================================
 
@@ -30,9 +29,6 @@ use solana_sdk::pubkey::Pubkey;
 
 /// Owns the wUSDT liquidity pool and is the wUSDT mint authority.
 pub const SWAP_POOL_SEED: &[u8] = b"bb_swap_pool_v1";
-
-/// Owns the $XX (MAXX) bonding curve reserve and is the MAXX mint authority.
-pub const MAXX_CURVE_SEED: &[u8] = b"bb_maxx_curve_v1";
 
 /// Owns the global L2 escrow vault (prediction market settlement collateral).
 ///
@@ -49,12 +45,8 @@ pub const ESCROW_VAULT_CONTEST_SEED: &[u8] = b"bb_escrow_vault_v2";
 /// `ContestState` account address (root, totals, status, claim deadline).
 pub const CONTEST_STATE_SEED: &[u8] = b"bb_contest_state_v1";
 
-/// Owns the $DECAY recharge treasury.
-pub const DECAY_TREASURY_SEED: &[u8] = b"bb_decay_treasury_v1";
-
 /// Owns the house / platform rake treasury.
 /// Receives expired contest house_rake sweeps after the 30-day claim window.
-/// Separate from $DECAY treasury for clean on-chain accounting.
 pub const HOUSE_TREASURY_SEED: &[u8] = b"bb_house_treasury_v1";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,13 +74,6 @@ pub fn derive_pda(seed: &[u8]) -> [u8; 32] {
 #[inline]
 pub fn swap_pool_pda() -> Pubkey {
     Pubkey::new_from_array(derive_pda(SWAP_POOL_SEED))
-}
-
-/// PDA that owns the $MAXX bonding curve reserve and has MAXX mint authority.
-/// The only code path that can mint MAXX is the bonding curve buy handler.
-#[inline]
-pub fn maxx_curve_pda() -> Pubkey {
-    Pubkey::new_from_array(derive_pda(MAXX_CURVE_SEED))
 }
 
 /// PDA that owns the global L2 escrow vault (user collateral for L2 markets).
@@ -129,17 +114,38 @@ pub fn contest_state_pda(contest_id: &str) -> Pubkey {
     Pubkey::new_from_array(bytes)
 }
 
-/// PDA that owns the $DECAY recharge treasury.
-#[inline]
-pub fn decay_treasury_pda() -> Pubkey {
-    Pubkey::new_from_array(derive_pda(DECAY_TREASURY_SEED))
-}
-
 /// PDA that owns the house / platform rake treasury.
 /// Receives expired contest house_rake after the claim window closes.
 #[inline]
 pub fn house_treasury_pda() -> Pubkey {
     Pubkey::new_from_array(derive_pda(HOUSE_TREASURY_SEED))
+}
+
+/// Seed for the L5 rollup liquidity pool vault (legacy — kept for backward compat).
+pub const ROLLUP_LIQUIDITY_POOL_SEED: &[u8] = b"bb_rollup_liquidity_pool_v1";
+
+/// PDA for the L5 rollup liquidity pool (legacy).
+#[inline]
+pub fn rollup_liquidity_pool_pda() -> Pubkey {
+    Pubkey::new_from_array(derive_pda(ROLLUP_LIQUIDITY_POOL_SEED))
+}
+
+/// Base58 string address of the legacy L5 rollup liquidity pool PDA.
+#[deprecated(note = "Use rollup_vault_address(rollup_id) for per-rollup vault isolation")]
+pub fn rollup_liquidity_pool_address() -> String {
+    bs58::encode(rollup_liquidity_pool_pda().to_bytes()).into_string()
+}
+
+/// Deterministic per-rollup vault PDA.
+/// Each rollup_id ("L2", "L3", "L5") gets its own isolated vault address derived
+/// from SHA-256("bb_rollup_vault_v1:{rollup_id}"). This mathematically quarantines
+/// liquidity so a compromise in one rollup cannot drain another's vault.
+pub fn rollup_vault_address(rollup_id: &str) -> String {
+    let seed = format!("bb_rollup_vault_v1:{}", rollup_id);
+    let bytes = Sha256::digest(seed.as_bytes());
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    bs58::encode(arr).into_string()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,12 +157,7 @@ pub fn swap_pool_address() -> String {
     bs58::encode(swap_pool_pda().to_bytes()).into_string()
 }
 
-/// Base58 string address of the MAXX bonding curve PDA.
-pub fn maxx_curve_address() -> String {
-    bs58::encode(maxx_curve_pda().to_bytes()).into_string()
-}
-
-/// Base58 string address of the escrow vault PDA (legacy global).
+/// Base58 string address of the house treasury PDA.
 #[deprecated(note = "Use escrow_vault_address_for(contest_id) for per-contest fund isolation")]
 pub fn escrow_vault_address() -> String {
     #[allow(deprecated)]
@@ -171,11 +172,6 @@ pub fn escrow_vault_address_for(contest_id: &str) -> String {
 /// Base58 string address of the per-contest `ContestState` PDA.
 pub fn contest_state_pda_address(contest_id: &str) -> String {
     bs58::encode(contest_state_pda(contest_id).to_bytes()).into_string()
-}
-
-/// Base58 string address of the DECAY treasury PDA.
-pub fn decay_treasury_pda_address() -> String {
-    bs58::encode(decay_treasury_pda().to_bytes()).into_string()
 }
 
 /// Base58 string address of the house treasury PDA.
@@ -206,9 +202,7 @@ mod tests {
     #[test]
     fn pda_derivation_is_deterministic() {
         assert_eq!(swap_pool_pda(), swap_pool_pda());
-        assert_eq!(maxx_curve_pda(), maxx_curve_pda());
         assert_eq!(escrow_vault_pda(), escrow_vault_pda());
-        assert_eq!(decay_treasury_pda(), decay_treasury_pda());
         assert_eq!(house_treasury_pda(), house_treasury_pda());
     }
 
@@ -216,9 +210,8 @@ mod tests {
     fn all_pdas_are_distinct() {
         let pdas = [
             swap_pool_pda(),
-            maxx_curve_pda(),
             escrow_vault_pda(),
-            decay_treasury_pda(),
+            house_treasury_pda(),
         ];
         for i in 0..pdas.len() {
             for j in (i + 1)..pdas.len() {
@@ -259,8 +252,6 @@ mod tests {
     fn per_contest_vault_does_not_collide_with_global_pdas() {
         let v = escrow_vault_pda_for("anything");
         assert_ne!(v, swap_pool_pda());
-        assert_ne!(v, maxx_curve_pda());
-        assert_ne!(v, decay_treasury_pda());
         assert_ne!(v, escrow_vault_pda(), "v2 per-contest must not collide with v1 global");
     }
 

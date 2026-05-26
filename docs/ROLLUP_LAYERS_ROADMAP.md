@@ -1,7 +1,7 @@
 # BlackBook — Rollup Layers 2–5 Roadmap
 
 > **L1 is the settlement layer. Layers 2–5 are rollup execution environments that post state roots back to L1.**
-> Last updated: 2026-04-26
+> Last updated: May 2026 — Universal Rollup Hub live
 
 ---
 
@@ -11,42 +11,105 @@
 ┌──────────────────────────────────────────────────────────────┐
 │                    BLACKBOOK L1 (Settlement)                 │
 │  PoH Clock · Tower BFT · Sealevel · Gulf Stream · Turbine   │
-│  Global Escrow Contract · Merkle Root Verification          │
-│  Three-token economy: BB · wUSDT · $XX                      │
+│  Global Escrow · Universal Rollup Hub · NFT Bridge          │
+│  Two-token economy: BB · wUSDT                              │
+│                                                              │
+│  POST /rollup/:rollup_id/lock_bb                            │
+│  POST /rollup/:rollup_id/submit_root                        │
+│  POST /rollup/:rollup_id/exit         ← BB or NFT           │
 └────────┬────────────┬────────────┬────────────┬─────────────┘
          │            │            │            │
     ┌────▼────┐  ┌────▼────┐  ┌───▼───┐  ┌────▼────┐
     │  L2     │  │  L3     │  │  L4   │  │  L5     │
-    │ Predict │  │ DEX /   │  │ Yield │  │ Govern  │
-    │ Market  │  │ Trading │  │ Vault │  │ -ance   │
+    │ Predict │  │  NFT    │  │ Yield │  │ Creator │
+    │ Market  │  │ Bridge  │  │ Vault │  │ Economy │
+    │ rollup  │  │ rollup  │  │       │  │ rollup  │
     └─────────┘  └─────────┘  └───────┘  └─────────┘
 ```
 
-**How every L2–5 layer talks to L1:**
-1. Users lock BB in the L1 Global Escrow contract via `POST /escrow/deposit`
-2. Layer runs autonomously (its own DB, own execution)
-3. On settlement: layer submits a SHA-256 Merkle root via `POST /escrow/submit-state-root`
-4. L1 enforces: valid sequencer signature, zero-sum invariant, monotonically increasing block number
-5. Users claim winnings via `POST /escrow/withdraw` with a Merkle proof — L1 verifies, releases BB
+**How every layer talks to L1 via the Universal Rollup Hub:**
+1. Users lock $BB in the per-rollup vault PDA via `POST /rollup/:rollup_id/lock_bb`
+2. Layer runs autonomously (own DB, own execution engine)
+3. On settlement: sequencer submits a SHA-256 Merkle root via `POST /rollup/:rollup_id/submit_root`
+4. L1 enforces: registered sequencer signature, monotonically increasing batch_id
+5. Users exit via `POST /rollup/:rollup_id/exit` with a Merkle proof — L1 releases BB or mints NFT
 
 ---
 
-## Layer 2 — Prediction Market ⭐ PRIORITY
+## Universal Rollup Hub — L1 Bridge API ✅ LIVE
 
-**Status:** Running at `:1234`. Frontend wallet integrated. **Settlement end-to-end not yet confirmed.**
+All five routes are implemented and building cleanly at `src/contracts/rollup/mod.rs`.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /rollup/:rollup_id/lock_bb` | User Ed25519 | Lock $BB into rollup vault PDA |
+| `GET  /rollup/:rollup_id/locks/:lock_id` | Public | Sequencer reads lock record |
+| `POST /rollup/:rollup_id/locks/:lock_id/consume` | Sequencer Ed25519 | Mark lock as spent |
+| `POST /rollup/:rollup_id/submit_root` | Sequencer Ed25519 | Anchor Merkle state root on L1 |
+| `POST /rollup/:rollup_id/exit` | User Ed25519 | Exit BB or NFT back to L1 |
+
+**rollup_id values:** `"L2"` (Prediction Markets), `"L3"` (NFTs), `"L5"` (Creator Economy)
+
+### Sequencer Registration
+Each rollup's sequencer is registered via env var at startup:
+```
+L2_SEQUENCER_PUBKEY=<64-char hex Ed25519 pubkey>
+L3_SEQUENCER_PUBKEY=<64-char hex Ed25519 pubkey>
+L5_SEQUENCER_PUBKEY=<64-char hex Ed25519 pubkey>
+```
+If an env var is absent, that rollup's `submit_root` and `consume_lock` return HTTP 503.
+`lock_bb` and `exit` are always open.
+
+### Signed Message Formats (canonical — must match exactly)
+| Action | Message Format |
+|---|---|
+| lock_bb | `ROLLUP_LOCK_BB:{rollup_id}:{wallet}:{bb_lamports}:{symbol_hint}:{ts}:{nonce}` |
+| consume lock | `CONSUME_LOCK:{rollup_id}:{lock_id}:{ts}` |
+| submit_root | `ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{ts}` |
+| exit BB | `ROLLUP_EXIT:{rollup_id}:BB:{address}:{batch_id}:{ts}:{nonce}` |
+| exit NFT | `ROLLUP_EXIT:{rollup_id}:NFT:{address}:{batch_id}:{ts}:{nonce}` |
+
+### Canonical Merkle Leaf Encoding
+Sequencers MUST produce leaves using these exact formats (colon-separated strings, no JSON):
+
+```
+BB leaf:   SHA-256( "{rollup_id}:BB:{address}:{balance_lamports}" )
+NFT leaf:  SHA-256( "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}" )
+```
+- `address` — lowercase L1 wallet address
+- `balance_lamports` — $BB amount as decimal integer (no decimals)
+- `metadata_hash` — SHA-256 hex of the NFT metadata JSON
+
+### ReDB Storage
+| Table | Key format | Value |
+|---|---|---|
+| `ROLLUP_STATE_ROOTS` | `"{rollup_id}:{batch_id:020}"` (zero-padded) | 32-byte root |
+| `ROLLUP_CONSUMED_EXITS` | `SHA256("{rollup_id}:{batch_id}:{asset_type}:{identity}")` | timestamp u64 |
+| `ROLLUP_LOCKS` | lock UUID | `RollupLockRecord` JSON |
+
+### Double-Spend Protection
+Every exit is permanently sealed in `ROLLUP_CONSUMED_EXITS` **after** the asset transfer succeeds.
+On BB exits the vault debit+credit are rolled back if the seal write conflicts (concurrent exit attempt).
+On NFT exits the `nft_bridge::get_nft` pre-check rejects if the token already exists on L1.
+
+---
+
+## Layer 2 — Prediction Market ⭐ IN PRODUCTION
+
+**Status:** Running at `:1234`. Frontend wallet integrated. Rollup Hub bridge ready.
 
 ### What L1 Provides
 | Feature | L1 Endpoint | Status |
 |---|---|---|
-| BB lock-in | `POST /escrow/deposit` | ✅ Working |
-| State root anchoring | `POST /escrow/submit-state-root` | ✅ Working |
-| Monotonicity enforcement | Auto-reject if `l2_block_number <=` last seen | ✅ Implemented |
-| Zero-sum check | `total_deposited == total_payout + house_rake` | ✅ Implemented |
-| Claim window (30 days) | `6_480_000 slots` from settlement | ✅ Implemented |
-| User withdrawal via Merkle | `POST /escrow/withdraw` | ✅ Working |
-| Double-claim prevention | DashMap + ReDB atomic write | ✅ Implemented |
-| ReDB-first writes | Persist to disk before DashMap update | ✅ Implemented |
-| Contest state query | `GET /escrow/contest/:id` | ✅ Working |
+| BB lock-in (new hub path) | `POST /rollup/L2/lock_bb` | ✅ Live |
+| State root anchoring | `POST /rollup/L2/submit_root` | ✅ Live |
+| BB exit with Merkle proof | `POST /rollup/L2/exit` | ✅ Live |
+| Legacy escrow deposit | `POST /escrow/deposit` | ✅ Working |
+| Legacy state root | `POST /escrow/submit-state-root` | ✅ Working |
+| Legacy withdrawal | `POST /escrow/withdraw` | ✅ Working |
+| Monotonicity enforcement | Auto-reject stale batch_id | ✅ Implemented |
+| Claim window (30 days) | 6,480,000 slots from settlement | ✅ Implemented |
+| Double-claim prevention | ROLLUP_CONSUMED_EXITS (permanent seal) | ✅ Implemented |
 
 ### L2 ← L1 Integration Contract (What L2 Must Send)
 
@@ -121,45 +184,86 @@ Medium. The L1 settlement primitives are already in place. L3 needs its own exec
 
 ---
 
-## Layer 4 — Yield Vault
+## Layer 3 — NFT Bridge ✅ L1 SIDE COMPLETE
 
-**Status:** Not started. Architecture defined below.
+**Status:** L1 anchor + rollup hub exit wired. L3 sequencer and execution engine not yet built.
 
 ### Purpose
-Users lock BB/wUSDT into yield strategies. Strategies run on L4 (e.g. lending, liquidity provision). Returns are settled back to user wallets on L1 via the escrow → merkle claim pattern.
+L3 is the NFT layer. Users lock $BB on L1, play / trade NFTs in the L3 environment,
+then exit their NFTs back to L1 where they are permanently anchored via `nft_bridge::put_nft()`.
 
-### How It Uses L1
-- Deposits: same `POST /escrow/deposit`
-- Settlement: `POST /escrow/submit-state-root` with the final yield distribution Merkle root
-- Withdrawals: same `POST /escrow/withdraw`
+### What L1 Provides (all live)
+| Feature | L1 Endpoint | Status |
+|---|---|---|
+| $BB lock into L3 vault | `POST /rollup/L3/lock_bb` | ✅ Live |
+| State root anchoring | `POST /rollup/L3/submit_root` | ✅ Live |
+| NFT exit with Merkle proof | `POST /rollup/L3/exit` (asset_type="NFT") | ✅ Live |
+| NFT read | `GET /nft/:collection_id/:token_id` | ✅ Live |
+| BB exit from L3 | `POST /rollup/L3/exit` (asset_type="BB") | ✅ Live |
 
-### Key Difference from L2
-Yield vaults are **continuous** (rolling epochs) rather than event-driven (single market resolution). The L4 needs to:
-1. Submit a state root every epoch (e.g. weekly)
-2. Allow partial claims — users can claim yield without closing their principal position
+### NFT Exit Flow
+```
+L3 user wants to bring their NFT to L1
+  1. L3 sequencer builds Merkle tree of NFT ownerships:
+     leaf = SHA-256("{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}")
+  2. L3 submits root → POST /rollup/L3/submit_root
+  3. User calls POST /rollup/L3/exit with:
+     { asset_type: "NFT", collection_id, nft_token_id, metadata_uri, metadata_hash,
+       batch_id, proof_siblings, sibling_is_right, public_key, signature, timestamp, nonce }
+  4. L1 verifies Merkle proof → double-spend check → calls nft_bridge::put_nft()
+  5. NFT is now permanently anchored on L1 (can be read via GET /nft/...)
+```
 
-### L1 Changes Required
-- [ ] **Partial claims** — current withdraw marks the whole market as claimed. Need `claim_partial` variant that allows claiming yield without burning the full position.
-- [ ] **Re-deposit on claim** — allow a claim to auto-re-lock into the next epoch (compound).
+### What Still Needs to Be Built
+- [ ] **L3 execution engine** — NFT trading environment (off-chain, Rust or Node)
+- [ ] **L3 sequencer** — builds NFT Merkle tree, signs roots, calls L1
+- [ ] **L3 SDK** — TypeScript client for minting, trading, exiting NFTs
+- [ ] **L3_SEQUENCER_PUBKEY** env var — must be set in production
 
 ---
 
-## Layer 5 — Governance
+## Layer 4 — Yield Vault 📋 PLANNED
 
-**Status:** Not started. Architecture defined below.
+**Status:** Not started.
 
 ### Purpose
-$XX holders vote on platform parameters: house rake %, LMSR b-parameter, fee rates, oracle sources, new layer approvals.
+Auto-compounding yield vaults. Users lock $BB, vault allocates to L2/L3 strategies, profits
+settle back via Merkle proof claims on L1.
 
 ### How It Uses L1
-- Vote weight = $XX balance at snapshot slot (from `GET /usdc/balance/:address`)
-- Proposal execution calls admin endpoints on L1 (guarded by governance multisig)
-- Vote tallying happens off-chain (L5 engine), result anchored to L1 as a state root
+- Lock funds: `POST /rollup/L4/lock_bb` (once rollup_id `"L4"` is added to the registry)
+- Settlement: `POST /rollup/L4/submit_root`
+- Withdrawals: `POST /rollup/L4/exit`
 
 ### L1 Changes Required
-- [ ] **Snapshot balance** — `GET /balance/snapshot/:address/:slot` — read historical balance from ReDB for a specific past slot
-- [ ] **Governance timelock** — a new escrow type with a time-delay before execution
-- [ ] **Multisig sequencer** — governance layer needs M-of-N sequencer keys (vs. single key for L2)
+- [ ] Add `"L4"` to rollup registry + `L4_SEQUENCER_PUBKEY` env var
+- [ ] **Partial claims** — yield vaults claim yield without closing principal
+
+---
+
+## Layer 5 — Creator Economy Rollup 📋 PLANNED
+
+**Status:** L1 bridge fully wired (`rollup_id = "L5"`). L5 execution engine not built.
+
+### Purpose
+Creator token launchpad — like pump.fun but settlement-backed. Creators lock $BB on L1 to
+seed their L5 token's initial reserve. The L5 sequencer credits rollup-$BB and runs the
+bonding curve. When a creator or holder wants to exit back to L1, they supply a Merkle proof.
+
+### What L1 Provides (all live)
+| Feature | L1 Endpoint | Status |
+|---|---|---|
+| Creator seed lock | `POST /rollup/L5/lock_bb` | ✅ Live |
+| State root anchoring | `POST /rollup/L5/submit_root` | ✅ Live |
+| BB exit back to L1 | `POST /rollup/L5/exit` (asset_type="BB") | ✅ Live |
+| Lock consumed? | `POST /rollup/L5/locks/:id/consume` | ✅ Live |
+| Legacy L5 roots migrated | Startup migration L5_STATE_ROOTS → ROLLUP_STATE_ROOTS | ✅ Done |
+
+### What Still Needs to Be Built
+- [ ] **L5 bonding curve engine** — price formula, token accounting, off-chain
+- [ ] **L5 sequencer** — builds Merkle tree of balances, signs roots, calls L1
+- [ ] **L5 SDK** — TypeScript client for lock, trade, exit
+- [ ] **`L5_SEQUENCER_PUBKEY`** env var — must be set in production
 
 ---
 
@@ -169,49 +273,52 @@ These items are needed by ALL rollup layers.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Global Escrow deposit | ✅ Done | `POST /escrow/deposit` |
-| Merkle root verification | ✅ Done | Sorted SHA-256, 32-byte nodes |
-| Monotonicity enforcement | ✅ Done | Rejects stale l2_block_number |
-| Zero-sum invariant | ✅ Done | `deposited == payout + rake` |
+| Universal Rollup Hub | ✅ Done | `/rollup/:rollup_id/lock_bb\|submit_root\|exit` |
+| Per-rollup vault PDA | ✅ Done | `rollup_vault_address(rollup_id)` — unique per rollup |
+| Multi-asset exit (BB + NFT) | ✅ Done | `asset_type` field in ExitRequest |
+| Permanent double-spend seal | ✅ Done | `ROLLUP_CONSUMED_EXITS` ReDB table |
+| Sequencer registry | ✅ Done | `authorized_sequencers` DashMap, loaded from env vars |
+| NFT anchor (L3 exit) | ✅ Done | `nft_bridge::put_nft()` called from exit handler |
+| Legacy L5 root migration | ✅ Done | `L5_STATE_ROOTS` → `ROLLUP_STATE_ROOTS` at startup |
+| Global Escrow deposit | ✅ Done | `POST /escrow/deposit` (legacy L2 path) |
+| Merkle root verification | ✅ Done | SHA-256 sorted-pair, 32-byte nodes |
+| Monotonicity enforcement | ✅ Done | Zero-padded batch_id rejects stale roots |
 | ReDB-first persistence | ✅ Done | Disk before DashMap cache |
-| Atomic double-claim | ✅ Done | DashMap entry() + ReDB |
-| Claim deadline (30d) | ✅ Done | 6,480,000 slots |
-| `simulateTransaction` | ❌ Needed | Milestone 2 in integration plan |
-| WebSocket subscriptions | ❌ Needed | Milestone 7 in integration plan |
-| Partial claims | ❌ Needed | Required for L4 yield vaults |
-| Balance snapshots | ❌ Needed | Required for L5 governance voting |
-| Layer-prefixed market IDs | ❌ Needed | Required when L3+ go live |
+| Rollup lock consumed guard | ✅ Done | `consumed` field + `consume_lock_handler` |
+| WebSocket balance push | ✅ Done | Real-time balance updates post-exit |
+| `simulateTransaction` | ❌ Needed | RPC pre-flight for wallets |
+| Partial claims (L4) | ❌ Needed | Yield vaults need claim-without-close |
+| Balance snapshots (governance) | ❌ Needed | `GET /balance/snapshot/:addr/:slot` |
 
 ---
 
 ## Implementation Priority
 
 ```
-IMMEDIATE (L2 prediction market — already running):
-  1. Confirm L2 settlement_bridge.rs sends correctly signed state root
-  2. Confirm L2 proof endpoint returns correct Merkle leaf format
-  3. Run T1–T9 test suite from docs/L2_TEST_GUIDE.md end-to-end
-  4. Add claim deadline display in PredictPage.tsx
+IMMEDIATE (sequencer integration):
+  1. Update L2 sequencer to use /rollup/L2/ paths with new leaf format
+     BB leaf: SHA-256("{rollup_id}:BB:{address}:{balance_lamports}")
+  2. Set L2_SEQUENCER_PUBKEY in Hetzner .env
+  3. Run end-to-end exit test: lock_bb → play → submit_root → exit
 
-NEXT (make L2 production-hardened):
-  5. L2 deposit_tx validation before accepting market entry
-  6. WebSocket subscription for live balance updates post-claim
-  7. simulateTransaction RPC for Phantom/wallet pre-flight
+NEXT (L3 NFT layer):
+  4. Build L3 execution engine (NFT minting/trading, off-chain)
+  5. L3 sequencer: builds NFT Merkle tree with correct leaf format
+     NFT leaf: SHA-256("{rollup_id}:NFT:{col}:{tok}:{owner}:{meta_hash}")
+  6. Set L3_SEQUENCER_PUBKEY in production
+  7. SDK: TypeScript client for lock_bb/submit_root/exit (asset_type=NFT)
 
-MEDIUM TERM (L3 DEX foundation):
-  8. Market ID namespace prefix (`L2:`, `L3:`, `L4:`, `L5:`)
-  9. Build L3 execution engine (order book or AMM)
-  10. L3 epoch settlement bridge (same pattern as L2)
+NEXT (L5 Creator Economy):
+  8. Build L5 bonding curve engine (off-chain)
+  9. L5 sequencer: builds BB balance Merkle tree
+  10. Set L5_SEQUENCER_PUBKEY in production
 
-LONG TERM (L4 + L5):
-  11. Partial claim variant in escrow withdraw
-  12. Balance snapshot endpoint for governance
-  13. Multi-sig sequencer allowlist for governance
+LONG TERM:
+  11. L4 Yield Vaults (add "L4" rollup_id, partial claims)
+  12. simulateTransaction RPC
+  13. Balance snapshot endpoint
 ```
 
----
-
----
 
 ## LI.FI Integration & $XX Token Strategy
 

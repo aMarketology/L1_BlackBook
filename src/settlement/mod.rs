@@ -69,8 +69,12 @@ pub struct BalanceUpdateEvent {
 /// ~2h dispute window at 400 ms/slot: 2*60*60 / 0.4 = 18_000 slots.
 /// Spec says 6_480 but oracle.md calls for ~2h; using 6_480 to match spec.
 const DISPUTE_WINDOW_SLOTS: u64 = 6_480;
-const MIN_DISPUTE_STAKE_PICO_XX: u64 = 100 * crate::svm::MAXX_UNIT;
-const DISPUTE_ESCALATION_THRESHOLD: u64 = 1_000 * crate::svm::MAXX_UNIT;
+/// Minimum $BB lamports to open a dispute (100 BB = $10).
+#[allow(dead_code)]
+const MIN_DISPUTE_STAKE_BB_LAMPORTS: u64 = 100 * crate::svm::LAMPORTS_PER_BB;
+/// Escalation threshold in $BB lamports (1 000 BB = $100).
+#[allow(dead_code)]
+const DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS: u64 = 1_000 * crate::svm::LAMPORTS_PER_BB;
 
 // ============================================================================
 // SERVICE STRUCT
@@ -612,7 +616,7 @@ impl SettlementService for BlackBookSettlementService {
             merkle_root: root_arr,
             proposed_at_slot: current_slot,
             finalize_at_slot,
-            dispute_stake_pico_xx: 0,
+            dispute_stake_bb_lamports: 0,
             status: PendingRootStatus::Pending,
             proposer_pubkey: submitted_pubkey_hex.clone(),
             oracle_signatures,

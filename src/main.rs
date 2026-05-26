@@ -23,7 +23,8 @@ use axum::{
 };
 
 use solana_sdk::account::ReadableAccount;
-use tower_http::cors::{CorsLayer, Any};
+use tower_http::cors::{CorsLayer, Any, AllowOrigin};
+use axum::http::HeaderValue;
 use tower_http::trace::TraceLayer;
 use axum::extract::DefaultBodyLimit;
 use serde::Deserialize;
@@ -222,6 +223,8 @@ pub type WsSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
 pub struct WsSubscriptions {
     pub clients: dashmap::DashMap<std::net::SocketAddr, WsSender>,
     pub account_subs: dashmap::DashMap<String, dashmap::DashSet<std::net::SocketAddr>>,
+    /// Clients subscribed to PoH slot notifications (`slotSubscribe`).
+    pub slot_subs: dashmap::DashSet<std::net::SocketAddr>,
 }
 
 impl WsSubscriptions {
@@ -229,6 +232,7 @@ impl WsSubscriptions {
         Self {
             clients: dashmap::DashMap::new(),
             account_subs: dashmap::DashMap::new(),
+            slot_subs: dashmap::DashSet::new(),
         }
     }
 }
@@ -280,6 +284,12 @@ pub struct AppState {
     /// Double-withdrawal protection: "{market_id}:{address}" → true
     pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
 
+    // ===== Universal Rollup Hub Auth =====
+    /// Maps rollup_id ("L2", "L3", "L5") → authorized sequencer pubkey (64-char hex).
+    /// Loaded from {L2,L3,L5}_SEQUENCER_PUBKEY env vars at startup.
+    /// Only the registered key for a given rollup_id may submit roots or consume locks.
+    pub authorized_sequencers: Arc<dashmap::DashMap<String, String>>,
+
     // ===== Contest Settlement State =====
     /// Per-contest lifecycle state: contest_id → ContestState
     /// Hot cache, ReDB-backed via ConcurrentBlockchain.store_contest_state().
@@ -313,13 +323,11 @@ pub struct AppState {
     /// Default: 10_000 wUSDT = 10_000_000_000 micro. 0 means unlimited.
     pub withdrawal_daily_cap_micro: u64,
 
-    // ===== Layer 5: Creator Coin Launchpad =====
-    /// Registry of all launched creator coins — ticker → CreatorCoinRecord.
-    pub creator_coins: Arc<dashmap::DashMap<String, storage::CreatorCoinRecord>>,
-    /// AMM pool state — ticker → CoinPoolState (constant-product AMM reserves).
-    pub coin_pools: Arc<dashmap::DashMap<String, storage::CoinPoolState>>,
-    /// User coin balances — "{ticker}:{wallet}" → coin units (6 decimals).
-    pub coin_balances: Arc<dashmap::DashMap<String, u64>>,
+    // ===== Layer 5: Rollup Liquidity Bridge =====
+    /// Hot cache of all $BB lock records — lock_id → RollupLockRecord.
+    /// Durable copy is in ReDB (ROLLUP_LIQUIDITY_LOCKS table).
+    /// The L5 sequencer polls GET /rollup/locks/:creator to read new entries.
+    pub rollup_lock_records: Arc<dashmap::DashMap<String, storage::RollupLockRecord>>,
 
     // ===== Backup State =====
     pub backup_last_at: Arc<AtomicU64>,
@@ -329,6 +337,13 @@ pub struct AppState {
     /// Registered Reader nodes for per-tick PoH shred broadcasting.
     /// node_id → ReaderRecord { udp_addr, last_seen }
     pub turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>>,
+
+    // ===== Reader Mode: Writer Proxy =====
+    /// When running as a Reader node, this holds the Writer's HTTP base URL
+    /// (e.g. "http://1.2.3.4:8080"). All state-changing POST requests are
+    /// forwarded to the Writer so local and Hetzner state stay identical.
+    /// `None` when running as a Writer node.
+    pub writer_http_url: Option<String>,
 }
 
 // ============================================================================
@@ -393,6 +408,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "sealevel": true,
             "pipeline": pipeline_stats.is_running,
         },
+        "node_mode": state.node_mode.to_string(),
     }))
 }
 
@@ -429,7 +445,7 @@ async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// GET /metrics — Prometheus text exposition (no external crate).
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     #[allow(deprecated)]
-    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, escrow_vault_address};
+    use svm::{SplTokenEngine, usdc_mint_bytes, escrow_vault_address};
 
     let stats = state.blockchain.stats();
     let current_slot = state.current_slot.load(Ordering::Relaxed);
@@ -441,11 +457,6 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // wUSDT supply (raw micro-units)
     let usdt_mint = usdc_mint_bytes();
     let wusdt_supply_micro = SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &usdt_mint)
-        .unwrap_or(0);
-
-    // MAXX supply (raw pico-units)
-    let maxx_mint = maxx_mint_bytes();
-    let maxx_supply_pico = SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &maxx_mint)
         .unwrap_or(0);
 
     // Swap pool balances
@@ -482,7 +493,6 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     gauge!("bb_block_height",               "Current PoH slot (block height)",                     current_slot);
     gauge!("bb_total_tx_count",             "Total transactions processed",                        stats.total_tx_count);
     gauge!("wusdt_supply_micro",            "Total wUSDT supply in micro-units (6 dec)",           wusdt_supply_micro);
-    gauge!("maxx_supply_pico",              "Total MAXX supply in pico-units (12 dec)",            maxx_supply_pico);
     gauge!("escrow_balance_lamports",       "Escrow vault BB balance in lamports",                 escrow_balance_lamports);
     gauge!("pool_bb_lamports",              "Swap pool BB balance in lamports",                    pool_bb_lamports);
     gauge!("pool_wusdt_micro",              "Swap pool wUSDT balance in micro-units",              pool_wusdt_micro);
@@ -1806,15 +1816,14 @@ async fn admin_seed_swap_pool_handler(
     })))
 }
 
-/// GET /dealer/balances — Returns the dealer's BB, wUSDT, $XX, and $DECAY balances.
+/// GET /dealer/balances — Returns the dealer's BB and wUSDT balances.
 ///
 /// This is a read-only health/monitoring endpoint. Returns HTTP 503 if the dealer
 /// address is not configured (DEALER_PRIVATE_KEY env var not set).
 async fn dealer_balances_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_mint_bytes, USDC_UNIT, MAXX_UNIT, LAMPORTS_PER_BB};
-    use contracts::decay_token::get_owner_tokens;
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT, LAMPORTS_PER_BB};
 
     if state.dealer_address.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
@@ -1839,21 +1848,6 @@ async fn dealer_balances_handler(
     };
     let wusdt_balance = wusdt_raw as f64 / USDC_UNIT as f64;
 
-    // $XX (MAXX) balance
-    let maxx_raw = match bs58::decode(addr).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            let pk = solana_sdk::pubkey::Pubkey::new_from_array(arr);
-            SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &maxx_mint_bytes(), &pk)
-        }
-        _ => 0u64,
-    };
-    let maxx_balance = maxx_raw as f64 / MAXX_UNIT as f64;
-
-    // $DECAY token count
-    let decay_token_ids = get_owner_tokens(&state.blockchain.db, addr);
-    let decay_count = decay_token_ids.len();
-
     (StatusCode::OK, Json(serde_json::json!({
         "dealer_address": addr,
         "bb": {
@@ -1865,16 +1859,6 @@ async fn dealer_balances_handler(
             "balance": wusdt_balance,
             "raw": wusdt_raw,
             "unit": "wUSDT"
-        },
-        "maxx": {
-            "balance": maxx_balance,
-            "raw": maxx_raw,
-            "unit": "$XX"
-        },
-        "decay": {
-            "token_count": decay_count,
-            "token_ids": decay_token_ids,
-            "unit": "$DECAY"
         }
     }))).into_response()
 }
@@ -2022,86 +2006,6 @@ async fn usdc_accounts_handler(
     (StatusCode::OK, Json(serde_json::json!({
         "owner": address,
         "token_accounts": result,
-    })))
-}
-
-/// GET /maxx/balance/{address} — Get MAXX ($XX) balance for a wallet
-async fn maxx_balance_handler(
-    State(state): State<AppState>,
-    Path(address): Path<String>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, maxx_mint_bytes, maxx_mint_address, MAXX_DECIMALS, MAXX_UNIT};
-
-    let wallet_bytes = match bs58::decode(&address).into_vec() {
-        Ok(v) if v.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&v); a }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid base58 wallet address" }))),
-    };
-    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
-    let mint = maxx_mint_bytes();
-    let raw_balance = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
-    let human_balance = raw_balance as f64 / MAXX_UNIT as f64;
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "address": address,
-        "maxx_balance": human_balance,
-        "ticker": "$XX",
-        "raw_balance": raw_balance,
-        "decimals": MAXX_DECIMALS,
-        "mint": maxx_mint_address(),
-    })))
-}
-
-/// GET /maxx/supply — Get total MAXX ($XX) supply on BlackBook L1
-async fn maxx_supply_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, maxx_mint_bytes, maxx_mint_address, MAXX_DECIMALS, MAXX_UNIT};
-
-    let mint = maxx_mint_bytes();
-    match SplTokenEngine::get_mint_supply(&state.blockchain.svm_accounts, &mint) {
-        Ok(supply) => {
-            let human_supply = supply as f64 / MAXX_UNIT as f64;
-            (StatusCode::OK, Json(serde_json::json!({
-                "ticker": "$XX",
-                "token_name": "MAXX",
-                "mint": maxx_mint_address(),
-                "total_supply": human_supply,
-                "raw_supply": supply,
-                "decimals": MAXX_DECIMALS,
-            })))
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("{:?}", e) }))),
-    }
-}
-
-/// GET /maxx/vault — Get the bonding-curve vault's wUSDT reserve and MAXX market state
-async fn maxx_vault_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, maxx_vault_address, USDC_UNIT};
-    use contracts::maxx_token::get_maxx_state;
-
-    // wUSDT balance held in the bonding-curve vault
-    let vault_addr = maxx_vault_address();
-    let vault_bytes = bs58::decode(&vault_addr).into_vec().unwrap_or_default();
-    let vault_usdt = if vault_bytes.len() == 32 {
-        let mut k = [0u8; 32]; k.copy_from_slice(&vault_bytes);
-        let vk = solana_sdk::pubkey::Pubkey::new_from_array(k);
-        let usdt_mint = usdc_mint_bytes();
-        SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &usdt_mint, &vk) as f64 / USDC_UNIT as f64
-    } else { 0.0 };
-
-    let market_state = get_maxx_state(&state.blockchain.db).unwrap_or_default();
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "vault_address": vault_addr,
-        "vault_usdt_balance": vault_usdt,
-        "ticker": "$XX",
-        "token_name": "MAXX",
-        "total_supply": market_state.total_supply as f64 / 1_000_000_000_000_f64,
-        "spot_price_usd": market_state.spot_price,
-        "reserve_currency": market_state.reserve_currency,
-        "last_update_height": market_state.last_update_height,
     })))
 }
 
@@ -2539,6 +2443,29 @@ pub fn spawn_account_notification_broadcaster(state: AppState) {
                 }
             }
 
+            // ── Slot notifications ─────────────────────────────────────────
+            if !ws_state.ws_subscriptions.slot_subs.is_empty() {
+                let slot_msg = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "slotNotification",
+                    "params": {
+                        "subscription": 2,
+                        "result": {
+                            "slot": block.slot,
+                            "parent": block.slot.saturating_sub(1),
+                            "root": block.slot.saturating_sub(32)
+                        }
+                    }
+                });
+                if let Ok(msg_text) = serde_json::to_string(&slot_msg) {
+                    for addr in ws_state.ws_subscriptions.slot_subs.iter() {
+                        if let Some(tx) = ws_state.ws_subscriptions.clients.get(&*addr) {
+                            let _ = tx.send(axum::extract::ws::Message::Text(msg_text.clone().into()));
+                        }
+                    }
+                }
+            }
+
             for pubkey in modified_keys {
                 // In Solana, pubkeys are tracked via base58 string.
                 let pubkey_b58 = solana_sdk::bs58::encode(pubkey).into_string(); 
@@ -2640,6 +2567,22 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, who: std::net::Sock
                                     }
                                 }
                             }
+                        } else if req.method == "slotSubscribe" {
+                            state.ws_subscriptions.slot_subs.insert(who);
+                            let res = RpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                id: req.id,
+                                result: Some(2), // Sub ID 2 = slot subscription
+                                method: None,
+                                params: None,
+                            };
+                            if let Some(tx) = state.ws_subscriptions.clients.get(&who) {
+                                if let Ok(text) = serde_json::to_string(&res) {
+                                    let _ = tx.send(axum::extract::ws::Message::Text(text.into()));
+                                }
+                            }
+                        } else if req.method == "slotUnsubscribe" {
+                            state.ws_subscriptions.slot_subs.remove(&who);
                         }
                     }
                 }
@@ -2654,39 +2597,128 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, who: std::net::Sock
 
     // Cleanup
     state.ws_subscriptions.clients.remove(&who);
+    state.ws_subscriptions.slot_subs.remove(&who);
     for mut entry in state.ws_subscriptions.account_subs.iter_mut() {
         entry.value_mut().remove(&who);
     }
 }
 
-/// Middleware: block all write requests (POST/PUT/DELETE/PATCH) when running in Reader mode.
-/// This makes it mathematically impossible for a Reader node to mutate chain state via HTTP.
-/// GET, HEAD, and OPTIONS pass through unchanged so balance queries and health checks work normally.
-async fn reader_write_guard(
-    State(state): State<AppState>,
+/// Axum middleware: when this node is a Reader, proxy all state-changing
+/// (POST/PUT/DELETE/PATCH) requests to the Writer node. GET requests are
+/// served locally from the synced state. This ensures a single canonical
+/// blockchain regardless of which node the wallet connects to.
+async fn reader_proxy_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::http::Method;
-    if state.node_mode == NodeMode::Reader
-        && !matches!(req.method(), &Method::GET | &Method::HEAD | &Method::OPTIONS)
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "Node is in read-only mode. Submit write transactions to the Writer node.",
-                "writer_url": "https://layer1.blackbook.id",
-                "hint": "This node mirrors the canonical chain but cannot process transactions."
-            }))
-        ).into_response();
+    let Some(ref writer_base) = state.writer_http_url else {
+        // Writer mode — handle locally
+        return next.run(req).await;
+    };
+
+    let method = req.method().clone();
+    // Only proxy state-changing methods
+    if !matches!(
+        method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::DELETE
+            | axum::http::Method::PATCH
+    ) {
+        return next.run(req).await;
     }
-    next.run(req).await
+
+    let path = req.uri().path().to_owned();
+    let query = req.uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target_url = format!("{writer_base}{path}{query}");
+
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": "failed to read request body" })),
+            )
+                .into_response()
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let mut builder = match method.as_str() {
+        "POST" => client.post(&target_url),
+        "PUT" => client.put(&target_url),
+        "DELETE" => client.delete(&target_url),
+        "PATCH" => client.patch(&target_url),
+        _ => {
+            return next
+                .run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                ))
+                .await
+        }
+    };
+
+    if let Some(ct) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+    }
+
+    match builder.body(bytes).send().await {
+        Ok(resp) => {
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            (status, body_bytes).into_response()
+        }
+        Err(e) => {
+            error!("❌ Reader proxy failed → {}: {}", target_url, e);
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({
+                    "error": "Reader node could not reach Writer — try again",
+                    "writer_url": target_url
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn build_router(state: AppState) -> Router {
 
+    // CORS: allow a hardcoded set of production + dev origins.
+    // Add extra origins at runtime via CORS_EXTRA_ORIGINS (comma-separated).
+    // Example: CORS_EXTRA_ORIGINS=https://staging.blackbook.id,http://localhost:3000
+    let mut allowed: Vec<HeaderValue> = vec![
+        // Production
+        "https://blackbook.id".parse().unwrap(),
+        "https://wallet.blackbook.id".parse().unwrap(),
+        // Local dev (Vite on 5173, fallback ports)
+        "http://localhost:5173".parse().unwrap(),
+        "http://localhost:5174".parse().unwrap(),
+        "http://localhost:3000".parse().unwrap(),
+        "http://127.0.0.1:5173".parse().unwrap(),
+        "http://127.0.0.1:3000".parse().unwrap(),
+    ];
+    // Append any runtime-injected extra origins
+    if let Ok(extra) = std::env::var("CORS_EXTRA_ORIGINS") {
+        for raw in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match raw.parse::<HeaderValue>() {
+                Ok(v) => { info!("🔒 CORS: adding extra origin {}", raw); allowed.push(v); }
+                Err(_) => warn!("⚠️  CORS_EXTRA_ORIGINS: invalid entry '{}' — skipped", raw),
+            }
+        }
+    }
+    info!("🔒 CORS: {} origin(s) allowed", allowed.len());
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(move |origin, _req| {
+            allowed.contains(origin)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -2706,22 +2738,10 @@ fn build_router(state: AppState) -> Router {
         .route("/tx/:tx_id", get(transaction_details_handler))
         .route("/address/:address/transactions", get(address_transactions_handler))
         .route("/ledger", get(ledger_handler))
-        // Max Token Market (MAXX / $XX)
-        .route("/maxx/buy", post(contracts::maxx_token::buy_maxx_handler))
-        .route("/maxx/sell", post(contracts::maxx_token::sell_maxx_handler))
-        .route("/maxx/manifest", get(contracts::maxx_token::maxx_market_manifest_handler))
-        .route("/maxx/balance/:address", get(maxx_balance_handler))
-        .route("/maxx/supply", get(maxx_supply_handler))
-        .route("/maxx/vault", get(maxx_vault_handler))
-        // $DECAY value-recapture token (NFT-style per-token state)
-        .route("/decay/mint", post(contracts::decay_token::mint_decay_handler))
-        .route("/decay/use", post(contracts::decay_token::use_decay_handler))
-        .route("/decay/recharge", post(contracts::decay_token::recharge_decay_handler))
-        .route("/decay/stake", post(contracts::decay_token::stake_decay_handler))
-        .route("/decay/token/:id", get(contracts::decay_token::decay_token_handler))
-        .route("/decay/owner/:address", get(contracts::decay_token::decay_owner_handler))
-        .route("/decay/treasury", get(contracts::decay_token::decay_treasury_handler))
-        .route("/decay/supply", get(contracts::decay_token::decay_supply_handler))
+        // NOTE: $MAXX, $DECAY, and $oz tokens have been removed from L1.
+        // These creator/governance tokens now live on the L5 token-launch layer.
+        // L1 only supports the native $BB token (10¢-pegged stablecoin) +
+        // wUSDT (peg backing) + escrow for L2 prediction-market settlement.
         // Transfers (Submission)
         .route("/transfer/simple", post(signed_transfer_handler))
         .route("/transfer", post(signed_transfer_handler))
@@ -2787,7 +2807,13 @@ fn build_router(state: AppState) -> Router {
         .route("/oracle/nodes", get(contracts::oracle::list_oracle_nodes_handler))
         .route("/oracle/event/:market_id", get(contracts::oracle::oracle_event_handler))
         .route("/oracle/dispute", post(contracts::oracle::oracle_dispute_handler))
-        .route("/oracle/vote", post(contracts::oracle::oracle_vote_handler));
+        .route("/oracle/vote", post(contracts::oracle::oracle_vote_handler))
+        // L5 rollup bridge endpoints (lock $BB, query lock, consume lock, submit state root, exit)
+        .route("/rollup/:rollup_id/lock_bb", post(contracts::rollup::lock_bb_handler))
+        .route("/rollup/:rollup_id/locks/:lock_id", get(contracts::rollup::get_lock_by_id_handler))
+        .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
+        .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
+        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {
@@ -2813,7 +2839,10 @@ fn build_router(state: AppState) -> Router {
     }
 
     router
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), reader_write_guard))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reader_proxy_middleware,
+        ))
         .with_state(state)
         .layer(DefaultBodyLimit::max(1_048_576)) // 1 MB — prevents JSON DoS
         .layer(TraceLayer::new_for_http())
@@ -2945,6 +2974,33 @@ async fn main() {
         }
     };
 
+    // ── Startup migration: copy legacy L5_STATE_ROOTS → ROLLUP_STATE_ROOTS ──
+    // One-time idempotent migration; harmless if run multiple times.
+    {
+        use crate::storage::L5_STATE_ROOTS;
+        use redb::ReadableTable;
+        if let Ok(read_txn) = blockchain.db.begin_read() {
+            if let Ok(table) = read_txn.open_table(L5_STATE_ROOTS) {
+                if let Ok(iter) = table.iter() {
+                    let mut migrated = 0usize;
+                    for entry in iter.flatten() {
+                        let batch_id: u64 = entry.0.value();
+                        let root_slice = entry.1.value();
+                        if root_slice.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(root_slice);
+                            let _ = blockchain.store_rollup_state_root("L5", batch_id, arr);
+                            migrated += 1;
+                        }
+                    }
+                    if migrated > 0 {
+                        info!("🔄 Migrated {} L5 state roots → ROLLUP_STATE_ROOTS", migrated);
+                    }
+                }
+            }
+        }
+    }
+
     // ── Global Escrow: PDA is now computed on demand via escrow_vault_address() ──
     // No longer stored in AppState. All escrow code calls svm::escrow_vault_address() directly.
     {
@@ -2978,6 +3034,22 @@ async fn main() {
         set
     };
 
+    // ── Universal Rollup Hub: per-rollup sequencer pubkey registry ───────────
+    // Each rollup registers its sequencer pubkey via a separate env var.
+    // If the env var is not set, that rollup will return 503 on submit/consume.
+    let authorized_sequencers: Arc<dashmap::DashMap<String, String>> =
+        Arc::new(dashmap::DashMap::new());
+    for (rollup_id, env_var) in &[("L2", "L2_SEQUENCER_PUBKEY"), ("L3", "L3_SEQUENCER_PUBKEY"), ("L5", "L5_SEQUENCER_PUBKEY")] {
+        match std::env::var(env_var) {
+            Ok(pk) if pk.len() == 64 => {
+                info!("🔑 {} sequencer registered: {}...", rollup_id, &pk[..16]);
+                authorized_sequencers.insert(rollup_id.to_string(), pk);
+            }
+            Ok(pk) => warn!("⚠️  {} has invalid length {} (expected 64 hex chars) — {} disabled", env_var, pk.len(), rollup_id),
+            Err(_) => warn!("⚠️  {} not set — {} sequencer disabled", env_var, rollup_id),
+        }
+    }
+
     // ── Deposit Gateway: custody wallet + reload pending requests ──
     let custody_wallet_address = std::env::var("CUSTODY_WALLET_ADDRESS")
         .unwrap_or_else(|_| {
@@ -3006,29 +3078,6 @@ async fn main() {
             withdrawal_requests.insert(record.withdrawal_id.clone(), record);
         }
         info!("💸 Loaded {} withdrawal record(s) from ReDB", count);
-    }
-
-    // ── Layer 5: Creator coin launchpad — recover from ReDB ───────────────
-    let creator_coins_map: Arc<dashmap::DashMap<String, storage::CreatorCoinRecord>> =
-        Arc::new(dashmap::DashMap::new());
-    if let Ok(coins) = blockchain.load_all_creator_coins() {
-        let count = coins.len();
-        for c in coins { creator_coins_map.insert(c.ticker.clone(), c); }
-        info!("🚀 L5: loaded {} creator coin(s) from ReDB", count);
-    }
-    let coin_pools_map: Arc<dashmap::DashMap<String, storage::CoinPoolState>> =
-        Arc::new(dashmap::DashMap::new());
-    if let Ok(pools) = blockchain.load_all_coin_pools() {
-        let count = pools.len();
-        for p in pools { coin_pools_map.insert(p.ticker.clone(), p); }
-        info!("🚀 L5: loaded {} AMM pool(s) from ReDB", count);
-    }
-    let coin_balances_map: Arc<dashmap::DashMap<String, u64>> =
-        Arc::new(dashmap::DashMap::new());
-    if let Ok(bals) = blockchain.load_all_coin_balances() {
-        let count = bals.len();
-        for (k, v) in bals { coin_balances_map.insert(k, v); }
-        info!("🚀 L5: loaded {} coin balance record(s) from ReDB", count);
     }
 
     // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
@@ -3602,6 +3651,7 @@ async fn main() {
         l2_sequencer_allowlist,
         market_roots,
         withdrawal_claims,
+        authorized_sequencers,
         contest_states: contest_states.clone(),
         custody_wallet_address,
         deposit_requests,
@@ -3619,13 +3669,27 @@ async fn main() {
                 .map(|wusdt| wusdt * 1_000_000u64)
                 .unwrap_or(default_cap)
         },
-        // Layer 5: creator coin hot caches (pre-loaded before state construction)
-        creator_coins: creator_coins_map,
-        coin_pools: coin_pools_map,
-        coin_balances: coin_balances_map,
+        // Layer 5: rollup liquidity bridge (pre-loaded from ReDB at startup)
+        rollup_lock_records: Arc::new(dashmap::DashMap::new()),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
         turbine_readers: turbine_readers.clone(),
+        writer_http_url: if config.mode == NodeMode::Reader {
+            // Derive the Writer's HTTP URL from its gRPC address.
+            // gRPC default port 50051 → HTTP port 8080.
+            // Override via WRITER_HTTP_URL env var if ports differ.
+            let url = std::env::var("WRITER_HTTP_URL")
+                .unwrap_or_else(|_| {
+                    let addr = config.writer_addr
+                        .replace("http://", "")
+                        .replace(":50051", ":8080");
+                    format!("http://{addr}")
+                });
+            info!("📡 Reader mode: proxying writes to {}", url);
+            Some(url)
+        } else {
+            None
+        },
     };
 
     // Start custody watcher background task (if custody wallet is configured)
@@ -3805,20 +3869,15 @@ async fn main() {
                     Ok(mint_addr) => info!("💵 USDC Mint: {} (authority: {})", mint_addr, mint_authority_addr),
                     Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
                 }
-                // Bootstrap MAXX ($XX) mint alongside USDC — always idempotent
-                match SplTokenEngine::bootstrap_maxx_mint(&rpc_svm_accounts, &mint_authority) {
-                    Ok(mint_addr) => info!("🟣 MAXX ($XX) Mint: {} (authority: {})", mint_addr, mint_authority_addr),
-                    Err(e) => error!("❌ MAXX mint bootstrap failed: {:?}", e),
-                }
 
                 // ── PDA AUTHORITY ROTATION (idempotent) ────────────────────
-                // Rotate wUSDT and MAXX mint authorities from the dealer key
-                // to their respective PDAs. Safe to run on every boot — no-op
-                // if already set. After rotation, no private key can mint
-                // these tokens; only the swap / bonding-curve handlers can.
+                // Rotate wUSDT mint authority from the dealer key to the
+                // swap_pool PDA. Safe to run on every boot — no-op if already
+                // set. After rotation, no private key can mint wUSDT; only the
+                // swap handlers can.
                 {
-                    use crate::svm::pda::{swap_pool_pda, maxx_curve_pda};
-                    use crate::svm::{usdc_mint_bytes, maxx_mint_bytes};
+                    use crate::svm::pda::swap_pool_pda;
+                    use crate::svm::usdc_mint_bytes;
 
                     match SplTokenEngine::set_mint_authority(
                         &rpc_svm_accounts,
@@ -3830,16 +3889,6 @@ async fn main() {
                         Err(e)    => warn!("⚠️  wUSDT mint authority rotation failed: {:?}", e),
                     }
 
-                    match SplTokenEngine::set_mint_authority(
-                        &rpc_svm_accounts,
-                        &maxx_mint_bytes(),
-                        &maxx_curve_pda(),
-                    ) {
-                        Ok(true)  => info!("🔐 MAXX mint authority → maxx_curve PDA ({})", crate::svm::maxx_curve_address()),
-                        Ok(false) => info!("🔐 MAXX mint authority already set to maxx_curve PDA — no-op"),
-                        Err(e)    => warn!("⚠️  MAXX mint authority rotation failed: {:?}", e),
-                    }
-
                     // Flush persisted SVM state after authority rotation
                     match rpc_svm_accounts.flush_block() {
                         Ok(n)  => info!("💾  Flushed {} svm_accounts entries to ReDB after PDA rotation", n),
@@ -3848,39 +3897,6 @@ async fn main() {
                 }
             }
             _ => error!("❌ Invalid USDC_MINT_AUTHORITY: '{}' — must be 32-byte base58 pubkey", mint_authority_addr),
-        }
-    }
-
-    // ── MAXX VAULT MIGRATION (idempotent) ─────────────────────────────────
-    // Old code used maxx_vault_bytes() (SHA256("BlackBook_MAXX_Vault_v1")) as
-    // the bonding curve reserve ATA. New code uses maxx_curve_pda() ATA.
-    // If any wUSDT remains in the old vault, migrate it once on boot.
-    {
-        use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT, maxx_curve_pda};
-        use crate::svm::maxx_vault_bytes;
-
-        let old_vault_pk = solana_sdk::pubkey::Pubkey::new_from_array(maxx_vault_bytes());
-        let new_vault_pk = maxx_curve_pda();
-        let mint = usdc_mint_bytes();
-
-        if old_vault_pk != new_vault_pk {
-            let old_balance = SplTokenEngine::get_token_balance(&rpc_svm_accounts, &mint, &old_vault_pk);
-            if old_balance > 0 {
-                match SplTokenEngine::transfer_tokens(&rpc_svm_accounts, &mint, &old_vault_pk, &new_vault_pk, old_balance) {
-                    Ok(_) => {
-                        info!(
-                            "🔄 MAXX vault migration: moved {} microUSDT ({:.6} wUSDT) from old vault → maxx_curve PDA ({})",
-                            old_balance,
-                            old_balance as f64 / USDC_UNIT as f64,
-                            crate::svm::maxx_curve_address()
-                        );
-                        let _ = rpc_svm_accounts.flush_block();
-                    }
-                    Err(e) => warn!("⚠️  MAXX vault migration failed: {:?}", e),
-                }
-            } else {
-                info!("🔐 MAXX vault: old vault empty — no migration needed (maxx_curve PDA: {})", crate::svm::maxx_curve_address());
-            }
         }
     }
 

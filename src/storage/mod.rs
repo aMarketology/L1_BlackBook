@@ -115,27 +115,10 @@ pub const ESCROW_DEPOSITORS: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// Allows O(depositors_in_contest) iteration without scanning the full ESCROW_DEPOSITORS table.
 pub const ESCROW_DEPOSITORS_BY_CONTEST: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors_by_contest");
 
-/// Layer 5 creator coin registry: ticker → CreatorCoinRecord JSON (bytes)
-const CREATOR_COINS: TableDefinition<&str, &[u8]> = TableDefinition::new("creator_coins");
-
-/// Layer 5 AMM pool state: ticker → CoinPoolState JSON (bytes)
-const COIN_POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("coin_pools");
-
-/// Layer 5 user coin balances: "{ticker}:{wallet}" → coin_units (u64, 6 decimals)
-const COIN_BALANCES: TableDefinition<&str, u64> = TableDefinition::new("coin_balances");
-
-/// Maxx Token Market state: ticker → MaxxTokenState JSON (bytes)
-pub const MAXX_TOKEN_MARKET: TableDefinition<&str, &[u8]> = TableDefinition::new("maxx_token_market");
-
-/// $DECAY tokens: token_id (u64) → DecayToken JSON (bytes).
-/// Each $DECAY is an NFT-style per-instance object with its own backing & uses_count.
-pub const DECAY_TOKENS: TableDefinition<u64, &[u8]> = TableDefinition::new("decay_tokens");
-
-/// $DECAY owner index: owner address → JSON-serialized Vec<u64> of token IDs.
-pub const DECAY_OWNER_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("decay_owner_index");
-
-/// $DECAY metadata counters: "next_id" → next available token ID (u64).
-pub const DECAY_META: TableDefinition<&str, u64> = TableDefinition::new("decay_meta");
+/// L5 rollup liquidity locks: lock_id (UUID) → RollupLockRecord JSON (bytes).
+/// Records every $BB lock-in by a creator to seed initial liquidity for their
+/// L5 Creator Coin. The L5 sequencer reads these records to credit rollup-$BB.
+pub const ROLLUP_LIQUIDITY_LOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollup_liquidity_locks");
 
 /// Oracle node registry: pubkey_hex → OracleNode JSON (bytes).
 const ORACLE_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("oracle_nodes");
@@ -144,6 +127,22 @@ const ORACLE_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("oracle_
 /// Step 2 of the optimistic oracle — populated when oracle submits a root,
 /// consumed when finalized or discarded after the dispute window.
 const PENDING_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_roots");
+
+/// Layer 5 rollup state history: batch_id (u64) → merkle_root ([u8; 32]).
+/// Legacy table kept for startup migration only. New roots go to ROLLUP_STATE_ROOTS.
+pub const L5_STATE_ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("l5_state_roots");
+
+/// Universal rollup state roots: composite key "<rollup_id>:<batch_id>" → merkle_root ([u8; 32]).
+/// All rollups (L2, L3, L5) share this single table, isolated by key prefix.
+/// Keys use zero-padded 20-digit decimal batch_ids for lexicographic ordering:
+///   "L5:00000000000000000100" → root for L5 batch 100
+pub const ROLLUP_STATE_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollup_state_roots");
+
+/// Rollup exit double-spend guard: exit_id (SHA-256 hex of "<rollup_id>:<batch_id>:<asset_type>:<address>") → consumed_at (u64 unix secs).
+/// Written atomically when a user successfully exits. Any subsequent attempt
+/// with the same (batch_id, address) pair is rejected 403 before any balance
+/// move occurs, regardless of nonce.
+pub const ROLLUP_CONSUMED_EXITS: TableDefinition<&str, u64> = TableDefinition::new("rollup_consumed_exits");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -225,8 +224,8 @@ pub struct OracleNode {
     pub active: bool,
     pub total_resolutions: u64,
     pub correct_resolutions: u64,
-    /// Slashable $XX bond in pico-MAXX (12 decimals).
-    pub slash_balance_pico_xx: u64,
+    /// Slashable $BB bond in lamports (100_000 lamports = 1 BB = $0.10).
+    pub slash_balance_bb_lamports: u64,
 }
 
 /// Lifecycle state of a pending oracle root during the dispute window.
@@ -247,11 +246,11 @@ pub struct OracleSignature {
     pub sig_hex: String,
 }
 
-/// A disputer who staked $XX against a pending root.
+/// A disputer who staked $BB against a pending root.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Disputer {
     pub wallet: String,
-    pub stake_pico_xx: u64,
+    pub stake_bb_lamports: u64,
 }
 
 /// An oracle-submitted market root awaiting the dispute window.
@@ -263,8 +262,8 @@ pub struct PendingRoot {
     pub proposed_at_slot: u64,
     /// Slot after which the root auto-finalizes if not disputed.
     pub finalize_at_slot: u64,
-    /// $XX staked by disputers (pico-MAXX).
-    pub dispute_stake_pico_xx: u64,
+    /// $BB staked by disputers (lamports).
+    pub dispute_stake_bb_lamports: u64,
     pub status: PendingRootStatus,
     /// L2 sequencer (or oracle committee) that proposed this root.
     #[serde(default)]
@@ -758,6 +757,12 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(WITHDRAWALS)?;
             let _ = write_txn.open_table(CONTEST_STATES)?;
             let _ = write_txn.open_table(UNATTRIBUTED_DEPOSITS)?;
+            // Legacy L5 roots (kept for startup migration)
+            let _ = write_txn.open_table(L5_STATE_ROOTS)?;
+            // Universal rollup state roots (L2 / L3 / L5)
+            let _ = write_txn.open_table(ROLLUP_STATE_ROOTS)?;
+            // Rollup exit double-spend guard
+            let _ = write_txn.open_table(ROLLUP_CONSUMED_EXITS)?;
 
             // SVM tables (behind feature flag)
             {
@@ -1485,6 +1490,90 @@ impl ConcurrentBlockchain {
         Ok(results)
     }
 
+    /// Persist a rollup liquidity lock record to ReDB.
+    /// Called by the `POST /rollup/lock_bb` handler after debiting the creator.
+    pub fn store_rollup_lock(&self, record: &RollupLockRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).map_err(|e| e.to_string())?;
+            table.insert(record.lock_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Fetch a single lock record by lock_id. Returns None if not found.
+    /// Called by `GET /rollup/locks/:lock_id`.
+    pub fn load_rollup_lock_by_id(&self, lock_id: &str) -> Option<RollupLockRecord> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).ok()?;
+        let value = table.get(lock_id).ok()??;
+        serde_json::from_slice::<RollupLockRecord>(value.value()).ok()
+    }
+
+    /// Mark a lock as consumed in ReDB (idempotent — safe to call twice).
+    /// Called by `POST /rollup/locks/:lock_id/consume`.
+    pub fn consume_rollup_lock(&self, lock_id: &str) -> Result<(), String> {
+        let mut record = self.load_rollup_lock_by_id(lock_id)
+            .ok_or_else(|| format!("Lock {} not found", lock_id))?;
+        if record.consumed {
+            return Ok(()); // already consumed, idempotent
+        }
+        record.consumed = true;
+        self.store_rollup_lock(&record)
+    }
+
+    /// Load all rollup lock records for a given creator address (called at startup or by L5 poller).
+    pub fn load_rollup_locks_by_creator(&self, creator: &str) -> Result<Vec<RollupLockRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<RollupLockRecord>(value.value()) {
+                if record.creator_address == creator {
+                    results.push(record);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Return true if this (batch_id, address) pair has already exited.
+    /// Key is SHA-256("batch_id:address") — computed by the caller.
+    pub fn is_exit_consumed(&self, exit_id: &str) -> bool {
+        let read_txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let table = match read_txn.open_table(ROLLUP_CONSUMED_EXITS) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        table.get(exit_id).ok().flatten().is_some()
+    }
+
+    /// Persist the exit record atomically.  Returns Err if the row already exists
+    /// (caller should treat that as a 403).
+    pub fn mark_exit_consumed(&self, exit_id: &str, consumed_at: u64) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn
+                .open_table(ROLLUP_CONSUMED_EXITS)
+                .map_err(|e| e.to_string())?;
+            // Guard: reject if already present (second concurrent exit)
+            if table.get(exit_id).map_err(|e| e.to_string())?.is_some() {
+                return Err("already_consumed".to_string());
+            }
+            table
+                .insert(exit_id, consumed_at)
+                .map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Check if an external tx hash has already been minted (replay protection).
     pub fn is_bridge_tx_processed(&self, tx_hash: &str) -> bool {
         // "reserved" is an in-flight sentinel — not yet committed
@@ -1803,86 +1892,6 @@ impl ConcurrentBlockchain {
         Ok(results)
     }
 
-    // ── Layer 5: Creator Coin storage ─────────────────────────────────────────
-
-    pub fn store_creator_coin(&self, record: &CreatorCoinRecord) -> Result<(), String> {
-        let json = serde_json::to_vec(record).map_err(|e| e.to_string())?;
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(CREATOR_COINS).map_err(|e| e.to_string())?;
-            table.insert(record.ticker.as_str(), json.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    pub fn load_all_creator_coins(&self) -> Result<Vec<CreatorCoinRecord>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = match read_txn.open_table(CREATOR_COINS) {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()), // table not yet created
-        };
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (_key, value) = entry.map_err(|e| e.to_string())?;
-            if let Ok(record) = serde_json::from_slice::<CreatorCoinRecord>(value.value()) {
-                results.push(record);
-            }
-        }
-        Ok(results)
-    }
-
-    pub fn store_coin_pool(&self, pool: &CoinPoolState) -> Result<(), String> {
-        let json = serde_json::to_vec(pool).map_err(|e| e.to_string())?;
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(COIN_POOLS).map_err(|e| e.to_string())?;
-            table.insert(pool.ticker.as_str(), json.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    pub fn load_all_coin_pools(&self) -> Result<Vec<CoinPoolState>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = match read_txn.open_table(COIN_POOLS) {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (_key, value) = entry.map_err(|e| e.to_string())?;
-            if let Ok(pool) = serde_json::from_slice::<CoinPoolState>(value.value()) {
-                results.push(pool);
-            }
-        }
-        Ok(results)
-    }
-
-    pub fn store_coin_balance(&self, key: &str, amount: u64) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(COIN_BALANCES).map_err(|e| e.to_string())?;
-            table.insert(key, amount).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    pub fn load_all_coin_balances(&self) -> Result<Vec<(String, u64)>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = match read_txn.open_table(COIN_BALANCES) {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (key, value) = entry.map_err(|e| e.to_string())?;
-            results.push((key.value().to_string(), value.value()));
-        }
-        Ok(results)
-    }
-
     // ========================================================================
     // UNATTRIBUTED DEPOSIT STORAGE
     // ========================================================================
@@ -2082,49 +2091,34 @@ pub struct EscrowDepositorEntry {
 }
 
 // ============================================================================
-// LAYER 5 — CREATOR COIN RECORDS
+// LAYER 5 — ROLLUP BRIDGE RECORDS
 // ============================================================================
 
-/// Metadata for a creator coin launched via the Layer 5 launchpad.
-/// Immutable after launch — stored in the CREATOR_COINS ReDB table.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CreatorCoinRecord {
-    /// Ticker symbol (2–10 uppercase alphanumeric). e.g. "MAX".
-    pub ticker: String,
-    /// Human-readable coin name. e.g. "Max Token".
-    pub name: String,
-    /// Base58 BB wallet of the creator (receives trade fees + 50% initial supply).
-    pub creator_wallet: String,
-    /// Unix timestamp of launch.
-    pub launched_at: u64,
-    /// Fixed total supply in base units (6 decimals). Always 1,000,000,000,000,000.
-    pub total_supply: u64,
-    /// Optional description / tagline (max 280 chars).
-    pub description: Option<String>,
-}
+/// Durable record of a creator locking $BB on L1 to seed a rollup token launch.
 
-/// Constant-product AMM pool state for a creator coin.
-/// Updated on every trade — stored in the COIN_POOLS ReDB table.
+fn default_rollup_id_l5() -> String { "L5".to_string() }
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CoinPoolState {
-    /// Ticker symbol (mirrors CreatorCoinRecord.ticker).
-    pub ticker: String,
-    /// BB in the pool, in lamports (u64, 5 decimals: 1 BB = 100_000 lamports).
-    pub reserve_bb: u64,
-    /// Creator coin units in the pool (6 decimals: 1 coin = 1_000_000 units).
-    pub reserve_coin: u64,
-    /// Cumulative BB fees sent to the creator wallet.
-    pub total_fees_bb: u64,
-    /// Cumulative coin fees sent to the creator wallet (from sells).
-    pub total_fees_coins: u64,
-    /// All-time trading volume in BB lamports.
-    pub volume_bb: u64,
-    /// Total number of trades executed against this pool.
-    pub tx_count: u64,
-    /// Unix timestamp when the pool was created.
-    pub created_at: u64,
-    /// Unix timestamp of the most recent trade.
-    pub last_trade_at: u64,
+pub struct RollupLockRecord {
+    /// UUID generated by the L1 handler — used as the lock receipt ID.
+    pub lock_id: String,
+    /// Rollup identifier ("L2", "L3", "L5") that this lock belongs to.
+    #[serde(default = "default_rollup_id_l5")]
+    pub rollup_id: String,
+    /// Creator's L1 wallet address.
+    pub creator_address: String,
+    /// Amount locked, in $BB lamports (1 BB = 100_000 lamports).
+    pub bb_lamports: u64,
+    /// Optional symbol hint for the L5 token the creator intends to launch.
+    pub token_symbol_hint: Option<String>,
+    /// Unix timestamp (seconds) of lock submission.
+    pub locked_at: u64,
+    /// Rollup liquidity pool PDA that received the funds.
+    pub vault_address: String,
+    /// True once the L5 sequencer has credited rollup-$BB for this lock.
+    /// Prevents double-credit replay attacks.
+    #[serde(default)]
+    pub consumed: bool,
 }
 
 // ============================================================================
@@ -2235,6 +2229,129 @@ impl ConcurrentBlockchain {
             table.insert(root.market_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    // ── Legacy L5 State Root helpers (kept for startup migration) ─────────────
+
+    #[deprecated(note = "Use store_rollup_state_root(rollup_id, batch_id, root) instead")]
+    pub fn store_l5_state_root(&self, batch_id: u64, root: [u8; 32]) -> Result<(), String> {
+        if let Some(latest) = self.load_latest_l5_batch_id() {
+            if batch_id <= latest {
+                return Err(format!(
+                    "L5 batch_id {} is not greater than latest {} (monotonicity violation)",
+                    batch_id, latest
+                ));
+            }
+        }
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(L5_STATE_ROOTS).map_err(|e| e.to_string())?;
+            table.insert(batch_id, root.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    #[deprecated(note = "Use load_rollup_state_root(rollup_id, batch_id) instead")]
+    pub fn load_l5_state_root(&self, batch_id: u64) -> Option<[u8; 32]> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(L5_STATE_ROOTS).ok()?;
+        let guard = table.get(batch_id).ok()??;
+        let bytes = guard.value();
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Some(arr)
+        } else {
+            None
+        }
+    }
+
+    #[deprecated(note = "Use latest_rollup_batch_id(rollup_id) instead")]
+    pub fn load_latest_l5_batch_id(&self) -> Option<u64> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(L5_STATE_ROOTS).ok()?;
+        let guard = table.last().ok()??;
+        Some(guard.0.value())
+    }
+
+    // ── Generic Multi-Rollup State Root Methods ───────────────────────────────
+
+    /// Returns the composite ReDB key for a rollup state root.
+    /// Format: "<rollup_id>:<20-digit-zero-padded-batch_id>"
+    /// Zero-padding ensures lexicographic ordering equals numeric ordering.
+    fn rollup_root_key(rollup_id: &str, batch_id: u64) -> String {
+        format!("{}:{:020}", rollup_id, batch_id)
+    }
+
+    /// Append a new state root for `rollup_id` at `batch_id`.
+    /// Enforces per-rollup monotonicity: batch_id must exceed the current
+    /// latest batch for that specific rollup (L2 and L5 counters are independent).
+    pub fn store_rollup_state_root(
+        &self,
+        rollup_id: &str,
+        batch_id: u64,
+        root: [u8; 32],
+    ) -> Result<(), String> {
+        if let Some(latest) = self.latest_rollup_batch_id(rollup_id) {
+            if batch_id <= latest {
+                return Err(format!(
+                    "{} batch_id {} is not greater than latest {} (monotonicity violation)",
+                    rollup_id, batch_id, latest
+                ));
+            }
+        }
+        let key = Self::rollup_root_key(rollup_id, batch_id);
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn
+                .open_table(ROLLUP_STATE_ROOTS)
+                .map_err(|e| e.to_string())?;
+            table
+                .insert(key.as_str(), root.as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load the merkle root for a specific rollup + batch_id.
+    /// Returns `None` if no root exists for that (rollup_id, batch_id) pair.
+    pub fn load_rollup_state_root(&self, rollup_id: &str, batch_id: u64) -> Option<[u8; 32]> {
+        let key = Self::rollup_root_key(rollup_id, batch_id);
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(ROLLUP_STATE_ROOTS).ok()?;
+        let guard = table.get(key.as_str()).ok()??;
+        let bytes = guard.value();
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Some(arr)
+        } else {
+            None
+        }
+    }
+
+    /// Return the highest batch_id stored for a given rollup_id, or None.
+    /// Scans the prefix "<rollup_id>:" and returns the largest batch_id seen.
+    pub fn latest_rollup_batch_id(&self, rollup_id: &str) -> Option<u64> {
+        let prefix = format!("{}:", rollup_id);
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(ROLLUP_STATE_ROOTS).ok()?;
+        let iter = table.iter().ok()?;
+        let mut latest: Option<u64> = None;
+        for entry in iter {
+            if let Ok((key, _)) = entry {
+                let k = key.value();
+                if let Some(suffix) = k.strip_prefix(&prefix) {
+                    if let Ok(bid) = suffix.parse::<u64>() {
+                        latest = Some(match latest {
+                            Some(prev) => prev.max(bid),
+                            None => bid,
+                        });
+                    }
+                }
+            }
+        }
+        latest
     }
 }
 
