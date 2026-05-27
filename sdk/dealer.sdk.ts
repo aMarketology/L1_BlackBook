@@ -865,6 +865,137 @@ export class DealerSDK {
     return sha256Fn(combined);
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  8b. ROLLUP HUB (System B) — Merkle tree + root submission
+  //      Leaf format: SHA256("L2:BB:{address}:{balance_lamports}")
+  //      Sig format:  "ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{rootHex}:{ts}"
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a Rollup Hub (System B) Merkle tree.
+   *
+   * Leaf format (matches L1 `rollup/mod.rs` verification exactly):
+   *   SHA256( UTF8("{rollupId}:BB:{address}:{balance_lamports}") )
+   *
+   * IMPORTANT: This is incompatible with buildMerkleTree() (System A).
+   *   - No bs58 decoding.
+   *   - No SPL unit conversion — lamports are passed as-is.
+   *   - Pure UTF-8 string hashing.
+   *
+   * Parent hashing: same sorted-pair combiner as System A.
+   *   SHA256( min(left, right) || max(left, right) )
+   *
+   * @param rollupId  Rollup identifier: "L2", "L3", or "L5"
+   * @param entries   Array of { address, lamports } — lamports as bigint
+   * @returns         MerkleTreeResult with root, leaves, and per-address proofs
+   */
+  async buildRollupMerkleTree(
+    rollupId: string,
+    entries: Array<{ address: string; lamports: bigint }>
+  ): Promise<MerkleTreeResult> {
+    if (entries.length === 0) {
+      throw new Error("Cannot build Rollup Merkle tree with zero entries");
+    }
+
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const enc = new TextEncoder();
+
+    // Build leaves: SHA256( "{rollupId}:BB:{address}:{lamports}" )
+    const leaves: Uint8Array[] = [];
+    const addressToIndex = new Map<string, number>();
+
+    for (let i = 0; i < entries.length; i++) {
+      const { address, lamports } = entries[i];
+      const leafInput = `${rollupId}:BB:${address}:${lamports}`;
+      leaves.push(sha256(enc.encode(leafInput)));
+      addressToIndex.set(address, i);
+    }
+
+    // Build tree level by level (same algorithm as buildMerkleTree)
+    let currentLevel = [...leaves];
+    const levelData: Uint8Array[][] = [currentLevel];
+
+    while (currentLevel.length > 1) {
+      const next: Uint8Array[] = [];
+      for (let i = 0; i < currentLevel.length; i += 2) {
+        if (i + 1 < currentLevel.length) {
+          next.push(this.merkleHash(sha256, currentLevel[i], currentLevel[i + 1]));
+        } else {
+          next.push(currentLevel[i]);
+        }
+      }
+      currentLevel = next;
+      levelData.push(currentLevel);
+    }
+
+    const root = currentLevel[0];
+
+    // Build per-address Merkle proofs
+    const proofs = new Map<string, string[]>();
+    for (const [address, idx] of addressToIndex) {
+      const proof: string[] = [];
+      let index = idx;
+      for (let level = 0; level < levelData.length - 1; level++) {
+        const levelNodes = levelData[level];
+        const siblingIndex = index % 2 === 0 ? index + 1 : index - 1;
+        if (siblingIndex < levelNodes.length) {
+          proof.push(bytesToHex(levelNodes[siblingIndex]));
+        }
+        index = Math.floor(index / 2);
+      }
+      proofs.set(address, proof);
+    }
+
+    return {
+      root,
+      rootHex: bytesToHex(root),
+      leaves,
+      proofs,
+    };
+  }
+
+  /**
+   * Submit a Rollup Hub (System B) Merkle root to L1.
+   *
+   * Signed message format (UTF-8 — NOT binary-packed):
+   *   "ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{rootHex}:{timestamp}"
+   *
+   * @param rollupId  Rollup identifier: "L2", "L3", or "L5"
+   * @param batchId   Strictly monotonic batch counter (bigint)
+   * @param tree      MerkleTreeResult from buildRollupMerkleTree()
+   */
+  async submitRollupRoot(
+    rollupId: string,
+    batchId: bigint,
+    tree: MerkleTreeResult
+  ): Promise<{ success: boolean; batch_id: number; merkle_root_hex: string }> {
+    const timestamp = Date.now();
+    const message = `ROLLUP_SUBMIT_ROOT:${rollupId}:${batchId}:${tree.rootHex}:${timestamp}`;
+    const signature = await this.signMessage(message);
+
+    const body = {
+      batch_id: Number(batchId),
+      merkle_root_hex: tree.rootHex,
+      sequencer_public_key: this.wallet.publicKeyHex,
+      signature,
+      timestamp,
+    };
+
+    const res = await fetch(`${this.rpcUrl}/rollup/${rollupId}/submit_root`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`submitRollupRoot failed (${res.status}): ${err}`);
+    }
+
+    return res.json();
+  }
+
   /**
    * Get the Merkle proof for a specific winner in a tree.
    * Returns the proof array ready to submit to POST /escrow/withdraw.

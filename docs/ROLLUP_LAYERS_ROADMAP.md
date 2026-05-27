@@ -1,7 +1,7 @@
 # BlackBook — Rollup Layers 2–5 Roadmap
 
 > **L1 is the settlement layer. Layers 2–5 are rollup execution environments that post state roots back to L1.**
-> Last updated: May 2026 — Universal Rollup Hub live
+> Last updated: May 2026 — Full infrastructure audit complete. Dual L2 system documented. L5 golden rule established.
 
 ---
 
@@ -152,35 +152,30 @@ leaf = SHA256( pubkey_raw_32_bytes || payout_spl_u64_le_bytes )
 }
 ```
 
-### What Needs to Be Built / Verified
+### The Dual L2 System — Critical Architecture Note
 
-- [ ] **L2 deposit_tx validation** — L2 must call `GET /deposit/status/:tx_hash` before accepting entry
-- [ ] **L2 state root bridge** — `settlement_bridge.rs` must build the correct Merkle tree (sorted SHA-256) and call L1 `/submit-state-root` with the correct binary signed message format
-- [ ] **L2 proof endpoint** — `GET /proof/:market_id/:wallet_address` must return the claim proof in the format above
-- [ ] **End-to-end test** — deposit → play → resolve → claim (see `docs/L2_TEST_GUIDE.md` for the 9-step test suite)
-- [ ] **Claim deadline display** — frontend `PredictPage.tsx` should show days remaining to claim from `claim_deadline_slot`
+There are two **incompatible** L2 settlement paths in the codebase. This is intentional during migration.
 
----
+| | System A — Legacy Global Escrow | System B — Rollup Hub |
+|---|---|---|
+| Endpoints | `/escrow/deposit`, `/escrow/submit-state-root`, `/escrow/withdraw` | `/rollup/L2/lock_bb`, `/rollup/L2/submit_root`, `/rollup/L2/exit` |
+| Merkle leaf | `SHA256(bs58_decode(wallet)[32] ∥ amount_spl_u64_le[8])` — **binary** | `SHA256("L2:BB:{address}:{lamports}")` — **UTF-8 string** |
+| Amount units | SPL units (6 dec, lamports × 10) | Lamports (5 dec) |
+| Sig format | Binary packed: `id_bytes ∥ block_num_le64 ∥ root32` | UTF-8: `"ROLLUP_SUBMIT_ROOT:L2:{batch_id}:{root_hex}:{ts}"` |
+| Vault | Single global PDA | Per-rollup PDA: `rollup_vault_address("L2")` |
+| Who funds vault | **Dealer** pre-funds prize pool | **Each user** locks their own BB |
+| Zero-sum check | Enforced at root submission | Not needed — vault balance is ground truth |
+| Claim deadline | 30 days (6.48M slots) | No deadline |
+| SDK | `dealer.sdk.ts` — `buildMerkleTree()`, `submitStateRoot()` | Not yet built |
 
-## Layer 3 — DEX / Trading Layer
+**Deprecation plan:**
+1. ✅ No new System A markets — stop calling `/escrow/deposit` for new contests
+2. 🔒 Keep `/escrow/*` endpoints permanently live — existing funds are locked, users must be able to claim
+3. 🔲 Add `buildRollupMerkleTree()` and `submitRollupRoot()` to `dealer.sdk.ts`
+4. 🔲 Build the TypeScript L2 sequencer against System B
+5. 🔲 Delete `src/contracts/layer2_market/mod.rs` only after all System A claim windows expire (30+ days after last settlement)
 
-**Status:** Not started. Architecture defined below.
-
-### Purpose
-An on-chain automated market maker (AMM) or order book DEX allowing users to trade between BB, wUSDT, and $XX using funds locked in L1 escrow.
-
-### How It Uses L1
-- Users deposit into the **same Global Escrow PDA** as L2 (single escrow, multi-layer)
-- Trade execution happens off-chain in the L3 engine
-- At the end of each epoch (every N slots), the L3 submits a net-settlement root to L1
-- Net: only the differences are settled, not every individual trade
-
-### L1 Changes Required
-- [ ] **Contest namespace** — escrow market_ids should be prefixed: `L2:market_id`, `L3:epoch_id` to prevent cross-layer ID collisions
-- [ ] **Multi-layer escrow routing** — `GET /escrow/contest/:id` should return the layer prefix so UIs can route correctly
-
-### Estimated Effort
-Medium. The L1 settlement primitives are already in place. L3 needs its own execution engine (Rust or Node) and a settlement bridge.
+> **Note:** `src/contracts/layer2_market/mod.rs` is already `#![allow(dead_code)]` — it is called from nowhere. The actual Merkle tree for System A is built entirely in `dealer.sdk.ts::buildMerkleTree()`. The Rust file is a reference spec only.
 
 ---
 

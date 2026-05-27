@@ -1,213 +1,140 @@
 # BlackBook — Next Steps
 
-> **What to do right now, in order.**
-> Last updated: May 2026 — Universal Rollup Hub live (L2/L3/L5 bridges complete)
+> **What to do right now, in priority order.**
+> Last updated: May 2026 — Post full-infrastructure audit. gRPC reconnect fix deployed. Dual L2 system documented.
 
 ---
 
-## Immediate: Test the BB-only Chain Locally
+## Current Status Snapshot
 
-With the chain stripped to `$BB` + `wUSDT` only, run the smoke suite before re-deploying.
-
-```powershell
-# 1. Build and start (admin endpoints enabled for seeding)
-cargo run --features unsafe_admin
-
-# 2. In a second terminal — run the full smoke test
-.\tests\l1_smoke.ps1
-```
-
-**Test coverage of `l1_smoke.ps1`:**
-
-| Test | What it checks |
-|------|----------------|
-| 5.1 | `/escrow/status` — escrow vault reachable, L2 key configured |
-| 5.2a | `/admin/mint` — mint 100 BB to test wallet |
-| 5.2b | `/balance/:addr` — balance ≥ 100 after mint |
-| 5.3 | `/escrow/contest/:id` — 404 for unknown contest |
-| 5.5 | `/escrow/submit-state-root` — HTTP fallback path |
-
-**Manual tests to run after smoke (require `node` or signing helper):**
-
-```powershell
-# a) Transfer BB between wallets
-curl -X POST http://localhost:8080/transfer/simple \
-  -H "Content-Type: application/json" \
-  -d '{ "from": "<WALLET_A>", "to": "<WALLET_B>", "amount": 10, ... }'
-
-# b) Swap BB → wUSDT (10 BB = 1 wUSDT)
-curl -X POST http://localhost:8080/swap/bb-to-usdc ...
-
-# c) Full escrow lifecycle (requires Ed25519 signed payloads)
-#    deposit → submit-state-root → withdraw with merkle proof
-node tests/full_flow_test.mjs
-```
+| Layer | L1 Bridge | Sequencer | SDK |
+|---|---|---|---|
+| **L2 Prediction Markets** | ✅ System A (legacy) + ✅ System B (Rollup Hub) | ✅ Running | ⚠️ Needs `buildRollupMerkleTree` + `submitRollupRoot` |
+| **L3 NFT Bridge** | ✅ L1 side complete | ❌ Not built | ❌ Not built |
+| **L5 Creator Economy** | ✅ L1 side complete | ❌ Not built | ⚠️ `TokenFactory.ts` calls wrong endpoint |
+| **Reader/Writer CQRS** | ✅ Fixed gRPC reconnect anchor bug | — | — |
 
 ---
 
-## Next: Deploy to Hetzner (Clean Genesis)
+## P0 — Step 1: Expand `dealer.sdk.ts` (System B SDK)
 
-The BB token is $0.10 USD. The old ReDB data was minted at 10:1. Boot the chain clean.
+**File:** `sdk/dealer.sdk.ts`
 
-```bash
-# SSH into Hetzner
-ssh root@<hetzner-ip>
+The existing SDK only speaks System A (legacy escrow). The Rollup Hub (System B) needs two new methods.
 
-# 1. Stop the node
-docker compose -f deployment/docker-compose.prod.yml down
+### `buildRollupMerkleTree(rollupId, entries)`
+Build the SHA-256 Merkle tree using the **Rollup Hub canonical leaf format**.
 
-# 2. Wipe the old ReDB volume (10:1 era data)
-docker volume rm blackbook-data
-
-# 3. Pull updated code
-git pull origin master
-
-# 4. Rebuild and launch with clean genesis
-docker compose -f deployment/docker-compose.prod.yml up -d --build
-
-# 5. Verify
-curl http://localhost:8080/health
-curl http://localhost:8080/supply/audit  # expects backing_ratio: 1.0
 ```
+BB leaf: SHA-256( "{rollupId}:BB:{address}:{balance_lamports}" )
+```
+
+- `address` — lowercase L1 wallet address (plain string, no bs58 decoding)
+- `balance_lamports` — `u64` as decimal string
+- Tree combination: `SHA256(min(a,b) || max(a,b))` — same sorted-pair helper as existing `merkleHash()`
+- Returns: `MerkleTreeResult` (same type as existing `buildMerkleTree()`)
+
+**Critical difference from System A:** No base58 decoding. No SPL unit conversion. Pure UTF-8 string hashing.
+
+### `submitRollupRoot(rollupId, batchId, tree)`
+Post the state root to the Rollup Hub with sequencer signature.
+
+```
+Sig message (UTF-8): "ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{root_hex}:{timestamp}"
+```
+
+- Uses `signMessage()` (UTF-8) — NOT `signBinaryMessage()` (which is System A only)
+- POST body: `{ batch_id, merkle_root_hex, sequencer_public_key, signature, timestamp }`
+- Endpoint: `POST /rollup/{rollupId}/submit_root`
+- Dealer wallet must be the registered sequencer for the rollup (set via `L2_SEQUENCER_PUBKEY` env var on L1)
 
 ---
 
-## P0 — Security (Block on Deployment)
+## P0 — Step 2: TypeScript L2 Sequencer
 
-These must be done before opening to real users.
+Build a standalone Node.js sequencer that runs the prediction market lifecycle using System B.
 
-### 1. Lock CORS to explicit origins
-**File:** `src/main.rs`
-```rust
-// Change:
-.allow_origin(Any)
-// To:
-.allow_origin("https://blackbook.id".parse::<HeaderValue>().unwrap())
-```
+**Responsibilities:**
+1. Watch for `lock_bb` events (poll `GET /rollup/L2/locks/:lock_id`)
+2. Accept user bets off-chain with local DB
+3. On market resolution: build Rollup Merkle tree with `buildRollupMerkleTree()`
+4. Submit to L1 via `submitRollupRoot()`
+5. Store proofs for user withdrawal requests
 
-### 2. Remove `real_wallets/` from Docker image
-**File:** `Dockerfile`
-Verify `real_wallets/` is NOT copied in — it's in `.gitignore` but double-check the `COPY` statements in the Dockerfile don't inadvertently pull it in.
+**Signed messages the sequencer sends:**
+| Action | Format |
+|---|---|
+| Consume lock | `"CONSUME_LOCK:L2:{lock_id}:{ts}"` |
+| Submit root | `"ROLLUP_SUBMIT_ROOT:L2:{batch_id}:{root_hex}:{ts}"` |
 
-### 3. Fix Shard B PIN verification
-**File:** `src/kms/` or wallet handler
-PIN is currently verified against itself rather than a stored hash. Store `sha256(PIN)` at creation time and verify against that.
+**Key rule:** Sequencer must keep `batch_id` strictly monotonic. L1 rejects anything <= the last accepted root.
 
 ---
 
-## P1 — L2 Settlement End-to-End
+## P0 — Step 3: Freeze System A New Entries
 
-The escrow contract is fully built on L1. The L2 dealer needs to be confirmed working against the live Hetzner node.
+**Do NOT shut down System A endpoints.** Existing users have funds locked in the global PDA. They have a 30-day claim window.
 
-**Checklist:**
-- [ ] Dealer submits `POST /escrow/deposit` from L2 and receives `deposit_tx`
-- [ ] Dealer calls `POST /escrow/submit-state-root` after market close
-- [ ] Winner calls `POST /escrow/withdraw` with Merkle proof and receives BB
-- [ ] Run `tests/escrow_e2e.rs` against `http://layer1.blackbook.id`
-- [ ] Confirm monotonicity check rejects replayed state roots (HTTP 409)
-- [ ] Confirm zero-sum check rejects invalid payout totals (HTTP 400)
+**Action required:**
+- Stop routing new market deposits to `/escrow/deposit`
+- Route all new markets through `/rollup/L2/lock_bb`
+- Keep `/escrow/submit-state-root` and `/escrow/withdraw` permanently available
 
-**Key files:**
-- `sdk/dealer.sdk.ts` — L2 dealer integration
-- `sdk/escrow.sdk.ts` — user withdrawal SDK
-- `tests/l2_settlement_integration.rs`
+**Dead code note:** `src/contracts/layer2_market/mod.rs` has `#![allow(dead_code)]` — it is called from nowhere. The real Merkle tree for System A is built in `dealer.sdk.ts::buildMerkleTree()`. Do not delete either until all claim windows expire.
 
 ---
 
-## P1 — Universal Rollup Hub: Sequencer Integration
+## P1 — Fix `TokenFactory.ts` Endpoint
 
-The L1 bridge is complete. The sequencers need to update their integrations.
+**File:** `sdk/TokenFactory.ts`
 
-### L2 Sequencer (Prediction Markets)
-The L2 dealer currently uses the old `/escrow/...` paths. These still work but should migrate
-to the new Rollup Hub paths for consistency and future-proofing.
+Currently calls `POST /l5/launch-coin` which does **not exist on L1**.
 
-**Required changes in L2 dealer/sequencer:**
-- [ ] Update `lock_bb` calls → `POST /rollup/L2/lock_bb` with signed message:
-  `"ROLLUP_LOCK_BB:L2:{wallet}:{bb_lamports}:{symbol_hint}:{ts}:{nonce}"`
-- [ ] Update `submit_root` → `POST /rollup/L2/submit_root` with signed message:
-  `"ROLLUP_SUBMIT_ROOT:L2:{batch_id}:{merkle_root_hex}:{ts}"`
-- [ ] Update `exit` → `POST /rollup/L2/exit` with new **BB leaf format**:
-  `SHA-256("L2:BB:{address}:{balance_lamports}")` (colon-separated, NOT old JSON format)
-- [ ] Set `L2_SEQUENCER_PUBKEY` env var on Hetzner node
-- [ ] Run end-to-end test: `lock_bb → play → submit_root → exit`
+**Correct two-step flow:**
+1. User calls `POST /rollup/L5/lock_bb` on L1 with initial liquidity amount
+2. L1 returns a `lock_id`
+3. User sends `lock_id` + coin config to the **TypeScript L5 sequencer**
+4. Sequencer consumes the lock (`POST /rollup/L5/locks/:lock_id/consume`)
+5. Sequencer manages coin state off-chain, anchors roots via `POST /rollup/L5/submit_root`
 
-**Test in order:**
-```bash
-# 1. Lock $BB on L1 as if entering L2
-curl -X POST http://localhost:8080/rollup/L2/lock_bb -d '{...signed...}'
+**L5 exit golden rule:** Creator Coins **cannot** be exited to L1 directly. Users must swap Creator Coins back to $BB on L5 first (via L5 bonding curve / vAMM), then exit via the standard BB Merkle proof path.
 
-# 2. (off-chain) L2 plays, sequencer builds Merkle tree with new leaf format
-# Leaf = SHA-256("L2:BB:<address>:<balance_lamports>")
+---
 
-# 3. Sequencer submits root
-curl -X POST http://localhost:8080/rollup/L2/submit_root -d '{...signed...}'
+## P1 — Fix Wrong Comment in `token_swap/mod.rs`
 
-# 4. User exits
-curl -X POST http://localhost:8080/rollup/L2/exit \
-  -d '{"asset_type":"BB","address":"...","balance_lamports":500000,...}'
+**File:** `src/contracts/token_swap/mod.rs` line 18
+
+Current (wrong): `// 1 BB = 1 wUSDT ($BB is a 1:1 USD stablecoin)`
+
+Correct: `// 1 BB = 0.10 wUSDT — 10 BB buys 1 wUSDT. BB is a $0.10 token, NOT a stablecoin.`
+
+The constants `BB_TO_USDC_RATE = 10` and `BB_PER_USDT = 10` in `src/svm/types.rs` are correct. Only the comment is wrong.
+
+---
+
+## P2 — L3 NFT Bridge Sequencer
+
+L1 is ready. The sequencer and execution engine must be built.
+
+**L3 Merkle leaf format:**
 ```
-
-### L3 Sequencer (NFT Bridge) — NEW
-L1 is ready. L3 execution engine needs to be built.
+NFT leaf: SHA-256( "L3:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}" )
+```
 
 **Build order:**
-- [ ] L3 execution engine (off-chain NFT trading environment)
-- [ ] L3 sequencer: builds NFT Merkle tree using exact leaf format:
-  `SHA-256("L3:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}")`
-- [ ] Set `L3_SEQUENCER_PUBKEY` env var
-- [ ] Test NFT exit: `lock_bb → trade → submit_root → exit(asset_type=NFT)`
-
-### L5 Sequencer (Creator Economy) — NEW
-L1 bridge fully wired. Execution engine needed.
-
-- [ ] Build L5 bonding curve engine
-- [ ] L5 sequencer: `SHA-256("L5:BB:{address}:{balance_lamports}")` leaf format
-- [ ] Set `L5_SEQUENCER_PUBKEY` env var
-
----
-
-## P1 — Wallet Production
-
-- [ ] Strip MAXX / DECAY / $oz UI components from wallet (they reference removed endpoints)
-- [ ] Update `tokens.ts` — register only `$BB` and `wUSDT`
-- [ ] `SwapModal.tsx` — only show BB ↔ wUSDT swap
-- [ ] Lock CORS to explicit origin (see P0 above)
-- [ ] Confirm swap pool is seeded: 10 BB = 1 wUSDT ratio
-- [ ] Run smoke test: `/supply/audit` shows `target_ratio: 10.0`
+1. L3 execution engine (NFT trading environment, off-chain)
+2. L3 sequencer: builds NFT Merkle tree, calls `POST /rollup/L3/submit_root`
+3. Set `L3_SEQUENCER_PUBKEY` env var on L1
 
 ---
 
 ## P2 — Infrastructure
 
-- [ ] **Multi-validator:** spin up a second Hetzner CX42 as a Reader node
-  - Reader connects to Writer via gRPC `SubscribeBlocks` on port 50051
-  - Validate block propagation latency < 100ms within same datacenter
-- [ ] **Prometheus metrics endpoint** (`GET /metrics`) — slot height, TPS, escrow TVL
-- [ ] **Nginx rate limiting** — 429 at load balancer before hitting Rust
-- [ ] **Log rotation** — already set to `max-size: 100m` × 7 files in docker-compose
-
----
-
-## P3 — Load Testing
-
-Run after P0 security items are complete.
-
-```bash
-# Sealevel parallel execution load test
-cargo run --example sealevel_load_test
-
-# UDP TPU flood test
-cargo run --example udp_tpu_load_test
-
-# Full LMSR agent swarm (50 agents, 3 BB each)
-MASTER_KEY=<64-hex> AGENT_COUNT=50 BB_PER_AGENT=5 node tests/lmsr_agent_swarm.mjs
-```
-
-**Target benchmarks:**
-- Sustained TPS ≥ 1,000 (currently 230 tested)
-- Escrow deposit → settlement → withdrawal < 5 seconds
-- Zero state divergence after 10 simulated node crashes
+- [ ] **Prometheus metrics** — `GET /metrics`: slot height, TPS, escrow TVL, rollup lock count
+- [ ] **Multi-validator** — second Hetzner CX42 as a Reader node (gRPC `SubscribeBlocks` on port 50051)
+- [ ] **UptimeRobot** — ping `/health` every 60s (free tier)
+- [ ] **ReDB backup** — daily cron snapshot of `blockchain_data/blockchain.redb`
 
 ---
 
@@ -215,21 +142,37 @@ MASTER_KEY=<64-hex> AGENT_COUNT=50 BB_PER_AGENT=5 node tests/lmsr_agent_swarm.mj
 
 | Item | File | Priority |
 |------|------|----------|
-| Replace `credit(f64)` with `credit_svm_lamports(u64)` at remaining call sites | `src/main.rs` (lines ~1176, 1256, 1480, 1797) | P1 |
-| Remove remaining `f64` from `TransactionRecord` fields | `src/storage/mod.rs` | P2 |
-| Add unit test for BB 10:1 invariant at startup | `tests/` | P2 |
+| Fix wrong comment (1 BB = 1 wUSDT) | `src/contracts/token_swap/mod.rs` line 18 | P1 |
+| Replace `credit(f64)` with `credit_svm_lamports(u64)` | `src/main.rs` ~lines 1176, 1256, 1480, 1797 | P1 |
+| Strip MAXX/DECAY/$oz UI from wallet | `blackbook-wallet/src/` | P1 |
 | Add unit test for Rollup Hub exit (BB + NFT) | `tests/` | P2 |
-| Replace deprecated `load_latest_l5_batch_id` with `latest_rollup_batch_id` | `src/storage/mod.rs` line 2238 | P3 |
+| Delete `layer2_market/mod.rs` after System A claim windows expire | `src/contracts/layer2_market/mod.rs` | P3 |
 
 ---
 
-## Token Economy Reference (BB-only, post-simplification)
+## Token Economy Reference
 
-| Token | Decimals | 1 Unit = | USD Value |
-|-------|----------|----------|-----------|
-| `$BB` | 5 | 100,000 lamports | **$0.10** |
-| `wUSDT` | 6 | 1,000,000 micro | $1.00 |
+| Token | Symbol | Decimals | 1 unit = | Role |
+|---|---|---|---|---|
+| BlackBook | `$BB` | 5 | $0.10 USD | Gas, bets, oracle bond |
+| Wrapped Stablecoin | `wUSDT` | 6 | $1.00 USD | Swap reserve |
 
-**Swap rate:** 10 BB = 1 wUSDT (`BB_TO_USDC_RATE = 10`)
-**Gas / collateral / escrow / oracle staking:** all denominated in `$BB` lamports
-**MAXX, DECAY, OZ:** removed from L1 (archived in `archive/contracts/`)
+**Fixed rate:** 10 BB = 1 wUSDT. No AMM. No oracle. Dealer market-maker only.
+
+**Removed (archived in `archive/contracts/`):** MAXX, DECAY, OZ. Do NOT restore.
+
+---
+
+## Quick Reference: Canonical Signed Message Formats
+
+| Action | Signer | Format |
+|---|---|---|
+| Transfer | User | `"TRANSFER:{from}:{to}:{amount}:{ts}:{nonce}"` |
+| Faucet | User | `"FAUCET:{addr}:{amount}:{ts}:{nonce}"` |
+| Swap BB->wUSDT | User | `"SWAP_BB_USDC:{wallet}:{bb_amount}:{ts}:{nonce}"` |
+| Lock BB in rollup | User | `"ROLLUP_LOCK_BB:{rollup_id}:{wallet}:{lamports}:{symbol_hint}:{ts}:{nonce}"` |
+| Consume lock | Sequencer | `"CONSUME_LOCK:{rollup_id}:{lock_id}:{ts}"` |
+| Submit root | Sequencer | `"ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{root_hex}:{ts}"` |
+| Exit BB | User | `"ROLLUP_EXIT:{rollup_id}:BB:{address}:{batch_id}:{ts}:{nonce}"` |
+| Exit NFT | User | `"ROLLUP_EXIT:{rollup_id}:NFT:{address}:{batch_id}:{ts}:{nonce}"` |
+| Legacy escrow root | L2 sequencer | Binary packed: `contest_id_bytes || block_num_le64 || root32` |

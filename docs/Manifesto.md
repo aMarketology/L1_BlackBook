@@ -48,72 +48,73 @@ Shred size: 1,232 bytes (UDP MTU). 32 data + 32 coding shreds per FEC set (50% R
 
 ---
 
-## The Three-Token Economy
+## The Token Economy
 
-BlackBook runs a closed, self-reinforcing token economy with one stable foundation and two dynamic assets.
+BlackBook runs a two-token settlement economy. MAXX, DECAY, and OZ have been removed and are archived in `archive/contracts/`.
 
 ### `$BB` — The Native Gas Token
 
 - **1 BB = $0.10 USD.** Fixed. No oracle. No float. 10 BB = 1 wUSDT.
 - 5 decimal places: 1 BB = 100,000 lamports. Minimum unit: $0.000001.
 - Backed 10:1 by wUSDT reserves (enforced on-chain at every boot).
-- Powers all gas, all escrow deposits, all prediction market stakes.
+- Powers all gas, all prediction market stakes, all oracle bonds.
 - Bridged in via Solana/BSC custody wallet → minted on L1 at 10:1.
 - Bridged out by burning BB → releasing stablecoin from custody.
 
 ### `wUSDT` — Wrapped Stablecoin Reserve
 
 - 6 decimal places. 1 wUSDT = 1,000,000 micro-units.
-- Held in the swap pool PDA as backing reserve for BB.
-- Powers the MAXX bonding curve and $oz vault.
-- Not user-tradeable directly — moves through the swap contract.
+- Held in the swap pool PDA as the sole backing reserve for BB.
+- Swappable against BB at the fixed 10:1 rate via `POST /swap/bb-to-usdc` and `POST /swap/usdc-to-bb`.
+- Not AMM-priced — dealer market-maker only.
 
-### `$XX / MAXX` — Bonding-Curve Governance Token
-
-- 12 decimal places (picoMAXX). Linear bonding curve: `P(s) = 5×10⁻⁸ × s`
-- Reserve held in wUSDT. Price rises as supply grows — no inflation surprise.
-- Burned to recharge $oz tokens (value sink).
-
-### `$oz` — Premium Access Token
-
-- NFT-style per-instance object backed by wUSDT.
-- Each `$oz` leaks 1% of its backing into the treasury per use (geometric decay: ~36.6% remains after 100 uses).
-- After 100 uses: dead. Recharge by burning 5 MAXX + paying 2 wUSDT fee (1.5 wUSDT with a long-stake lock).
-- Stake lock gives a 25% recharge discount.
-- All 4 write endpoints fully Ed25519 authenticated.
+> **Removed:** MAXX (bonding-curve governance), DECAY (per-instance utility), OZ (premium access) — all archived. Do NOT restore.
 
 ---
 
 ## Smart Contracts (Layer 1 Native Modules)
 
-| Contract | Purpose |
-|----------|---------|
-| **Global Escrow** | PDA vault for all open markets. Deposits, Merkle roots, winner payouts. |
-| **Deposit Gateway** | wUSDT → BB 10:1 bridge-in. Custody wallet monitoring on Solana + BSC. |
-| **Withdrawal Gateway** | BB → wUSDT bridge-out. Burn BB, release stablecoin. |
-| **Token Swap** | BB ↔ wUSDT fixed-rate swap (10:1). Pool-backed, no private key. |
-| **MAXX Bonding Curve** | Linear curve buy/sell for $XX governance token. |
-| **$oz Contract** | Mint, use, recharge, stake. wUSDT-backed premium access token. |
-| **Lightning Gateway** | BTC Lightning → BB at $0.10/BB rate. BTCPayServer webhook. |
+| Contract | Purpose | Status |
+|----------|---------|--------|
+| **Global Escrow** | Legacy PDA vault for L2 prediction markets (System A). Deposits, Merkle roots, winner payouts. | ✅ Live — freeze new entries |
+| **Universal Rollup Hub** | New settlement path for all L2/L3/L5 rollups. lock_bb / submit_root / exit. | ✅ Live |
+| **NFT Bridge** | L1-side NFT anchoring. put_nft / get_nft via Rollup Hub exit. | ✅ Live |
+| **Deposit Gateway** | wUSDT → BB 10:1 bridge-in. Custody wallet monitoring on Solana + BSC. | ✅ Live |
+| **Withdrawal Gateway** | BB → wUSDT bridge-out. Burn BB, release stablecoin. | ✅ Live |
+| **Token Swap** | BB ↔ wUSDT fixed-rate swap (10:1). Pool-backed, no private key. | ✅ Live |
+| **Oracle** | Node registration, dispute staking ($BB), vote + finalize. | ✅ Live |
 
 ---
 
 ## L2 Settlement Protocol
 
+Two settlement paths co-exist during migration. All new markets use System B.
+
+### System B — Rollup Hub (current)
 ```
-L2 bets
-  → Dealer aggregates outcomes
-  → settle_market_and_generate_root(winners)
-  → SHA-256 sorted-pair Merkle tree → 32-byte root
-  → POST /escrow/submit-state-root  (L2 sequencer signed)
-  → Users withdraw via POST /escrow/withdraw  (with Merkle proof)
+User locks $BB → POST /rollup/L2/lock_bb → lock_id returned
+L2 accepts bet off-chain (sequencer reads lock)
+Market resolves → sequencer builds Merkle tree
+  leaf = SHA-256( "L2:BB:{address}:{balance_lamports}" )  // UTF-8 string
+  combine = SHA-256( min(a,b) || max(a,b) )                // sorted-pair
+→ POST /rollup/L2/submit_root  (sequencer signed)
+→ Users exit via POST /rollup/L2/exit  (with Merkle proof)
 ```
 
-**Security guarantees:**
-- Zero-sum invariant: `total_deposited == total_payout + house_rake`
-- Monotonic block numbers: L1 rejects any state root with `l2_block_number ≤` last accepted
-- Claim window: 6,480,000 slots (~30 days) from settlement
-- Double-claim prevention: atomic nonce check in ReDB before DashMap
+### System A — Legacy Global Escrow (frozen, claim windows still open)
+```
+Dealer pre-funds escrow → POST /escrow/deposit
+Market resolves → build Merkle tree
+  leaf = SHA-256( bs58_decode(wallet)[32] || payout_spl_u64_le[8] )  // binary
+→ POST /escrow/submit-state-root  (L2 sequencer binary-signed)
+→ Users withdraw via POST /escrow/withdraw  (with Merkle proof)
+```
+
+**Security guarantees (both systems):**
+- Monotonic batch/block ID: L1 rejects any root with ID ≤ last accepted
+- Double-claim prevention: `ROLLUP_CONSUMED_EXITS` permanent seal in ReDB
+- Claim window (System A only): 6,480,000 slots (~30 days) from settlement
+- System B: per-rollup vault PDA — balances are ground truth, no zero-sum needed
 
 ---
 

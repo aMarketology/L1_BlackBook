@@ -2,6 +2,78 @@
 
 ---
 
+## Session: 2026-05-21 — Infrastructure Audit + gRPC Fix + Doc Update
+
+> **Goal:** Fix gRPC reconnect stale-anchor bug in Reader. Full infrastructure audit of all 5 layers. Document the dual L2 settlement system. Update all docs. Set next steps for dealer.sdk.ts System B expansion.
+
+### Status: ✅ Complete
+
+### What Was Done
+
+| Item | Result |
+|------|--------|
+| Fixed Reader gRPC reconnect anchor bug (`session_anchor_reset` flag) | ✅ `src/reader/mod.rs` |
+| Verified fix live: `📡 Session anchor reset → slot 175316 prev_hash d6f21391…` | ✅ No more "failed verification" errors after reconnect |
+| Full infrastructure audit — all 5 layers, all contracts, all SDKs | ✅ |
+| Documented dual L2 systems (System A legacy vs System B Rollup Hub) | ✅ |
+| Confirmed `layer2_market/mod.rs` is dead code (`#![allow(dead_code)]`) | ✅ |
+| Confirmed wrong comment in `token_swap/mod.rs` line 18 (cosmetic bug) | ✅ |
+| Confirmed `TokenFactory.ts` calls non-existent `POST /l5/launch-coin` | ✅ |
+| Archived outdated docs: `three_token_system.md`, `upgrade.md` → `docs/archive/` | ✅ |
+| Rewrote `docs/NEXT-STEPS.md` with current P0/P1/P2 priorities | ✅ |
+| Updated `docs/Manifesto.md` — removed MAXX/DECAY/OZ references | ✅ |
+| Updated `docs/ROLLUP_LAYERS_ROADMAP.md` — dual system table + deprecation plan | ✅ |
+
+### Key Architecture Findings
+
+| Finding | Detail |
+|---------|--------|
+| **Two incompatible L2 settlement systems** | System A (binary leaf, `/escrow/*`) vs System B (UTF-8 leaf, `/rollup/L2/*`) — proofs cannot be shared |
+| **System A leaf** | `SHA256(bs58_decode(wallet)[32] \|\| payout_spl_u64_le[8])` |
+| **System B leaf** | `SHA256("L2:BB:{address}:{balance_lamports}")` — plain UTF-8 string |
+| **`layer2_market/mod.rs`** | Dead code — never called. Real Merkle build is in `dealer.sdk.ts::buildMerkleTree()` |
+| **`token_swap/mod.rs` line 18** | Comment says "1 BB = 1 wUSDT" but constants say 10:1. Comment is wrong |
+| **`TokenFactory.ts`** | Calls `POST /l5/launch-coin` which has no Rust handler |
+| **L5 exit golden rule** | Creator Coins cannot exit to L1 directly — must swap to $BB on L5 first |
+| **BB price** | $0.10 USD (10 BB = 1 wUSDT). The `BB_TO_USDC_RATE = 10` constant is correct |
+
+### gRPC Reconnect Bug Details
+
+**Root cause:** After h2 disconnect + 5s retry, the Reader's local PoH clock had advanced ~12 slots past the Writer's live slot. The existing drift detection (`block.slot > local_slot + 1`) only handles forward gaps. Backward drift never fires → hundreds of "Block N failed verification" errors until a lucky 2-slot gap triggered a reset.
+
+**Fix:** Added `let mut session_anchor_reset = true;` before the subscribe while-loop. On first block of each gRPC session, unconditionally resets `self.latest_hash` to `block.previous_hash` and snaps the slot counter, logs `📡 Session anchor reset → slot {N}`.
+
+---
+
+## Next Session Priorities
+
+### Step 1 (P0): Expand `dealer.sdk.ts` — System B SDK
+
+Add two methods to `sdk/dealer.sdk.ts` (after the existing `buildMerkleTree()` around line 850):
+
+1. **`buildRollupMerkleTree(rollupId, entries)`**
+   - Leaf: `SHA256("L2:BB:{address}:{lamports}")` — plain UTF-8, no bs58 decode
+   - Same `merkleHash()` sorted-pair combiner as existing tree
+   - Returns `MerkleTreeResult`
+
+2. **`submitRollupRoot(rollupId, batchId, tree)`**
+   - Sig (UTF-8): `"ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{root_hex}:{ts}"`
+   - Uses `signMessage()` — NOT `signBinaryMessage()`
+   - POST to `POST /rollup/{rollupId}/submit_root`
+
+### Step 2 (P0): TypeScript L2 Sequencer
+Node.js server. Polls lock records, accepts bets, resolves markets with `buildRollupMerkleTree()`, submits roots, stores proofs. Sequencer pubkey registered as `L2_SEQUENCER_PUBKEY` on L1.
+
+### Step 3 (P0): Freeze System A New Entries
+No new `/escrow/deposit` calls. All new markets via `/rollup/L2/lock_bb`. Keep `/escrow/withdraw` alive forever (30-day claim windows).
+
+### P1 Items
+- Fix `TokenFactory.ts` to use two-step lock_bb flow
+- Fix wrong comment in `token_swap/mod.rs` line 18
+- Strip MAXX/DECAY/$oz UI components from `blackbook-wallet/`
+
+---
+
 ## Session: 2026-05-20 — Reader Sync Fixes + CI/CD Hot-Upgrade
 
 > **Goal:** Fix two Reader sync bugs causing balance parity failures, verify both nodes agree on state, and set up automatic hot-upgrade CI/CD so every `git push` to `master` auto-deploys to Hetzner.

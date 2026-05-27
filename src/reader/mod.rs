@@ -177,8 +177,38 @@ impl ReaderNode {
 
         let mut stream = client.subscribe_blocks(request).await?.into_inner();
 
+        // On every new subscription session (initial connect OR reconnect after
+        // an h2/network drop) the local PoH clock may have drifted ahead of the
+        // Writer's live position during the retry delay.  When that happens,
+        // incoming blocks have slot numbers *below* local_slot, so the forward-
+        // drift guard (`block.slot > local_slot + 1`) never fires and the stale
+        // chain anchor causes every block to fail prev_hash verification.
+        //
+        // Solution: reset the anchor unconditionally to the first block's
+        // `previous_hash` at the start of every session.  After that single
+        // trusted reset the normal per-block chain verification resumes.
+        let mut session_anchor_reset = true;
+
         while let Some(block_data) = stream.message().await? {
             let block = proto_to_block(&block_data);
+
+            // ── Session anchor reset (first block after each connect/reconnect) ──
+            if session_anchor_reset {
+                session_anchor_reset = false;
+                let mut h = self.latest_hash.write();
+                *h = block.previous_hash.clone();
+                // Also snap the slot counter so forward-drift detection works
+                // correctly from this point forward.
+                self.current_slot.fetch_max(
+                    block.slot.saturating_sub(1),
+                    Ordering::Relaxed,
+                );
+                info!(
+                    "📡 Session anchor reset → slot {} prev_hash {}…",
+                    block.slot,
+                    &block.previous_hash[..block.previous_hash.len().min(16)]
+                );
+            }
 
             // ── Clock drift detection ──────────────────────────────────────
             // The Writer's broadcast ring-buffer is lossy (RecvError::Lagged).
