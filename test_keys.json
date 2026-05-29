@@ -11,5 +11,10 @@
     "note": "Real L2 sequencer keypair — matches L2_SEQUENCER_KEY + L2_SEQUENCER_PUBKEY on Hetzner node (91.98.196.34)",
     "private_key_hex": "47d8d39738edff6e48d727126da4ec1683142c95ad456d6424be31847e61ad7f",
     "public_key_hex": "bc9359a98d3037e00ac9e7b90e814f89748fd9e1b997c20b06a9924412e8ac2a"
+  },
+  "l3_sequencer": {
+    "note": "Local-dev L3 sequencer keypair — set L3_SEQUENCER_PUBKEY=6084dfc510a04e38a6d8cf3dc122f3b7e4a9922d29491d2acd6aaa2b365eeb40 on L1",
+    "private_key_hex": "280976c88e815a65d5668640533534a02c3d900af5fc413dcb22f3d80fc4614e",
+    "public_key_hex": "6084dfc510a04e38a6d8cf3dc122f3b7e4a9922d29491d2acd6aaa2b365eeb40"
   }
 }

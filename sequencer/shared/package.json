@@ -1,0 +1,46 @@
+{
+  "name": "@bb/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./db": {
+      "import": "./dist/db.js",
+      "types": "./dist/db.d.ts"
+    },
+    "./merkle": {
+      "import": "./dist/merkle.js",
+      "types": "./dist/merkle.d.ts"
+    },
+    "./signing": {
+      "import": "./dist/signing.js",
+      "types": "./dist/signing.d.ts"
+    },
+    "./l1Client": {
+      "import": "./dist/l1Client.js",
+      "types": "./dist/l1Client.d.ts"
+    },
+    "./types": {
+      "import": "./dist/types.js",
+      "types": "./dist/types.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.4.5"
+  }
+}

@@ -1,10 +1,10 @@
 pub mod finalize;
 use std::sync::atomic::Ordering;
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::AppState;
-use crate::storage::{PendingRootStatus, Disputer, OracleNode};
+use crate::storage::{PendingRootStatus, Disputer};
 use crate::svm::LAMPORTS_PER_BB;
 
 // ── ORACLE CONSTANTS ─────────────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ pub async fn register_oracle_handler(
     }
 
     let current_slot = state.current_slot.load(Ordering::Relaxed);
-    let node = OracleNode {
+    let node = crate::storage::OracleNode {
         pubkey_hex: req.pubkey_hex.clone(),
         name: req.name.clone(),
         registered_at_slot: current_slot,
@@ -96,7 +96,7 @@ pub async fn register_oracle_handler(
             })))
         }
         Err(e) => {
-            warn!(error = %e, "Failed to store oracle node");
+            tracing::warn!(error = %e, "Failed to store oracle node");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("Storage error: {}", e)
             })))

@@ -1,7 +1,7 @@
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use serde::Deserialize;
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::AppState;
 use crate::storage::DepositRecord;
@@ -361,7 +361,7 @@ pub async fn deposit_approve_handler(
     match state.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
         Ok(_) => {
             if let Err(e) = state.blockchain.commit_bridge_tx(&req.external_tx_hash, &mint_tx_id) {
-                warn!("⚠️  Failed to persist bridge tx committed flag: {}", e);
+                tracing::warn!("⚠️  Failed to persist bridge tx committed flag: {}", e);
             }
         }
         Err(e) => {
@@ -421,7 +421,7 @@ pub async fn deposit_approve_handler(
         crate::storage::AuthType::SystemInternal,
     );
     if let Err(e) = state.blockchain.log_transaction(tx_record) {
-        warn!("⚠️ Failed to log transaction receipt for deposit: {}", e);
+        tracing::warn!("⚠️ Failed to log transaction receipt for deposit: {}", e);
     }
 
     info!("✅ DEPOSIT APPROVED: {:.6} {} → {:.5} BB → {} (ext_tx: {})",

@@ -1,0 +1,38 @@
+import type { SequencerConfig, L1LockRecord } from './types.js';
+export declare class L1Error extends Error {
+    readonly status: number;
+    readonly body: unknown;
+    constructor(message: string, status: number, body: unknown);
+}
+/**
+ * Read a lock record directly from L1.
+ * `GET /rollup/:rollupId/locks/:lockId`
+ *
+ * Use this to verify a lock exists and is unconsumed before crediting the
+ * user's off-chain balance in the local DB.
+ */
+export declare function getLock(config: SequencerConfig, lockId: string): Promise<L1LockRecord>;
+/**
+ * Mark a lock as consumed on L1 (idempotent — safe to retry).
+ * `POST /rollup/:rollupId/locks/:lockId/consume`
+ *
+ * Canonical signed message (no nonce):
+ *   `"CONSUME_LOCK:{rollup_id}:{lock_id}:{timestamp}"`
+ *
+ * Workflow: credit the user's local balance first, then call this.
+ * If L1 returns 2xx or 409 (already consumed), treat as success.
+ * After success call `consumeLockLocal()` in the local DB.
+ */
+export declare function consumeLock(config: SequencerConfig, lockId: string): Promise<void>;
+/**
+ * Anchor a Merkle state root on L1.
+ * `POST /rollup/:rollupId/submit_root`
+ *
+ * Canonical signed message (no nonce):
+ *   `"ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{timestamp}"`
+ *
+ * @param batchId        Monotonically increasing batch identifier (per rollup).
+ * @param merkleRootHex  64-char lowercase hex SHA-256 Merkle root.
+ */
+export declare function submitRoot(config: SequencerConfig, batchId: number, merkleRootHex: string): Promise<void>;
+//# sourceMappingURL=l1Client.d.ts.map

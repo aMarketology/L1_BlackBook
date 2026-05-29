@@ -1,0 +1,246 @@
+import express from 'express';
+import { ed25519 as ed } from '@noble/curves/ed25519';
+import { hexToBytes } from '@noble/hashes/utils';
+import { getBalance, buildMerkleTree, getLatestBatchId } from '@bb/shared';
+import type { SequencerConfig, DatabaseType, BbEntry } from '@bb/shared';
+import { registerLock } from './lockIngest.js';
+import {
+  createMarket,
+  getMarket,
+  getAllMarkets,
+  lockMarket,
+  placeBet,
+  resolveMarket,
+  getAllBalances,
+} from './markets.js';
+import { sealAndSubmit } from './batchSealer.js';
+import type { MarketStatus, BetSide, MarketOutcome } from './markets.js';
+
+// ─── Ed25519 verification ─────────────────────────────────────────────────────
+
+function verifyEd25519(message: string, signatureHex: string, publicKeyHex: string): boolean {
+  try {
+    const sig = hexToBytes(signatureHex);
+    const pk = hexToBytes(publicKeyHex);
+    const msg = new TextEncoder().encode(message);
+    return ed.verify(sig, msg, pk);
+  } catch {
+    return false;
+  }
+}
+
+// ─── Server factory ───────────────────────────────────────────────────────────
+
+export function createServer(config: SequencerConfig, db: DatabaseType) {
+  const app = express();
+  app.use(express.json());
+
+  // ── POST /register-lock ─────────────────────────────────────────────────
+  // User submits a lock_id from L1. Sequencer verifies → consumes on L1 →
+  // credits off-chain balance. After this the user bets at L2 speed.
+  app.post('/register-lock', async (req, res) => {
+    const { lock_id } = req.body as { lock_id?: string };
+    if (!lock_id || typeof lock_id !== 'string') {
+      res.status(400).json({ error: 'lock_id (string) is required' });
+      return;
+    }
+    try {
+      const result = await registerLock(config, db, lock_id);
+      res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  // ── GET /balances/:address ────────────────────────────────────────────────
+  app.get('/balances/:address', (req, res) => {
+    const lamports = getBalance(db, 'L2', req.params.address, 'BB');
+    res.json({
+      address: req.params.address,
+      bb_lamports: lamports.toString(),
+      bb: Number(lamports) / 100_000,
+    });
+  });
+
+  // ── GET /proof/:address ─────────────────────────────────────────────────
+  // Build an exit-ready Merkle inclusion proof for `address` against the
+  // CURRENT balance set (which equals the latest sealed batch as long as no
+  // balance has changed since the last seal). Returns everything the L1
+  // POST /rollup/L2/exit handler needs except the user's own signature.
+  //
+  // Note: sibling_is_right is all-false because the L1 verifier's hash_pair
+  // sorts (min,max) internally, so direction is irrelevant.
+  app.get('/proof/:address', (req, res) => {
+    const address = req.params.address;
+    const balances = getAllBalances(db);
+    if (balances.length === 0) {
+      res.status(404).json({ error: 'No balances to prove against' });
+      return;
+    }
+
+    const entries: BbEntry[] = balances.map(b => ({
+      type: 'BB',
+      address: b.address,
+      lamports: b.lamports,
+    }));
+
+    const idx = entries.findIndex(e => e.address === address);
+    if (idx === -1) {
+      res.status(404).json({ error: `No balance found for ${address}` });
+      return;
+    }
+
+    const { root, proofs } = buildMerkleTree('L2', entries);
+    const siblings = proofs[idx];
+    const batchId = getLatestBatchId(db, 'L2');
+    if (batchId === 0) {
+      res.status(409).json({ error: 'No batch sealed yet — resolve a market or wait for a PoH seal' });
+      return;
+    }
+
+    res.json({
+      address,
+      batch_id: batchId,
+      balance_lamports: entries[idx].lamports.toString(),
+      merkle_root: root,
+      proof_siblings: siblings,
+      sibling_is_right: siblings.map(() => false),
+    });
+  });
+
+  // ── POST /markets ─────────────────────────────────────────────────────────
+  // Create a new prediction market.
+  // TODO: restrict to oracle / admin key in production.
+  app.post('/markets', (req, res) => {
+    const { market_id, question } = req.body as { market_id?: string; question?: string };
+    if (!market_id || !question) {
+      res.status(400).json({ error: 'market_id and question are required' });
+      return;
+    }
+    try {
+      createMarket(db, market_id, question);
+      res.status(201).json({ market_id, status: 'OPEN' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(409).json({ error: msg });
+    }
+  });
+
+  // ── GET /markets ──────────────────────────────────────────────────────────
+  app.get('/markets', (req, res) => {
+    const status = req.query.status as MarketStatus | undefined;
+    const markets = getAllMarkets(db, status);
+    res.json(markets);
+  });
+
+  // ── GET /markets/:id ──────────────────────────────────────────────────────
+  app.get('/markets/:id', (req, res) => {
+    const market = getMarket(db, req.params.id);
+    if (!market) { res.status(404).json({ error: 'Market not found' }); return; }
+    res.json(market);
+  });
+
+  // ── POST /markets/:id/lock ────────────────────────────────────────────────
+  // Freeze betting (OPEN → LOCKED). Oracle / admin only.
+  app.post('/markets/:id/lock', (req, res) => {
+    try {
+      lockMarket(db, req.params.id);
+      res.json({ market_id: req.params.id, status: 'LOCKED' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  // ── POST /markets/:id/bet ─────────────────────────────────────────────────
+  // Place an off-chain bet. Signed by the bettor's Ed25519 wallet key.
+  //
+  // Body:   { wallet_address, side, amount_lamports, public_key,
+  //           signature, timestamp, nonce }
+  // Message: "L2_BET:{market_id}:{wallet_address}:{side}:{amount_lamports}:{timestamp}:{nonce}"
+  app.post('/markets/:id/bet', (req, res) => {
+    const {
+      wallet_address, side, amount_lamports,
+      public_key, signature, timestamp, nonce,
+    } = req.body as {
+      wallet_address?: string;
+      side?: string;
+      amount_lamports?: number;
+      public_key?: string;
+      signature?: string;
+      timestamp?: number;
+      nonce?: string;
+    };
+
+    if (!wallet_address || !side || !amount_lamports || !public_key || !signature || !timestamp || !nonce) {
+      res.status(400).json({ error: 'wallet_address, side, amount_lamports, public_key, signature, timestamp, nonce are all required' });
+      return;
+    }
+    if (side !== 'YES' && side !== 'NO') {
+      res.status(400).json({ error: 'side must be YES or NO' });
+      return;
+    }
+    if (!Number.isInteger(amount_lamports) || amount_lamports <= 0) {
+      res.status(400).json({ error: 'amount_lamports must be a positive integer' });
+      return;
+    }
+
+    // Freshness
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - timestamp) > 60) {
+      res.status(400).json({ error: 'timestamp outside ±60 s window' });
+      return;
+    }
+
+    // Signature
+    const message = `L2_BET:${req.params.id}:${wallet_address}:${side}:${amount_lamports}:${timestamp}:${nonce}`;
+    if (!verifyEd25519(message, signature, public_key)) {
+      res.status(401).json({ error: 'Invalid signature' });
+      return;
+    }
+
+    try {
+      placeBet(db, req.params.id, wallet_address, side as BetSide, BigInt(amount_lamports));
+      res.json({
+        ok: true,
+        market_id: req.params.id,
+        wallet_address,
+        side,
+        amount_lamports,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  // ── POST /markets/:id/resolve ─────────────────────────────────────────────
+  // Resolve a market and immediately seal a Merkle batch to L1.
+  // Oracle / admin only. TODO: add oracle signature verification.
+  //
+  // Body: { outcome: 'YES' | 'NO' }
+  app.post('/markets/:id/resolve', async (req, res) => {
+    const { outcome } = req.body as { outcome?: string };
+    if (outcome !== 'YES' && outcome !== 'NO') {
+      res.status(400).json({ error: 'outcome must be YES or NO' });
+      return;
+    }
+    try {
+      const payouts = resolveMarket(db, req.params.id, outcome as MarketOutcome, 0);
+      // Immediately anchor the updated balances on L1.
+      const sealResult = await sealAndSubmit(config, db, 0);
+      res.json({
+        market_id: req.params.id,
+        outcome,
+        payout_count: payouts.length,
+        batch: sealResult ?? null,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  return app;
+}

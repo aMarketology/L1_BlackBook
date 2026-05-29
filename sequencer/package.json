@@ -1,0 +1,11 @@
+{
+  "name": "blackbook-sequencer",
+  "private": true,
+  "workspaces": ["shared", "l2", "l3", "l5"],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:l2": "npm run dev --workspace=l2",
+    "dev:l3": "npm run dev --workspace=l3",
+    "dev:l5": "npm run dev --workspace=l5"
+  }
+}

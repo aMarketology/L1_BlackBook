@@ -1,6 +1,6 @@
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 use ed25519_dalek::{Verifier, VerifyingKey, Signature};
 use crate::AppState;
 use crate::storage::WithdrawalRecord;
@@ -363,7 +363,7 @@ pub async fn withdraw_release_handler(
                     let _ = state.blockchain.svm_accounts.flush_block();
                     info!("🔥 Burned {:.6} wUSDT from dealer (withdrawal {})", record.wusdt_amount_micro as f64 / USDC_UNIT as f64, &req.withdrawal_id[..8]);
                 }
-                Err(e) => warn!("⚠️  wUSDT burn on release failed — supply may be inflated: {:?}", e),
+                Err(e) => tracing::warn!("⚠️  wUSDT burn on release failed — supply may be inflated: {:?}", e),
             }
         }
     }

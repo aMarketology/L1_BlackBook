@@ -250,6 +250,32 @@ pub async fn get_lock_by_id_handler(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  GET /rollup/:rollup_id/roots/:batch_id
+//  Read a stored Merkle state root for debugging / smoke tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /rollup/:rollup_id/roots/:batch_id — return the 64-char hex Merkle root
+/// that was anchored on-chain for the given batch, or 404 if not found.
+pub async fn get_root_handler(
+    State(state): State<AppState>,
+    Path((rollup_id, batch_id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    match state.blockchain.load_rollup_state_root(&rollup_id, batch_id) {
+        Some(root_bytes) => {
+            let root_hex = hex::encode(root_bytes);
+            (StatusCode::OK, Json(serde_json::json!({
+                "rollup_id": rollup_id,
+                "batch_id": batch_id,
+                "merkle_root": root_hex,
+            })))
+        }
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("No root found for rollup={} batch={}", rollup_id, batch_id)
+        }))),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  POST /rollup/locks/:lock_id/consume
 //  L5 sequencer marks a lock as spent after crediting rollup-$BB.
 //  Idempotent — safe to call again if the sequencer retries.

@@ -2486,7 +2486,7 @@ impl ConcurrentBlockchain {
 
     #[deprecated(note = "Use store_rollup_state_root(rollup_id, batch_id, root) instead")]
     pub fn store_l5_state_root(&self, batch_id: u64, root: [u8; 32]) -> Result<(), String> {
-        if let Some(latest) = self.load_latest_l5_batch_id() {
+        if let Some(latest) = self.latest_rollup_batch_id("L5") {
             if batch_id <= latest {
                 return Err(format!(
                     "L5 batch_id {} is not greater than latest {} (monotonicity violation)",
@@ -2515,14 +2515,6 @@ impl ConcurrentBlockchain {
         } else {
             None
         }
-    }
-
-    #[deprecated(note = "Use latest_rollup_batch_id(rollup_id) instead")]
-    pub fn load_latest_l5_batch_id(&self) -> Option<u64> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(L5_STATE_ROOTS).ok()?;
-        let guard = table.last().ok()??;
-        Some(guard.0.value())
     }
 
     // ── Generic Multi-Rollup State Root Methods ───────────────────────────────

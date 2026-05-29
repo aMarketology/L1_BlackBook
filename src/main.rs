@@ -2905,6 +2905,7 @@ fn build_router(state: AppState) -> Router {
         .route("/rollup/:rollup_id/lock_bb", post(contracts::rollup::lock_bb_handler))
         .route("/rollup/:rollup_id/locks/:lock_id", get(contracts::rollup::get_lock_by_id_handler))
         .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
+        .route("/rollup/:rollup_id/roots/:batch_id", get(contracts::rollup::get_root_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
         .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler));
 
