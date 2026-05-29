@@ -14,11 +14,9 @@ use std::str::FromStr;
 // The pool PDA (swap_pool_pda()) holds both $BB and wUSDT — no private key exists
 // for this address; only the swap handlers below can move funds from it.
 //
-// Rate: 1 BB = 1 wUSDT  ($BB is a 1:1 USD stablecoin)
+// Rate: 10 BB = 1 wUSDT ($BB is a $0.10 token, NOT a 1:1 stablecoin)
 // ============================================================================
 
-/// 1 wUSDT = 10 BB ($0.10 per BB — dealer fixed rate)
-pub const BB_TO_USDC_RATE: u64 = 10;
 
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
@@ -148,10 +146,13 @@ pub async fn swap_bb_for_usdc_handler(
     let pool_pubkey  = swap_pool_pda();
     let pool_address = swap_pool_address();
 
-    // Integer math: bb_lamports / (LAMPORTS_PER_BB * RATE) * USDC_UNIT
-    // = bb_lamports * USDC_UNIT / (LAMPORTS_PER_BB * RATE)
+    // Read the active exchange rate from ReDB (adjustable by Oracle/Dealer).
+    // Falls back to BB_PER_USDT_DEFAULT (10) if no rate has been set.
+    let active_rate = state.blockchain.get_swap_rate("BB_USDT");
+
+    // Integer math: bb_lamports * USDC_UNIT / (LAMPORTS_PER_BB * rate)
     let usdc_raw_output = (req.bb_amount as u128 * USDC_UNIT as u128
-        / (LAMPORTS_PER_BB as u128 * BB_TO_USDC_RATE as u128)) as u64;
+        / (LAMPORTS_PER_BB as u128 * active_rate as u128)) as u64;
     if usdc_raw_output == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Amount too small for swap" })));
     }
@@ -277,9 +278,12 @@ pub async fn swap_usdc_for_bb_handler(
     let pool_pubkey  = swap_pool_pda();
     let pool_address = swap_pool_address();
 
-    // Integer math: usdc_micro * LAMPORTS_PER_BB * RATE / USDC_UNIT
+    // Read the active exchange rate from ReDB (adjustable by Oracle/Dealer).
+    let active_rate = state.blockchain.get_swap_rate("BB_USDT");
+
+    // Integer math: usdc_micro * LAMPORTS_PER_BB * rate / USDC_UNIT
     let bb_lamports_output = (req.usdc_amount as u128 * LAMPORTS_PER_BB as u128
-        * BB_TO_USDC_RATE as u128 / USDC_UNIT as u128) as u64;
+        * active_rate as u128 / USDC_UNIT as u128) as u64;
     if bb_lamports_output == 0 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Amount too small for swap" })));
     }

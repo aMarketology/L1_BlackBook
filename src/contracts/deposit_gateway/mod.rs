@@ -117,15 +117,12 @@ pub async fn deposit_request_handler(
         }
     }
 
-    // ── ALREADY PROCESSED OR PENDING? ─────────────────────────────────────
+    // ── ALREADY PROCESSED? (durable ReDB check) ────────────────────────────
+    // Note: the "pending" duplicate check is enforced atomically below via
+    // entry() — no separate contains_key needed here.
     if state.blockchain.is_bridge_tx_processed(&req.external_tx_hash) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": "This external_tx_hash has already been minted. Possible double-submission."
-        })));
-    }
-    if state.deposit_requests.contains_key(&req.external_tx_hash) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "A deposit request for this tx hash already exists. Check /deposit/status/:tx_hash"
         })));
     }
 
@@ -186,11 +183,21 @@ pub async fn deposit_request_handler(
         contest_id: None,
     };
 
-    // Persist to ReDB + hot DashMap
-    if let Err(e) = state.blockchain.store_deposit_request(&record) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Storage error: {}", e) })));
+    // Atomically claim the request slot — single entry() call eliminates
+    // TOCTOU between check and insert when concurrent requests share a tx_hash.
+    match state.deposit_requests.entry(req.external_tx_hash.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "A deposit request for this tx hash already exists. Check /deposit/status/:tx_hash"
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            if let Err(e) = state.blockchain.store_deposit_request(&record) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Storage error: {}", e) })));
+            }
+            slot.insert(record.clone());
+        }
     }
-    state.deposit_requests.insert(req.external_tx_hash.clone(), record.clone());
 
     info!("📥 DEPOSIT REQUEST: {:.6} {} → {:.5} BB for {} (tx: {})",
         req.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64, req.asset,

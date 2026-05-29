@@ -5,6 +5,7 @@ use ed25519_dalek::{Verifier, VerifyingKey, Signature};
 use crate::AppState;
 use crate::storage::WithdrawalRecord;
 use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+use crate::svm::spl_token::derive_ata_address;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
@@ -216,10 +217,17 @@ pub async fn withdraw_request_handler(
 
     // ── Nonce consumed after funds are moved (prevents replay) ────────────
 
-    // ── Create withdrawal record ──────────────────────────────────────────
+    // ── ATOMIC: flush both ATAs to ReDB + write withdrawal record in one txn ──
+    // Prevents the double-payment window where the withdrawal record lands in ReDB
+    // (dealer sends USDC) but the wUSDT debit is absent after a crash, leaving
+    // the user with both the USDC payout and the original wUSDT on restart.
+    let user_ata_key   = Pubkey::new_from_array(derive_ata_address(&user_pubkey.to_bytes(),   &mint));
+    let dealer_ata_key = Pubkey::new_from_array(derive_ata_address(&dealer_pubkey.to_bytes(), &mint));
+
     let withdrawal_id = uuid::Uuid::new_v4().to_string();
-    let record = WithdrawalRecord {
+    let mut record = WithdrawalRecord {
         withdrawal_id: withdrawal_id.clone(),
+        withdrawal_seq: 0, // assigned atomically inside atomic_withdrawal_flush_and_record
         wallet_address: req.wallet_address.clone(),
         solana_destination: req.solana_destination.clone(),
         wusdt_amount_micro: req.wusdt_amount_micro,
@@ -229,18 +237,34 @@ pub async fn withdraw_request_handler(
         solana_tx_hash: None,
     };
 
-    if let Err(e) = state.blockchain.store_withdrawal(&record) {
-        tracing::error!("Failed to persist withdrawal record to ReDB: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to persist withdrawal record — transaction aborted"
-        })));
-    }
+    let assigned_seq = match state.blockchain.atomic_withdrawal_flush_and_record(
+        &user_ata_key, &dealer_ata_key, &record,
+    ) {
+        Ok(seq) => seq,
+        Err(e) => {
+            tracing::error!("Atomic withdrawal commit failed: {}", e);
+            // Rollback the SPL transfer — best effort
+            let _ = SplTokenEngine::transfer_tokens(
+                &state.blockchain.svm_accounts, &mint, &dealer_pubkey, &user_pubkey, raw_required,
+            );
+            if state.withdrawal_daily_cap_micro > 0 {
+                state.withdrawal_window_total.fetch_sub(req.wusdt_amount_micro, std::sync::atomic::Ordering::Relaxed);
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Failed to commit withdrawal to disk — transaction aborted"
+            })));
+        }
+    };
+    // Stamp the seq into the hot-cache record so in-memory queries reflect it.
+    record.withdrawal_seq = assigned_seq;
+    state.withdrawal_seq_counter.store(assigned_seq + 1, std::sync::atomic::Ordering::Relaxed);
     state.withdrawal_requests.insert(withdrawal_id.clone(), record);
 
-    info!("💸 WITHDRAWAL REQUEST: {:.6} wUSDT from {} → Solana {} (id: {})",
+    info!("💸 WITHDRAWAL REQUEST: {:.6} wUSDT from {} → Solana {} (seq={}, id: {})",
         req.wusdt_amount_micro as f64 / USDC_UNIT as f64,
         &req.wallet_address[..8.min(req.wallet_address.len())],
         &req.solana_destination[..8.min(req.solana_destination.len())],
+        assigned_seq,
         &withdrawal_id[..8]);
 
     (StatusCode::OK, Json(serde_json::json!({

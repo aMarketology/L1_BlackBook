@@ -46,8 +46,8 @@ use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tracing::{info, warn};
-use crate::svm::accounts_db::SvmAccountsDB;
-use crate::svm::types::LAMPORTS_PER_BB;
+use crate::svm::accounts_db::{SvmAccountsDB, SVM_ACCOUNTS};
+use crate::svm::types::{LAMPORTS_PER_BB, StoredAccount};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::account::AccountSharedData;
 use solana_sdk::account::ReadableAccount;
@@ -101,6 +101,12 @@ const UNATTRIBUTED_DEPOSITS: TableDefinition<&str, &[u8]> = TableDefinition::new
 /// Durable record of every wUSDT → real USDC withdrawal initiated by users.
 const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdrawals");
 
+/// Monotonic sequence counter for withdrawal records.
+/// Single row: key "next" → next u64 to assign.  Updated atomically inside every
+/// `atomic_withdrawal_flush_and_record` write transaction so the counter is always
+/// in sync with persisted records after a crash or restart.
+const WITHDRAWAL_SEQ_COUNTER: TableDefinition<&str, u64> = TableDefinition::new("withdrawal_seq_counter");
+
 /// Per-contest settlement state: contest_id → ContestState JSON (bytes)
 /// Tracks lifecycle (Open → Settled → Expired), Merkle root, payout accounting,
 /// and claim deadline per BB market.
@@ -143,6 +149,12 @@ pub const ROLLUP_STATE_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::ne
 /// with the same (batch_id, address) pair is rejected 403 before any balance
 /// move occurs, regardless of nonce.
 pub const ROLLUP_CONSUMED_EXITS: TableDefinition<&str, u64> = TableDefinition::new("rollup_consumed_exits");
+
+/// Dynamic exchange rates: pool_id (String) → rate (u64).
+/// Key "BB_USDT" holds the current BB-per-wUSDT exchange rate.
+/// Defaults to BB_PER_USDT_DEFAULT (10) if unset. Adjustable by Oracle/Dealer
+/// to protect the internal accounting unit when wUSDT depegs.
+pub const SWAP_RATES: TableDefinition<&str, u64> = TableDefinition::new("swap_rates");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -755,6 +767,7 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(MERKLE_NODES)?;
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
             let _ = write_txn.open_table(WITHDRAWALS)?;
+            let _ = write_txn.open_table(WITHDRAWAL_SEQ_COUNTER)?;
             let _ = write_txn.open_table(CONTEST_STATES)?;
             let _ = write_txn.open_table(UNATTRIBUTED_DEPOSITS)?;
             // Legacy L5 roots (kept for startup migration)
@@ -763,6 +776,8 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(ROLLUP_STATE_ROOTS)?;
             // Rollup exit double-spend guard
             let _ = write_txn.open_table(ROLLUP_CONSUMED_EXITS)?;
+            // Dynamic exchange rates (Oracle/Dealer adjustable)
+            let _ = write_txn.open_table(SWAP_RATES)?;
 
             // SVM tables (behind feature flag)
             {
@@ -893,26 +908,15 @@ impl ConcurrentBlockchain {
     // WRITE OPERATIONS (ReDB MVCC - Safe, Serialized)
     // ========================================================================
 
-    /// Credit (add) tokens to an address — SVM-native
+    /// Mint (add) tokens to an address — SVM-native, u64 lamports only.
     ///
-    /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
-    /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
-    ///
-    /// # Deprecated
-    /// Prefer `credit_svm_lamports(address, lamports)` for all new code.
-    /// f64 → u64 conversion is lossy for balances above 2^53 lamports.
-    /// This wrapper is kept for backward compatibility with the public HTTP
-    /// API boundary (faucet, admin) where the amount arrives as a float.
-    #[deprecated(note = "use credit_svm_lamports(address, lamports: u64) to avoid f64 precision loss")]
-    pub fn credit(&self, address: &str, amount: f64) -> Result<(), String> {
-        if amount <= 0.0 {
-            return Err("Amount must be positive".to_string());
-        }
-
-        // ═══ SINGLE CONVERSION: f64 → u64 at the boundary ═══
-        let add_lamports = (amount * LAMPORTS_PER_BB as f64) as u64;
+    /// Operates entirely in u64 through the SVM AccountsDB and logs a `Mint`
+    /// ledger record + SVM receipt so the mint shows in the explorer. Callers
+    /// that receive a float at the HTTP boundary must convert ONCE with
+    /// `(amount * LAMPORTS_PER_BB as f64).round() as u64` before calling.
+    pub fn mint_lamports(&self, address: &str, add_lamports: u64) -> Result<(), String> {
         if add_lamports == 0 {
-            return Err("Amount too small to represent in lamports".to_string());
+            return Err("Amount must be > 0 lamports".to_string());
         }
 
         // ═══ SVM: Read current, compute new, write ═══
@@ -964,7 +968,7 @@ impl ConcurrentBlockchain {
             let slot = self.block_height.load(Ordering::Relaxed);
             let lamport_amount = add_lamports as i64;
             // Deterministic signature from mint details
-            let sig_input = format!("MINT:{}:{}:{}", address, amount, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let sig_input = format!("MINT:{}:{}:{}", address, add_lamports, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
             let sig_hash: [u8; 32] = Sha256::digest(sig_input.as_bytes()).into();
             let sig_b58 = bs58::encode(&sig_hash).into_string();
             let stored = crate::svm::types::StoredTransactionResult {
@@ -986,28 +990,19 @@ impl ConcurrentBlockchain {
             }
         }
         
-        info!(address = %address, amount = amount, new_balance = new_lamports as f64 / LAMPORTS_PER_BB as f64, "✅ Tokens ADDED to wallet");
+        info!(address = %address, lamports = add_lamports, new_balance = new_lamports as f64 / LAMPORTS_PER_BB as f64, "✅ Tokens ADDED to wallet");
         Ok(())
     }
 
-    /// Debit (subtract) tokens from an address — SVM-native
+    /// Burn (subtract) tokens from an address — SVM-native, u64 lamports only.
     ///
-    /// Converts f64 BB → u64 lamports ONCE at entry, then operates entirely
-    /// in u64 through the SVM AccountsDB. Mirrors to cache/ReDB after.
-    ///
-    /// # Deprecated
-    /// Prefer `debit_svm_lamports(address, lamports)` for all new code.
-    /// f64 → u64 conversion is lossy for balances above 2^53 lamports.
-    #[deprecated(note = "use debit_svm_lamports(address, lamports: u64) to avoid f64 precision loss")]
-    pub fn debit(&self, address: &str, amount: f64) -> Result<(), String> {
-        if amount <= 0.0 {
-            return Err("Amount must be positive".to_string());
-        }
-
-        // ═══ SINGLE CONVERSION: f64 → u64 at the boundary ═══
-        let sub_lamports = (amount * LAMPORTS_PER_BB as f64) as u64;
+    /// Operates entirely in u64 through the SVM AccountsDB and logs a `Burn`
+    /// ledger record. Callers that receive a float at the HTTP boundary must
+    /// convert ONCE with `(amount * LAMPORTS_PER_BB as f64).round() as u64`
+    /// before calling.
+    pub fn burn_lamports(&self, address: &str, sub_lamports: u64) -> Result<(), String> {
         if sub_lamports == 0 {
-            return Err("Amount too small to represent in lamports".to_string());
+            return Err("Amount must be > 0 lamports".to_string());
         }
 
         // ═══ SVM: Read current, check sufficient, write ═══
@@ -1016,8 +1011,8 @@ impl ConcurrentBlockchain {
         
         if current_lamports < sub_lamports {
             return Err(format!(
-                "Insufficient funds: have {:.6}, need {:.6}",
-                current_lamports as f64 / LAMPORTS_PER_BB as f64, amount
+                "Insufficient funds: have {} lamports, need {} lamports",
+                current_lamports, sub_lamports
             ));
         }
         
@@ -1054,7 +1049,7 @@ impl ConcurrentBlockchain {
             warn!("Failed to log burn transaction: {}", e);
         }
         
-        info!(address = %address, amount = amount, new_balance = new_balance_bb, "✅ Tokens SUBTRACTED from wallet");
+        info!(address = %address, lamports = sub_lamports, new_balance = new_balance_bb, "✅ Tokens SUBTRACTED from wallet");
         Ok(())
     }
 
@@ -1127,17 +1122,25 @@ impl ConcurrentBlockchain {
         };
 
         let count = records.len();
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
-            for record in &records {
-                let tx_json = serde_json::to_vec(record)
-                    .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-                table.insert(record.tx_id.as_str(), tx_json.as_slice())
-                    .map_err(|e| e.to_string())?;
+
+        // Write in chunks of 100 so the ReDB write lock is held for at most
+        // ~100 record serializations per transaction.  This keeps the lock
+        // available for concurrent writes (withdrawal commits, rollup roots)
+        // during large flush bursts without starving them for hundreds of ms.
+        const CHUNK_SIZE: usize = 100;
+        for chunk in records.chunks(CHUNK_SIZE) {
+            let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut table = write_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+                for record in chunk {
+                    let tx_json = serde_json::to_vec(record)
+                        .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+                    table.insert(record.tx_id.as_str(), tx_json.as_slice())
+                        .map_err(|e| e.to_string())?;
+                }
             }
+            write_txn.commit().map_err(|e| e.to_string())?;
         }
-        write_txn.commit().map_err(|e| e.to_string())?;
 
         Ok(count)
     }
@@ -1684,6 +1687,219 @@ impl ConcurrentBlockchain {
         Ok(())
     }
 
+    // ========================================================================
+    // ATOMIC COMBINED WRITES — SVM accounts + metadata in one ReDB transaction
+    // ========================================================================
+    //
+    // These methods eliminate the crash window that exists when SVM account
+    // changes (write-behind via flush_block) and metadata records (written
+    // immediately to ReDB) land in separate transactions.
+    //
+    // Without these methods the following scenario is possible:
+    //   1. SVM balance changes  → hot_state DashMap (not yet in ReDB)
+    //   2. metadata record      → ReDB  ← crash here
+    //   3. flush_block          → never runs
+    //
+    // On restart: metadata says operation completed, but balance change is gone.
+    // The user cannot retry (metadata blocks them) and has no payout. Fix: write
+    // both in one atomic ReDB transaction, then update hot_state only on success.
+
+    /// Atomically execute an escrow payout + seal the claim in a single ReDB transaction.
+    ///
+    /// Eliminates the crash window where the claim seal lands in ReDB but the
+    /// balance debit/credit does not — leaving the user with no payout and an
+    /// unretriable claim key.
+    ///
+    /// Hot-state (DashMap) is updated ONLY after the ReDB commit so the write
+    /// order is always: ReDB → DashMap (never the reverse).
+    pub fn atomic_escrow_claim_and_pay(
+        &self,
+        claim_key: &str,
+        escrow_addr: &str,
+        user_addr: &str,
+        amount_lamports: u64,
+        timestamp: u64,
+    ) -> Result<(), String> {
+        let escrow_pk = Self::addr_to_pubkey(escrow_addr);
+        let user_pk   = Self::addr_to_pubkey(user_addr);
+
+        let escrow_lamports = self.svm_accounts.get_lamports(&escrow_pk);
+        let user_lamports   = self.svm_accounts.get_lamports(&user_pk);
+
+        if escrow_lamports < amount_lamports {
+            return Err(format!(
+                "Insufficient escrow: {} < {} lamports",
+                escrow_lamports, amount_lamports
+            ));
+        }
+        let new_escrow = escrow_lamports.checked_sub(amount_lamports)
+            .ok_or_else(|| "Escrow underflow".to_string())?;
+        let new_user = user_lamports.checked_add(amount_lamports)
+            .ok_or_else(|| "User balance overflow".to_string())?;
+
+        let escrow_account = AccountSharedData::new(new_escrow, 0, &solana_sdk::system_program::id());
+        let user_account   = AccountSharedData::new(new_user,   0, &solana_sdk::system_program::id());
+
+        let escrow_bytes = borsh::to_vec(&StoredAccount::from(&escrow_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        let user_bytes = borsh::to_vec(&StoredAccount::from(&user_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+
+        // Single atomic ReDB write: claim seal + both SVM account states
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut claims = write_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+            claims.insert(claim_key, timestamp).map_err(|e| e.to_string())?;
+
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(escrow_pk.to_bytes().as_slice(), escrow_bytes.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(user_pk.to_bytes().as_slice(),   user_bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        // Update hot_state AFTER durable commit (ReDB → DashMap ordering)
+        self.svm_accounts.hot_state.insert(escrow_pk, escrow_account);
+        self.svm_accounts.hot_state.insert(user_pk, user_account);
+        self.mirror_balance_to_cache(escrow_addr, new_escrow);
+        self.mirror_balance_to_cache(user_addr, new_user);
+        // total_supply unchanged: escrow debit == user credit (zero-sum move)
+
+        info!(claim_key = %claim_key, amount = amount_lamports, "Atomic escrow claim committed");
+        Ok(())
+    }
+
+    /// Atomically debit user BB, credit vault BB, and persist the lock record
+    /// in a single ReDB write transaction.
+    ///
+    /// Eliminates the double-spend window where a lock record lands in ReDB
+    /// (sequencer processes it on L2) but the user's balance debit is lost on a
+    /// crash before the write-behind flush_block runs.
+    pub fn atomic_rollup_lock_bb(
+        &self,
+        user_addr: &str,
+        vault_addr: &str,
+        amount_lamports: u64,
+        record: &RollupLockRecord,
+    ) -> Result<(), String> {
+        let user_pk  = Self::addr_to_pubkey(user_addr);
+        let vault_pk = Self::addr_to_pubkey(vault_addr);
+
+        let user_lamports  = self.svm_accounts.get_lamports(&user_pk);
+        let vault_lamports = self.svm_accounts.get_lamports(&vault_pk);
+
+        if user_lamports < amount_lamports {
+            return Err(format!(
+                "Insufficient funds: {} < {} lamports",
+                user_lamports, amount_lamports
+            ));
+        }
+        let new_user  = user_lamports.checked_sub(amount_lamports)
+            .ok_or_else(|| "User underflow".to_string())?;
+        let new_vault = vault_lamports.checked_add(amount_lamports)
+            .ok_or_else(|| "Vault overflow".to_string())?;
+
+        let user_account  = AccountSharedData::new(new_user,  0, &solana_sdk::system_program::id());
+        let vault_account = AccountSharedData::new(new_vault, 0, &solana_sdk::system_program::id());
+
+        let user_bytes  = borsh::to_vec(&StoredAccount::from(&user_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        let vault_bytes = borsh::to_vec(&StoredAccount::from(&vault_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        let record_bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+
+        // Single atomic ReDB write: lock record + both SVM account states
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut locks = write_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).map_err(|e| e.to_string())?;
+            locks.insert(record.lock_id.as_str(), record_bytes.as_slice()).map_err(|e| e.to_string())?;
+
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(user_pk.to_bytes().as_slice(),  user_bytes.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(vault_pk.to_bytes().as_slice(), vault_bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        // Update hot_state AFTER durable commit (ReDB → DashMap ordering)
+        self.svm_accounts.hot_state.insert(user_pk, user_account);
+        self.svm_accounts.hot_state.insert(vault_pk, vault_account);
+        self.mirror_balance_to_cache(user_addr, new_user);
+        self.mirror_balance_to_cache(vault_addr, new_vault);
+        // total_supply unchanged: user debit == vault credit (zero-sum move)
+
+        info!(lock_id = %record.lock_id, amount = amount_lamports, "Atomic rollup lock committed");
+        Ok(())
+    }
+
+    /// After a successful SPL token transfer, atomically flush the two modified
+    /// ATAs to ReDB and write the withdrawal record in the same transaction.
+    ///
+    /// Eliminates the double-payment window where the withdrawal record lands in
+    /// ReDB (dealer sends USDC) but the wUSDT debit is lost on a crash before
+    /// the write-behind flush_block runs — which would leave the user with both
+    /// the USDC payout and their original wUSDT balance on restart.
+    ///
+    /// Also allocates the next monotonic `withdrawal_seq` from `WITHDRAWAL_SEQ_COUNTER`
+    /// inside the same transaction so the sequence is always consistent with the
+    /// persisted record after a crash.
+    ///
+    /// Returns the assigned `withdrawal_seq` so the caller can update the hot DashMap.
+    ///
+    /// Must be called AFTER `SplTokenEngine::transfer_tokens` succeeds so that
+    /// `from_ata` and `to_ata` already hold the post-transfer state in hot_state.
+    pub fn atomic_withdrawal_flush_and_record(
+        &self,
+        from_ata: &Pubkey,
+        to_ata: &Pubkey,
+        record: &WithdrawalRecord,
+    ) -> Result<u64, String> {
+        let from_account = self.svm_accounts.hot_state.get(from_ata)
+            .map(|a| a.clone())
+            .ok_or_else(|| format!("from ATA not in hot_state: {}", from_ata))?;
+        let to_account = self.svm_accounts.hot_state.get(to_ata)
+            .map(|a| a.clone())
+            .ok_or_else(|| format!("to ATA not in hot_state: {}", to_ata))?;
+
+        let from_bytes = borsh::to_vec(&StoredAccount::from(&from_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        let to_bytes = borsh::to_vec(&StoredAccount::from(&to_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+
+        // Single atomic ReDB write: withdrawal record + both SPL ATA states + seq counter
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        let assigned_seq = {
+            let mut seq_table = write_txn.open_table(WITHDRAWAL_SEQ_COUNTER)
+                .map_err(|e| e.to_string())?;
+            let next = seq_table.get("next").map_err(|e| e.to_string())?
+                .map(|v| v.value())
+                .unwrap_or(1u64);
+            seq_table.insert("next", next + 1).map_err(|e| e.to_string())?;
+            next
+        };
+        {
+            // Stamp the seq into the record before serialization
+            let mut stamped = record.clone();
+            stamped.withdrawal_seq = assigned_seq;
+            let record_bytes = serde_json::to_vec(&stamped).map_err(|e| e.to_string())?;
+
+            let mut withdrawals = write_txn.open_table(WITHDRAWALS)
+                .map_err(|e| e.to_string())?;
+            withdrawals.insert(stamped.withdrawal_id.as_str(), record_bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS)
+                .map_err(|e| e.to_string())?;
+            svm.insert(from_ata.to_bytes().as_slice(), from_bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+            svm.insert(to_ata.to_bytes().as_slice(), to_bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        info!(withdrawal_id = %record.withdrawal_id, seq = assigned_seq,
+              "Atomic withdrawal committed: SPL transfer + record + seq");
+        Ok(assigned_seq)
+    }
+
     /// Persist a withdrawal record (insert or overwrite).
     pub fn store_withdrawal(&self, record: &WithdrawalRecord) -> Result<(), String> {
         let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
@@ -1707,6 +1923,35 @@ impl ConcurrentBlockchain {
                 results.push(record);
             }
         }
+        Ok(results)
+    }
+
+    /// Load the current value of the withdrawal sequence counter from ReDB.
+    /// Used at startup to restore the in-memory `AtomicU64` without scanning all records.
+    /// Returns 1 if the table is empty (first-ever run).
+    pub fn load_withdrawal_seq_counter(&self) -> u64 {
+        let Ok(read_txn) = self.db.begin_read() else { return 1; };
+        let Ok(table) = read_txn.open_table(WITHDRAWAL_SEQ_COUNTER) else { return 1; };
+        table.get("next").ok().flatten().map(|v| v.value()).unwrap_or(1)
+    }
+
+    /// Return all withdrawal records whose `withdrawal_seq >= since_seq`, sorted ascending.
+    /// This is the primary poll interface for the bridge watcher: after a crash it
+    /// resumes from `last_processed_seq + 1` instead of doing a full table scan.
+    pub fn load_withdrawals_since(&self, since_seq: u64) -> Result<Vec<WithdrawalRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(WITHDRAWALS).map_err(|e| e.to_string())?;
+        let mut results: Vec<WithdrawalRecord> = Vec::new();
+        let iter = table.iter().map_err(|e| e.to_string())?;
+        for entry in iter {
+            let (_key, value) = entry.map_err(|e| e.to_string())?;
+            if let Ok(record) = serde_json::from_slice::<WithdrawalRecord>(value.value()) {
+                if record.withdrawal_seq >= since_seq {
+                    results.push(record);
+                }
+            }
+        }
+        results.sort_by_key(|r| r.withdrawal_seq);
         Ok(results)
     }
 
@@ -1994,6 +2239,12 @@ pub struct UnattributedDeposit {
 pub struct WithdrawalRecord {
     /// UUID assigned at request time — used as the primary key
     pub withdrawal_id: String,
+    /// Strictly increasing sequence number assigned atomically at creation.
+    /// Allows the bridge watcher to poll `GET /withdraw/since/:seq` and resume
+    /// from the last processed position after a crash without full table scans.
+    /// Defaults to 0 for records written before this field was introduced.
+    #[serde(default)]
+    pub withdrawal_seq: u64,
     /// BB wallet address (base58) whose wUSDT was burned
     pub wallet_address: String,
     /// Solana wallet address (base58) where the dealer should send real USDC
@@ -2353,6 +2604,46 @@ impl ConcurrentBlockchain {
         }
         latest
     }
+
+    // ── SWAP RATE ────────────────────────────────────────────────────────────
+
+    /// Read the active exchange rate for a swap pool from ReDB.
+    ///
+    /// `pool_id` is currently `"BB_USDT"`. Returns `BB_PER_USDT_DEFAULT` (10)
+    /// if no custom rate has been set, guaranteeing a valid baseline on genesis.
+    pub fn get_swap_rate(&self, pool_id: &str) -> u64 {
+        use crate::svm::BB_PER_USDT_DEFAULT;
+        let read_txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return BB_PER_USDT_DEFAULT,
+        };
+        let table = match read_txn.open_table(SWAP_RATES) {
+            Ok(t) => t,
+            Err(_) => return BB_PER_USDT_DEFAULT,
+        };
+        // All three branches (Err, Ok(None), Ok(Some(0))) fall back to default,
+        // preventing divide-by-zero in swap math on a fresh table or corrupt entry.
+        let rate = table.get(pool_id).ok().flatten()
+            .map(|v| v.value())
+            .unwrap_or(BB_PER_USDT_DEFAULT);
+        if rate == 0 { BB_PER_USDT_DEFAULT } else { rate }
+    }
+
+    /// Persist a new exchange rate for a swap pool to ReDB.
+    ///
+    /// `rate` must be ≥ 1 (zero would divide-by-zero in swap math).
+    /// Called by the Oracle/Dealer via `POST /admin/swap/set_rate`.
+    pub fn set_swap_rate(&self, pool_id: &str, rate: u64) -> Result<(), String> {
+        if rate == 0 {
+            return Err("Swap rate must be at least 1".to_string());
+        }
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(SWAP_RATES).map_err(|e| e.to_string())?;
+            table.insert(pool_id, rate).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
 }
 
 // ============================================================================
@@ -2370,15 +2661,15 @@ mod tests {
         let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
 
         // Credit
-        bc.credit("alice", 100.0).unwrap();
+        bc.mint_lamports("alice", 100 * LAMPORTS_PER_BB).unwrap();
         assert_eq!(bc.get_balance("alice"), 100.0);
 
         // Debit
-        bc.debit("alice", 30.0).unwrap();
+        bc.burn_lamports("alice", 30 * LAMPORTS_PER_BB).unwrap();
         assert_eq!(bc.get_balance("alice"), 70.0);
 
         // Insufficient funds
-        let result = bc.debit("alice", 100.0);
+        let result = bc.burn_lamports("alice", 100 * LAMPORTS_PER_BB);
         assert!(result.is_err());
     }
 
@@ -2387,7 +2678,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
 
-        bc.credit("alice", 100.0).unwrap();
+        bc.mint_lamports("alice", 100 * LAMPORTS_PER_BB).unwrap();
         bc.transfer("alice", "bob", 40.0).unwrap();
 
         assert_eq!(bc.get_balance("alice"), 60.0);

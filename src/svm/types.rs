@@ -34,10 +34,10 @@ use solana_sdk::pubkey::Pubkey;
 // CONSTANTS
 // ============================================================================
 
-/// 1 BB token = 100,000 lamports (5 decimals).
+/// 1 BB token = 100,000 lamports (5 decimal places, i.e. 10^5).
 ///
-/// At $1.00/BB the smallest unit (1 lamport) = $0.00001 — practical for
-/// micro-transactions with cent-level precision.
+/// At $0.10/BB the smallest unit (1 lamport) = $0.000001 — practical for
+/// micro-transactions with sub-cent precision.
 ///
 /// NEVER divide to get a fractional BB — always work in lamports and convert
 /// to human-readable BB only at display time.
@@ -46,19 +46,50 @@ pub const LAMPORTS_PER_BB: u64 = 100_000;
 /// USDT has 6 decimal places. 1 USDT = 1_000_000 micro-USDT.
 pub const USDT_UNIT: u64 = 1_000_000;
 
-/// Fixed exchange rate: 1 USDT buys 10 BB at the dealer market rate ($0.10/BB).
-pub const BB_PER_USDT: u64 = 10;
+// ============================================================================
+// $BB — INTERNAL ACCOUNTING UNIT (not a stablecoin)
+//
+// $BB represents exactly $0.10 USD of internal network compute/settlement
+// value. It is NOT a stablecoin and NOT pegged to any external asset.
+// It is an Internal Accounting Unit — like an arcade token, API credit, or
+// casino chip — that is redeemable via the bridge at the current exchange rate.
+//
+// BB_USD_CENTS is IMMUTABLE: it defines the internal ledger value of compute.
+// BB_PER_USDT_DEFAULT is the BASELINE exchange rate at node genesis. The active
+// market rate is stored in ReDB (SWAP_RATES table, key "BB_USDT") and may be
+// adjusted by the Oracle/Dealer to reflect real-world wUSDT conditions.
+// ============================================================================
 
-/// Convert micro-stablecoin (6 dec) → BB lamports (5 dec).
+/// Internal ledger value of 1 BB: exactly 10 US cents of network compute.
+/// IMMUTABLE — this is the foundation of all internal accounting.
+pub const BB_USD_CENTS: u64 = 10;
+
+/// Baseline exchange rate at node genesis: 10 BB per 1 wUSDT.
+/// The live rate is stored in ReDB (key "BB_USDT") and may flex if wUSDT depegs.
+/// Use `ConcurrentBlockchain::get_swap_rate("BB_USDT")` at runtime.
+pub const BB_PER_USDT_DEFAULT: u64 = 10;
+
+// Compile-time invariants: the internal accounting unit and decimal precision
+// are fixed. Only the external exchange rate (BB_PER_USDT_DEFAULT) may flex.
+const _: () = assert!(BB_USD_CENTS    == 10,       "$BB internal ledger value is exactly 10 US cents");
+const _: () = assert!(LAMPORTS_PER_BB == 100_000,  "BB always has exactly 5 decimal places (10^5 lamports)");
+
+/// Convert micro-stablecoin (6 dec) → BB lamports (5 dec) at a given exchange rate.
 ///
-/// Formula: `bb_lamports = micro * LAMPORTS_PER_BB * BB_PER_USDT / USDT_UNIT`
-///          = micro * 100_000 * 10 / 1_000_000 = micro (1 lamport per micro)
+/// Formula: `bb_lamports = micro * LAMPORTS_PER_BB * rate / USDT_UNIT`
 ///
 /// Uses u128 intermediate to prevent overflow on deposits up to ~$18 trillion.
-/// A future rate change only requires editing `BB_PER_USDT`.
-pub fn micro_stable_to_bb_lamports(micro: u64) -> u64 {
-    ((micro as u128) * (LAMPORTS_PER_BB as u128) * (BB_PER_USDT as u128)
+/// Pass `BB_PER_USDT_DEFAULT` for genesis baseline or the live ReDB rate.
+pub fn micro_stable_to_bb_lamports_at(micro: u64, rate: u64) -> u64 {
+    ((micro as u128) * (LAMPORTS_PER_BB as u128) * (rate as u128)
         / (USDT_UNIT as u128)) as u64
+}
+
+/// Convenience wrapper using the genesis default rate.
+/// For deposit gateway and bridge operations. For swap handlers, use
+/// `micro_stable_to_bb_lamports_at(micro, state.blockchain.get_swap_rate("BB_USDT"))`.
+pub fn micro_stable_to_bb_lamports(micro: u64) -> u64 {
+    micro_stable_to_bb_lamports_at(micro, BB_PER_USDT_DEFAULT)
 }
 
 /// Maximum u64 used as the rent_epoch sentinel that means "rent-exempt forever".

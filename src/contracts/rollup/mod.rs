@@ -174,23 +174,11 @@ pub async fn lock_bb_handler(
         })));
     }
 
-    // ── EXECUTE: debit creator → credit per-rollup vault PDA ────────────────────
+    // ── ATOMIC: debit user + credit vault + persist lock record — single ReDB txn ─
     let vault_addr = rollup_vault_address(&rollup_id);
-
-    if let Err(e) = state.blockchain.debit_svm_lamports(&req.wallet_address, req.bb_lamports) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Debit failed: {}", e)
-        })));
-    }
-    if let Err(e) = state.blockchain.credit_svm_lamports(&vault_addr, req.bb_lamports) {
-        // Rollback on credit failure
-        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_lamports);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Vault credit failed: {}", e)
-        })));
-    }
-
-    // ── PERSIST ────────────────────────────────────────────────────────────
+    // Replaces the previous three-step write (debit hot, credit hot, persist ReDB).
+    // A single commit means there is no double-spend window where the lock record
+    // is readable by the sequencer but the user's L1 debit was never persisted.
     let lock_id = uuid::Uuid::new_v4().to_string();
     let record = RollupLockRecord {
         lock_id: lock_id.clone(),        rollup_id: rollup_id.clone(),        creator_address: req.wallet_address.clone(),
@@ -201,12 +189,12 @@ pub async fn lock_bb_handler(
         consumed: false,
     };
 
-    if let Err(e) = state.blockchain.store_rollup_lock(&record) {
-        // Rollback both balance moves on persistence failure
-        let _ = state.blockchain.debit_svm_lamports(&vault_addr, req.bb_lamports);
-        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_lamports);
+    if let Err(e) = state.blockchain.atomic_rollup_lock_bb(
+        &req.wallet_address, &vault_addr, req.bb_lamports, &record,
+    ) {
+        tracing::error!("Atomic rollup lock failed: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Failed to persist lock record: {}", e)
+            "error": format!("Lock aborted — {}", e)
         })));
     }
 

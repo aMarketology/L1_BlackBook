@@ -313,6 +313,12 @@ pub struct AppState {
     pub dealer_address: String,
     /// All withdrawal requests: withdrawal_id (UUID) → WithdrawalRecord (hot cache, ReDB-backed)
     pub withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>>,
+    /// Monotonic sequence counter for withdrawal records.
+    /// Loaded from ReDB at startup; incremented atomically inside every
+    /// `atomic_withdrawal_flush_and_record` call.  The bridge watcher uses
+    /// `GET /withdraw/since/:seq` to resume polling after a crash without
+    /// needing a full table scan.
+    pub withdrawal_seq_counter: Arc<std::sync::atomic::AtomicU64>,
     /// Rolling 24h withdrawal cap enforcement.
     /// window_start: Unix timestamp (seconds) of when the current window opened.
     pub withdrawal_window_start: Arc<std::sync::atomic::AtomicU64>,
@@ -1177,7 +1183,9 @@ async fn admin_mint_handler(
         })));
     }
 
-    match state.blockchain.credit(&req.to, req.amount) {
+    // ═══ SINGLE f64 → u64 conversion at the HTTP boundary ═══
+    let mint_lamports = (req.amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+    match state.blockchain.mint_lamports(&req.to, mint_lamports) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.to);
             info!("🪙 MINT: {} BB → {} (receipt: {:?})",
@@ -1257,7 +1265,9 @@ async fn admin_burn_handler(
         })));
     }
 
-    match state.blockchain.debit(&req.from, req.amount) {
+    // ═══ SINGLE f64 → u64 conversion at the HTTP boundary ═══
+    let burn_lamports = (req.amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+    match state.blockchain.burn_lamports(&req.from, burn_lamports) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.from);
             info!("🔥 BURN: {} BB from {} (receipt: {:?})", req.amount, req.from, req.l2_receipt_id);
@@ -1480,8 +1490,9 @@ async fn dealer_settle_handler(
     for payout in &req.payouts {
         if payout.amount <= 0.0 { continue; }
 
-        // Mint to recipient directly
-        match state.blockchain.credit(&payout.address, payout.amount) {
+        // Mint to recipient directly — convert f64 → u64 at the boundary
+        let payout_lamports = (payout.amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+        match state.blockchain.mint_lamports(&payout.address, payout_lamports) {
             Ok(_) => {
                 total_paid += payout.amount;
                 let new_bal = state.blockchain.get_balance(&payout.address);
@@ -1721,6 +1732,27 @@ async fn dealer_send_wusdt_handler(
 
 /// GET /swap/pool/balances — Pool PDA reserve health check.
 ///
+/// GET /withdraw/since/:seq — Bridge-watcher polling endpoint.
+///
+/// Returns all withdrawal records with `withdrawal_seq >= seq`, sorted ascending.
+/// The bridge watcher persists the highest seq it has processed and resumes from
+/// `last_processed_seq + 1` after a crash — no full table scan needed.
+async fn withdraw_since_handler(
+    State(state): State<AppState>,
+    Path(seq): Path<u64>,
+) -> impl IntoResponse {
+    match state.blockchain.load_withdrawals_since(seq) {
+        Ok(records) => (StatusCode::OK, Json(serde_json::json!({
+            "since_seq": seq,
+            "count": records.len(),
+            "records": records,
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to load withdrawals: {}", e)
+        }))),
+    }
+}
+
 /// Returns the swap pool PDA address, its BB and wUSDT reserves, the computed
 /// ratio, and the expected ratio (10.0). This is a public read-only endpoint
 /// useful for front-ends and monitoring.
@@ -1796,9 +1828,10 @@ async fn admin_seed_swap_pool_handler(
         }
     }
 
-    // Credit BB to pool PDA
+    // Credit BB to pool PDA — convert f64 → u64 at the boundary
     if req.bb_amount > 0.0 {
-        match state.blockchain.credit(&pool_address, req.bb_amount) {
+        let bb_lamports = (req.bb_amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+        match state.blockchain.mint_lamports(&pool_address, bb_lamports) {
             Ok(_)  => info!("💧 Seeded swap pool with {} BB", req.bb_amount),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("BB credit to pool failed: {}", e)
@@ -1813,6 +1846,65 @@ async fn admin_seed_swap_pool_handler(
         "pool_address": pool_address,
         "wusdt_minted": req.wusdt_amount,
         "bb_credited": req.bb_amount,
+    })))
+}
+
+/// POST /admin/swap/set_rate — Adjust the BB↔wUSDT exchange rate in ReDB.
+///
+/// Called by the Oracle or Dealer when real-world wUSDT depegs or liquidity
+/// conditions require rate adjustment. `rate` is the number of BB per 1 wUSDT.
+/// The internal ledger value of BB (BB_USD_CENTS = 10 cents) is unaffected.
+///
+/// Example: if wUSDT trades at $0.98, set rate=10.2 so the pool stays solvent.
+#[cfg(feature = "unsafe_admin")]
+#[derive(serde::Deserialize)]
+struct SetSwapRateRequest {
+    /// Pool identifier. Currently only "BB_USDT" is supported.
+    pool: String,
+    /// New exchange rate: BB per 1 wUSDT (must be ≥ 1).
+    rate: u64,
+}
+
+#[cfg(feature = "unsafe_admin")]
+async fn admin_set_swap_rate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SetSwapRateRequest>,
+) -> impl IntoResponse {
+    use svm::BB_PER_USDT_DEFAULT;
+
+    if req.pool != "BB_USDT" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Unknown pool. Supported: \"BB_USDT\""
+        })));
+    }
+    if req.rate == 0 || req.rate > 1_000 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "rate must be between 1 and 1000 BB per wUSDT"
+        })));
+    }
+
+    let previous = state.blockchain.get_swap_rate(&req.pool);
+    if let Err(e) = state.blockchain.set_swap_rate(&req.pool, req.rate) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to persist rate: {}", e)
+        })));
+    }
+
+    tracing::warn!(
+        pool = %req.pool,
+        previous_rate = previous,
+        new_rate = req.rate,
+        default_rate = BB_PER_USDT_DEFAULT,
+        "⚠️  SWAP RATE UPDATED by admin"
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "pool": req.pool,
+        "previous_rate": previous,
+        "new_rate": req.rate,
+        "bb_usd_cents": 10,
+        "note": "$BB internal ledger value (10 US cents) is unaffected by this rate change"
     })))
 }
 
@@ -2781,6 +2873,7 @@ fn build_router(state: AppState) -> Router {
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
+        .route("/withdraw/since/:seq", get(withdraw_since_handler))
         // Swap
         .route("/swap/bb-to-usdc", post(contracts::token_swap::swap_bb_for_usdc_handler))
         .route("/swap/usdc-to-bb", post(contracts::token_swap::swap_usdc_for_bb_handler))
@@ -2830,6 +2923,7 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/usdc/mint", post(usdc_mint_handler))
             .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
             .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
+            .route("/admin/swap/set_rate", post(admin_set_swap_rate_handler))
             // Oracle (admin-only registration)
             .route("/oracle/register", post(contracts::oracle::register_oracle_handler))
             // Deposit Gateway (admin approve)
@@ -3079,6 +3173,11 @@ async fn main() {
         }
         info!("💸 Loaded {} withdrawal record(s) from ReDB", count);
     }
+    // Restore seq counter from ReDB so the bridge watcher's /since/:seq endpoint
+    // returns the correct window immediately after a restart.
+    let withdrawal_seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(
+        blockchain.load_withdrawal_seq_counter(),
+    ));
 
     // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
     let dealer_address: String = match std::env::var("DEALER_PRIVATE_KEY") {
@@ -3659,6 +3758,7 @@ async fn main() {
         bsc_watcher: bsc_watcher_arc.clone(),
         dealer_address,
         withdrawal_requests,
+        withdrawal_seq_counter,
         withdrawal_window_start: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         withdrawal_window_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         withdrawal_daily_cap_micro: {

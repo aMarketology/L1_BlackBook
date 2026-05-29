@@ -651,20 +651,16 @@ pub async fn escrow_withdraw_handler(
         })));
     }
 
-    if let Err(e) = state.blockchain.debit_svm_lamports(&escrow_addr, req.amount) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Escrow debit failed: {}", e) })));
-    }
-    if let Err(e) = state.blockchain.credit_svm_lamports(&req.wallet_address, req.amount) {
-        // Rollback
-        let _ = state.blockchain.credit_svm_lamports(&escrow_addr, req.amount);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("User credit failed: {}", e) })));
-    }
-
-    // Mark as claimed (ReDB FIRST + DashMap)
-    if let Err(e) = state.blockchain.store_escrow_claim(&claim_key, now) {
-        tracing::error!("Failed to persist escrow claim to ReDB: {}", e);
+    // ── ATOMIC: debit escrow + credit user + seal claim — single ReDB txn ──
+    // Replaces the previous three-step write (debit hot, credit hot, seal ReDB).
+    // A single commit means there is no crash window where the claim seal exists
+    // in ReDB but the balance moves are absent.
+    if let Err(e) = state.blockchain.atomic_escrow_claim_and_pay(
+        &claim_key, &escrow_addr, &req.wallet_address, req.amount, now,
+    ) {
+        tracing::error!("Atomic escrow claim failed: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to persist claim — transaction aborted"
+            "error": format!("Claim aborted — {}", e)
         })));
     }
     state.withdrawal_claims.insert(claim_key.clone(), true);

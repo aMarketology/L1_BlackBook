@@ -123,23 +123,91 @@ export interface Ed25519Keypair {
 
 export class TokenFactory {
   private readonly baseUrl: string;
+  private readonly l5SequencerUrl: string;
 
-  constructor(baseUrl: string) {
-    // Remove trailing slash for consistent URL building
-    this.baseUrl = baseUrl.replace(/\/$/, '');
+  /**
+   * @param l1BaseUrl       BlackBook L1 HTTP API, e.g. "http://localhost:8080"
+   * @param l5SequencerUrl  L5 Sequencer HTTP URL, e.g. "http://localhost:7075"
+   */
+  constructor(l1BaseUrl: string, l5SequencerUrl: string) {
+    this.baseUrl = l1BaseUrl.replace(/\/$/, '');
+    this.l5SequencerUrl = l5SequencerUrl.replace(/\/$/, '');
+  }
+
+  /**
+   * Step 1: Lock $BB in the L5 rollup vault on L1.
+   *
+   * Must be called before launching a coin. The L1 holds the BB before the L5
+   * prints any tokens — this is the trust anchor of the two-step flow.
+   *
+   * Signed message: "ROLLUP_LOCK_BB:L5:{wallet}:{lamports}:{symbolHint}:{ts}:{nonce}"
+   *
+   * @param keypair     Creator's Ed25519 keypair (NaCl format).
+   * @param lamports    $BB lamports to lock (≥ MIN_INITIAL_LIQUIDITY_BB).
+   * @param symbolHint  Token symbol being launched (informational, sent to L1).
+   * @returns           `{ lock_id }` from L1 on success.
+   */
+  async lockBb(
+    keypair: Ed25519Keypair,
+    lamports: bigint,
+    symbolHint: string
+  ): Promise<{ lock_id: string }> {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = generateNonce();
+    const wallet = bytesToHex(keypair.publicKey);
+    const sym = symbolHint.trim().toUpperCase();
+
+    const message = ['ROLLUP_LOCK_BB', 'L5', wallet, lamports.toString(), sym, timestamp, nonce].join(':');
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = nacl.sign.detached(messageBytes, keypair.secretKey);
+
+    const body = {
+      wallet_address: wallet,
+      bb_lamports: Number(lamports),
+      token_symbol_hint: sym,
+      public_key: bytesToHex(keypair.publicKey),
+      signature: bytesToHex(signatureBytes),
+      timestamp,
+      nonce,
+    };
+
+    const response = await fetch(`${this.baseUrl}/rollup/L5/lock_bb`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const json = await response.json();
+
+    if (!response.ok) {
+      throw new TokenFactoryError(
+        (json as { error?: string }).error ?? `L1 lock_bb returned HTTP ${response.status}`,
+        'LOCK_BB_FAILED',
+        response.status,
+        json
+      );
+    }
+
+    return json as { lock_id: string };
   }
 
   /**
    * Launch a new Creator Coin on L5.
    *
-   * Validates guardrails client-side before signing to give clear error messages.
-   * Constructs the canonical message, signs with the creator's Ed25519 keypair,
-   * and submits to `POST /l5/launch-coin`.
+   * Two-step flow (handled transparently by this method):
+   *   1. Lock `initialLiquidityBB` on L1 via `POST /rollup/L5/lock_bb` — L1 holds the BB.
+   *   2. POST coin config + `lock_id` to the L5 Sequencer `POST {l5SequencerUrl}/launch-coin`.
+   *
+   * The L5 Sequencer verifies the lock exists on L1 before activating the coin.
+   *
+   * ⚠️  Creator Coins CANNOT be exited to L1 directly. To recover $BB, users must
+   *     swap their Creator Coins back to $BB inside L5 first (via the L5 bonding
+   *     curve), then exit via the standard `POST /rollup/L5/exit` path.
    *
    * @param keypair  Creator's Ed25519 keypair (NaCl format).
    * @param config   Coin configuration (see `CreatorCoinConfig`).
-   * @returns        The `LaunchCoinResponse` from L1 on success.
-   * @throws         `TokenFactoryError` on validation failure or L1 rejection.
+   * @returns        The `LaunchCoinResponse` from the L5 Sequencer on success.
+   * @throws         `TokenFactoryError` on validation failure, L1 rejection, or sequencer rejection.
    */
   async launchCoin(
     keypair: Ed25519Keypair,
@@ -207,7 +275,8 @@ export class TokenFactory {
     const nonce = generateNonce();
 
     // ── Canonical message ─────────────────────────────────────────────────
-    // Must match exactly what L1 Rust constructs for signature verification:
+    // Verified by the L5 Sequencer (not L1). Signed by the creator so the
+    // sequencer can confirm the request is authentic:
     // "L5_LAUNCH:{creator_wallet}:{symbol}:{tax_rate_bps}:{initial_liquidity_bb}:{timestamp}:{nonce}"
     const creatorWallet = bytesToHex(keypair.publicKey);
     const message = [
@@ -241,19 +310,22 @@ export class TokenFactory {
       nonce,
     };
 
-    // ── Submit ────────────────────────────────────────────────────────────
-    const response = await fetch(`${this.baseUrl}/l5/launch-coin`, {
+    // ── Step 1: Lock $BB on L1 ────────────────────────────────────────────
+    const { lock_id } = await this.lockBb(keypair, config.initialLiquidityBB, symbol);
+
+    // ── Step 2: Submit coin config to L5 Sequencer ───────────────────────
+    const response = await fetch(`${this.l5SequencerUrl}/launch-coin`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, lock_id }),
     });
 
     const json = await response.json();
 
     if (!response.ok) {
       throw new TokenFactoryError(
-        (json as { error?: string }).error ?? `L1 returned HTTP ${response.status}`,
-        'L1_REJECTED',
+        (json as { error?: string }).error ?? `L5 Sequencer returned HTTP ${response.status}`,
+        'SEQUENCER_REJECTED',
         response.status,
         json
       );

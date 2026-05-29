@@ -29,6 +29,8 @@ pub mod pda;
 pub use types::{
     StoredTransactionResult,
     LAMPORTS_PER_BB,
+    BB_PER_USDT_DEFAULT,
+    BB_USD_CENTS,
 };
 
 pub use accounts_db::SvmAccountsDB;

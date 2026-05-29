@@ -165,8 +165,8 @@ export interface SubmitRootResult {
 /**
  * Sign and submit a Merkle state root to `POST /rollup/:rollup_id/submit_root`.
  *
- * Canonical signed message:
- *   `ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{timestamp}:{nonce}`
+ * Canonical signed message (must match L1 Rust exactly — no nonce):
+ *   `ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{timestamp}`
  */
 export async function submitStateRoot(
   config: SequencerConfig,
@@ -174,19 +174,17 @@ export async function submitStateRoot(
   merkleRoot: string
 ): Promise<SubmitRootResult> {
   const timestamp = Math.floor(Date.now() / 1000);
-  const nonce = generateNonce();
   const { rollupId, l1HttpUrl, keypair } = config;
 
-  const message = `ROLLUP_SUBMIT_ROOT:${rollupId}:${batchId}:${merkleRoot}:${timestamp}:${nonce}`;
+  const message = `ROLLUP_SUBMIT_ROOT:${rollupId}:${batchId}:${merkleRoot}:${timestamp}`;
   const signature = await signMessage(message, keypair.privateKeyHex);
 
   const body = {
     batch_id: batchId,
     merkle_root_hex: merkleRoot,
-    public_key: keypair.publicKeyHex,
+    sequencer_public_key: keypair.publicKeyHex,
     signature,
     timestamp,
-    nonce,
   };
 
   const res = await fetch(`${l1HttpUrl}/rollup/${rollupId}/submit_root`, {
