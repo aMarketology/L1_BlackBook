@@ -1,21 +1,25 @@
 # ============================================================================
 # BlackBook L1 — Production Docker Image (Multi-Stage)
 # ============================================================================
-# Stage 1: Build  (rust:1.88-slim → ~1.2GB build layer, discarded)
-# Stage 2: Runtime (debian:bookworm-slim → ~80MB final image)
+# Stage 1: Build  (ubuntu:22.04 + rustup → cached toolchain layer)
+# Stage 2: Runtime (ubuntu:22.04 → ~100MB final image)
 # ============================================================================
 
 # ── Stage 1: Builder ──────────────────────────────────────────
-FROM rust:1.88-slim AS builder
+FROM ubuntu:22.04 AS builder
 
-# Refresh Debian archive keyring first (handles GPG key rotation in older images)
-RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
-    && apt-get install -y --allow-unauthenticated debian-archive-keyring \
-    && apt-get update \
-    && apt-get install -y \
-        pkg-config libssl-dev protobuf-compiler \
-        perl make \
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    curl build-essential pkg-config libssl-dev protobuf-compiler \
+    perl make \
     && rm -rf /var/lib/apt/lists/*
+
+# Install pinned Rust toolchain via rustup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.88.0
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -31,14 +35,12 @@ COPY examples/ examples/
 RUN cargo build --release --locked --bin layer1
 
 # ── Stage 2: Runtime ──────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:22.04 AS runtime
 
+ENV DEBIAN_FRONTEND=noninteractive
 # Refresh Debian archive keyring first (handles GPG key rotation in older images)
-RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
-    && apt-get install -y --allow-unauthenticated debian-archive-keyring \
-    && apt-get update \
-    && apt-get install -y \
-        ca-certificates curl libssl3 \
+RUN apt-get update && apt-get install -y \
+    ca-certificates curl libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
