@@ -137,6 +137,20 @@ Tier 3:   Unattributed → queue for manual /deposit/claim
 
 **Compilation + test status:** `cargo check` clean (0 errors), `cargo test --lib` **58/58 passing**
 
+---
+
+## Wallet ↔ L1 connectivity (OFFLINE fix)
+
+| Issue | Fix |
+|-------|-----|
+| CORS missing Tauri origin | Added `tauri://localhost`, `https://tauri.localhost`, `layer1.blackbook.id` |
+| `Origin: null` blocked | Allowed in CORS predicate |
+| `/health` shape ≠ SDK | Flat fields: `slot`, `total_supply`, `uptime_seconds`, `online`, `ok` |
+| Wallet checks `status === "ok"` | L1 uses `healthy` / `degraded` — use `parseHealth()` in SDK |
+| Wrong URL `https://` | Production is `http://layer1.blackbook.id` until TLS is live |
+
+See [docs/wallet-l1-connectivity.md](docs/wallet-l1-connectivity.md).
+
 **Production audit (this session):**
 - Full `unwrap()` audit: all unsafe uses identified and confirmed safe (tests + post-bounds-check conversions)
 - Only 1 TODO: `kms/mod.rs` AWS KMS stub — intentional, local signer works for devnet/initial deploy

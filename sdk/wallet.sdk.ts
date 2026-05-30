@@ -40,13 +40,63 @@ export interface SDKConfig {
 
 // ── Response types ─────────────────────────────────────────────────────────
 
+/** Raw GET /health JSON (nested + flat compat fields from L1). */
 export interface HealthResponse {
   status: string;
+  /** Present on L1 v5+ — true when PoH is producing (<10s block age). */
+  ok?: boolean;
+  /** Always true when /health responds. Use for ONLINE/OFFLINE indicator. */
+  online?: boolean;
   version: string;
   network: string;
+  slot?: number;
+  total_supply?: number;
+  uptime_seconds?: number;
+  blockchain?: { total_supply?: number; block_count?: number };
+  poh_clock?: { current_slot?: number };
+  volume?: { uptime_secs?: number };
+}
+
+/** Normalize L1 /health (handles nested + legacy shapes). */
+export function parseHealth(raw: HealthResponse): {
+  online: boolean;
+  healthy: boolean;
   slot: number;
-  total_supply: number;
-  uptime_seconds: number;
+  totalSupply: number;
+  uptimeSeconds: number;
+  version: string;
+  network: string;
+} {
+  const slot =
+    raw.slot ??
+    raw.poh_clock?.current_slot ??
+    0;
+  const totalSupply =
+    raw.total_supply ??
+    raw.blockchain?.total_supply ??
+    0;
+  const uptimeSeconds =
+    raw.uptime_seconds ??
+    raw.volume?.uptime_secs ??
+    0;
+  const healthy =
+    raw.ok === true ||
+    raw.status === "healthy" ||
+    raw.status === "ok";
+  return {
+    online: raw.online !== false,
+    healthy,
+    slot,
+    totalSupply,
+    uptimeSeconds,
+    version: raw.version,
+    network: raw.network,
+  };
+}
+
+/** True if the node HTTP API is reachable (any /health 200). */
+export function isNodeOnline(health: HealthResponse): boolean {
+  return parseHealth(health).online;
 }
 
 export interface BalanceResponse {
@@ -270,6 +320,13 @@ export class BlackBookSDK {
   /** GET /health — Node health and chain stats */
   health(): Promise<HealthResponse> {
     return this.get("/health");
+  }
+
+  /** Ping L1 — use for ONLINE/OFFLINE UI (reachable = online). */
+  async ping(): Promise<{ online: boolean; healthy: boolean; health: HealthResponse }> {
+    const health = await this.health();
+    const parsed = parseHealth(health);
+    return { online: parsed.online, healthy: parsed.healthy, health };
   }
 
   /** GET /stats — Detailed node metrics */

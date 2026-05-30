@@ -306,6 +306,10 @@ pub struct AppState {
     /// Background watcher that polls BSC (BNB Chain) for BEP-20 USDC/USDT transfers.
     /// None when BSC_CUSTODY_WALLET is not set.
     pub bsc_watcher: Option<Arc<watcher::BscWatcher>>,
+    /// Ed25519 public key (hex, 64 chars) of the off-chain Bridge Watcher authority.
+    /// Only this key may drive `POST /bridge/deposit` (Model A onramp).
+    /// Empty string disables the bridge-authority endpoint (returns 503).
+    pub bridge_authority_pubkey: String,
 
     // ===== Withdrawal Gateway =====
     /// Dealer address (base58) derived from DEALER_PRIVATE_KEY at startup.
@@ -377,9 +381,16 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         now.saturating_sub(b.timestamp)
     });
     let is_healthy = block_age_s.map(|age| age < 10).unwrap_or(current_slot < 5);
+    let status_str = if is_healthy { "healthy" } else { "degraded" };
 
     Json(serde_json::json!({
-        "status": if is_healthy { "healthy" } else { "degraded" },
+        // Wallet / SDK compat (flat fields — see sdk/wallet.sdk.ts, hotwallet guide)
+        "status": status_str,
+        "ok": is_healthy,
+        "online": true,
+        "slot": poh_status["current_slot"],
+        "total_supply": total_supply,
+        "uptime_seconds": stats.uptime_secs,
         "version": VERSION,
         "network": NETWORK,
         "blockchain": {
@@ -2787,9 +2798,14 @@ fn build_router(state: AppState) -> Router {
     // Add extra origins at runtime via CORS_EXTRA_ORIGINS (comma-separated).
     // Example: CORS_EXTRA_ORIGINS=https://staging.blackbook.id,http://localhost:3000
     let mut allowed: Vec<HeaderValue> = vec![
-        // Production
+        // Production (wallet UI + API hostname)
         "https://blackbook.id".parse().unwrap(),
         "https://wallet.blackbook.id".parse().unwrap(),
+        "http://layer1.blackbook.id".parse().unwrap(),
+        "https://layer1.blackbook.id".parse().unwrap(),
+        // Tauri desktop shell (WebView origin)
+        "tauri://localhost".parse().unwrap(),
+        "https://tauri.localhost".parse().unwrap(),
         // Local dev (Vite on 5173, fallback ports)
         "http://localhost:5173".parse().unwrap(),
         "http://localhost:5174".parse().unwrap(),
@@ -2806,9 +2822,22 @@ fn build_router(state: AppState) -> Router {
             }
         }
     }
-    info!("🔒 CORS: {} origin(s) allowed", allowed.len());
+    let cors_allow_all = std::env::var("CORS_ALLOW_ALL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if cors_allow_all {
+        warn!("⚠️  CORS_ALLOW_ALL enabled — all origins allowed (dev only)");
+    }
+    info!("🔒 CORS: {} origin(s) allowed{}", allowed.len(), if cors_allow_all { " (+ allow all)" } else { "" });
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _req| {
+            if cors_allow_all {
+                return true;
+            }
+            // Tauri / some tools send Origin: null
+            if origin.as_bytes() == b"null" {
+                return true;
+            }
             allowed.contains(origin)
         }))
         .allow_methods(Any)
@@ -3757,6 +3786,7 @@ async fn main() {
         deposit_requests,
         custody_watcher: custody_watcher.clone(),
         bsc_watcher: bsc_watcher_arc.clone(),
+        bridge_authority_pubkey: std::env::var("BRIDGE_AUTHORITY_PUBKEY").unwrap_or_default(),
         dealer_address,
         withdrawal_requests,
         withdrawal_seq_counter,

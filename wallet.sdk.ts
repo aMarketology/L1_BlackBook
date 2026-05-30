@@ -40,13 +40,48 @@ export interface SDKConfig {
 
 // ── Response types ─────────────────────────────────────────────────────────
 
+/** Raw GET /health JSON (nested + flat compat fields from L1). */
 export interface HealthResponse {
   status: string;
+  ok?: boolean;
+  online?: boolean;
   version: string;
   network: string;
+  slot?: number;
+  total_supply?: number;
+  uptime_seconds?: number;
+  blockchain?: { total_supply?: number; block_count?: number };
+  poh_clock?: { current_slot?: number };
+  volume?: { uptime_secs?: number };
+}
+
+export function parseHealth(raw: HealthResponse): {
+  online: boolean;
+  healthy: boolean;
   slot: number;
-  total_supply: number;
-  uptime_seconds: number;
+  totalSupply: number;
+  uptimeSeconds: number;
+  version: string;
+  network: string;
+} {
+  const slot = raw.slot ?? raw.poh_clock?.current_slot ?? 0;
+  const totalSupply = raw.total_supply ?? raw.blockchain?.total_supply ?? 0;
+  const uptimeSeconds = raw.uptime_seconds ?? raw.volume?.uptime_secs ?? 0;
+  const healthy =
+    raw.ok === true || raw.status === "healthy" || raw.status === "ok";
+  return {
+    online: raw.online !== false,
+    healthy,
+    slot,
+    totalSupply,
+    uptimeSeconds,
+    version: raw.version,
+    network: raw.network,
+  };
+}
+
+export function isNodeOnline(health: HealthResponse): boolean {
+  return parseHealth(health).online;
 }
 
 export interface BalanceResponse {
@@ -344,6 +379,12 @@ export class BlackBookSDK {
   /** GET /health — Node health and chain stats */
   health(): Promise<HealthResponse> {
     return this.get("/health");
+  }
+
+  async ping(): Promise<{ online: boolean; healthy: boolean; health: HealthResponse }> {
+    const health = await this.health();
+    const parsed = parseHealth(health);
+    return { online: parsed.online, healthy: parsed.healthy, health };
   }
 
   /** GET /stats — Detailed node metrics */
