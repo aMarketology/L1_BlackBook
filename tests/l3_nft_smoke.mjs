@@ -28,7 +28,7 @@ const ALICE_PUBHEX = bytesToHex(ALICE_PUB);
 const ALICE_ADDR   = 'EB8tsQcA8Ewuqni2pqW5RiME95oiUAHj5eC9Lz2zX3j5';
 
 // ── NFT fixture ───────────────────────────────────────────────────────────────
-const COLLECTION    = 'smoke-col';
+const COLLECTION    = 'SMOKE_COL';          // uppercase alphanumeric for L1 symbol_hint
 const TOKEN_ID      = '1';               // stored as TEXT in L3 SQLite
 const TOKEN_ID_U64  = 1;                 // u64 in L1 ExitRequest
 const META_HASH     = 'deadbeef'.repeat(8);          // 64-char fake SHA-256
@@ -75,11 +75,11 @@ async function adminMint(addr, bb) {
   return post(`${L1}/admin/mint`, { to: addr, amount: bb, dealer_signature: 'dev' });
 }
 
-async function lockBb(user, priv, pubHex, addr, lamports) {
+async function lockBb(priv, pubHex, addr, lamports) {
   const t = ts(); const n = nonce();
   const msg = `ROLLUP_LOCK_BB:L3:${addr}:${lamports}:${COLLECTION}:${t}:${n}`;
   return post(`${L1}/rollup/L3/lock_bb`, {
-    wallet: addr, bb_lamports: lamports, symbol_hint: COLLECTION,
+    wallet_address: addr, bb_lamports: lamports, token_symbol_hint: COLLECTION,
     public_key: pubHex, signature: sign(msg, priv), timestamp: t, nonce: n,
   });
 }
@@ -119,7 +119,7 @@ console.log('══════════════════════�
 // ── 0. Health checks ──────────────────────────────────────────────────────────
 console.log('[ 0 ] Health checks …');
 const l1Health = await get(`${L1}/health`);
-assert(l1Health.status === 'alive' || l1Health.is_producing !== undefined, 'L1 is reachable');
+assert(l1Health.status === 'healthy' || l1Health.status === 'alive' || l1Health.is_producing !== undefined, 'L1 is reachable');
 assert(l1Health.node_mode !== 'reader', 'L1 is in writer mode (not reader)');
 
 const l3Health = await get(`${L3}/health`).catch(() => null);
@@ -129,18 +129,20 @@ assert(l3Health !== null, `L3 sequencer is reachable at ${L3}`);
 console.log('\n[ 1 ] Admin mint 500 BB to Alice …');
 await adminMint(ALICE_ADDR, 500);
 const balBefore = await get(`${L1}/balance/${ALICE_ADDR}`);
-assert(balBefore.balance_lamports >= 500 * LAMPORTS_PER_BB, `Alice has ≥500 BB (got ${balBefore.balance_lamports} lamports)`);
+const balBeforeLamports = Math.round((balBefore.balance_lamports ?? balBefore.balance * LAMPORTS_PER_BB));
+assert(balBeforeLamports >= 500 * LAMPORTS_PER_BB, `Alice has ≥500 BB (got ${balBeforeLamports} lamports)`);
 
 // ── 2. Alice locks 200 BB into L3 rollup vault ────────────────────────────────
 console.log('\n[ 2 ] Alice locks 200 BB into L3 vault …');
-const lockResp = await lockBb(null, ALICE_PRIV, ALICE_PUBHEX, ALICE_ADDR, 200 * LAMPORTS_PER_BB);
+const lockResp = await lockBb(ALICE_PRIV, ALICE_PUBHEX, ALICE_ADDR, 200 * LAMPORTS_PER_BB);
 assert(lockResp.lock_id, `Got lock_id: ${lockResp.lock_id}`);
 const lockId = lockResp.lock_id;
 
 const balAfterLock = await get(`${L1}/balance/${ALICE_ADDR}`);
+const balAfterLockLamports = Math.round((balAfterLock.balance_lamports ?? balAfterLock.balance * LAMPORTS_PER_BB));
 assert(
-  balAfterLock.balance_lamports <= balBefore.balance_lamports - 200 * LAMPORTS_PER_BB,
-  `Alice's L1 balance decreased by 200 BB (before=${balBefore.balance_lamports} after=${balAfterLock.balance_lamports})`,
+  balAfterLockLamports <= balBeforeLamports - 200 * LAMPORTS_PER_BB,
+  `Alice's L1 balance decreased by 200 BB (before=${balBeforeLamports} after=${balAfterLockLamports})`,
 );
 
 // ── 3. Mint NFT on L3 ─────────────────────────────────────────────────────────
