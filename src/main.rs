@@ -94,6 +94,7 @@ pub struct NodeConfig {
 use layer1::storage;
 use layer1::poh_blockchain;
 use layer1::svm;
+use layer1::kms;
 use layer1::solana_rpc;
 use layer1::relay;
 use layer1::settlement;
@@ -347,6 +348,12 @@ pub struct AppState {
     /// Registered Reader nodes for per-tick PoH shred broadcasting.
     /// node_id → ReaderRecord { udp_addr, last_seen }
     pub turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>>,
+
+    // ===== Vault Bridge (Outbound: BB → Solana USDT) =====
+    /// KMS or local Ed25519 signer that issues claim attestations for the
+    /// Solana Anchor vault program. `None` when neither AWS_KMS_KEY_ID nor
+    /// VAULT_SIGNER_PRIVATE_KEY is set — vault claims return 503 in that case.
+    pub vault_signer: Option<Arc<kms::VaultSigner>>,
 
     // ===== Reader Mode: Writer Proxy =====
     /// When running as a Reader node, this holds the Writer's HTTP base URL
@@ -2936,7 +2943,15 @@ fn build_router(state: AppState) -> Router {
         .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
         .route("/rollup/:rollup_id/roots/:batch_id", get(contracts::rollup::get_root_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
-        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler));
+        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler))
+        // ── Vault Bridge: BB → Solana USDT ──────────────────────────────────
+        // Step 0: get the KMS oracle pubkey (used in initialize_vault).
+        .route("/vault/kms-pubkey", get(contracts::vault_gateway::kms_pubkey_handler))
+        // Step 1: burn BB, receive wUSDT on L1 + a durable BurnRecord receipt.
+        .route("/vault/burn", post(contracts::vault_gateway::burn_handler))
+        // Step 2: exchange the BurnRecord for a KMS-signed claim attestation
+        //         that the Solana Anchor vault program will accept.
+        .route("/vault/claim-attestation", post(contracts::vault_gateway::claim_attestation_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {
@@ -3805,6 +3820,7 @@ async fn main() {
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
         turbine_readers: turbine_readers.clone(),
+        vault_signer: kms::VaultSigner::from_env().map(Arc::new),
         writer_http_url: if config.mode == NodeMode::Reader {
             // Derive the Writer's HTTP URL from its gRPC address.
             // gRPC default port 50051 → HTTP port 8080.

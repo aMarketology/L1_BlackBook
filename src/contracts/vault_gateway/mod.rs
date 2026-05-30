@@ -7,7 +7,52 @@ use std::str::FromStr;
 use tracing::{info, warn, error};
 
 use crate::AppState;
-use crate::svm::{SplTokenEngine, usdc_mint_bytes, LAMPORTS_PER_BB};
+use crate::svm::{SplTokenEngine, usdc_mint_bytes};
+
+// ============================================================================
+// GET /vault/kms-pubkey
+// ============================================================================
+//
+// Returns the Ed25519 public key of the configured vault signer (KMS or local).
+// Operators use this during `initialize_vault` to register the oracle pubkey in
+// the Solana Anchor program.
+//
+// Response: { "pubkey_hex": "<64-char lowercase hex>",
+//             "pubkey_base58": "<base58-encoded Solana pubkey>",
+//             "source": "local" | "kms" }
+// 503 when no signer is configured.
+// ============================================================================
+
+/// GET /vault/kms-pubkey
+pub async fn kms_pubkey_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match &state.vault_signer {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Vault signer not configured (set AWS_KMS_KEY_ID or VAULT_SIGNER_PRIVATE_KEY)"
+            })),
+        ),
+        Some(signer) => {
+            let hex = signer.pubkey_hex();
+            let raw = signer.pubkey_bytes();
+            let base58 = bs58::encode(&raw).into_string();
+            let source = match signer.as_ref() {
+                layer1::kms::VaultSigner::Local(_) => "local",
+                // Future: VaultSigner::Kms(_) => "kms",
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "pubkey_hex":    hex,
+                    "pubkey_base58": base58,
+                    "source":        source,
+                })),
+            )
+        }
+    }
+}
 
 // ============================================================================
 // VAULT GATEWAY — BB Burn → wUSDT Credit  (Cross-Chain Bridge Step 1)
@@ -246,7 +291,7 @@ pub async fn claim_attestation_handler(
     Json(req): Json<ClaimAttestationRequest>,
 ) -> impl IntoResponse {
     // ── Check vault signer is configured ─────────────────────────────────
-    let signer = match &state.vault_signer {
+    let signer: &layer1::kms::VaultSigner = match &state.vault_signer {
         Some(s) => s,
         None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
             "error": "Vault signer not configured (set AWS_KMS_KEY_ID or VAULT_SIGNER_PRIVATE_KEY)"

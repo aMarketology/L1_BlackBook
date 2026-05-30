@@ -907,7 +907,8 @@ export class DealerSDK {
 
     for (let i = 0; i < entries.length; i++) {
       const { address, lamports } = entries[i];
-      const leafInput = `${rollupId}:BB:${address}:${lamports}`;
+      // L1 verifier lowercases the address before hashing — must match exactly.
+      const leafInput = `${rollupId}:BB:${address.toLowerCase()}:${lamports}`;
       leaves.push(sha256(enc.encode(leafInput)));
       addressToIndex.set(address, i);
     }

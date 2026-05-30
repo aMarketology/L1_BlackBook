@@ -92,7 +92,8 @@ Layer 5: Burn ledger verification
 | **8** | Inbound ID (Mayan `customPayload`) | **DONE** — backend complete (codec + Tier 1.5 wired), frontend remaining |
 | **9** | Outbound ID (Solana Anchor Vault) | **DONE** — full Anchor program written (6 instructions, 7 tests, 3 events) |
 | **10** | KMS Oracle + Wiring | **DONE** — KMS signer + BurnRecord ledger + /vault/claim-attestation + route wired; production audit 58/58 tests; L2 LMSR bug fixed |
-| **11** | Hetzner Deploy + Go Live | **PARTIAL** — infra live. Next: /vault/burn-for-claim, Anchor mainnet deploy, smoke test |
+| **11** | Hetzner Deploy + Go Live | **PARTIAL** — infra live, /vault/burn + /vault/claim-attestation + /vault/kms-pubkey all wired; dealer.sdk.ts leaf lowercase fix applied. Next: Anchor mainnet deploy, smoke test |
+| **12** | On-Ramp (Transak + LI.FI) | **DONE** — Transak API key live (`6dec68d5`), custody wallet set, BuyCryptoTab wired, iframe + postMessage flow complete |
 
 ---
 
@@ -132,7 +133,9 @@ Tier 3:   Unattributed → queue for manual /deposit/claim
 - [x] `src/kms/mod.rs` — local Ed25519 signer with KMS placeholder — **DONE** (3/3 tests passing)
 - [x] Burn ledger: `BURN_RECORDS` ReDB table + `BurnRecord` struct + CRUD methods — **DONE** (`store_burn`, `load_burn`, `mark_attestation_issued`, `mark_burn_claimed_on_solana`)
 - [x] `POST /vault/claim-attestation` endpoint — **DONE** (vault_gateway contract module, route wired in main.rs, `vault_signer` on AppState)
-- [ ] `POST /vault/burn-for-claim` — BB burn endpoint that records `BurnRecord` — **TODO** (vault_gateway handler exists, burn entry point not yet wired)
+- [x] `POST /vault/burn` — BB burn endpoint — **DONE** (wired in main.rs, `BURN_RECORDS` ReDB table + `BurnRecord` struct + store/load/consume methods added to storage)
+- [x] `GET /vault/kms-pubkey` — returns oracle pubkey for `initialize_vault` — **DONE**
+- [x] `dealer.sdk.ts` `buildRollupMerkleTree` address lowercase fix — **DONE** (leaf format now matches L1 verifier and shared sequencer)
 - [ ] Outbound claim watcher (confirms Solana settlement) — deferred to Day 11 (observability only, not critical path)
 
 **Compilation + test status:** `cargo check` clean (0 errors), `cargo test --lib` **58/58 passing**
@@ -164,7 +167,7 @@ See [docs/wallet-l1-connectivity.md](docs/wallet-l1-connectivity.md).
 - [x] nginx reverse proxy + Let's Encrypt TLS — **DONE** (`layer1.blackbook.id`, `layer2.blackbook.id`)
 - [x] gRPC relay port 50051 exposed publicly — **DONE** (docker-compose.prod.yml)
 - [x] Local dev reader mode → Hetzner writer — **DONE** (defaults changed in `main.rs`)
-- [ ] `POST /vault/burn-for-claim` — wire BB burn endpoint so users can initiate outbound bridge
+- [x] `POST /vault/burn` + `GET /vault/kms-pubkey` — **DONE**
 - [ ] Anchor vault deploy to Solana mainnet (`cd bb-vault && anchor build && anchor deploy --provider.cluster mainnet-beta`)
 - [ ] Update `declare_id!` in `bb-vault/programs/bb-vault/src/lib.rs` with real deployed program ID
 - [ ] Fund vault ATA with initial USDT (`findProgramAddressSync([Buffer.from("vault")], programId)`)
@@ -172,6 +175,19 @@ See [docs/wallet-l1-connectivity.md](docs/wallet-l1-connectivity.md).
 - [ ] Full inbound + outbound smoke test on mainnet
 - [ ] Monitoring + alerts (disk, vault USDT balance, daily limit utilization)
 - [ ] Tag `v6.0.0-production`
+
+#### Day 12: On-Ramp (Transak + Custody Watcher)
+- [x] `VITE_TRANSAK_API_KEY` set — **DONE** (`6dec68d5-9394-43a8-8edd-27c74decd15a`)
+- [x] `VITE_CUSTODY_WALLET` set — **DONE** (`GTvWn5tvMukS4uJxik8nSszuYF27642kJSwtbkKBcgUB`)
+- [x] `CUSTODY_WALLET_ADDRESS` on Hetzner + watcher active — **DONE**
+- [x] `BuyCryptoTab` Transak iframe — **DONE** (walletAddress locked, partnerOrderId = BB address)
+- [x] postMessage flow (TRANSAK_ORDER_SUCCESSFUL → poll /deposit/status) — **DONE**
+- [x] `DepositModal.tsx` — Mayan tab + Buy tab + Solana Direct tab — **DONE**
+- [x] Live API console in Settings (sanitized fetch interceptor) — **DONE**
+- [x] PROD/LOCAL toggle in NodeStatus popup — **DONE**
+- [ ] Add `blackbook-wallet` domain to Transak dashboard allowlist
+- [ ] Send $1–2 USDT test to custody wallet (Solana Direct tab) to verify watcher → BB credit
+- [ ] LI.FI widget integration (cross-chain bridge tab) — next phase
 
 **Prerequisite env vars for Day 11:**
 ```

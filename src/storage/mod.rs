@@ -112,6 +112,11 @@ const WITHDRAWAL_SEQ_COUNTER: TableDefinition<&str, u64> = TableDefinition::new(
 /// and claim deadline per BB market.
 const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("contest_states");
 
+/// Vault bridge burn records: poh_slot (u64) → BurnRecord JSON (bytes).
+/// Durable receipt created when a user calls POST /vault/burn.
+/// Primary key is the PoH slot because every burn happens in a unique slot.
+const BURN_RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("burn_records");
+
 /// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
 /// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
 /// (pro-rata return to known depositors) and for deposit double-mint protection.
@@ -1493,6 +1498,58 @@ impl ConcurrentBlockchain {
         Ok(results)
     }
 
+    // ── Vault Bridge: Burn Records ──────────────────────────────────────────
+
+    /// Persist a fresh BurnRecord to ReDB (keyed by poh_slot).
+    /// Called atomically after BB debit + wUSDT mint succeed in burn_handler.
+    pub fn store_burn(&self, record: &BurnRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
+            table.insert(record.poh_slot, bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load a BurnRecord by PoH slot. Returns Ok(None) if not found.
+    /// Called by claim_attestation_handler to verify the burn exists.
+    pub fn load_burn(&self, poh_slot: u64) -> Result<Option<BurnRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
+        match table.get(poh_slot).map_err(|e| e.to_string())? {
+            Some(v) => {
+                let record = serde_json::from_slice::<BurnRecord>(v.value())
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a BurnRecord as consumed (redeemable=false, attestation_issued=true).
+    /// Called before the KMS signs the claim attestation to prevent double-spend.
+    pub fn consume_burn_record(&self, poh_slot: u64) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
+            // Materialize bytes before dropping the immutable borrow (AccessGuard),
+            // then re-borrow table mutably for the insert.
+            let record_opt: Option<BurnRecord> = {
+                let raw = table.get(poh_slot).map_err(|e| e.to_string())?;
+                raw.map(|v| serde_json::from_slice::<BurnRecord>(v.value()).map_err(|e| e.to_string()))
+                   .transpose()?
+            }; // AccessGuard dropped here
+            if let Some(mut record) = record_opt {
+                record.redeemable = false;
+                record.attestation_issued = true;
+                let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+                table.insert(poh_slot, bytes.as_slice()).map_err(|e| e.to_string())?;
+            }
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
     /// Persist a rollup liquidity lock record to ReDB.
     /// Called by the `POST /rollup/lock_bb` handler after debiting the creator.
     pub fn store_rollup_lock(&self, record: &RollupLockRecord) -> Result<(), String> {
@@ -2370,6 +2427,31 @@ pub struct RollupLockRecord {
     /// Prevents double-credit replay attacks.
     #[serde(default)]
     pub consumed: bool,
+}
+
+// ============================================================================
+// VAULT BRIDGE BURN RECORD
+// ============================================================================
+
+/// Durable receipt created when a user calls POST /vault/burn.
+/// Keyed by the PoH slot of the burn (every burn lands in a unique slot).
+/// Redeemed via POST /vault/claim-attestation to bridge wUSDT → real USDT on Solana.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BurnRecord {
+    /// L1 wallet address (base58) that performed the burn.
+    pub wallet: String,
+    /// PoH slot in which the burn was recorded — used as primary key.
+    pub poh_slot: u64,
+    /// wUSDT micro-units created (equals bb_lamports destroyed — Immutable Law).
+    pub amount_usdt_micro: u64,
+    /// True once POST /vault/claim-attestation has been called (redeemable → false).
+    pub attestation_issued: bool,
+    /// True once the Solana Anchor program has confirmed the on-chain claim.
+    pub claimed_on_solana: bool,
+    /// False after claim-attestation is issued — prevents double-redemption.
+    pub redeemable: bool,
+    /// Unix timestamp of the burn request.
+    pub created_at: u64,
 }
 
 // ============================================================================

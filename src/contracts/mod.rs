@@ -3,6 +3,7 @@ pub mod token_swap;
 pub mod layer2_market;
 pub mod deposit_gateway;
 pub mod withdrawal_gateway;
+pub mod vault_gateway;
 pub mod nft_bridge;
 pub mod oracle;
 pub mod rollup;
