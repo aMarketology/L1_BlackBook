@@ -319,6 +319,111 @@ impl SvmAccountsDB {
     }
 
     // ========================================================================
+    // ATOMIC READ-MODIFY-WRITE — eliminates HTTP double-spend race
+    // ========================================================================
+    //
+    // `get()` + `insert()` is not atomic: two concurrent HTTP handlers can both
+    // read the same balance before either writes back, producing a double-spend.
+    //
+    // `entry()` holds the DashMap shard write-lock for the entire check+modify,
+    // making each single-account mutation sequentially consistent.
+    // No higher-level mutex is needed for single-account operations.
+
+    /// Atomically check balance and debit `lamports` from a single account.
+    ///
+    /// The entire read-check-debit executes under one DashMap shard write-lock.
+    /// Returns the new balance so callers can update any secondary caches
+    /// (e.g. `mirror_balance_to_cache`) without a second hot_state read.
+    ///
+    /// Errors:
+    ///   - `SvmError::InvalidTransaction`  — `lamports == 0`
+    ///   - `SvmError::AccountNotFound`     — account does not exist
+    ///   - `SvmError::InsufficientFunds`   — balance < lamports
+    pub fn atomic_debit(
+        &self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> Result<u64, SvmError> {
+        use dashmap::mapref::entry::Entry;
+
+        if lamports == 0 {
+            return Err(SvmError::InvalidTransaction(
+                "Debit amount must be > 0".into(),
+            ));
+        }
+
+        let new_balance = match self.hot_state.entry(*pubkey) {
+            Entry::Occupied(mut e) => {
+                let account = e.get_mut();
+                if account.lamports() < lamports {
+                    return Err(SvmError::InsufficientFunds {
+                        available: account.lamports(),
+                        required: lamports,
+                    });
+                }
+                let new_bal = account.lamports() - lamports;
+                account.set_lamports(new_bal);
+                account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+                new_bal
+            }
+            Entry::Vacant(_) => {
+                return Err(SvmError::AccountNotFound(pubkey.to_string()));
+            }
+        };
+        // Mark dirty AFTER the lock is released (entry dropped above).
+        self.dirty.mark(pubkey.to_bytes());
+        Ok(new_balance)
+    }
+
+    /// Atomically credit `lamports` to a single account (creates it if absent).
+    ///
+    /// The entire read-modify-write executes under one DashMap shard write-lock.
+    /// Returns the new balance.
+    ///
+    /// Errors:
+    ///   - `SvmError::InvalidTransaction`  — `lamports == 0`
+    ///   - `SvmError::LamportOverflow`     — balance + lamports > u64::MAX
+    pub fn atomic_credit(
+        &self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> Result<u64, SvmError> {
+        use dashmap::mapref::entry::Entry;
+
+        if lamports == 0 {
+            return Err(SvmError::InvalidTransaction(
+                "Credit amount must be > 0".into(),
+            ));
+        }
+
+        let new_balance = match self.hot_state.entry(*pubkey) {
+            Entry::Occupied(mut e) => {
+                let account = e.get_mut();
+                let new_bal = account
+                    .lamports()
+                    .checked_add(lamports)
+                    .ok_or(SvmError::LamportOverflow)?;
+                account.set_lamports(new_bal);
+                account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+                new_bal
+            }
+            Entry::Vacant(v) => {
+                let account = AccountSharedData::create(
+                    lamports,
+                    vec![],
+                    solana_sdk::system_program::id(),
+                    false,
+                    RENT_EPOCH_EXEMPT,
+                );
+                v.insert(account);
+                lamports
+            }
+        };
+        self.dirty.mark(pubkey.to_bytes());
+        Ok(new_balance)
+    }
+
+    // ========================================================================
     // FLUSH — single ACID ReDB write transaction per block
     // ========================================================================
 
@@ -392,59 +497,24 @@ impl SvmAccountsDB {
         to: &Pubkey,
         lamports: u64,
     ) -> Result<(), SvmError> {
-        use solana_sdk::account::WritableAccount;
-
         if lamports == 0 {
             return Err(SvmError::InvalidTransaction(
                 "Transfer amount must be > 0".into(),
             ));
         }
 
-        // Load sender — must exist
-        let mut from_account = self
-            .hot_state
-            .get(from)
-            .map(|r| r.clone())
-            .ok_or_else(|| SvmError::AccountNotFound(from.to_string()))?;
+        // Atomically check-and-debit the sender under a single shard lock.
+        // If this returns Ok, lamports are guaranteed gone from `from` before
+        // any concurrent thread can observe the old balance.
+        self.atomic_debit(from, lamports)?;
 
-        // Check sender has enough lamports
-        if from_account.lamports() < lamports {
-            return Err(SvmError::InsufficientFunds {
-                available: from_account.lamports(),
-                required: lamports,
-            });
+        // Atomically credit the recipient.
+        // Overflow (u64::MAX lamports) is unreachable in practice; if it somehow
+        // triggers, roll the sender's lamports back to keep the ledger balanced.
+        if let Err(e) = self.atomic_credit(to, lamports) {
+            let _ = self.atomic_credit(from, lamports);
+            return Err(e);
         }
-
-        // Load or create recipient
-        let mut to_account = self
-            .hot_state
-            .get(to)
-            .map(|r| r.clone())
-            .unwrap_or_else(|| {
-                // New account: System Program owned, rent-exempt, empty data
-                AccountSharedData::create(
-                    0,
-                    vec![],
-                    solana_sdk::system_program::id(),
-                    false,
-                    RENT_EPOCH_EXEMPT,
-                )
-            });
-
-        // Zero-sum guard: recipient balance must not overflow u64
-        let new_to = to_account
-            .lamports()
-            .checked_add(lamports)
-            .ok_or(SvmError::LamportOverflow)?;
-
-        // Debit sender
-        from_account.set_lamports(from_account.lamports() - lamports);
-        // Credit recipient
-        to_account.set_lamports(new_to);
-
-        // Persist to hot_state (dirty-marked — will flush at end of block)
-        self.store_account(from, from_account);
-        self.store_account(to, to_account);
 
         Ok(())
     }

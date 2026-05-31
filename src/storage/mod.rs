@@ -47,10 +47,10 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use crate::svm::accounts_db::{SvmAccountsDB, SVM_ACCOUNTS};
-use crate::svm::types::{LAMPORTS_PER_BB, StoredAccount};
+use crate::svm::types::{LAMPORTS_PER_BB, RENT_EPOCH_EXEMPT, StoredAccount};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::account::AccountSharedData;
-use solana_sdk::account::ReadableAccount;
+use solana_sdk::account::{Account, AccountSharedData};
+use solana_sdk::account::{ReadableAccount, WritableAccount};
 
 // ============================================================================
 // REDB TABLE DEFINITIONS (Type-Safe!)
@@ -113,9 +113,10 @@ const WITHDRAWAL_SEQ_COUNTER: TableDefinition<&str, u64> = TableDefinition::new(
 const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("contest_states");
 
 /// Vault bridge burn records: poh_slot (u64) → BurnRecord JSON (bytes).
-/// Durable receipt created when a user calls POST /vault/burn.
-/// Primary key is the PoH slot because every burn happens in a unique slot.
-const BURN_RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("burn_records");
+/// Vault bridge burn receipts: burn_id (64-char lowercase hex SHA-256) → BurnRecord JSON.
+/// Keyed by burn_id instead of poh_slot so that multiple burns within the same 400 ms
+/// slot never collide. burn_id = SHA-256(wallet_bytes || poh_slot_le8 || nonce_utf8).
+const BURN_RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("burn_records");
 
 /// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
 /// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
@@ -1500,24 +1501,25 @@ impl ConcurrentBlockchain {
 
     // ── Vault Bridge: Burn Records ──────────────────────────────────────────
 
-    /// Persist a fresh BurnRecord to ReDB (keyed by poh_slot).
-    /// Called atomically after BB debit + wUSDT mint succeed in burn_handler.
+    /// Persist a fresh BurnRecord to ReDB, keyed by burn_id (not poh_slot).
+    /// burn_id is a hex SHA-256 derived in burn_handler — guaranteed unique even
+    /// when two burns land in the same 400 ms PoH slot.
     pub fn store_burn(&self, record: &BurnRecord) -> Result<(), String> {
         let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-            table.insert(record.poh_slot, bytes.as_slice()).map_err(|e| e.to_string())?;
+            table.insert(record.burn_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())
     }
 
-    /// Load a BurnRecord by PoH slot. Returns Ok(None) if not found.
-    /// Called by claim_attestation_handler to verify the burn exists.
-    pub fn load_burn(&self, poh_slot: u64) -> Result<Option<BurnRecord>, String> {
+    /// Load a BurnRecord by its burn_id. Returns Ok(None) if not found.
+    /// Called by claim_attestation_handler to verify the burn exists before signing.
+    pub fn load_burn(&self, burn_id: &str) -> Result<Option<BurnRecord>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
         let table = read_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-        match table.get(poh_slot).map_err(|e| e.to_string())? {
+        match table.get(burn_id).map_err(|e| e.to_string())? {
             Some(v) => {
                 let record = serde_json::from_slice::<BurnRecord>(v.value())
                     .map_err(|e| e.to_string())?;
@@ -1529,14 +1531,14 @@ impl ConcurrentBlockchain {
 
     /// Mark a BurnRecord as consumed (redeemable=false, attestation_issued=true).
     /// Called before the KMS signs the claim attestation to prevent double-spend.
-    pub fn consume_burn_record(&self, poh_slot: u64) -> Result<(), String> {
+    pub fn consume_burn_record(&self, burn_id: &str) -> Result<(), String> {
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
             // Materialize bytes before dropping the immutable borrow (AccessGuard),
             // then re-borrow table mutably for the insert.
             let record_opt: Option<BurnRecord> = {
-                let raw = table.get(poh_slot).map_err(|e| e.to_string())?;
+                let raw = table.get(burn_id).map_err(|e| e.to_string())?;
                 raw.map(|v| serde_json::from_slice::<BurnRecord>(v.value()).map_err(|e| e.to_string()))
                    .transpose()?
             }; // AccessGuard dropped here
@@ -1544,7 +1546,7 @@ impl ConcurrentBlockchain {
                 record.redeemable = false;
                 record.attestation_issued = true;
                 let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-                table.insert(poh_slot, bytes.as_slice()).map_err(|e| e.to_string())?;
+                table.insert(burn_id, bytes.as_slice()).map_err(|e| e.to_string())?;
             }
         }
         write_txn.commit().map_err(|e| e.to_string())
@@ -1696,49 +1698,38 @@ impl ConcurrentBlockchain {
         self.credit_svm_lamports(address, lamports)
     }
 
-    /// Credit lamports directly — zero f64 conversion.
+    /// Credit lamports directly — zero f64 conversion, race-free.
     ///
-    /// Use this everywhere an amount is already in u64 lamports (e.g. from
-    /// a proto field or a SPL unit already in the 5-decimal system) to avoid
-    /// the `u64 → f64 → u64` precision-loss round-trip in `credit()`.
+    /// Delegates to `SvmAccountsDB::atomic_credit`, which holds the DashMap
+    /// shard write-lock for the entire read-modify-write so concurrent HTTP
+    /// handlers cannot observe a stale balance and double-credit.
     pub fn credit_svm_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
         if lamports == 0 {
             return Err("Amount must be > 0 lamports".to_string());
         }
         let pk = Self::addr_to_pubkey(address);
-        let current = self.svm_accounts.get_lamports(&pk);
-        let new_lamports = current.checked_add(lamports)
-            .ok_or("Balance overflow")?;
-        let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
-        self.svm_accounts.store_account(&pk, account);
+        let new_lamports = self.svm_accounts
+            .atomic_credit(&pk, lamports)
+            .map_err(|e| e.to_string())?;
         self.mirror_balance_to_cache(address, new_lamports);
         self.total_supply.fetch_add(lamports, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Debit lamports directly — zero f64 conversion.
+    /// Debit lamports directly — zero f64 conversion, race-free.
     ///
-    /// Use this everywhere an amount is already in u64 lamports to avoid
-    /// the `u64 → f64 → u64` precision-loss round-trip in `debit()`.
+    /// Delegates to `SvmAccountsDB::atomic_debit`, which holds the DashMap
+    /// shard write-lock for the entire read-check-debit so concurrent HTTP
+    /// handlers cannot both read the same balance and both pass the check
+    /// (the classic double-spend race on the HTTP path).
     pub fn debit_svm_lamports(&self, address: &str, lamports: u64) -> Result<(), String> {
         if lamports == 0 {
             return Err("Amount must be > 0 lamports".to_string());
         }
         let pk = Self::addr_to_pubkey(address);
-        let current = self.svm_accounts.get_lamports(&pk);
-        if current < lamports {
-            return Err(format!(
-                "Insufficient funds: have {} lamports, need {} lamports",
-                current, lamports
-            ));
-        }
-        let new_lamports = current.checked_sub(lamports)
-            .ok_or_else(|| format!(
-                "Arithmetic underflow: have {} lamports, tried to sub {}",
-                current, lamports
-            ))?;
-        let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
-        self.svm_accounts.store_account(&pk, account);
+        let new_lamports = self.svm_accounts
+            .atomic_debit(&pk, lamports)
+            .map_err(|e| e.to_string())?;
         self.mirror_balance_to_cache(address, new_lamports);
         self.total_supply.fetch_sub(lamports, Ordering::Relaxed);
         Ok(())
@@ -1822,6 +1813,163 @@ impl ConcurrentBlockchain {
         // total_supply unchanged: escrow debit == user credit (zero-sum move)
 
         info!(claim_key = %claim_key, amount = amount_lamports, "Atomic escrow claim committed");
+        Ok(())
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // VAULT BRIDGE — atomic BB→wUSDT burn
+    // ────────────────────────────────────────────────────────────────────────
+    //
+    // Three tables need to change together:
+    //   SVM_ACCOUNTS : wallet (BB debit), wUSDT Mint (supply +), wUSDT ATA (+)
+    //   BURN_RECORDS : new BurnRecord receipt
+    //
+    // Both ConcurrentBlockchain.db and SvmAccountsDB.db are the SAME Arc<Database>
+    // — the tables live in one file, so one write_txn covers all of them.
+    //
+    // Write order: compute mutations → single ReDB commit → update hot_state.
+    // A crash before the commit leaves all four rows unchanged.
+    // A crash after the commit leaves hot_state stale, but SvmAccountsDB::new()
+    // warms hot_state from ReDB on the next restart — no data loss.
+
+    /// Atomically debit BB lamports, mint wUSDT, and persist the BurnRecord in
+    /// **one** ReDB write transaction.
+    ///
+    /// Eliminates the crash window that existed when `debit_svm_lamports` and
+    /// `SplTokenEngine::mint_to` each wrote to hot_state independently and relied
+    /// on `flush_block()` for durability: if `flush_block()` flushed only the
+    /// debit before a crash, the user lost BB and received no wUSDT.
+    ///
+    /// Guarantee: either all four rows land in ReDB or none do.
+    pub fn atomic_vault_burn(
+        &self,
+        wallet_address: &str,
+        wallet_pubkey: &Pubkey,
+        bb_lamports: u64,
+        wusdt_micro: u64,
+        burn_record: &BurnRecord,
+    ) -> Result<(), String> {
+        use crate::svm::spl_token::{
+            MintLayout, TokenAccountLayout, derive_ata_address, SPL_TOKEN_PROGRAM_ID,
+        };
+        use crate::svm::usdc_mint_bytes;
+
+        if bb_lamports == 0 {
+            return Err("bb_lamports must be > 0".to_string());
+        }
+
+        // ── 1. Read all affected accounts from hot_state ─────────────────────
+        let mint_bytes   = usdc_mint_bytes();
+        let mint_pubkey  = Pubkey::new_from_array(mint_bytes);
+        let ata_bytes    = derive_ata_address(&wallet_pubkey.to_bytes(), &mint_bytes);
+        let ata_pubkey   = Pubkey::new_from_array(ata_bytes);
+
+        let mut wallet_account = self.svm_accounts
+            .get_account(wallet_pubkey)
+            .ok_or_else(|| format!("BB account not found: {}", wallet_address))?;
+
+        let mut mint_account = self.svm_accounts
+            .get_account(&mint_pubkey)
+            .ok_or("wUSDT mint account not found")?;
+
+        let mut ata_account = self.svm_accounts
+            .get_account(&ata_pubkey)
+            .unwrap_or_else(|| {
+                // First-time mint for this wallet — create the ATA in memory
+                let layout = TokenAccountLayout {
+                    mint: mint_bytes,
+                    owner: wallet_pubkey.to_bytes(),
+                    amount: 0,
+                    delegate_option: 0,
+                    delegate: [0u8; 32],
+                    state: 1,
+                    is_native_option: 0,
+                    is_native: 0,
+                    delegated_amount: 0,
+                    close_authority_option: 0,
+                    close_authority: [0u8; 32],
+                };
+                AccountSharedData::from(Account {
+                    lamports: 1_000_000,
+                    data: layout.to_bytes(),
+                    owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
+                    executable: false,
+                    rent_epoch: RENT_EPOCH_EXEMPT,
+                })
+            });
+
+        // ── 2. Compute all mutations in memory — no writes yet ───────────────
+        //
+        // BB wallet: debit
+        if wallet_account.lamports() < bb_lamports {
+            return Err(format!(
+                "Insufficient BB: have {} lamports, need {}",
+                wallet_account.lamports(), bb_lamports
+            ));
+        }
+        wallet_account.set_lamports(wallet_account.lamports() - bb_lamports);
+        wallet_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+
+        // wUSDT Mint: increase supply
+        let mut mint_layout = MintLayout::from_bytes(mint_account.data())
+            .map_err(|e| format!("Mint deserialize failed: {}", e))?;
+        mint_layout.supply = mint_layout.supply
+            .checked_add(wusdt_micro)
+            .ok_or("Mint supply overflow")?;
+        mint_account.set_data_from_slice(&mint_layout.to_bytes());
+        mint_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+
+        // wUSDT ATA: increase token balance
+        let mut token_layout = TokenAccountLayout::from_bytes(ata_account.data())
+            .map_err(|e| format!("ATA deserialize failed: {}", e))?;
+        token_layout.amount = token_layout.amount
+            .checked_add(wusdt_micro)
+            .ok_or("ATA token overflow")?;
+        ata_account.set_data_from_slice(&token_layout.to_bytes());
+        ata_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+
+        // ── 3. Single atomic ReDB write: 3 SVM accounts + BurnRecord ─────────
+        let serialize = |acct: &AccountSharedData| -> Result<Vec<u8>, String> {
+            borsh::to_vec(&StoredAccount::from(acct))
+                .map_err(|e| format!("Account serialization: {}", e))
+        };
+        let wallet_ser = serialize(&wallet_account)?;
+        let mint_ser   = serialize(&mint_account)?;
+        let ata_ser    = serialize(&ata_account)?;
+        let record_ser = serde_json::to_vec(burn_record).map_err(|e| e.to_string())?;
+
+        // `self.db` == `self.svm_accounts.db` (same Arc) — one txn covers all tables
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(wallet_pubkey.as_ref(),  wallet_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(mint_pubkey.as_ref(),    mint_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(ata_pubkey.as_ref(),     ata_ser.as_slice()).map_err(|e| e.to_string())?;
+
+            let mut burns = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
+            burns.insert(burn_record.burn_id.as_str(), record_ser.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        // ── 4. Update hot_state AFTER the durable commit ─────────────────────
+        // If we crash here the data is safe in ReDB; SvmAccountsDB::new()
+        // reloads hot_state from disk on restart.
+        let new_bb_lamports = wallet_account.lamports();
+        self.svm_accounts.hot_state.insert(*wallet_pubkey, wallet_account);
+        self.svm_accounts.hot_state.insert(mint_pubkey,    mint_account);
+        self.svm_accounts.hot_state.insert(ata_pubkey,     ata_account);
+
+        self.mirror_balance_to_cache(wallet_address, new_bb_lamports);
+        // total_supply decreases: BB is permanently destroyed, not transferred
+        self.total_supply.fetch_sub(bb_lamports, Ordering::Relaxed);
+
+        info!(
+            wallet = %wallet_address,
+            bb_burned = bb_lamports,
+            wusdt_minted = wusdt_micro,
+            burn_id = %burn_record.burn_id,
+            "Atomic vault burn committed"
+        );
         Ok(())
     }
 
@@ -2434,13 +2582,17 @@ pub struct RollupLockRecord {
 // ============================================================================
 
 /// Durable receipt created when a user calls POST /vault/burn.
-/// Keyed by the PoH slot of the burn (every burn lands in a unique slot).
+/// Keyed by burn_id (hex SHA-256 of wallet+slot+nonce) — not poh_slot — so concurrent
+/// burns in the same slot never overwrite each other.
 /// Redeemed via POST /vault/claim-attestation to bridge wUSDT → real USDT on Solana.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BurnRecord {
+    /// Collision-free primary key: hex(SHA-256(wallet_bytes || poh_slot_le8 || nonce_utf8)).
+    /// Returned as "burn_id" in the POST /vault/burn response.
+    pub burn_id: String,
     /// L1 wallet address (base58) that performed the burn.
     pub wallet: String,
-    /// PoH slot in which the burn was recorded — used as primary key.
+    /// PoH slot in which the burn was recorded — used in the KMS attestation message.
     pub poh_slot: u64,
     /// wUSDT micro-units created (equals bb_lamports destroyed — Immutable Law).
     pub amount_usdt_micro: u64,

@@ -179,8 +179,25 @@ pub async fn burn_handler(
     // Proof: 10 BB = 1,000,000 lamports = 1,000,000 microUSDT = 1 wUSDT.
     let wusdt_micro: u64 = req.bb_lamports;
 
-    // Get current PoH slot (serves as BurnRecord primary key)
+    // Get current PoH slot (retained in the record for the KMS attestation message)
     let poh_slot = state.current_slot.load(Ordering::Relaxed);
+
+    // ── Generate collision-free burn_id ──────────────────────────────────
+    // burn_id = hex(SHA-256(wallet_bytes || poh_slot_le8 || nonce_utf8)).
+    // Two burns in the same 400 ms slot produce different burn_ids because
+    // replay-protection already guarantees each (wallet, nonce) pair is unique.
+    let burn_id: String = {
+        use sha2::{Sha256, Digest};
+        let wallet_bytes = match bs58::decode(&req.wallet_address).into_vec() {
+            Ok(b) => b,
+            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid wallet_address bytes" }))),
+        };
+        let mut h = Sha256::new();
+        h.update(&wallet_bytes);
+        h.update(poh_slot.to_le_bytes());
+        h.update(req.nonce.as_bytes());
+        hex::encode(h.finalize())
+    };
 
     // ── Resolve wallet Pubkey for SPL ops ────────────────────────────────
     let wallet_pubkey = match Pubkey::from_str(&req.wallet_address) {
@@ -188,30 +205,13 @@ pub async fn burn_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid wallet pubkey" }))),
     };
 
-    // ── ATOMIC: Destroy BB, Create wUSDT ──────────────────────────────────
-    // Step A: Debit BB lamports (permanently destroys from supply — no f64)
-    if let Err(e) = state.blockchain.debit_svm_lamports(&req.wallet_address, req.bb_lamports) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("BB burn failed: {}", e)
-        })));
-    }
-
-    // Step B: Mint wUSDT to wallet (equal supply increase)
-    let mint = usdc_mint_bytes();
-    if let Err(e) = SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, wusdt_micro) {
-        // Rollback: restore user's BB
-        if let Err(re) = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_lamports) {
-            error!("CRITICAL: wUSDT mint failed AND BB rollback failed for wallet {}: mint_err={} rollback_err={}", req.wallet_address, e, re);
-        } else {
-            warn!("wUSDT mint failed, BB rollback successful: {}", e);
-        }
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("wUSDT mint failed: {}", e)
-        })));
-    }
-
-    // Step C: Persist BurnRecord to ReDB (durable receipt for claim-attestation)
+    // ── ATOMIC: Debit BB + Mint wUSDT + Persist BurnRecord in one ReDB txn ─
+    //
+    // All three mutations (BB debit, wUSDT mint, BurnRecord) are written in a
+    // single write_txn.commit(). A crash at any point before the commit leaves
+    // all tables unchanged — no partial state, no rollback needed.
     let record = crate::storage::BurnRecord {
+        burn_id: burn_id.clone(),
         wallet: req.wallet_address.clone(),
         poh_slot,
         amount_usdt_micro: wusdt_micro,
@@ -220,10 +220,16 @@ pub async fn burn_handler(
         redeemable: true,
         created_at: now,
     };
-    if let Err(e) = state.blockchain.store_burn(&record) {
-        // Monetary state is already mutated — log critical but don't abort.
-        // The user has their wUSDT; the burn record can be reconstructed from PoH.
-        error!("CRITICAL: BurnRecord persistence failed for slot {}: {}", poh_slot, e);
+    if let Err(e) = state.blockchain.atomic_vault_burn(
+        &req.wallet_address,
+        &wallet_pubkey,
+        req.bb_lamports,
+        wusdt_micro,
+        &record,
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Vault burn failed: {}", e)
+        })));
     }
 
     // ── Record to PoH block ──────────────────────────────────────────────
@@ -245,15 +251,16 @@ pub async fn burn_handler(
         state.block_producer.record_executed_transaction(tx);
     }
 
-    info!("🔥 VAULT BURN: {} lamports BB destroyed, {} microUSDT minted → wallet {} (slot {})",
-        req.bb_lamports, wusdt_micro, &req.wallet_address[..8.min(req.wallet_address.len())], poh_slot);
+    info!("🔥 VAULT BURN: {} lamports BB destroyed, {} microUSDT minted → wallet {} (slot {} burn_id {})",
+        req.bb_lamports, wusdt_micro, &req.wallet_address[..8.min(req.wallet_address.len())],
+        poh_slot, &burn_id[..8]);
 
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "poh_slot": poh_slot,
         "bb_burned": req.bb_lamports,
         "wusdt_credited": wusdt_micro,
-        "burn_id": poh_slot.to_string(),
+        "burn_id": burn_id,
     })))
 }
 
@@ -277,7 +284,10 @@ pub async fn burn_handler(
 #[derive(Deserialize)]
 pub struct ClaimAttestationRequest {
     pub wallet_address: String,
-    pub poh_slot: u64,
+    /// The burn_id returned by POST /vault/burn — hex SHA-256 of (wallet+slot+nonce).
+    /// Replaces the old poh_slot field: uniquely identifies the burn record even when
+    /// multiple burns land in the same PoH slot.
+    pub burn_id: String,
     pub amount_usdt_micro: u64,
     pub public_key: String,
     pub signature: String,
@@ -329,10 +339,25 @@ pub async fn claim_attestation_handler(
         dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
     }
 
+    // ── Load burn record first — poh_slot is needed for signature verification ──
+    // We look up by burn_id (not poh_slot) so records never collide within a slot.
+    // Fail fast before touching expensive sig-verify / crypto if the ID is wrong.
+    let burn = match state.blockchain.load_burn(&req.burn_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": format!("No burn record found for burn_id {}", req.burn_id)
+        }))),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Storage error: {}", e)
+        }))),
+    };
+
     // ── Ed25519 signature verification ───────────────────────────────────
+    // The signed message encodes poh_slot (from the burn record) — clients include
+    // it when they sign so the attestation is cryptographically bound to the slot.
     let message = format!(
         "CLAIM_ATTESTATION:{}:{}:{}:{}:{}",
-        req.wallet_address, req.poh_slot, req.amount_usdt_micro, req.timestamp, req.nonce
+        req.wallet_address, burn.poh_slot, req.amount_usdt_micro, req.timestamp, req.nonce
     );
     let pubkey_bytes = match hex::decode(&req.public_key) {
         Ok(b) if b.len() == 32 => b,
@@ -364,17 +389,6 @@ pub async fn claim_attestation_handler(
             "error": "public_key does not match wallet_address"
         })));
     }
-
-    // ── Verify burn record exists in ReDB ────────────────────────────────
-    let burn = match state.blockchain.load_burn(req.poh_slot) {
-        Ok(Some(b)) => b,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": format!("No burn record found for PoH slot {}", req.poh_slot)
-        }))),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("Storage error: {}", e)
-        }))),
-    };
 
     // Verify the burn belongs to this wallet, amount matches, and is redeemable
     if burn.wallet != req.wallet_address {
@@ -430,14 +444,14 @@ pub async fn claim_attestation_handler(
     }
 
     // Mark record consumed in ReDB (redeemable=false, attestation_issued=true)
-    if let Err(e) = state.blockchain.consume_burn_record(req.poh_slot) {
+    if let Err(e) = state.blockchain.consume_burn_record(&req.burn_id) {
         // wUSDT is already burned — log critical but continue to issue signature.
         // The record state will be inconsistent but the user can't double-spend.
-        error!("CRITICAL: consume_burn_record failed after wUSDT burn for slot {}: {}", req.poh_slot, e);
+        error!("CRITICAL: consume_burn_record failed after wUSDT burn for burn_id {}: {}", req.burn_id, e);
     }
 
     // ── Sign the claim attestation ───────────────────────────────────────
-    let attestation = match signer.sign_claim(req.poh_slot, req.amount_usdt_micro, &req.wallet_address) {
+    let attestation = match signer.sign_claim(burn.poh_slot, req.amount_usdt_micro, &req.wallet_address) {
         Ok(a) => a,
         Err(e) => {
             warn!("⚠️  Vault signer failed: {}", e);
@@ -447,8 +461,8 @@ pub async fn claim_attestation_handler(
         }
     };
 
-    info!("✅ Claim attestation issued: slot={} amount={} wallet={}",
-        req.poh_slot, req.amount_usdt_micro,
+    info!("✅ Claim attestation issued: slot={} burn_id={} amount={} wallet={}",
+        burn.poh_slot, &req.burn_id[..8], req.amount_usdt_micro,
         &req.wallet_address[..8.min(req.wallet_address.len())]);
 
     (StatusCode::OK, Json(serde_json::json!({
