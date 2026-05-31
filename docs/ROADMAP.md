@@ -36,10 +36,10 @@ Every L2–L5 layer settles to L1 via the Universal Rollup Hub:
 | Component | Status |
 |-----------|--------|
 | PoH Clock (400ms, 64 ticks/slot, SHA-256) | ✅ |
-| Tower BFT (exponential lockout, 2/3 supermajority) | ✅ |
+| Tower BFT (exponential lockout, 2/3 supermajority) | ⚠️ Code present, **single-writer self-vote only** — not a real quorum (see note) |
 | Gulf Stream (8-leader lookahead, 300K tx cache) | ✅ |
 | Sealevel (Rayon parallel, batch 2,048, conflict serialization) | ✅ |
-| Turbine (1,232-byte shreds, RS FEC 32+32, Merkle proofs) | ✅ |
+| Turbine (1,232-byte shreds, RS FEC 32+32) | ⚠️ Shredding/FEC works; shred Merkle proofs + signatures are placeholders, no network propagation yet |
 | SVM (execute_transfer, blockhash queue, intra-block dedup) | ✅ |
 | SvmAccountsDB (DashMap hot + ReDB durable) | ✅ |
 | SPL Token engine (Mint, TokenAccount, ATA creation) | ✅ |
@@ -47,6 +47,8 @@ Every L2–L5 layer settles to L1 via the Universal Rollup Hub:
 | Writer/Reader relay (gRPC SubscribeBlocks, ForwardTx) | ✅ |
 | Ed25519 transfers + replay protection | ✅ |
 | Solana BSC watcher threads (custody balance monitoring) | ✅ |
+
+> **Consensus reality note (⚠️ rows above):** the chain currently runs as a single trusted **writer** node with read-only **reader** replicas. Tower BFT voting, signed votes, leader block-signing, reader-side state verification, and a multi-validator set are designed/scaffolded but **not yet load-bearing**. See the "Consensus — Current Implementation Status" table in [Manifesto.md](Manifesto.md) and §3.2.1 of `root_whitepaper.md`. Making this real is the core of the planned **Layer 0** trust fabric.
 
 ---
 

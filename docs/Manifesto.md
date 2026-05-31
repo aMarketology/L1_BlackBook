@@ -20,23 +20,43 @@ The Layer 1 does not try to do everything. It **perfectly anchors everything**.
 
 ### Chain Specs
 
-| Parameter | Value |
-|-----------|-------|
-| Slot time | 400 ms |
-| Block capacity | 50,000 txs/block |
-| Theoretical TPS | 125,000 |
-| Sustained TPS (tested) | 230 |
-| Epoch length | 432,000 slots (~3 days) |
-| Finality | 32 confirmations → ROOTED (irreversible) |
-| Signature scheme | Ed25519 |
-| Storage | ReDB (ACID) + DashMap (hot cache) |
-| Language | Rust — no VM overhead |
+| Parameter | Value | Source of truth |
+|-----------|-------|-----------------|
+| Slot time | 400 ms | `main.rs::POH_SLOT_DURATION_MS` |
+| Hashes per tick / ticks per slot | 12,500 / 64 | `main.rs::POH_HASHES_PER_TICK`, `POH_TICKS_PER_SLOT` |
+| Block capacity | 240,000 txs/block | `poh_blockchain.rs::MAX_TXS_PER_BLOCK` |
+| Theoretical TPS | 600,000 (240k ÷ 0.4s) | derived |
+| Sustained TPS (tested) | ~230 (single-node REST path) | informal |
+| Epoch length | 432,000 slots (~2 days at 400 ms) | `main.rs::POH_SLOTS_PER_EPOCH` |
+| Finality (tx tracker) | 2 confirmations → Finalized | `runtime/poh_service.rs::CONFIRMATIONS_REQUIRED` |
+| Finality (Tower rooting) | 32 consecutive confirmed slots → Rooted | `consensus.rs::MAX_TOWER_DEPTH` — multi-validator design, see status below |
+| Signature scheme | Ed25519 (transactions/endpoints) | `svm/sigverify.rs`, `auth.rs` |
+| Storage | ReDB (ACID) + DashMap (hot cache) | `storage/mod.rs` |
+| Language | Rust — no VM overhead | — |
 
 ### Consensus: PoH + Tower BFT
 
-- **Proof of History** provides a deterministic, cryptographic timestamp for every transaction — no clock-skew, no mempool games.
-- **Tower BFT** uses exponential lockout voting (`2^(depth+1)` slots per confirmation), making rollbacks exponentially expensive.
-- **Gulf Stream** eliminates the global mempool. Readers forward transactions directly to the upcoming Writer with an 8-slot lookahead, pre-filling its queue before the slot arrives.
+- **Proof of History** provides a deterministic, cryptographic timestamp for every transaction — no clock-skew, no mempool games. **(Live.)**
+- **Tower BFT** uses exponential lockout voting (`2^(depth+1)` slots per confirmation), making rollbacks exponentially expensive. **(Designed; see status below.)**
+- **Gulf Stream** eliminates the global mempool. Readers forward transactions directly to the upcoming Writer with an 8-slot lookahead, pre-filling its queue before the slot arrives. **(Live for tx forwarding.)**
+
+### Consensus — Current Implementation Status (read this)
+
+The production chain runs as a **single writer node** with one or more read-only replica (Reader) nodes. To keep marketing and engineering aligned, the following is the honest state of the consensus stack as implemented in `runtime/consensus.rs`, `src/poh_blockchain.rs`, `src/relay/mod.rs`, and `src/reader/mod.rs`:
+
+| Component | Designed | Live today |
+|-----------|----------|-----------|
+| PoH clock (400 ms slots) | ✅ | ✅ |
+| Sealevel parallel execution | ✅ | ✅ |
+| Gulf Stream tx forwarding | ✅ | ✅ |
+| Writer → Reader block streaming (gRPC) | ✅ | ✅ |
+| Tower BFT multi-validator voting | ✅ | ❌ — only the writer self-votes (stake 1000), so "supermajority" is always 100% |
+| Ed25519-signed votes / P2P vote gossip | ✅ | ❌ — `Vote::signature` is a plain SHA-256 of public fields (no key), and votes are not gossiped |
+| Leader signature on blocks | — | ❌ — `FinalizedBlock` carries a `leader` field but no signature |
+| Reader independent state verification | — | ❌ — Readers verify the hash-chain + PoH linkage only, then **trust** the writer's state (`reader/mod.rs`: "Reader doesn't re-execute") |
+| Turbine shred signatures | ✅ | ❌ — shred `signature` is a `format!("sig_{leader}_{index}")` placeholder |
+
+**Bottom line:** today BlackBook is a high-performance, centrally-sequenced settlement chain (the writer is trusted). The Solana-style decentralization primitives are scaffolded but not yet load-bearing. Genuine BFT requires: leader block-signing, Ed25519-signed votes with P2P gossip, reader-side state verification, and ≥ 2 independent validators. These are the natural candidates for the planned **Layer 0** trust fabric.
 
 ### Execution: Sealevel Parallel Processing
 

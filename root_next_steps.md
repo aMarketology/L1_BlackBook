@@ -4,6 +4,14 @@
 > Last updated: **2026-04-24**  
 > Status: **Pre-launch — ready to deploy, ready to sell**
 
+> ⚠️ **OUTDATED TOKEN MODEL — read before trusting this file.**
+> Sections below describe a *three/four-token* economy (`$BB`, `wUSDT`, `$MAXX`, `$DECAY`).
+> This no longer matches the code. The canonical economy is **two tokens only: `$BB` + `wUSDT`**.
+> `MAXX`, `DECAY`, and `OZ` were **removed** and archived in `archive/contracts/` — do not restore them.
+> For the authoritative token model and consensus reality, see [docs/Manifesto.md](docs/Manifesto.md)
+> and [docs/ROADMAP.md](docs/ROADMAP.md). The Phase 0–5 token narrative here is kept only for
+> historical context; ignore any `$MAXX` / `$DECAY` "live" claims.
+
 ---
 
 ## What We Have Right Now (Fully Built ✅)

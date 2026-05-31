@@ -6,7 +6,7 @@
 
 ## Abstract
 
-BlackBook is a Solana-architecture-inspired Layer 1 blockchain written entirely in Rust, purpose-built to serve as a high-throughput settlement layer for prediction market rollups (Layer 2) and creator copyright enforcement systems (Layer 3). The chain achieves 400-millisecond slot times through a continuous SHA-256 Proof of History clock, parallel transaction execution via the Sealevel engine, and mempool-less transaction forwarding via Gulf Stream — while securing finality through Tower BFT exponential lockout voting with 32-confirmation rooting.
+BlackBook is a Solana-architecture-inspired Layer 1 blockchain written entirely in Rust, purpose-built to serve as a high-throughput settlement layer for prediction market rollups (Layer 2) and creator copyright enforcement systems (Layer 3). The chain achieves 400-millisecond slot times through a continuous SHA-256 Proof of History clock, parallel transaction execution via the Sealevel engine, and mempool-less transaction forwarding via Gulf Stream. Finality is provided today by a single trusted writer node (PoH-ordered, 2-confirmation tracker); the Tower BFT exponential-lockout voting scheme with 32-confirmation rooting described in §3.2 is implemented as scaffolding for a future multi-validator deployment but is **not yet load-bearing** — see §3.2.1.
 
 Unlike general-purpose smart contract platforms, BlackBook's six native contracts are engineered for a single, high-value use case: trustlessly locking collateral on L1 while high-frequency prediction markets execute on L2, settling outcomes back to L1 through cryptographically verifiable Merkle proofs. The L1 never holds user logic — it holds user money and mathematical truth.
 
@@ -147,6 +147,17 @@ $$\text{finality time} = 32 \times 400\text{ms} = 12.8\text{s}$$
 **Fork Selection:**
 
 When forks exist, Tower BFT selects the heaviest subtree — the fork with the most cumulative stake-weighted votes. Ties are broken by preferring the higher slot number.
+
+### 3.2.1 Implementation Status (Honest Disclosure)
+
+The mechanics above describe the **target multi-validator design**. The current production deployment runs a **single writer node**, so:
+
+- The writer self-votes with a fixed stake, making "≥ 66.7% supermajority" trivially 100% — it is not a Byzantine quorum.
+- `Vote::signature` (`runtime/consensus.rs`) is a SHA-256 digest of the vote's public fields, **not an Ed25519 signature** — votes are currently unauthenticated and not gossiped between nodes.
+- `FinalizedBlock` is **not signed** by the leader; Reader nodes verify the hash-chain and PoH linkage, then trust the writer's state root rather than re-executing transactions (`src/reader/mod.rs`).
+- Turbine shred signatures are placeholder strings (`src/poh_blockchain.rs`).
+
+For everyday users this means finality is fast and deterministic but **trust-based** (custodial-equivalent): security currently rests on the honesty/availability of the writer operator, not on a decentralized validator set. Closing this gap — leader block-signing, Ed25519-signed and gossiped votes, reader-side state verification, and ≥ 2 independent validators — is the core of the planned Layer 0 work and the §18 roadmap.
 
 ### 3.3 Gulf Stream
 
@@ -503,14 +514,17 @@ All signing uses the Ed25519 curve (via `ed25519-dalek`). Private keys are 32-by
 
 ### Throughput
 
-| Metric | Value |
-|--------|-------|
-| Slot Time | 400 ms |
-| Max Transactions per Slot | 10,000 |
-| Theoretical Peak TPS | 25,000 tx/sec |
-| Optimal Sealevel Batch | 2,048 tx |
-| Pipeline Buffer Depth | 100,000 packets × 4 stages |
-| UDP TPU Capacity | 5,000 packets/sec/IP × 8 workers |
+| Metric | Value | Source |
+|--------|-------|--------|
+| Slot Time | 400 ms | `main.rs::POH_SLOT_DURATION_MS` |
+| Max Transactions per Slot (block cap) | 240,000 | `poh_blockchain.rs::MAX_TXS_PER_BLOCK` |
+| Theoretical Peak TPS | 600,000 (240k ÷ 0.4s) | derived |
+| Sustained TPS (single-node, tested) | ~230 | informal — not yet load-tested at scale |
+| Optimal Sealevel Batch | 2,048 tx | `runtime/sealevel.rs` |
+| Pipeline Buffer Depth | 100,000 packets × 4 stages | `runtime/tpu.rs` |
+| UDP TPU Capacity | configurable per-IP × 8 workers | `runtime/tpu.rs` |
+
+> Note: theoretical peak assumes a full 240k-tx block every slot and is bounded in practice by signature-verification throughput, Sealevel conflict rate, and disk I/O. The legacy `verify_block_validity` helper still hard-caps proposed blocks at 10,000 txs, but it sits on the not-yet-active multi-validator path and does not gate the live single-writer producer.
 
 ### Latency
 
@@ -519,7 +533,8 @@ All signing uses the Ed25519 curve (via `ed25519-dalek`). Private keys are 32-by
 | Ed25519 Signature Verification | ~10 μs per tx |
 | Sealevel Batch Execution | 1–10 ms (conflict-dependent) |
 | Block Production | 400 ms (fixed slot time) |
-| Finality (Rooted) | 12.8 seconds (32 × 400ms) |
+| Finality (tx tracker, live) | ~0.8 s (2 × 400ms, `CONFIRMATIONS_REQUIRED = 2`) |
+| Finality (Tower Rooted, multi-validator design) | 12.8 s (32 × 400ms) — not yet load-bearing, see §3.2.1 |
 | gRPC Settlement Round-trip | < 400 ms (same network) |
 
 ### Memory Footprint

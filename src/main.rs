@@ -158,7 +158,7 @@ const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
 const POH_SLOT_DURATION_MS: u64 = 400;
 const POH_HASHES_PER_TICK: u64 = 12500;
 const POH_TICKS_PER_SLOT: u64 = 64;
-const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
+const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~2 days at 400ms slots (432000 × 0.4s = 48h)
 
 // No hardcoded test accounts — this is a zero-sum stablecoin.
 // All accounts are created at runtime via wallet creation endpoints.
@@ -2903,9 +2903,10 @@ fn build_router(state: AppState) -> Router {
         .route("/deposit/request", post(contracts::deposit_gateway::deposit_request_handler))
         .route("/deposit/status/:tx_hash", get(contracts::deposit_gateway::deposit_status_handler))
         .route("/deposit/claim", post(contracts::deposit_gateway::deposit_claim_handler))
-        // Deposit webhooks — Helius (Solana) and Alchemy (BSC) push notifications
+        // Deposit webhooks — Helius (Solana), Alchemy (BSC), Transak (fiat onramp)
         .route("/deposit/webhook/helius", post(watcher_webhook::helius_webhook_handler))
         .route("/deposit/webhook/alchemy", post(watcher_webhook::alchemy_webhook_handler))
+        .route("/transak/webhook", post(watcher_webhook::transak_webhook_handler))
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))

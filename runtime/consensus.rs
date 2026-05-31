@@ -57,8 +57,11 @@ pub struct PoHConfig {
 
 impl Default for PoHConfig {
     fn default() -> Self {
+        // NOTE: The authoritative production values live in `main.rs`
+        // (POH_SLOT_DURATION_MS = 400, etc.). This Default is used by unit tests
+        // only; keep it in sync with main.rs to avoid spec drift.
         Self {
-            slot_duration_ms: 600,
+            slot_duration_ms: 400,
             hashes_per_tick: 12500,
             ticks_per_slot: 64,
             slots_per_epoch: 432000,
