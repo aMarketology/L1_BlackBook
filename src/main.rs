@@ -94,7 +94,6 @@ pub struct NodeConfig {
 use layer1::storage;
 use layer1::poh_blockchain;
 use layer1::svm;
-use layer1::kms;
 use layer1::solana_rpc;
 use layer1::relay;
 use layer1::settlement;
@@ -158,7 +157,7 @@ const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
 const POH_SLOT_DURATION_MS: u64 = 400;
 const POH_HASHES_PER_TICK: u64 = 12500;
 const POH_TICKS_PER_SLOT: u64 = 64;
-const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~2 days at 400ms slots (432000 × 0.4s = 48h)
+const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
 
 // No hardcoded test accounts — this is a zero-sum stablecoin.
 // All accounts are created at runtime via wallet creation endpoints.
@@ -349,12 +348,6 @@ pub struct AppState {
     /// node_id → ReaderRecord { udp_addr, last_seen }
     pub turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>>,
 
-    // ===== Vault Bridge (Outbound: BB → Solana USDT) =====
-    /// KMS or local Ed25519 signer that issues claim attestations for the
-    /// Solana Anchor vault program. `None` when neither AWS_KMS_KEY_ID nor
-    /// VAULT_SIGNER_PRIVATE_KEY is set — vault claims return 503 in that case.
-    pub vault_signer: Option<Arc<kms::VaultSigner>>,
-
     // ===== Reader Mode: Writer Proxy =====
     /// When running as a Reader node, this holds the Writer's HTTP base URL
     /// (e.g. "http://1.2.3.4:8080"). All state-changing POST requests are
@@ -388,16 +381,9 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         now.saturating_sub(b.timestamp)
     });
     let is_healthy = block_age_s.map(|age| age < 10).unwrap_or(current_slot < 5);
-    let status_str = if is_healthy { "healthy" } else { "degraded" };
 
     Json(serde_json::json!({
-        // Wallet / SDK compat (flat fields — see sdk/wallet.sdk.ts, hotwallet guide)
-        "status": status_str,
-        "ok": is_healthy,
-        "online": true,
-        "slot": poh_status["current_slot"],
-        "total_supply": total_supply,
-        "uptime_seconds": stats.uptime_secs,
+        "status": if is_healthy { "healthy" } else { "degraded" },
         "version": VERSION,
         "network": NETWORK,
         "blockchain": {
@@ -2805,12 +2791,10 @@ fn build_router(state: AppState) -> Router {
     // Add extra origins at runtime via CORS_EXTRA_ORIGINS (comma-separated).
     // Example: CORS_EXTRA_ORIGINS=https://staging.blackbook.id,http://localhost:3000
     let mut allowed: Vec<HeaderValue> = vec![
-        // Production (wallet UI + API hostname)
+        // Production
         "https://blackbook.id".parse().unwrap(),
         "https://wallet.blackbook.id".parse().unwrap(),
-        "http://layer1.blackbook.id".parse().unwrap(),
-        "https://layer1.blackbook.id".parse().unwrap(),
-        // Tauri desktop shell (WebView origin)
+        // Tauri desktop app (WebView origin)
         "tauri://localhost".parse().unwrap(),
         "https://tauri.localhost".parse().unwrap(),
         // Local dev (Vite on 5173, fallback ports)
@@ -2829,22 +2813,9 @@ fn build_router(state: AppState) -> Router {
             }
         }
     }
-    let cors_allow_all = std::env::var("CORS_ALLOW_ALL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if cors_allow_all {
-        warn!("⚠️  CORS_ALLOW_ALL enabled — all origins allowed (dev only)");
-    }
-    info!("🔒 CORS: {} origin(s) allowed{}", allowed.len(), if cors_allow_all { " (+ allow all)" } else { "" });
+    info!("🔒 CORS: {} origin(s) allowed", allowed.len());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _req| {
-            if cors_allow_all {
-                return true;
-            }
-            // Tauri / some tools send Origin: null
-            if origin.as_bytes() == b"null" {
-                return true;
-            }
             allowed.contains(origin)
         }))
         .allow_methods(Any)
@@ -2903,10 +2874,9 @@ fn build_router(state: AppState) -> Router {
         .route("/deposit/request", post(contracts::deposit_gateway::deposit_request_handler))
         .route("/deposit/status/:tx_hash", get(contracts::deposit_gateway::deposit_status_handler))
         .route("/deposit/claim", post(contracts::deposit_gateway::deposit_claim_handler))
-        // Deposit webhooks — Helius (Solana), Alchemy (BSC), Transak (fiat onramp)
+        // Deposit webhooks — Helius (Solana) and Alchemy (BSC) push notifications
         .route("/deposit/webhook/helius", post(watcher_webhook::helius_webhook_handler))
         .route("/deposit/webhook/alchemy", post(watcher_webhook::alchemy_webhook_handler))
-        .route("/transak/webhook", post(watcher_webhook::transak_webhook_handler))
         // Withdrawal Gateway (public request + status)
         .route("/withdraw/request", post(contracts::withdrawal_gateway::withdraw_request_handler))
         .route("/withdraw/status/:id", get(contracts::withdrawal_gateway::withdraw_status_handler))
@@ -2944,15 +2914,7 @@ fn build_router(state: AppState) -> Router {
         .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
         .route("/rollup/:rollup_id/roots/:batch_id", get(contracts::rollup::get_root_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
-        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler))
-        // ── Vault Bridge: BB → Solana USDT ──────────────────────────────────
-        // Step 0: get the KMS oracle pubkey (used in initialize_vault).
-        .route("/vault/kms-pubkey", get(contracts::vault_gateway::kms_pubkey_handler))
-        // Step 1: burn BB, receive wUSDT on L1 + a durable BurnRecord receipt.
-        .route("/vault/burn", post(contracts::vault_gateway::burn_handler))
-        // Step 2: exchange the BurnRecord for a KMS-signed claim attestation
-        //         that the Solana Anchor vault program will accept.
-        .route("/vault/claim-attestation", post(contracts::vault_gateway::claim_attestation_handler));
+        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {
@@ -3802,7 +3764,6 @@ async fn main() {
         deposit_requests,
         custody_watcher: custody_watcher.clone(),
         bsc_watcher: bsc_watcher_arc.clone(),
-        bridge_authority_pubkey: std::env::var("BRIDGE_AUTHORITY_PUBKEY").unwrap_or_default(),
         dealer_address,
         withdrawal_requests,
         withdrawal_seq_counter,
@@ -3821,7 +3782,6 @@ async fn main() {
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
         turbine_readers: turbine_readers.clone(),
-        vault_signer: kms::VaultSigner::from_env().map(Arc::new),
         writer_http_url: if config.mode == NodeMode::Reader {
             // Derive the Writer's HTTP URL from its gRPC address.
             // gRPC default port 50051 → HTTP port 8080.
