@@ -19,13 +19,13 @@ const L1 = 'http://localhost:8080';
 const L3 = 'http://localhost:7073';
 const LAMPORTS_PER_BB = 100_000;
 
-// ── Alice (from test_keys.json) ──────────────────────────────────────────────
-const ALICE_SECRET = '1c12a697254491cc286dd6431e9c84acda48ae85b667e08f8527eeb810f9316bc3c0aa0bad64ed2c74d91c24682ae5a4021960e2b70f629296c51a01190f5870';
-const ALICE_PRIV   = hexToBytes(ALICE_SECRET.slice(0, 64)); // 32-byte seed
+// ── Alice (local dev test wallet — no real funds) ─────────────────────────────
+const ALICE_SECRET = '917afb3be15f2a75690de7657c176adc0fa3eeed60a06158d8f354b0832f3d62';
+const ALICE_PRIV   = hexToBytes(ALICE_SECRET); // 32-byte seed
 const ALICE_PUB    = ed.getPublicKey(ALICE_PRIV);
 const ALICE_PUBHEX = bytesToHex(ALICE_PUB);
 // Alice's address is base58(ALICE_PUB) — matches test_keys.json
-const ALICE_ADDR   = 'EB8tsQcA8Ewuqni2pqW5RiME95oiUAHj5eC9Lz2zX3j5';
+const ALICE_ADDR   = '8PywhzJYBCspVwV5TF3ugH86FNhcE56SSerLJJWJRMfB';
 
 // ── NFT fixture ───────────────────────────────────────────────────────────────
 const COLLECTION    = 'SMOKE_COL';          // uppercase alphanumeric for L1 symbol_hint

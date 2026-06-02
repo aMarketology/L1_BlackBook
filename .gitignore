@@ -42,6 +42,7 @@ Thumbs.db
 # Wallet secrets — never commit
 real_wallets/
 *.keypair.json
+test_keys.json
 # blackbook-wallet lives in its own repo (aMarketology/blackbook-wallet)
 blackbook-wallet/
 # Live chain database — binary, too large for git, regenerated on node start
