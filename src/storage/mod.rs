@@ -1227,14 +1227,21 @@ impl ConcurrentBlockchain {
         Ok(all.into_iter().find(|r| r.tx_hash == tx_hash))
     }
 
-    /// Transfer tokens between addresses (atomic) — legacy API (no SVM receipt).
+    /// Transfer between addresses in lamports (u64). Preferred API.
+    pub fn transfer_lamports(&self, from: &str, to: &str, lamports: u64) -> Result<(), String> {
+        let amount_bb = lamports as f64 / LAMPORTS_PER_BB as f64;
+        self.transfer_inner(from, to, amount_bb, AuthType::SystemInternal)
+    }
+
+    /// Transfer tokens between addresses — legacy float API. Use `transfer_lamports` for new code.
+    #[deprecated(note = "Use transfer_lamports(u64) instead")]
     pub fn transfer(&self, from: &str, to: &str, amount: f64) -> Result<(), String> {
         self.transfer_inner(from, to, amount, AuthType::SystemInternal)
     }
 
     /// Core atomic transfer — SVM-native.
     ///
-    /// Converts f64 → u64 ONCE, then does the entire debit/credit in u64
+    /// Converts f64 → u64 ONCE at the boundary, then does all math in u64
     /// lamports through SVM AccountsDB. Mirrors to cache/ReDB after.
     fn transfer_inner(&self, from: &str, to: &str, amount: f64, auth_type: AuthType) -> Result<(), String> {
         if amount <= 0.0 {
@@ -2905,7 +2912,7 @@ mod tests {
         let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
 
         bc.mint_lamports("alice", 100 * LAMPORTS_PER_BB).unwrap();
-        bc.transfer("alice", "bob", 40.0).unwrap();
+        bc.transfer_lamports("alice", "bob", 40 * LAMPORTS_PER_BB).unwrap();
 
         assert_eq!(bc.get_balance("alice"), 60.0);
         assert_eq!(bc.get_balance("bob"), 40.0);
