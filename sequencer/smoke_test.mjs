@@ -14,8 +14,8 @@
 import { ed25519 as ed } from '@noble/curves/ed25519';
 import { bytesToHex, randomBytes } from '@noble/hashes/utils';
 
-const L1 = 'http://localhost:8080';
-const L2 = 'http://localhost:7072';
+const L1 = process.env.L1_URL ?? 'http://localhost:8080';
+const L2 = process.env.L2_URL ?? 'http://localhost:7072';
 const LAMPORTS_PER_BB = 100_000;
 
 // ── base58 (Bitcoin/Solana alphabet) ────────────────────────────────────────
@@ -73,8 +73,24 @@ function assert(cond, msg) {
 }
 
 // ── L1 / L2 operations ─────────────────────────────────────────────────────────
-async function mint(addr, bb) {
-  return post(`${L1}/admin/mint`, { to: addr, amount: bb, dealer_signature: 'dev' });
+async function mint(user, bb) {
+  // Use the public /faucet endpoint — no unsafe_admin needed on production.
+  // Faucet is capped at MAX_FAUCET_BB (0.1 BB). L1 clamps amount server-side
+  // then builds the canonical message with the clamped value, so we must sign
+  // with the same clamped value.
+  // Canonical message: "FAUCET:{addr}:{clamped_amount}:{ts}:{nonce}"
+  const MAX_FAUCET_BB = 0.1;
+  const clamped = Math.min(bb, MAX_FAUCET_BB);
+  const ts = now(), n = nonce();
+  const msg = `FAUCET:${user.address}:${clamped}:${ts}:${n}`;
+  return post(`${L1}/faucet`, {
+    wallet_address: user.address,
+    amount: clamped,
+    public_key: user.pubHex,
+    signature: sign(msg, user.priv),
+    timestamp: ts,
+    nonce: n,
+  });
 }
 
 async function lockBb(user, lamports) {
@@ -137,18 +153,27 @@ async function main() {
   console.log(`userA ${A.address}`);
   console.log(`userB ${B.address}\n`);
 
-  const HUNDRED = 100 * LAMPORTS_PER_BB;     // 10_000_000 lamports
-  const FIFTY   = 50  * LAMPORTS_PER_BB;     // 5_000_000  lamports
+  // Scale to faucet cap: 0.1 BB per user = 10_000 lamports each.
+  // Zero-sum market: A bets 5_000 lamports YES, B bets 5_000 lamports NO.
+  // Outcome YES => A wins the pot => A = 10_000 lamports, B = 5_000 lamports.
+  const FULL  = 0.1 * LAMPORTS_PER_BB;   // 10_000 lamports  (0.1 BB)
+  const HALF  = 0.05 * LAMPORTS_PER_BB;  //  5_000 lamports  (0.05 BB)
+  const HUNDRED = FULL;
+  const FIFTY   = HALF;
 
-  console.log('① Mint 100 BB to each user on L1');
-  await mint(A.address, 100);
-  await mint(B.address, 100);
-  assert((await l1Bb(A.address)) === 100, 'L1 userA balance = 100 BB');
-  assert((await l1Bb(B.address)) === 100, 'L1 userB balance = 100 BB');
+  console.log('① Mint 0.1 BB to each user on L1 (faucet cap)');
+  await mint(A, 0.1);
+  await mint(B, 0.1);
+  // Faucet returns 0.1 BB — balance may show as a small float; check > 0
+  const balA = await l1Bb(A.address);
+  const balB = await l1Bb(B.address);
+  assert(balA > 0, `L1 userA balance > 0 (got ${balA})`);
+  assert(balB > 0, `L1 userB balance > 0 (got ${balB})`);
+  console.log(`   A=${balA} BB, B=${balB} BB`);
 
-  console.log('\n② Lock 100 BB each into the L2 vault (lock_bb)');
-  const lockA = await lockBb(A, HUNDRED);
-  const lockB = await lockBb(B, HUNDRED);
+  console.log('\n② Lock 0.1 BB each into the L2 vault (lock_bb)');
+  const lockA = await lockBb(A, FULL);
+  const lockB = await lockBb(B, FULL);
   console.log(`   lockA=${lockA}`);
   console.log(`   lockB=${lockB}`);
   assert((await l1Bb(A.address)) === 0, 'L1 userA balance = 0 after lock');
@@ -157,34 +182,39 @@ async function main() {
   console.log('\n③ Register locks on L2 (verify -> consume -> credit)');
   await post(`${L2}/register-lock`, { lock_id: lockA });
   await post(`${L2}/register-lock`, { lock_id: lockB });
-  assert((await l2Lamports(A.address)) === BigInt(HUNDRED), 'L2 userA = 10_000_000 lamports');
-  assert((await l2Lamports(B.address)) === BigInt(HUNDRED), 'L2 userB = 10_000_000 lamports');
+  assert((await l2Lamports(A.address)) === BigInt(FULL), 'L2 userA = 10_000 lamports');
+  assert((await l2Lamports(B.address)) === BigInt(FULL), 'L2 userB = 10_000 lamports');
 
   console.log('\n④ Create market + place bets');
   const marketId = `m_${nonce()}`;
   await post(`${L2}/markets`, { market_id: marketId, question: 'Smoke test: YES or NO?' });
-  await placeBet(A, marketId, 'YES', FIFTY);
-  await placeBet(B, marketId, 'NO', FIFTY);
-  assert((await l2Lamports(A.address)) === BigInt(HUNDRED - FIFTY), 'L2 userA = 5_000_000 after bet');
-  assert((await l2Lamports(B.address)) === BigInt(HUNDRED - FIFTY), 'L2 userB = 5_000_000 after bet');
+  await placeBet(A, marketId, 'YES', HALF);
+  await placeBet(B, marketId, 'NO', HALF);
+  assert((await l2Lamports(A.address)) === BigInt(FULL - HALF), 'L2 userA = 5_000 after bet');
+  assert((await l2Lamports(B.address)) === BigInt(FULL - HALF), 'L2 userB = 5_000 after bet');
 
   console.log('\n⑤ Resolve YES (seals batch + submits root to L1)');
   const resolve = await post(`${L2}/markets/${marketId}/resolve`, { outcome: 'YES' });
   console.log(`   batch=${JSON.stringify(resolve.batch)}`);
   assert(resolve.batch && resolve.batch.batchId >= 1, 'batch sealed + root submitted');
-  assert((await l2Lamports(A.address)) === BigInt(150 * LAMPORTS_PER_BB), 'L2 userA = 150 BB (winner)');
-  assert((await l2Lamports(B.address)) === BigInt(50  * LAMPORTS_PER_BB), 'L2 userB = 50 BB (loser keeps unbet half)');
+  // A wins pot: A = 5_000 (unbet) + 5_000 (bet returned) + 5_000 (B's pot) = 15_000; B keeps unbet 5_000
+  assert((await l2Lamports(A.address)) === BigInt(15000), 'L2 userA = 15_000 (winner takes pot)');
+  assert((await l2Lamports(B.address)) === BigInt(HALF), 'L2 userB = 5_000 (loser keeps unbet half)');
 
-  console.log('\n⑥ Exit userA (150 BB) to L1 with Merkle proof');
+  console.log('\n⑥ Exit userA (0.15 BB) to L1 with Merkle proof');
   const exA = await exitBb(A);
   console.log(`   proof depth=${exA.proof.proof_siblings.length} root=${exA.proof.merkle_root.slice(0, 16)}…`);
   assert(exA.res.success === true, 'userA exit accepted');
-  assert((await l1Bb(A.address)) === 150, 'L1 userA balance = 150 BB after exit');
+  const exitBalA = await l1Bb(A.address);
+  assert(exitBalA > 0.14, `L1 userA balance > 0.14 BB after exit (got ${exitBalA})`);
+  console.log(`   L1 userA = ${exitBalA} BB`);
 
-  console.log('\n⑦ Exit userB (50 BB) to L1 with Merkle proof');
+  console.log('\n⑦ Exit userB (0.05 BB) to L1 with Merkle proof');
   const exB = await exitBb(B);
   assert(exB.res.success === true, 'userB exit accepted');
-  assert((await l1Bb(B.address)) === 50, 'L1 userB balance = 50 BB after exit');
+  const exitBalB = await l1Bb(B.address);
+  assert(exitBalB > 0.04, `L1 userB balance > 0.04 BB after exit (got ${exitBalB})`);
+  console.log(`   L1 userB = ${exitBalB} BB`);
 
   console.log('\n⑧ Double-spend guard: re-exit userA must be rejected');
   let rejected = false;

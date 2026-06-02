@@ -266,7 +266,7 @@ impl TpuService {
                     let mut tx = RuntimeTx::new(
                         pkt.from.clone(), pkt.to.clone(), pkt.amount, tx_type
                     );
-                    tx.nonce = pkt.priority;
+                    tx.priority = pkt.priority;
                     let tx_id = tx.id.clone();
 
                     if let Err(e) = gs.submit(tx.clone()) {

@@ -239,6 +239,10 @@ pub struct Transaction {
     pub signature: String,
     #[serde(default)]
     pub nonce: u64,
+    /// Priority fee in lamports/compute-unit. Higher → earlier execution slot
+    /// when multiple transactions compete for the same write account (Local Fee Market).
+    #[serde(default)]
+    pub priority: u64,
     #[serde(default)]
     pub read_accounts: Vec<String>,
     #[serde(default)]
@@ -259,6 +263,7 @@ impl Transaction {
             from, to, amount, timestamp,
             signature: format!("sig_{}", &id[..8]),
             nonce: 0,
+            priority: 0,
             read_accounts, write_accounts,
             tx_type,
         }

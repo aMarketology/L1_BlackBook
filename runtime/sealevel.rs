@@ -11,6 +11,7 @@
 
 use rayon::prelude::*;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 use serde::Serialize;
@@ -184,34 +185,82 @@ impl ParallelScheduler {
         }
     }
 
-    /// Schedule into non-conflicting batches using lock manager
-    pub fn schedule_with_locks(&self, transactions: Vec<Transaction>) -> Vec<Vec<Transaction>> {
+    /// Schedule transactions into non-conflicting batches — **O(N)** per-account queue algorithm.
+    ///
+    /// ### Algorithm
+    /// Maintains a `next_free` map: `account → earliest_batch_index` where that account
+    /// is available. For each transaction (sorted by priority desc):
+    ///   1. `slot = max(next_free[a] for all accounts a)` — the first conflict-free batch.
+    ///   2. If `slot` is full, walk forward until a non-full slot is found (amortized O(1)).
+    ///   3. Place the tx in `batches[slot]`, advance `next_free[a] = slot + 1`.
+    ///
+    /// ### Complexity
+    /// O(N × W) where W = avg write accounts per tx (≈ 2 for transfers).
+    /// The previous O(N²) scan-and-retry loop is eliminated entirely.
+    ///
+    /// ### Local Fee Market
+    /// Transactions are sorted by `priority` (descending) before scheduling.
+    /// When multiple txs contend on the same hot account (e.g. swap pool),
+    /// the highest-priority tx wins the earliest execution slot.
+    pub fn schedule_with_locks(&self, mut transactions: Vec<Transaction>) -> Vec<Vec<Transaction>> {
         if transactions.is_empty() { return vec![]; }
 
+        // Local Fee Market: high-priority txs claim the earliest conflict-free slot.
+        transactions.sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
+
         let batch_size = self.get_batch_size();
-        let mut batches: Vec<Vec<Transaction>> = vec![];
-        let mut remaining = transactions;
 
-        while !remaining.is_empty() {
-            let mut batch: Vec<Transaction> = vec![];
-            let mut next: Vec<Transaction> = vec![];
+        // `next_free[account]` = smallest batch index where this account is unlocked.
+        // Accounts absent from the map are free at batch 0.
+        let mut next_free: HashMap<String, usize> = HashMap::with_capacity(transactions.len() * 2);
+        let mut batch_counts: Vec<usize> = Vec::new();
+        let mut batches: Vec<Vec<Transaction>> = Vec::new();
 
-            for tx in remaining {
-                if batch.len() >= batch_size {
-                    next.push(tx);
-                    continue;
-                }
-                if self.lock_manager.try_acquire_locks(&tx) {
-                    batch.push(tx);
-                } else {
-                    next.push(tx);
-                }
+        let total = transactions.len() as u64;
+        let mut deferred: u64 = 0;
+
+        for tx in transactions {
+            // Step 1 — find the earliest batch slot where ALL accounts are free.
+            // Read-accounts are treated as write-accounts conservatively to
+            // prevent read-after-write hazards across concurrent Rayon threads.
+            let conflict_slot = tx
+                .write_accounts
+                .iter()
+                .chain(tx.read_accounts.iter())
+                .map(|a| next_free.get(a).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+
+            // Step 2 — within that conflict-free slot, find one that has room.
+            // `conflict_slot` is already free of account contention; any later slot
+            // is too, so we only need to advance for capacity reasons (amortized O(1)).
+            let mut slot = conflict_slot;
+            while batch_counts.get(slot).copied().unwrap_or(0) >= batch_size {
+                slot += 1;
             }
 
-            for tx in &batch { self.lock_manager.release_locks(tx); }
-            if !batch.is_empty() { batches.push(batch); }
-            remaining = next;
+            if slot > 0 { deferred += 1; }
+
+            // Step 3 — grow storage if needed.
+            while batches.len() <= slot {
+                batches.push(Vec::new());
+                batch_counts.push(0);
+            }
+
+            // Step 4 — assign and advance per-account free pointers.
+            batch_counts[slot] += 1;
+            for a in tx.write_accounts.iter().chain(tx.read_accounts.iter()) {
+                let e = next_free.entry(a.clone()).or_insert(0);
+                if *e <= slot {
+                    *e = slot + 1;
+                }
+            }
+            batches[slot].push(tx);
         }
+
+        // Update conflict stats for tune_batch_size adaptive logic.
+        self.lock_manager.total_acquisitions.fetch_add(total, Ordering::Relaxed);
+        self.lock_manager.total_conflicts.fetch_add(deferred, Ordering::Relaxed);
 
         self.total_batches.fetch_add(batches.len() as u64, Ordering::Relaxed);
         batches
@@ -450,6 +499,41 @@ mod tests {
         let tx3 = Transaction::new("dave".into(), "eve".into(), 25u64, TransactionType::Transfer);
 
         let batches = scheduler.schedule_batch(&[tx1, tx2, tx3]);
-        assert!(batches.len() >= 2); // tx1+tx2 conflict, tx3 is independent
+        // tx1 and tx2 both write to "alice" — they must be in different batches.
+        // tx3 is fully independent and fits in batch 0 alongside one of them.
+        assert!(batches.len() >= 2, "conflicting txs must be separated");
+        // Total tx count must be preserved
+        let total: usize = batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_hot_account_linear_batches() {
+        // N transactions all writing to the same "hot" account.
+        // Old algorithm: O(N²). New algorithm: O(N), produces N batches of 1.
+        let scheduler = ParallelScheduler::new();
+        let n = 100;
+        let txs: Vec<Transaction> = (0..n)
+            .map(|i| Transaction::new("hot_pool".into(), format!("user_{}", i), 1u64, TransactionType::Transfer))
+            .collect();
+        let batches = scheduler.schedule_with_locks(txs);
+        assert_eq!(batches.len(), n, "each conflicting tx gets its own batch");
+        let total: usize = batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total, n);
+    }
+
+    #[test]
+    fn test_priority_wins_hot_account() {
+        // Two txs conflict on "hot". High-priority tx should land in batch 0.
+        let scheduler = ParallelScheduler::new();
+        let mut low = Transaction::new("hot".into(), "a".into(), 1u64, TransactionType::Transfer);
+        low.priority = 10;
+        let mut high = Transaction::new("hot".into(), "b".into(), 1u64, TransactionType::Transfer);
+        high.priority = 9_999;
+        let batches = scheduler.schedule_with_locks(vec![low, high]);
+        assert_eq!(batches.len(), 2);
+        // batch 0 should contain the high-priority tx (to="b")
+        assert_eq!(batches[0][0].to, "b", "high-priority tx must be in batch 0");
+        assert_eq!(batches[1][0].to, "a", "low-priority tx must be deferred");
     }
 }

@@ -1,0 +1,23 @@
+{
+  "name": "@bb/bridge-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "node --experimental-vm-modules --watch dist/index.js",
+    "build": "tsc --noEmit false --outDir dist",
+    "check": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.5"
+  }
+}

@@ -168,6 +168,15 @@ See [docs/wallet-l1-connectivity.md](docs/wallet-l1-connectivity.md).
 - [x] gRPC relay port 50051 exposed publicly — **DONE** (docker-compose.prod.yml)
 - [x] Local dev reader mode → Hetzner writer — **DONE** (defaults changed in `main.rs`)
 - [x] `POST /vault/burn` + `GET /vault/kms-pubkey` — **DONE**
+- [x] `POST /transak/webhook` — fiat onramp attribution (HMAC-SHA256, pre-registers Tier 1 deposit record) — **DONE**
+
+**Transak Partner Dashboard checklist** (`dashboard.transak.com`):
+- [ ] Upgrade environment: Staging → Production (get a production API key)
+- [ ] Set `VITE_TRANSAK_API_KEY` in wallet `.env` to the production key
+- [ ] Configure webhook: `https://layer1.blackbook.id/transak/webhook`
+- [ ] Copy the **Webhook Secret** from the dashboard into Hetzner env: `TRANSAK_WEBHOOK_SECRET=<secret>`
+- [ ] Whitelist allowed domains: `layer1.blackbook.id`, `tauri://localhost`, your production wallet URL
+- [ ] Verify `network: solana` + `cryptoCurrency: USDT` are enabled in the dashboard
 - [ ] Anchor vault deploy to Solana mainnet (`cd bb-vault && anchor build && anchor deploy --provider.cluster mainnet-beta`)
 - [ ] Update `declare_id!` in `bb-vault/programs/bb-vault/src/lib.rs` with real deployed program ID
 - [ ] Fund vault ATA with initial USDT (`findProgramAddressSync([Buffer.from("vault")], programId)`)
@@ -180,14 +189,38 @@ See [docs/wallet-l1-connectivity.md](docs/wallet-l1-connectivity.md).
 - [x] `VITE_TRANSAK_API_KEY` set — **DONE** (`6dec68d5-9394-43a8-8edd-27c74decd15a`)
 - [x] `VITE_CUSTODY_WALLET` set — **DONE** (`GTvWn5tvMukS4uJxik8nSszuYF27642kJSwtbkKBcgUB`)
 - [x] `CUSTODY_WALLET_ADDRESS` on Hetzner + watcher active — **DONE**
-- [x] `BuyCryptoTab` Transak iframe — **DONE** (walletAddress locked, partnerOrderId = BB address)
-- [x] postMessage flow (TRANSAK_ORDER_SUCCESSFUL → poll /deposit/status) — **DONE**
-- [x] `DepositModal.tsx` — Mayan tab + Buy tab + Solana Direct tab — **DONE**
+- [x] `BuyCryptoTab` Transak iframe — **RETIRED** (replaced by Wormhole Connect — crypto-native users don't need fiat onramp)
+- [x] `WormholeTab` — Wormhole Connect v6 widget, destination defaulted to Solana USDT — **DONE**
+- [x] `DepositModal.tsx` — Wormhole tab + Any-Chain (LI.FI) tab + Mayan tab + Solana Direct tab + Lightning — **DONE**
 - [x] Live API console in Settings (sanitized fetch interceptor) — **DONE**
 - [x] PROD/LOCAL toggle in NodeStatus popup — **DONE**
 - [ ] Add `blackbook-wallet` domain to Transak dashboard allowlist
 - [ ] Send $1–2 USDT test to custody wallet (Solana Direct tab) to verify watcher → BB credit
 - [ ] LI.FI widget integration (cross-chain bridge tab) — next phase
+
+#### Day 13: TypeScript Bridge Watcher (M0+M1+M2)
+- [x] `sequencer/bridge-watcher/` workspace scaffold — **DONE** (package.json, tsconfig, .env.example)
+- [x] `config.ts` — zod-validated env load, fail-fast — **DONE**
+- [x] `logger.ts` — structured JSON, auto-redacts private/secret keys — **DONE**
+- [x] `db/sqlite.ts` — WAL-mode SQLite, migrations (cursor + signatures tables) — **DONE**
+- [x] `db/cursor.ts` — durable scan cursor (only advances past terminal states) — **DONE**
+- [x] `db/processed.ts` — per-sig state machine CRUD — **DONE**
+- [x] `solana/rpc.ts` — fetch-based JSON-RPC client, primary+fallback, timeout — **DONE**
+- [x] `solana/poller.ts` — paginated `getSignaturesForAddress`, oldest-first — **DONE**
+- [x] `solana/finality.ts` — `getTransaction(finalized)` gate — **DONE**
+- [x] `solana/parse.ts` — `preTokenBalances`/`postTokenBalances` inflow extraction — **DONE**
+- [x] `solana/memo.ts` — `bb:<addr>` memo parsing + base58 decode — **DONE**
+- [x] `attribution.ts` — combines inflow + memo → `AttributedDeposit` — **DONE**
+- [x] `l1/client.ts` — M2: `pollDepositStatus`, M3-stub: `submitBridgeDeposit` — **DONE**
+- [x] `l1/messages.ts` — canonical `BRIDGE_DEPOSIT:` message builder — **DONE**
+- [x] `l1/sign.ts` — M3 Ed25519 signing stub — **DONE**
+- [x] `reconciler.ts` — re-drives Retry + AwaitingFinality + stale Submitting — **DONE**
+- [x] `server.ts` — `/health` + `/metrics` (Prometheus text) — **DONE**
+- [x] `metrics.ts` — in-process counters/gauges — **DONE**
+- [x] `index.ts` — poll loop + reconciler tick + graceful startup — **DONE**
+- [x] `npx tsc --noEmit` — **0 errors** — **DONE**
+- [x] Wired into `sequencer/package.json` workspaces + `dev:bridge` script — **DONE**
+- [ ] M3: `POST /bridge/deposit` L1 endpoint + bridge-authority key (enables memo-only attribution)
 
 **Prerequisite env vars for Day 11:**
 ```

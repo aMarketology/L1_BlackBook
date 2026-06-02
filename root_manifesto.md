@@ -29,13 +29,14 @@ The L1 is a Solana-architecture-inspired chain written entirely in Rust, running
 | Slot time | **400 ms** |
 | Hashes per tick | 12,500 (SHA-256) |
 | Ticks per slot | 64 |
-| Epoch length | 432,000 slots (~3 days) |
-| Finality model | 32 consecutive confirmations → **ROOTED** (irreversible) |
-| Supermajority | 2/3+ stake on a slot = CONFIRMED |
-| Node model | 1 Writer (block producer) + up to 100 Readers (validators) |
+| Epoch length | 432,000 slots (~2 days at 400 ms) |
+| Finality model (live) | PoH-ordered, 2-confirmation tracker (`CONFIRMATIONS_REQUIRED = 2`) |
+| Finality model (Tower design) | 32 consecutive confirmed slots → **ROOTED** — multi-validator only, not yet active |
+| Supermajority | 2/3+ stake on a slot = CONFIRMED (trivially 100% with a single self-voting writer today) |
+| Node model | 1 Writer (block producer) + up to 100 Readers (currently read-only replicas, not voting validators) |
 
-- **PoH Clock** provides a deterministic, cryptographic timestamp for every transaction — no clock-skew debates, no mempool-ordering games.
-- **Tower BFT** uses exponential lockout voting (`2^(depth+1)` slots per confirmation), making rollbacks exponentially expensive.
+- **PoH Clock** provides a deterministic, cryptographic timestamp for every transaction — no clock-skew debates, no mempool-ordering games. **(Live.)**
+- **Tower BFT** uses exponential lockout voting (`2^(depth+1)` slots per confirmation), making rollbacks exponentially expensive. **(Scaffolded — single-writer self-vote only today; see "Consensus — Current Implementation Status" in [docs/Manifesto.md](docs/Manifesto.md).)**
 - **Gulf Stream** eliminates the global mempool entirely. Reader nodes forward transactions directly to the upcoming Writer node with an 8-slot lookahead, pre-filling its queue before the slot arrives. Cache: up to 300K pending transactions.
 
 #### Execution: Sealevel Parallel Processing
@@ -244,7 +245,6 @@ The L3 is a specialized app-chain / app-ecosystem where creators mint NFTs that 
 ### Green — Production-Ready
 
 - ✅ PoH clock (continuous, stable 400ms slots)
-- ✅ Tower BFT voting & finality (32-confirmation rooting)
 - ✅ Gulf Stream (mempool-less transaction forwarding)
 - ✅ Sealevel parallel execution (conflict detection, lock manager, bounded retry)
 - ✅ Transaction pipeline (4-stage async processing)
@@ -252,7 +252,7 @@ The L3 is a specialized app-chain / app-ecosystem where creators mint NFTs that 
 - ✅ Deposit gateway (custody watcher on Solana + BSC)
 - ✅ Withdrawal gateway (dealer address-based releases)
 - ✅ ReDB persistence (ACID transactions)
-- ✅ Turbine shredding (block propagation with FEC)
+- ✅ Turbine shredding **into FEC shreds** (single-node; network propagation + real shred signatures not yet wired — see Yellow)
 - ✅ Network throttler & circuit breaker
 - ✅ Atomic nonce deduplication (DashMap `entry()` API — replay protection)
 - ✅ Ed25519 signature enforcement on all signed endpoints
@@ -263,6 +263,7 @@ The L3 is a specialized app-chain / app-ecosystem where creators mint NFTs that 
 
 ### Yellow — Planned / Partially Wired
 
+- 🟡 **Tower BFT consensus** (vote-tower, lockout, fork-choice, and rooting logic all exist in `runtime/consensus.rs`, but the live chain runs a **single self-voting writer** — no real quorum, votes are unsigned SHA-256 digests, blocks are unsigned, and Readers trust the writer's state. Decentralization = the Layer 0 work.)
 - 🟡 P2P Gossip (Turbine propagation logic exists, not fully wired — Phase 5+)
 - 🟡 PDA Derivation (struct exists, Layer 5+ feature)
 - 🟡 Creator Coin AMM (Anchor program structure present, integration planned)

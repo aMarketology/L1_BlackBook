@@ -354,6 +354,13 @@ pub struct AppState {
     /// forwarded to the Writer so local and Hetzner state stay identical.
     /// `None` when running as a Writer node.
     pub writer_http_url: Option<String>,
+
+    // ===== Vault Claim Signer (KMS / Local Ed25519) =====
+    /// Signs "CLAIM:{poh_slot}:{amount}:{user_pubkey}" attestations verified
+    /// by the Solana Anchor vault program via the Ed25519 sysvar.
+    /// Loaded from AWS_KMS_KEY_ID (KMS) or VAULT_SIGNER_PRIVATE_KEY (local).
+    /// `None` when neither env var is set — vault claim endpoints return 503.
+    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
 }
 
 // ============================================================================
@@ -2794,9 +2801,6 @@ fn build_router(state: AppState) -> Router {
         // Production
         "https://blackbook.id".parse().unwrap(),
         "https://wallet.blackbook.id".parse().unwrap(),
-        // Tauri desktop app (WebView origin)
-        "tauri://localhost".parse().unwrap(),
-        "https://tauri.localhost".parse().unwrap(),
         // Local dev (Vite on 5173, fallback ports)
         "http://localhost:5173".parse().unwrap(),
         "http://localhost:5174".parse().unwrap(),
@@ -2903,6 +2907,10 @@ fn build_router(state: AppState) -> Router {
         .route("/nft/:collection_id/:token_id", get(contracts::nft_bridge::get_nft_handler))
         .route("/nft/:collection_id/:token_id/owner", get(contracts::nft_bridge::get_nft_owner_handler))
         .route("/nft/transfer", post(contracts::nft_bridge::transfer_nft_handler))
+        // Vault Gateway (BB burn → wUSDT credit + KMS claim attestation)
+        .route("/vault/kms-pubkey", get(contracts::vault_gateway::kms_pubkey_handler))
+        .route("/vault/burn", post(contracts::vault_gateway::burn_handler))
+        .route("/vault/claim-attestation", post(contracts::vault_gateway::claim_attestation_handler))
         // Oracle
         .route("/oracle/nodes", get(contracts::oracle::list_oracle_nodes_handler))
         .route("/oracle/event/:market_id", get(contracts::oracle::oracle_event_handler))
@@ -3764,6 +3772,7 @@ async fn main() {
         deposit_requests,
         custody_watcher: custody_watcher.clone(),
         bsc_watcher: bsc_watcher_arc.clone(),
+        bridge_authority_pubkey: std::env::var("BRIDGE_AUTHORITY_PUBKEY").unwrap_or_default(),
         dealer_address,
         withdrawal_requests,
         withdrawal_seq_counter,
@@ -3782,6 +3791,7 @@ async fn main() {
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
         turbine_readers: turbine_readers.clone(),
+        vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
         writer_http_url: if config.mode == NodeMode::Reader {
             // Derive the Writer's HTTP URL from its gRPC address.
             // gRPC default port 50051 → HTTP port 8080.

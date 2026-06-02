@@ -42,8 +42,20 @@ Thumbs.db
 # Wallet secrets — never commit
 real_wallets/
 *.keypair.json
-
+# blackbook-wallet lives in its own repo (aMarketology/blackbook-wallet)
+blackbook-wallet/
 # Live chain database — binary, too large for git, regenerated on node start
 blockchain_data/
+# Sequencer runtime data (SQLite DB + WAL/SHM)
+sequencer/**/data/*.sqlite
+sequencer/**/data/*.sqlite-wal
+sequencer/**/data/*.sqlite-shm
 
+# Sequencer compiled output (TypeScript dist)
+sequencer/**/dist/
+
+# Sequencer secrets
+sequencer/.env.l2
+sequencer/.env.l3
+sequencer/.env.l5
 claim.mjs
