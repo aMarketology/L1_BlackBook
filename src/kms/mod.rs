@@ -49,7 +49,8 @@ impl VaultSigner {
         if let Ok(key_id) = std::env::var("AWS_KMS_KEY_ID") {
             if !key_id.is_empty() {
                 warn!("⚠️  AWS_KMS_KEY_ID is set ({}) but KMS signer is not yet implemented — falling back to local signer", &key_id[..8.min(key_id.len())]);
-                // TODO: return Some(VaultSigner::Kms(KmsSigner::new(key_id)))
+                // KMS backend deferred: add aws-sdk-kms to Cargo.toml, implement KmsSigner,
+                // then replace this branch with: return Some(VaultSigner::Kms(KmsSigner::new(key_id)))
             }
         }
 
