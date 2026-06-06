@@ -35,6 +35,13 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
   const app = express();
   app.use(express.json());
 
+  // ── GET /health ──────────────────────────────────────────────────────────
+  // Used by Docker health check and load balancers.
+  app.get('/health', (_req, res) => {
+    const batchId = getLatestBatchId(db, 'L2');
+    res.json({ status: 'ok', rollup: 'L2', latest_batch_id: batchId });
+  });
+
   // ── POST /register-lock ─────────────────────────────────────────────────
   // User submits a lock_id from L1. Sequencer verifies → consumes on L1 →
   // credits off-chain balance. After this the user bets at L2 speed.
@@ -64,15 +71,16 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
   });
 
   // ── GET /proof/:address ─────────────────────────────────────────────────
-  // Build an exit-ready Merkle inclusion proof for `address` against the
-  // CURRENT balance set (which equals the latest sealed batch as long as no
-  // balance has changed since the last seal). Returns everything the L1
-  // POST /rollup/L2/exit handler needs except the user's own signature.
-  //
-  // Note: sibling_is_right is all-false because the L1 verifier's hash_pair
-  // sorts (min,max) internally, so direction is irrelevant.
-  app.get('/proof/:address', (req, res) => {
+  // Returns a Merkle inclusion proof for `address` against the latest SEALED
+  // batch. A fresh seal is triggered first so the proof is always valid against
+  // the root L1 has stored. Pass the returned batch_id + proof to
+  // POST /rollup/L2/exit on L1.
+  app.get('/proof/:address', async (req, res) => {
     const address = req.params.address;
+
+    // Seal current state first so proof matches the root L1 has stored.
+    await sealAndSubmit(config, db, 0).catch(() => { /* ignore if nothing to seal */ });
+
     const balances = getAllBalances(db);
     if (balances.length === 0) {
       res.status(404).json({ error: 'No balances to prove against' });
@@ -95,7 +103,7 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
     const siblings = proofs[idx];
     const batchId = getLatestBatchId(db, 'L2');
     if (batchId === 0) {
-      res.status(409).json({ error: 'No batch sealed yet — resolve a market or wait for a PoH seal' });
+      res.status(409).json({ error: 'No batch sealed yet — place a bet and try again' });
       return;
     }
 

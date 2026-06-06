@@ -17,11 +17,11 @@ export interface SequencerKeypair {
 export interface SequencerConfig {
   /** Which rollup this sequencer manages. */
   rollupId: RollupId;
-  /** BlackBook L1 HTTP API base URL, e.g. "http://91.98.196.34:8080". */
+  /** BlackBook L1 HTTP API base URL, e.g. "https://layer1.blackbook.id". */
   l1HttpUrl: string;
   /**
    * BlackBook L1 WebSocket URL for slot notifications.
-   * e.g. "ws://91.98.196.34:8080/ws"
+   * e.g. "wss://layer1.blackbook.id/ws"
    * Sends `slotSubscribe` → receives `slotNotification` push events.
    */
   l1WsUrl: string;

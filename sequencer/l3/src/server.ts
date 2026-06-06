@@ -2,6 +2,28 @@ import express from 'express';
 import { ed25519 as ed } from '@noble/curves/ed25519';
 import { hexToBytes } from '@noble/hashes/utils';
 import type { SequencerConfig, DatabaseType } from '@bb/shared';
+
+// ─── Base58 address helper ────────────────────────────────────────────────────
+// Converts a 32-byte hex Ed25519 public key to its base58 wallet address.
+// Used so the transfer ownership check works whether the mint stored the
+// address as base58 (the normal wallet format) or as hex.
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function pubkeyHexToAddress(hex: string): string {
+  const bytes = hexToBytes(hex);
+  let num = BigInt('0x' + Buffer.from(bytes).toString('hex'));
+  const base = BigInt(58);
+  let result = '';
+  while (num > 0n) {
+    result = BASE58_ALPHABET[Number(num % base)] + result;
+    num = num / base;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    result = '1' + result;
+  }
+  return result;
+}
 import { buildLeafPreimage, hashLeaf, buildMerkleTree } from '@bb/shared';
 import type { NftEntry } from '@bb/shared';
 import {
@@ -121,19 +143,22 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
       return;
     }
 
-    // Verify signer is the current owner — public_key == owner_address on record.
+    // Verify signer is the current owner.
+    // owner_address is stored as base58 wallet address; public_key is 64-char hex.
+    // Derive the base58 address from the hex key so the formats match.
     const nft = getNft(db, collection_id, token_id);
     if (!nft) {
       res.status(404).json({ error: `NFT ${collection_id}/${token_id} not found` });
       return;
     }
-    if (nft.owner_address !== public_key) {
+    const signerAddress = pubkeyHexToAddress(public_key);
+    if (nft.owner_address !== signerAddress) {
       res.status(403).json({ error: `Signer is not the owner of ${collection_id}/${token_id}` });
       return;
     }
 
     try {
-      transferNft(db, collection_id, token_id, public_key, new_owner);
+      transferNft(db, collection_id, token_id, signerAddress, new_owner);
       res.json({ collection_id, token_id, new_owner });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
