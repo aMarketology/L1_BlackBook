@@ -8,6 +8,8 @@
 node_modules/
 package-lock.json
 yarn.lock
+# Sequencer is a Node.js subproject — its lockfile is required for Docker npm ci
+!sequencer/package-lock.json
 
 # Environment Variables
 .env
