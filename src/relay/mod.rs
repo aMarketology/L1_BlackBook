@@ -8,7 +8,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use tokio::sync::broadcast;
@@ -152,9 +152,6 @@ pub struct WriterRelayService {
 
     /// Number of currently connected readers
     connected_readers: Arc<AtomicU32>,
-
-    /// Latest slot (updated by broadcast receiver)
-    latest_slot: Arc<AtomicU64>,
 }
 
 impl WriterRelayService {
@@ -171,7 +168,6 @@ impl WriterRelayService {
             validator_id,
             start_time: Instant::now(),
             connected_readers: Arc::new(AtomicU32::new(0)),
-            latest_slot: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -318,7 +314,7 @@ impl ValidatorRelay for WriterRelayService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let latest = self.latest_slot.load(Ordering::Relaxed);
+        let latest = self.block_producer.current_slot();
         let latest_hash = self.block_producer.get_block(latest)
             .map(|b| b.hash.clone())
             .unwrap_or_default();

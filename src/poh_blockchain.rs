@@ -1394,6 +1394,11 @@ impl BlockProducer {
         self.blocks.read().len()
     }
 
+    /// Get the current PoH slot (live, shared with the main loop)
+    pub fn current_slot(&self) -> u64 {
+        self.current_slot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Get pending transaction count
     pub fn pending_tx_count(&self) -> usize {
         self.pending_txs.read().len()
