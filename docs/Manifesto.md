@@ -1,198 +1,148 @@
-﻿# BlackBook — Technical Manifesto
+# BlackBook — Manifesto
 
-> **v1.0.0 — June 2026. Production node live. L2 sequencer live. 502 tx/s validated.**
-> Node: `91.98.196.34:8080` · Git tag: `v1.0.0` (commit `4224b0c`)
-
----
-
-## The Core Premise
-
-Prediction markets don't need a general-purpose blockchain. They need one thing: a chain that settles bets as fast as they are made, without leaking capital to MEV, without latency from consensus bloat, and without trusting a human operator with the funds.
-
-BlackBook is that chain. Purpose-built for high-frequency L2 prediction markets. Every architectural decision — PoH ordering, Sealevel parallelism, the Universal Rollup Hub — exists to make the L2 engine credible and fast.
+> **The Ultimate Vessel for Fast Transactions, Prediction Markets, and Creator Copyright Protection.**
 
 ---
 
-## v1.0.0 Production Status
+## The Vision
 
-| Metric | Value |
-|--------|-------|
-| **Sustained TPS (validated)** | **502 tx/s (Hetzner CX42, June 2026)** |
-| Peak (burst) | ~1,200 tx/s |
-| PoH slot time | 400 ms |
-| L1 HTTP port | :8080 (Axum) |
-| L1 UDP TPU port | :8003 (bincode, 8 workers) |
-| Persistent store | ReDB (`blockchain_data/blockchain.redb`) |
-| In-memory cache | DashMap (write-behind over ReDB) |
-| Auth model | Ed25519 everywhere |
-| L2 smoke test | 8 steps, all passing on live Hetzner |
-| Build | `cargo build --release`, zero errors |
-| Git | tag `v1.0.0`, pushed to `aMarketology/L1_BlackBook` |
+BlackBook is a **Consortium / Permissioned Layer 1** — a purpose-built, three-layer blockchain stack
+modeled after the institutional infrastructure that powers global finance. Like Visa's settlement
+backbone or Swift's interbank rails, BlackBook is not open to anonymous participation. It is a
+vetted, exclusive network of institutional-grade validator nodes delivering sub-second finality
+with the security guarantees of a private enterprise network and the auditability of a public chain.
+
+1. **Layer 1 — The Vessel.** A hyper-fast, permissioned base-layer blockchain for sub-second transaction finality, capital bridging, and cryptographic truth. Only whitelisted validators produce and verify blocks.
+2. **Layer 2 — The Rollup.** A scalable execution environment built specifically for high-frequency prediction market trading, settling back to L1.
+3. **Layer 3 — The Creator Shield.** A specialized app-chain for creators to mint, track, and enforce NFT copyrights across the open internet.
+
+The Layer 1 does not try to do everything. It **perfectly anchors everything**.
 
 ---
 
-## Consensus: PoH + Tower BFT
+## Layer 1 — The Vessel
+
+### Chain Specs
 
 | Parameter | Value |
 |-----------|-------|
-| Slot time | **400 ms** |
-| Hashes per tick | 12,500 (SHA-256) |
-| Ticks per slot | 64 |
-| Epoch length | 432,000 slots (~2 days) |
-| Finality (current) | PoH-ordered, 2-confirmation tracker |
-| Finality (design) | 32 confirmed slots → ROOTED (multi-validator when available) |
-| Node model | 1 Writer + up to 100 Readers (read-only replicas) |
+| Slot time | 400 ms |
+| Block capacity | 50,000 txs/block |
+| Theoretical TPS | 125,000 |
+| Sustained TPS (tested) | 230 |
+| Epoch length | 432,000 slots (~3 days) |
+| Finality | 32 confirmations → ROOTED (irreversible) |
+| Signature scheme | Ed25519 |
+| Storage | ReDB (ACID) + DashMap (hot cache) |
+| Language | Rust — no VM overhead |
 
-- **PoH Clock** — deterministic, cryptographic timestamp for every transaction. No clock-skew debates, no mempool-ordering games.
-- **Tower BFT** — exponential lockout voting (`2^(depth+1)` slots per confirmation). Rollbacks become exponentially expensive. Currently single-writer self-vote; multi-validator designed and scaffolded.
-- **Gulf Stream** — eliminates global mempool. Reader nodes forward transactions to the next block producer with 8-slot lookahead. Up to 300K pending transactions cached.
+### Consensus: PoH + Tower BFT (Permissioned Validator Set)
 
----
+- **Proof of History** provides a deterministic, cryptographic timestamp for every transaction — no clock-skew, no mempool games.
+- **Tower BFT** uses exponential lockout voting (`2^(depth+1)` slots per confirmation), making rollbacks exponentially expensive. Voting power is denominated in `u64` lamports — no floating-point arithmetic anywhere in the consensus path.
+- **Gulf Stream** eliminates the global mempool. Readers forward transactions directly to the upcoming Writer with an 8-slot lookahead, pre-filling its queue before the slot arrives.
+- **Validator Whitelist** (`APPROVED_VALIDATORS`): an on-chain-admin-controlled registry binding Ed25519 public key → static IP. UDP packets from unknown IPs are dropped at the socket layer before any signature verification — zero CPU cost for spam.
 
-## Execution: Sealevel O(N) Parallel Scheduler
+### Execution: Sealevel Parallel Processing
 
-All non-conflicting transactions execute simultaneously across every CPU core.
+All non-conflicting transactions execute **simultaneously** across every CPU core. `AccountLockManager` enforces per-account read/write exclusivity per batch. Dynamic batch tuning: 2,048 txs optimal; auto-shrinks if conflict rate exceeds 25%.
 
-### Algorithm (v1.0.0 — O(N) per-account queue)
+### Block Propagation: Turbine Permissioned Gossip
 
-```rust
-// Sort by priority desc — Local Fee Market
-transactions.sort_unstable_by(|a, b| b.priority.cmp(&a.priority));
+Shred size: 1,232 bytes (UDP MTU). 32 data + 32 coding shreds per FEC set (50% Reed-Solomon erasure).
 
-// Single forward pass: O(N) total
-let mut next_free: HashMap<String, usize> = HashMap::new();
-for tx in &transactions {
-    let slot = tx.accounts.iter()
-        .filter_map(|a| next_free.get(a))
-        .copied().max().unwrap_or(0);
-    batches[slot].push(tx);
-    for a in &tx.accounts { next_free.insert(a.clone(), slot + 1); }
-}
-// Each batch[i] is conflict-free — safe to Rayon-parallel-execute
-```
-
-**Before v1.0.0:** O(N²) scan-and-retry loop. 1,000 txs on one hot account → ~500,000 iterations.  
-**After v1.0.0:** O(N) single pass. 1,000 txs on one hot account → 1,000 iterations, 1,000 serial batches.
-
-### Local Fee Market
-
-Transactions carry a `priority: u64` (lamports/compute-unit). Higher priority → earlier slot assignment on contested accounts. This is a direct implementation of Solana's Local Fee Market: users bid for write access to hot accounts without slowing down uncontested accounts.
-
-### Key Properties
-
-- `AccountLockManager` enforces per-account read/write exclusivity per batch.
-- Dynamic batch tuning: 2,048 txs optimal; shrinks if conflict rate exceeds 25%.
-- An NFT mint on L3 settling to L1 will **never** slow down a stablecoin transfer in the same slot.
+Topology: **VIP Mesh** — the Writer shreds a block and distributes shreds across the approved validator set. Each approved node, trusting the others by whitelist membership, immediately re-broadcasts its shred to the rest of the peer group. The Writer expends a fraction of the bandwidth; the block propagates globally across all consortium nodes in milliseconds. Nodes outside the whitelist never receive a single shred.
 
 ---
 
-## Transaction Pipeline: 4-Stage Async
+## The Token Economy
 
-```
-FETCH → VERIFY → EXECUTE → COMMIT
-```
+BlackBook runs a two-token settlement economy. MAXX, DECAY, and OZ have been removed and are archived in `archive/contracts/`.
 
-1. **FETCH** — Receive from network/RPC (UDP TPU + HTTP).
-2. **VERIFY** — Validate Ed25519 signatures (16 parallel workers).
-3. **EXECUTE** — Process via Sealevel (parallel account locking).
-4. **COMMIT** — Batch finalize + broadcast (128 txs per batch).
+### `$BB` — The Native Gas Token
 
-Buffer: 100K packets per stage. Pipeline latency: microsecond range.
-
----
-
-## Token Economy
-
-### `$BB` — Native Gas Token
-
-| Property | Value |
-|----------|-------|
-| Decimals | 5 |
-| Unit | `LAMPORTS_PER_BB = 100_000` |
-| Purpose | Gas, betting collateral, oracle bonds |
-| Bridge rate | 10 BB = 1 wUSDT (fixed, dealer market-maker) |
-| Faucet cap | 0.1 BB per request (production) |
-
+- **1 BB = $0.10 USD.** Fixed. No oracle. No float. 10 BB = 1 wUSDT.
+- 5 decimal places: 1 BB = 100,000 lamports. Minimum unit: $0.000001.
+- Backed 10:1 by wUSDT reserves (enforced on-chain at every boot).
 - Powers all gas, all prediction market stakes, all oracle bonds.
 - Bridged in via Solana/BSC custody wallet → minted on L1 at 10:1.
 - Bridged out by burning BB → releasing stablecoin from custody.
 
 ### `wUSDT` — Wrapped Stablecoin Reserve
 
-| Property | Value |
-|----------|-------|
-| Decimals | 6 |
-| Unit | `USDC_UNIT = 1_000_000` |
-| Purpose | Swap reserve, stablecoin backing |
-
-- Held in the swap pool PDA as sole backing reserve for BB.
-- Swappable against BB at fixed 10:1 via `POST /swap/bb-to-usdc` and `POST /swap/usdc-to-bb`.
+- 6 decimal places. 1 wUSDT = 1,000,000 micro-units.
+- Held in the swap pool PDA as the sole backing reserve for BB.
+- Swappable against BB at the fixed 10:1 rate via `POST /swap/bb-to-usdc` and `POST /swap/usdc-to-bb`.
 - Not AMM-priced — dealer market-maker only.
 
-> **Removed:** MAXX, DECAY, OZ — all archived. Do NOT restore.
+> **Removed:** MAXX (bonding-curve governance), DECAY (per-instance utility), OZ (premium access) — all archived. Do NOT restore.
 
 ---
 
-## L1 Native Contracts
+## Smart Contracts (Layer 1 Native Modules)
 
 | Contract | Purpose | Status |
 |----------|---------|--------|
-| **Universal Rollup Hub** | lock_bb / submit_root / exit for all L2/L3/L5 rollups | ✅ Live |
-| **NFT Bridge** | L1-side NFT anchoring via Rollup Hub exit | ✅ Live |
-| **Token Swap** | BB ↔ wUSDT fixed-rate swap (10:1) | ✅ Live |
-| **Deposit Gateway** | wUSDT → BB bridge-in | ✅ Live |
-| **Withdrawal Gateway** | BB → wUSDT bridge-out | ✅ Live |
-| **Oracle** | Node registration, dispute staking, vote + finalize | ✅ Live |
-| **Global Escrow** | Legacy System A escrow (frozen for new entries) | ✅ Claim windows still open |
+| **Global Escrow** | Legacy PDA vault for L2 prediction markets (System A). Deposits, Merkle roots, winner payouts. | ✅ Live — freeze new entries |
+| **Universal Rollup Hub** | New settlement path for all L2/L3/L5 rollups. lock_bb / submit_root / exit. | ✅ Live |
+| **NFT Bridge** | L1-side NFT anchoring. put_nft / get_nft via Rollup Hub exit. | ✅ Live |
+| **Deposit Gateway** | wUSDT → BB 10:1 bridge-in. Custody wallet monitoring on Solana + BSC. | ✅ Live |
+| **Withdrawal Gateway** | BB → wUSDT bridge-out. Burn BB, release stablecoin. | ✅ Live |
+| **Token Swap** | BB ↔ wUSDT fixed-rate swap (10:1). Pool-backed, no private key. | ✅ Live |
+| **Oracle** | Node registration, dispute staking ($BB), vote + finalize. | ✅ Live |
 
 ---
 
 ## L2 Settlement Protocol
 
-### System B — Universal Rollup Hub (current, all new markets)
+Two settlement paths co-exist during migration. All new markets use System B.
 
+### System B — Rollup Hub (current)
 ```
 User locks $BB → POST /rollup/L2/lock_bb → lock_id returned
 L2 accepts bet off-chain (sequencer reads lock)
 Market resolves → sequencer builds Merkle tree
-  leaf    = SHA-256( "L2:BB:{address}:{balance_lamports}" )
-  combine = SHA-256( min(a,b) || max(a,b) )   // sorted-pair hash
-→ POST /rollup/L2/submit_root  (sequencer Ed25519-signed)
+  leaf = SHA-256( "L2:BB:{address}:{balance_lamports}" )  // UTF-8 string
+  combine = SHA-256( min(a,b) || max(a,b) )                // sorted-pair
+→ POST /rollup/L2/submit_root  (sequencer signed)
 → Users exit via POST /rollup/L2/exit  (with Merkle proof)
 ```
 
-**Security guarantees:**
-- Monotonic batch_id: L1 rejects any root with ID ≤ last accepted.
-- Double-spend seal: `ROLLUP_CONSUMED_EXITS` table in ReDB — permanent.
-- Per-rollup vault PDA isolation: L2 funds can never touch L3 vault.
-- Sequencer pubkey locked at startup from `L2_SEQUENCER_PUBKEY` env var.
+### System A — Legacy Global Escrow (frozen, claim windows still open)
+```
+Dealer pre-funds escrow → POST /escrow/deposit
+Market resolves → build Merkle tree
+  leaf = SHA-256( bs58_decode(wallet)[32] || payout_spl_u64_le[8] )  // binary
+→ POST /escrow/submit-state-root  (L2 sequencer binary-signed)
+→ Users withdraw via POST /escrow/withdraw  (with Merkle proof)
+```
+
+**Security guarantees (both systems):**
+- Monotonic batch/block ID: L1 rejects any root with ID ≤ last accepted
+- Double-claim prevention: `ROLLUP_CONSUMED_EXITS` permanent seal in ReDB
+- Claim window (System A only): 6,480,000 slots (~30 days) from settlement
+- System B: per-rollup vault PDA — balances are ground truth, no zero-sum needed
 
 ---
 
 ## Security Architecture
 
-| Property | Implementation |
-|----------|---------------|
-| Ed25519 auth | Every state-changing endpoint. No unsigned writes. |
-| Replay protection | Nonce + 60s timestamp window. `DashMap entry()` atomic check. |
-| Crash safety | ReDB written **before** DashMap. No state regression on restart. |
-| Admin gate | `unsafe_admin` compile-time feature flag. Off in production builds. |
-| Input safety | No `.unwrap()` on user data anywhere in codebase. |
-| Rate limiting | `NetworkThrottler`: 10 tx/window/wallet. |
-| CORS | Locked to explicit origins. |
+- Ed25519 on every state-changing endpoint — no unsigned writes.
+- Nonce + 60-second timestamp window — no replay attacks.
+- ReDB written **before** DashMap — crash-safe, no state regression on restart.
+- `unsafe_admin` feature flag — admin endpoints compile-time gated for production.
+- No `.unwrap()` on user input anywhere in the codebase.
+- Sealevel bounded retry with exponential backoff — no infinite spin-locks.
 
 ---
 
 ## Why BlackBook Exists
 
-Every major prediction market platform today is:
+Every major prediction market platform today is either:
+- Slow (Polymarket settles in hours, not seconds)
+- Centralized (Kalshi is a licensed exchange with KYC gates)
+- Financially fragile (onchain AMMs leak to MEV bots on every bet)
 
-- **Slow** — Polymarket settles in hours, not milliseconds.
-- **Centralized** — Kalshi is a licensed exchange with KYC gates.
-- **Financially fragile** — Onchain AMMs leak to MEV bots on every bet.
+BlackBook builds the infrastructure layer that doesn't exist yet: a sub-second, permissioned settlement chain where prediction markets are first-class citizens, capital is mathematically safe, and creators can prove copyright without begging a platform. The consortium model means no MEV bots, no Sybil attacks, no anonymous validator pollution — only trusted institutions with skin in the game.
 
-BlackBook builds the infrastructure layer that does not exist yet: a sub-second settlement chain where prediction markets are first-class citizens, capital is mathematically safe, and creators can prove copyright without begging a platform.
-
-At 502 tx/s sustained, the L1 already outpaces every settlement chain designed for general-purpose use. The Sealevel O(N) scheduler means adding L3 NFT mints or L5 creator economy trades does not degrade L2 market throughput. Every layer is isolated. Every exit is proven.
-
-**BlackBook is the layer under everything.**
+**BlackBook is the exclusive layer under everything.**

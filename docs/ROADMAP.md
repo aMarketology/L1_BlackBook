@@ -2,6 +2,10 @@
 
 > **Last updated: June 2026 — v1.0.0 production milestone tagged.**
 > Production node: `91.98.196.34:8080` · Tag: `v1.0.0` (commit `4224b0c`)
+>
+> **Network model: Consortium / Permissioned Layer 1.**
+> Only whitelisted Ed25519-keyed validator nodes participate in consensus and receive block shreds.
+> This is the architectural north star for all P2P and consensus work.
 
 ---
 
@@ -9,10 +13,10 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    BLACKBOOK L1  (Settlement Layer)                 │
+│           BLACKBOOK L1  (Consortium / Permissioned Settlement)      │
 │   PoH · Tower BFT · Sealevel O(N) · Gulf Stream · Turbine          │
 │   Universal Rollup Hub · NFT Bridge · SPL Token Engine             │
-│   BB + wUSDT economy  ·  Ed25519 auth everywhere                   │
+│   BB + wUSDT economy  ·  Ed25519 auth  ·  Whitelist Validator Mesh │
 └────────┬──────────────┬──────────────┬──────────────┬──────────────┘
          │              │              │              │
     ┌────▼────┐    ┌────▼────┐    ┌───▼────┐    ┌───▼─────┐
@@ -40,7 +44,7 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 | Sealevel parallel execution (Rayon thread pool) | ✅ |
 | **O(N) per-account queue scheduler** | ✅ v1.0.0 |
 | **Local Fee Market (priority lanes on hot accounts)** | ✅ v1.0.0 |
-| Turbine shredding (1,232-byte UDP shreds, RS FEC 32+32) | ✅ Shredding works; propagation scaffolded |
+| Turbine shredding (1,232-byte UDP shreds, RS FEC 32+32) | ✅ Shredding works; permissioned gossip planned Phase 7 |
 | SvmAccountsDB (DashMap hot + ReDB durable) | ✅ |
 | SPL Token engine (Mint, TokenAccount, ATA) | ✅ |
 | JSON-RPC (28 Solana-compatible methods, port 8899) | ✅ |
@@ -116,47 +120,64 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 
 ---
 
-## 🔄 PHASE 5 — Frontend Integration (CURRENT PRIORITY)
+## ✅ PHASE 5 — Frontend Integration (COMPLETE)
 
-Wire the React wallet at `blackbook-wallet/` to the live L2 sequencer.
-
-| Item | Status |
-|------|--------|
-| L1 balance fetch (`GET /balance/:addr`) | ✅ Already wired |
-| L2 balance fetch (`GET {L2}/balances/:addr`) | ❌ |
-| Lock BB into L2 (`POST /rollup/L2/lock_bb` via wallet) | ❌ |
-| Create market (L2 POST `/markets`) | ❌ |
-| Place bet (L2 POST `/markets/:id/bet`) | ❌ |
-| Exit to L1 with Merkle proof | ❌ |
-| Market list + live odds display | ❌ |
-| Transaction history from L1 | ❌ |
-| Environment config (`VITE_L2_URL`, `VITE_L1_URL`) | ❌ |
-
----
-
-## 📋 PHASE 6 — Deploy L2 to Hetzner
-
-Run the L2 sequencer in production alongside L1 on the same server.
+React wallet wired to live L2 sequencer at `https://layer2.blackbook.id/seq`.
 
 | Item | Status |
 |------|--------|
-| Dockerfile for L2 sequencer | ❌ |
-| `docker-compose.prod.yml` L2 service entry | ❌ |
-| `L2_SEQUENCER_PRIVKEY` in Hetzner `.env` | ❌ |
-| Nginx proxy for L2 (`:7072` internal → `/l2/`) | ❌ |
-| Health check endpoint on L2 | ❌ |
-| PM2 or systemd watchdog | ❌ |
+| L1 balance fetch (`GET /balance/:addr`) | ✅ |
+| L2 sequencer deployed to Hetzner | ✅ June 2026 |
+| `https://layer2.blackbook.id/seq/health` live | ✅ |
 
 ---
 
-## 📋 PHASE 7 — Performance: Kernel Bypass (XDP / io_uring)
+## ✅ PHASE 6 — Deploy L2 to Hetzner (COMPLETE — June 2026)
+
+| Item | Status |
+|------|--------|
+| Multi-stage Dockerfile for L2 sequencer (Node 22-alpine) | ✅ |
+| `docker-compose.prod.yml` `l2-sequencer` service | ✅ |
+| `L2_SEQUENCER_PRIVKEY` alias in Hetzner `.env` | ✅ |
+| Nginx `/seq/` → `:7072` with HTTPS (Certbot cert) | ✅ |
+| `l2-sequencer` container healthy in `docker ps` | ✅ |
+| PoH WebSocket subscription to L1 confirmed in logs | ✅ |
+
+---
+
+## 🔄 PHASE 7 — Permissioned P2P Gossip (Turbine Rewrite) — CURRENT PRIORITY
+
+Convert the star-topology Turbine from 1-Writer→N-Reader broadcast to a closed-loop
+**VIP Mesh** gossip protocol among the whitelisted consortium validator set.
+
+### Design: The Three Laws of the Consortium Network
+1. **IP Whitelist as First Defence** — UDP socket drops unknown-source packets in <1 µs, before any crypto.
+2. **Shred & Share** — Writer splits block into 1,232-byte shreds, assigns each to a different approved node. Those nodes immediately re-broadcast to the full peer set.
+3. **u64 Stake, no f64** — The `LeaderSchedule` f64 staking weights are ripped out and replaced with exact u64 lamport-denominated voting power.
+
+| Item | Status |
+|------|--------|
+| `APPROVED_VALIDATORS` registry: `Vec<(Ed25519Pubkey, SocketAddr)>` in AppState | ❌ |
+| UDP source-IP gate on `:8004` receiver — drop non-whitelisted before crypto | ❌ |
+| Ed25519-signed shred envelope (`ShredEnvelope { shred, slot, index, sig }`) | ❌ |
+| Writer → shred distribution (round-robin assign shreds to peer set) | ❌ |
+| Peer re-broadcast — each node blasts its shred to all other whitelisted peers | ❌ |
+| Shred reassembly + FEC decode on receiver nodes | ❌ |
+| `LeaderSchedule` f64 → u64 lamport staking rewrite | ❌ |
+| `GET /validators` endpoint — returns current approved set | ❌ |
+| `POST /admin/validators/add` + `/remove` (feature-gated) | ❌ |
+
+---
+
+## 📋 PHASE 8 — Performance: Kernel Bypass (XDP / io_uring)
 
 Eliminate OS network stack overhead. Target: hardware wire-speed ingestion on :8003.
+**Linux-only — implement on Hetzner node, not Windows dev box.**
 
 | Upgrade | Impact |
 |---------|--------|
 | **XDP (eXpress Data Path)** — intercept UDP at NIC before Linux kernel | Latency: ms → µs. Unlocks true 240K TPS ceiling |
-| **eBPF packet filter** — drop malformed packets pre-Rust | DDoS resilience at zero CPU cost |
+| **eBPF packet filter** — drop non-whitelisted IPs at NIC level | DDoS resilience at zero CPU cost |
 | **`io_uring`** — async disk I/O for ReDB flushes | Eliminates I/O blocking on CPU threads |
 | **NUMA-aware thread pinning** — bind Rayon workers to physical cores | Eliminates cross-socket cache misses |
 
@@ -164,7 +185,7 @@ Eliminate OS network stack overhead. Target: hardware wire-speed ingestion on :8
 
 ---
 
-## 📋 PHASE 8 — Trustlessness: ZK Validity Proofs
+## 📋 PHASE 9 — Trustlessness: ZK Validity Proofs
 
 Replace sequencer-authority trust with mathematical proof.
 
@@ -179,7 +200,7 @@ Replace sequencer-authority trust with mathematical proof.
 
 ---
 
-## 📋 PHASE 9 — Infinite Scale: Data Availability + State Pruning
+## 📋 PHASE 10 — Infinite Scale: Data Availability + State Pruning
 
 Prevent state bloat from killing performance at high TPS.
 
@@ -192,7 +213,7 @@ Prevent state bloat from killing performance at high TPS.
 
 ---
 
-## 📋 PHASE 10 — Resilience: HA Sequencer Failover
+## 📋 PHASE 11 — Resilience: HA Sequencer Failover
 
 Eliminate the L2 sequencer as a single point of failure.
 
@@ -209,9 +230,10 @@ Eliminate the L2 sequencer as a single point of failure.
 
 | Phase | Priority | Effort | Unlocks |
 |-------|----------|--------|---------|
-| 5 — Frontend | **NOW** | 1–2 weeks | Live users, revenue |
-| 6 — L2 on Hetzner | **NOW** | 2 days | Production L2 |
-| 7 — XDP | High | 2–3 weeks | 240K TPS ceiling |
-| 8 — ZK Proofs | High | 4–8 weeks | Trustless L2 |
-| 9 — DA + Pruning | Medium | 2–3 weeks | Infinite scale |
-| 10 — HA Failover | Medium | 1–2 weeks | 99.99% uptime |
+| 5 — Frontend | ✅ Done | — | — |
+| 6 — L2 on Hetzner | ✅ Done | — | — |
+| 7 — Permissioned P2P Gossip | **NOW** | 1–2 weeks | Multi-node consortium, remove Writer bandwidth SPOF |
+| 8 — XDP / io_uring | High | 2–3 weeks | 240K TPS ceiling on Hetzner |
+| 9 — ZK Proofs | High | 4–8 weeks | Trustless L2 |
+| 10 — DA + Pruning | Medium | 2–3 weeks | Infinite scale |
+| 11 — HA Failover | Medium | 1–2 weeks | 99.99% uptime |

@@ -1,22 +1,31 @@
-//! BlackBook L1 Consensus — P2P Tower Voting
+//! BlackBook L1 Consensus — Consortium / Permissioned Tower Voting
 //!
-//! 1-Writer / 100-Reader Node Model:
-//! ┌──────────────────────────────────────────────────────────────┐
-//! │  WRITER NODE (1)           │  READER NODES (up to 100)      │
-//! │  ─ Produces blocks         │  ─ Validate & vote on blocks   │
-//! │  ─ Runs PoH clock          │  ─ Replicate state via Turbine │
-//! │  ─ Executes transactions   │  ─ Serve RPC queries           │
-//! │  ─ The "leader" each slot  │  ─ Forward txs via Gulf Stream │
-//! └──────────────────────────────────────────────────────────────┘
+//! Network Model: Whitelisted Validator Mesh
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │  WRITER NODE (current leader)    │  APPROVED VALIDATOR NODES       │
+//! │  ─ Produces blocks               │  ─ Cryptographically whitelisted │
+//! │  ─ Runs PoH clock                │  ─ Vote on blocks (Tower BFT)   │
+//! │  ─ Executes transactions         │  ─ Receive shreds via VIP mesh  │
+//! │  ─ Shreds block → distributes    │  ─ Re-broadcast shreds to peers │
+//! │    shreds to approved peers      │  ─ Forward txs via Gulf Stream  │
+//! └──────────────────────┬──────────────────────────────────────────────┘
+//!                        │ Only whitelisted Ed25519 pubkeys + IPs
+//!                        │ UDP packets from unknown IPs dropped in <1µs
 //!
 //! Tower BFT Voting:
 //!   Vote on slot → lockout = 2^(depth+1) slots
 //!   32 consecutive confirmations → ROOTED (finalized, irreversible)
 //!   Supermajority = 2/3+ stake on a slot = CONFIRMED
+//!   Stake weight: u64 lamports (NOT f64 — exact integer math required)
 //!
 //! Gulf Stream:
-//!   Readers forward incoming transactions to the current Writer
+//!   Approved validators forward incoming transactions to the current Writer
 //!   so the Writer's mempool is pre-filled before its slot arrives.
+//!
+//! TECHNICAL DEBT — LeaderSchedule:
+//!   The `LeaderSchedule::update_stake()` currently uses f64 weights. This
+//!   MUST be rewritten to u64 lamport-denominated voting power as part of
+//!   Phase 7 (Permissioned Gossip). Do NOT extend the f64 path.
 
 
 
@@ -84,9 +93,12 @@ pub struct PoHEntry {
 // Reader nodes validate, vote, and replicate.
 // The schedule rotates the writer role based on engagement stake.
 
+// ⚠️  TECHNICAL DEBT: stakes uses f64 — must be migrated to u64 lamports in Phase 7.
+//      The permissioned model requires exact integer voting power, not logarithmic f64 weights.
+//      Do NOT add new callers to update_stake() until the migration is complete.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderSchedule {
-    stakes: HashMap<String, f64>,
+    stakes: HashMap<String, f64>, // TODO Phase 7: replace with HashMap<String, u64> lamports
     schedule: Vec<(u64, String)>, // (slot, leader)
     pub epoch: u64,
 }

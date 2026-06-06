@@ -2,16 +2,18 @@
 
 ## What This Codebase Is
 
-BlackBook is a custom Layer 1 blockchain written in Rust (v5.0.0, edition 2021).
-It is NOT Solana, NOT Ethereum. It is a purpose-built settlement chain for high-frequency
-L2 prediction markets. Architecture is heavily inspired by Solana internals but fully
-custom-implemented:
+BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (v5.0.0, edition 2021).
+It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain for L2
+prediction markets — modeled after institutional-grade private networks (Visa backbone, Swift, HFT
+settlement rails), NOT a permissionless public chain. Only cryptographically whitelisted validator
+nodes may participate in consensus or receive block shreds. Architecture is heavily inspired by
+Solana internals but fully custom-implemented:
 
 - **Proof of History (PoH)** clock in `runtime/poh_service.rs`
 - **Sealevel parallel execution** (read/write lock scheduling) in `runtime/sealevel.rs`
 - **Gulf Stream** mempool in `runtime/consensus.rs`
 - **Tower BFT** consensus in `runtime/consensus.rs`
-- **Turbine** block propagation (architecture defined, relay skeleton in `proto/`)
+- **Turbine** permissioned shred gossip — whitelisted VIP mesh only in `runtime/turbine.rs`
 - **SPL Token engine** (custom, not the real Solana one) in `src/svm/spl_token.rs`
 - **ReDB** as the persistent KV store (`blockchain_data/blockchain.redb`)
 - **DashMap** for in-memory state (write-behind cache over ReDB)
