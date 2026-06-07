@@ -619,8 +619,13 @@ impl SettlementService for BlackBookSettlementService {
             dispute_stake_bb_lamports: 0,
             status: PendingRootStatus::Pending,
             proposer_pubkey: submitted_pubkey_hex.clone(),
+            batch_id: 0,
+            rollup_id: String::new(),
             oracle_signatures,
             disputers: Vec::new(),
+            uphold_stake_lamports: 0,
+            discard_stake_lamports: 0,
+            voters: Vec::new(),
         };
 
         // ── PERSISTENCE: ReDB first ───────────────────────────────────────

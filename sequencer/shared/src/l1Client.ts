@@ -115,3 +115,45 @@ export async function submitRoot(
     timestamp,
   });
 }
+
+/**
+ * Submit a market outcome to the L1 Oracle dispute window.
+ * `POST /oracle/submit-pending-root`
+ *
+ * Call this AFTER `submitRoot()` succeeds for a resolved market.
+ * The L1 Oracle opens a 60-second dispute window; if no discard supermajority
+ * forms the outcome auto-finalizes and becomes queryable via GET /oracle/event/:id.
+ *
+ * Canonical signed message (no separate nonce — batchId + timestamp is unique):
+ *   `"ORACLE_SUBMIT:{rollup_id}:{market_id}:{outcome}:{merkle_root_hex}:{batch_id}:{ts}:{nonce}"`
+ *
+ * @param marketId       L2 market ID (same as used in createMarket / resolveMarket).
+ * @param outcome        "YES" | "NO" | "REFUND"
+ * @param merkleRootHex  64-char hex root — must match the submitRoot call exactly.
+ * @param batchId        Rollup Hub batch_id from the sealAndSubmit result.
+ */
+export async function submitOraclePendingRoot(
+  config: SequencerConfig,
+  marketId: string,
+  outcome: 'YES' | 'NO' | 'REFUND',
+  merkleRootHex: string,
+  batchId: number,
+): Promise<void> {
+  const timestamp = Math.floor(Date.now() / 1000);
+  // Use batchId as the nonce — monotonically increasing, unique per market + rollup.
+  const nonce = String(batchId);
+  const message = `ORACLE_SUBMIT:${config.rollupId}:${marketId}:${outcome}:${merkleRootHex}:${batchId}:${timestamp}:${nonce}`;
+  const signature = signMessage(message, config.keypair.privateKeyHex);
+
+  await httpPost(`${config.l1HttpUrl}/oracle/submit-pending-root`, {
+    rollup_id: config.rollupId,
+    market_id: marketId,
+    outcome,
+    merkle_root_hex: merkleRootHex,
+    batch_id: batchId,
+    public_key: config.keypair.publicKeyHex,
+    signature,
+    timestamp,
+    nonce,
+  });
+}

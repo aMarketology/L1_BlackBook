@@ -1,12 +1,15 @@
-//! BlackBook L1 Runtime — Settlement Layer Engine
+//! BlackBook L1 Runtime — Consensus & Execution Engine
 //!
-//! Two Core Jobs: Gatekeeper (USDT→$BB) + Invisible Security (SSS wallets)
+//! The runtime is the state-machine core of the L1: it advances the Proof of
+//! History clock, schedules parallel transaction execution, runs Tower BFT
+//! consensus, and propagates blocks across the permissioned validator mesh.
 //!
-//! Solana-inspired, improved:
-//!   - 600ms slots (stable vs Solana's fragile 400ms)
+//! Solana-inspired, fully custom-implemented:
+//!   - 400ms PoH slots driven by a dedicated OS-thread clock
+//!   - Sealevel parallel execution with account-level read/write locking
 //!   - Localized fee markets (spam only affects the spammer)
 //!   - Circuit breakers (automatic bank-run protection)
-//!   - Sealevel parallel execution with account-level locking
+//!   - Permissioned Turbine shred gossip (whitelisted validators only)
 
 pub mod core;
 pub mod sealevel;
@@ -14,6 +17,7 @@ pub mod consensus;
 pub mod poh_service;
 pub mod tpu;
 pub mod turbine;
+pub mod validator_registry;
 
 // PoH Service
 pub use poh_service::{

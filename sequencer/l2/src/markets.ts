@@ -1,6 +1,23 @@
 import { getBalance, creditBalance } from '@bb/shared';
 import type { DatabaseType } from '@bb/shared';
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * Dealer house fee rate in basis points (100 bps = 1%).
+ * The fee is taken from the total pool before pro-rata distribution to winners.
+ * Credited to DEALER_ADDRESS (configured via environment variable).
+ * Defaults to 100 bps (1%).
+ */
+const DEALER_FEE_BPS = Number(process.env.DEALER_FEE_BPS ?? '100');
+/**
+ * L1 wallet address of the market maker / prize pool operator.
+ * Receives the house fee from every resolved market.
+ * The dealer's L2 balance accumulates and is included in the Merkle tree —
+ * they exit to L1 via the same Rollup Hub proof mechanism as users.
+ */
+const DEALER_ADDRESS = process.env.DEALER_ADDRESS ?? 'dealer_reserve';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type MarketStatus = 'OPEN' | 'LOCKED' | 'RESOLVED';
@@ -175,8 +192,20 @@ export function resolveMarket(
       : BigInt(market.total_no_pool);
     const losingSide: BetSide = outcome === 'YES' ? 'NO' : 'YES';
 
+    // ── Dealer house fee ───────────────────────────────────────────────────
+    // Fee = floor(totalPool * DEALER_FEE_BPS / 10_000).
+    // Taken from totalPool before distribution so the invariant holds:
+    //   totalPool = dealerFee + sum(payouts)
+    const dealerFee = totalPool * BigInt(DEALER_FEE_BPS) / 10_000n;
+    const distributedPool = totalPool - dealerFee;
+    if (dealerFee > 0n) {
+      creditBalance(db, 'L2', DEALER_ADDRESS, 'BB', dealerFee, batchId);
+      payouts.push({ wallet_address: DEALER_ADDRESS, payout_lamports: dealerFee });
+    }
+
     if (winningPool === 0n) {
-      // Edge case: no bets on the winning side — full refund to the losing side
+      // Edge case: no bets on the winning side — full refund to the losing side.
+      // Dealer fee is NOT taken on refund — return 100% to users.
       const losers = db.prepare(`
         SELECT wallet_address, amount_lamports FROM l2_positions
         WHERE market_id = ? AND bet_side = ?
@@ -188,15 +217,15 @@ export function resolveMarket(
         payouts.push({ wallet_address: pos.wallet_address, payout_lamports: refund });
       }
     } else {
-      // Normal case: pro-rata payout from total pool to winners.
-      // payout_i = (stake_i / winningPool) * totalPool  — pure integer arithmetic.
+      // Normal case: pro-rata payout from distributedPool (after dealer fee) to winners.
+      // payout_i = (stake_i / winningPool) * distributedPool — pure integer arithmetic.
       const winners = db.prepare(`
         SELECT wallet_address, amount_lamports FROM l2_positions
         WHERE market_id = ? AND bet_side = ?
       `).all(marketId, outcome) as { wallet_address: string; amount_lamports: number }[];
 
       for (const pos of winners) {
-        const payout = (BigInt(pos.amount_lamports) * totalPool) / winningPool;
+        const payout = (BigInt(pos.amount_lamports) * distributedPool) / winningPool;
         creditBalance(db, 'L2', pos.wallet_address, 'BB', payout, batchId);
         payouts.push({ wallet_address: pos.wallet_address, payout_lamports: payout });
       }

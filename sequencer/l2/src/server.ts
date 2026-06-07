@@ -1,7 +1,7 @@
 import express from 'express';
 import { ed25519 as ed } from '@noble/curves/ed25519';
 import { hexToBytes } from '@noble/hashes/utils';
-import { getBalance, buildMerkleTree, getLatestBatchId } from '@bb/shared';
+import { getBalance, buildMerkleTree, getLatestBatchId, submitOraclePendingRoot } from '@bb/shared';
 import type { SequencerConfig, DatabaseType, BbEntry } from '@bb/shared';
 import { registerLock } from './lockIngest.js';
 import {
@@ -225,24 +225,70 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
 
   // ── POST /markets/:id/resolve ─────────────────────────────────────────────
   // Resolve a market and immediately seal a Merkle batch to L1.
-  // Oracle / admin only. TODO: add oracle signature verification.
+  // Oracle / admin only. Authenticated by the sequencer's Ed25519 key.
   //
-  // Body: { outcome: 'YES' | 'NO' }
+  // Body: { outcome: 'YES' | 'NO', public_key, signature, timestamp, nonce }
+  // Message: "L2_RESOLVE:{market_id}:{outcome}:{timestamp}:{nonce}"
   app.post('/markets/:id/resolve', async (req, res) => {
-    const { outcome } = req.body as { outcome?: string };
+    const { outcome, public_key, signature, timestamp, nonce } = req.body as {
+      outcome?: string;
+      public_key?: string;
+      signature?: string;
+      timestamp?: number;
+      nonce?: string;
+    };
     if (outcome !== 'YES' && outcome !== 'NO') {
       res.status(400).json({ error: 'outcome must be YES or NO' });
       return;
     }
+
+    // ── Sequencer-key authentication ──────────────────────────────────────
+    // Only the authorized sequencer may call /resolve.
+    if (!public_key || !signature || !timestamp || !nonce) {
+      res.status(400).json({ error: 'public_key, signature, timestamp, nonce are required' });
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - timestamp) > 60) {
+      res.status(400).json({ error: 'timestamp outside ±60 s window' });
+      return;
+    }
+    if (public_key !== config.keypair.publicKeyHex) {
+      res.status(403).json({ error: 'Caller is not the authorized sequencer' });
+      return;
+    }
+    const resolveMsg = `L2_RESOLVE:${req.params.id}:${outcome}:${timestamp}:${nonce}`;
+    if (!verifyEd25519(resolveMsg, signature, public_key)) {
+      res.status(401).json({ error: 'Invalid signature' });
+      return;
+    }
+
     try {
       const payouts = resolveMarket(db, req.params.id, outcome as MarketOutcome, 0);
-      // Immediately anchor the updated balances on L1.
+      // Immediately anchor the updated balances on L1 (Rollup Hub submit_root).
       const sealResult = await sealAndSubmit(config, db, 0);
+
+      // Submit to Oracle dispute window (non-blocking — failure is logged but
+      // does not roll back the market resolution or the Rollup Hub anchor).
+      if (sealResult) {
+        submitOraclePendingRoot(
+          config,
+          req.params.id,
+          outcome as 'YES' | 'NO',
+          sealResult.merkleRoot,
+          sealResult.batchId,
+        ).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[Oracle] submit-pending-root failed for market ${req.params.id}: ${msg}`);
+        });
+      }
+
       res.json({
         market_id: req.params.id,
         outcome,
         payout_count: payouts.length,
         batch: sealResult ?? null,
+        oracle_dispute_window_opened: sealResult !== null,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

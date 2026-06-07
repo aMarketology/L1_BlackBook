@@ -16,6 +16,10 @@ yarn.lock
 .env.local
 .env.production
 
+# Validator keypairs (Ed25519 seed files — NEVER commit private keys)
+keys/*.key
+config.toml
+
 # IDE
 .vscode/
 .idea/

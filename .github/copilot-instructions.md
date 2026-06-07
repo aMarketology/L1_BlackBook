@@ -2,11 +2,20 @@
 
 ## What This Codebase Is
 
-BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (v5.0.0, edition 2021).
+BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (engine v5.0.0, release v1.0.1, edition 2021).
 It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain for L2
 prediction markets — modeled after institutional-grade private networks (Visa backbone, Swift, HFT
 settlement rails), NOT a permissionless public chain. Only cryptographically whitelisted validator
-nodes may participate in consensus or receive block shreds. Architecture is heavily inspired by
+nodes may participate in consensus or receive block shreds.
+
+**Core identity:** the L1 is an **asset-custody ledger, state machine, and transaction execution
+environment** — nothing else. Its only relationship with keys is to (1) store a balance against a
+public key, (2) receive an Ed25519-signed transaction, and (3) verify the signature before
+executing. It NEVER generates, holds, or transmits user private keys or mnemonics — those are
+created and kept client-side only. Do NOT add fiat onramps, key-generation endpoints, or any
+custodial key handling to the L1.
+
+Architecture is heavily inspired by
 Solana internals but fully custom-implemented:
 
 - **Proof of History (PoH)** clock in `runtime/poh_service.rs`

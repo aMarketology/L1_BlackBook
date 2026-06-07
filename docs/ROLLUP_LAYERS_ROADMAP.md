@@ -1,7 +1,7 @@
 # BlackBook — Rollup Layers 2–5 Roadmap
 
 > **L1 is the settlement layer. Layers 2–5 are rollup execution environments that post state roots back to L1.**
-> Last updated: May 2026 — Full infrastructure audit complete. Dual L2 system documented. L5 golden rule established.
+> Last updated: June 2026 — Rollup exit path security-hardened (cross-batch double-exit closed). L3 transfer fix + SDK helpers landed.
 
 ---
 
@@ -84,13 +84,25 @@ NFT leaf:  SHA-256( "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadat
 | Table | Key format | Value |
 |---|---|---|
 | `ROLLUP_STATE_ROOTS` | `"{rollup_id}:{batch_id:020}"` (zero-padded) | 32-byte root |
-| `ROLLUP_CONSUMED_EXITS` | `SHA256("{rollup_id}:{batch_id}:{asset_type}:{identity}")` | timestamp u64 |
+| `ROLLUP_CONSUMED_EXITS` (BB) | `SHA256("{rollup_id}:BB:{address}")` — **batch-agnostic** | cumulative lamports withdrawn (u64) |
+| `ROLLUP_CONSUMED_EXITS` (NFT) | `SHA256("{rollup_id}:NFT:{collection_id}:{token_id}")` | seal timestamp (u64) |
 | `ROLLUP_LOCKS` | lock UUID | `RollupLockRecord` JSON |
 
-### Double-Spend Protection
-Every exit is permanently sealed in `ROLLUP_CONSUMED_EXITS` **after** the asset transfer succeeds.
-On BB exits the vault debit+credit are rolled back if the seal write conflicts (concurrent exit attempt).
-On NFT exits the `nft_bridge::get_nft` pre-check rejects if the token already exists on L1.
+### Double-Spend Protection (hardened post-v1.0.0)
+Exit keys are **batch-agnostic** — they do NOT include `batch_id`. This closes the
+cross-batch double-exit bug where the same balance could be withdrawn once per
+historical root.
+
+- **BB exits** track *cumulative lamports withdrawn* per address. Each exit releases
+  only `proven_balance − already_withdrawn` (the delta), so replaying a proof or
+  re-proving an unchanged balance releases nothing (HTTP 403). Re-depositing grows
+  the proven balance, letting the user exit just the increment.
+- The whole release runs in a single ReDB write txn (`atomic_rollup_bb_exit`):
+  re-read cumulative (race → 409 `exit_raced`), re-check vault solvency
+  (→ 409 `vault_insolvent`), debit vault + credit user + advance cumulative, then
+  mirror the hot cache **after** commit.
+- **NFT exits** use a binary seal: the key is written once after `nft_bridge::put_nft()`
+  succeeds; any later exit of the same `collection:token` is rejected (403).
 
 ---
 
@@ -181,7 +193,9 @@ There are two **incompatible** L2 settlement paths in the codebase. This is inte
 
 ## Layer 3 — NFT Bridge ✅ L1 SIDE COMPLETE
 
-**Status:** L1 anchor + rollup hub exit wired. L3 sequencer and execution engine not yet built.
+**Status:** L1 anchor + rollup hub exit wired. L3 sequencer scaffolded; transfer-ownership
+bug fixed and mint/transfer SDK helpers added (June 2026). Execution engine + production
+deploy still pending.
 
 ### Purpose
 L3 is the NFT layer. Users lock $BB on L1, play / trade NFTs in the L3 environment,
@@ -211,9 +225,10 @@ L3 user wants to bring their NFT to L1
 
 ### What Still Needs to Be Built
 - [ ] **L3 execution engine** — NFT trading environment (off-chain, Rust or Node)
-- [ ] **L3 sequencer** — builds NFT Merkle tree, signs roots, calls L1
-- [ ] **L3 SDK** — TypeScript client for minting, trading, exiting NFTs
-- [ ] **L3_SEQUENCER_PUBKEY** env var — must be set in production
+- [x] **L3 sequencer** — NFT Merkle tree + signed roots (transfer-ownership base58/hex bug fixed)
+- [x] **L3 SDK** — `buildL3MintPayload` + `buildL3TransferPayload` signing helpers
+- [x] **L3_SEQUENCER_PUBKEY** env var — registered (`9e4cb34b…` keypair generated)
+- [ ] **L3 production deploy** — sequencer container + Nginx route, end-to-end mint→trade→exit on live node
 
 ---
 

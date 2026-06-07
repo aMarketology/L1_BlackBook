@@ -91,13 +91,21 @@ impl MintLayout {
             return Err(format!("Mint data too short: {} bytes (need 82)", data.len()));
         }
         Ok(Self {
-            mint_authority_option: u32::from_le_bytes(data[0..4].try_into().unwrap()),
-            mint_authority: data[4..36].try_into().unwrap(),
-            supply: u64::from_le_bytes(data[36..44].try_into().unwrap()),
+            mint_authority_option: u32::from_le_bytes(
+                data[0..4].try_into().map_err(|_| "Mint: bad mint_authority_option slice".to_string())?
+            ),
+            mint_authority: data[4..36].try_into()
+                .map_err(|_| "Mint: bad mint_authority slice".to_string())?,
+            supply: u64::from_le_bytes(
+                data[36..44].try_into().map_err(|_| "Mint: bad supply slice".to_string())?
+            ),
             decimals: data[44],
             is_initialized: data[45] != 0,
-            freeze_authority_option: u32::from_le_bytes(data[46..50].try_into().unwrap()),
-            freeze_authority: data[50..82].try_into().unwrap(),
+            freeze_authority_option: u32::from_le_bytes(
+                data[46..50].try_into().map_err(|_| "Mint: bad freeze_authority_option slice".to_string())?
+            ),
+            freeze_authority: data[50..82].try_into()
+                .map_err(|_| "Mint: bad freeze_authority slice".to_string())?,
         })
     }
 }
@@ -153,17 +161,33 @@ impl TokenAccountLayout {
             return Err(format!("Token account data too short: {} bytes (need 165)", data.len()));
         }
         Ok(Self {
-            mint: data[0..32].try_into().unwrap(),
-            owner: data[32..64].try_into().unwrap(),
-            amount: u64::from_le_bytes(data[64..72].try_into().unwrap()),
-            delegate_option: u32::from_le_bytes(data[72..76].try_into().unwrap()),
-            delegate: data[76..108].try_into().unwrap(),
+            mint: data[0..32].try_into()
+                .map_err(|_| "TokenAccount: bad mint slice".to_string())?,
+            owner: data[32..64].try_into()
+                .map_err(|_| "TokenAccount: bad owner slice".to_string())?,
+            amount: u64::from_le_bytes(
+                data[64..72].try_into().map_err(|_| "TokenAccount: bad amount slice".to_string())?
+            ),
+            delegate_option: u32::from_le_bytes(
+                data[72..76].try_into().map_err(|_| "TokenAccount: bad delegate_option slice".to_string())?
+            ),
+            delegate: data[76..108].try_into()
+                .map_err(|_| "TokenAccount: bad delegate slice".to_string())?,
             state: data[108],
-            is_native_option: u32::from_le_bytes(data[109..113].try_into().unwrap()),
-            is_native: u64::from_le_bytes(data[113..121].try_into().unwrap()),
-            delegated_amount: u64::from_le_bytes(data[121..129].try_into().unwrap()),
-            close_authority_option: u32::from_le_bytes(data[129..133].try_into().unwrap()),
-            close_authority: data[133..165].try_into().unwrap(),
+            is_native_option: u32::from_le_bytes(
+                data[109..113].try_into().map_err(|_| "TokenAccount: bad is_native_option slice".to_string())?
+            ),
+            is_native: u64::from_le_bytes(
+                data[113..121].try_into().map_err(|_| "TokenAccount: bad is_native slice".to_string())?
+            ),
+            delegated_amount: u64::from_le_bytes(
+                data[121..129].try_into().map_err(|_| "TokenAccount: bad delegated_amount slice".to_string())?
+            ),
+            close_authority_option: u32::from_le_bytes(
+                data[129..133].try_into().map_err(|_| "TokenAccount: bad close_authority_option slice".to_string())?
+            ),
+            close_authority: data[133..165].try_into()
+                .map_err(|_| "TokenAccount: bad close_authority slice".to_string())?,
         })
     }
 }

@@ -810,10 +810,16 @@ pub async fn run_poh_clock(
                 if let Some(ref tx) = tick_tx {
                     if tx.try_send(tick_shred).is_err() {
                         drop_count += 1;
-                        if drop_count % 1_000 == 1 {
-                            eprintln!(
+                        // Only warn every 10_000 drops — the channel fills during
+                        // startup (TurbineTickService not yet running) or when no
+                        // peers are configured (registry empty = fast drain).
+                        // A single-validator dev node with no peers drops every
+                        // shred; log only once and then every 10k thereafter.
+                        if drop_count == 1 || drop_count % 10_000 == 0 {
+                            warn!(
                                 "⚠️  poh-clock: tick shred channel full — {} shreds \
-                                 dropped (total). TurbineTickService may be stalled.",
+                                 dropped (total). TurbineTickService may be stalled \
+                                 or registry is empty (single-validator mode).",
                                 drop_count
                             );
                         }

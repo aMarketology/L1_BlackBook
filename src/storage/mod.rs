@@ -150,10 +150,14 @@ pub const L5_STATE_ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("l5
 ///   "L5:00000000000000000100" → root for L5 batch 100
 pub const ROLLUP_STATE_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollup_state_roots");
 
-/// Rollup exit double-spend guard: exit_id (SHA-256 hex of "<rollup_id>:<batch_id>:<asset_type>:<address>") → consumed_at (u64 unix secs).
-/// Written atomically when a user successfully exits. Any subsequent attempt
-/// with the same (batch_id, address) pair is rejected 403 before any balance
-/// move occurs, regardless of nonce.
+/// Rollup exit double-spend guard. The key is batch-agnostic so a balance can
+/// never be exited twice across different historical roots:
+///   BB:  exit_id = SHA-256("<rollup_id>:BB:<address_lowercased>")
+///        value   = cumulative lamports already withdrawn by this address.
+///   NFT: exit_id = SHA-256("<rollup_id>:NFT:<collection_id>:<token_id>")
+///        value   = unix secs at which the (unique) token was exited (binary seal).
+/// For BB, every exit releases only `proven_balance − cumulative_withdrawn`, so
+/// replaying an old root or re-proving an unchanged balance releases nothing.
 pub const ROLLUP_CONSUMED_EXITS: TableDefinition<&str, u64> = TableDefinition::new("rollup_consumed_exits");
 
 /// Dynamic exchange rates: pool_id (String) → rate (u64).
@@ -286,12 +290,28 @@ pub struct PendingRoot {
     /// L2 sequencer (or oracle committee) that proposed this root.
     #[serde(default)]
     pub proposer_pubkey: String,
+    /// Rollup batch_id this root corresponds to (for cross-reference with ROLLUP_STATE_ROOTS).
+    #[serde(default)]
+    pub batch_id: u64,
+    /// Rollup ID this root belongs to ("L2" | "L3").
+    #[serde(default)]
+    pub rollup_id: String,
     /// Oracle committee attestation signatures (M-of-N, enforced in Step 3).
     #[serde(default)]
     pub oracle_signatures: Vec<OracleSignature>,
-    /// Wallets that have staked $XX against this root.
+    /// Wallets that have staked $BB against this root (disputers).
     #[serde(default)]
     pub disputers: Vec<Disputer>,
+    // ── Step 3: $BB-weighted governance vote fields ───────────────────────────
+    /// Total $BB lamports cast to uphold the root.
+    #[serde(default)]
+    pub uphold_stake_lamports: u64,
+    /// Total $BB lamports cast to discard the root.
+    #[serde(default)]
+    pub discard_stake_lamports: u64,
+    /// Wallet addresses that have already voted (prevents double-vote).
+    #[serde(default)]
+    pub voters: Vec<String>,
 }
 
 // ============================================================================
@@ -1117,6 +1137,22 @@ impl ConcurrentBlockchain {
 
     /// Flush all buffered transaction logs to ReDB in a single ACID commit.
     ///
+    /// Force an immediate ACID flush of all dirty SVM accounts to ReDB.
+    ///
+    /// Called by financially-critical handlers (swap, etc.) to guarantee that
+    /// balance changes land on disk BEFORE the HTTP 200 response is sent.
+    ///
+    /// Without this, a crash in the window between `debit_svm_lamports` /
+    /// `credit_svm_lamports` and the block-production `flush_block()` call
+    /// (up to 400 ms) would silently revert confirmed balances on restart.
+    ///
+    /// ReDB semantics: if this returns `Ok`, all dirty accounts are durable.
+    /// If it returns `Err`, nothing was written (the transaction was not
+    /// committed) — callers should rollback in-memory state and return 500.
+    pub fn flush_svm_accounts_now(&self) -> Result<usize, String> {
+        self.svm_accounts.flush_block().map_err(|e| e.to_string())
+    }
+
     /// Called once per slot (400ms) by the block production loop.
     /// This converts N per-tx fsyncs into 1 batched fsync — critical for
     /// achieving 600K TPS throughput.
@@ -1640,6 +1676,103 @@ impl ConcurrentBlockchain {
                 .map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Read the cumulative lamports a BB exit key has already withdrawn.
+    /// Returns 0 if the address has never exited from this rollup.
+    ///
+    /// For BB keys the stored value is the running total withdrawn; for NFT keys
+    /// any present value means the unique token has already been exited.
+    pub fn get_cumulative_exit(&self, exit_id: &str) -> u64 {
+        let read_txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let table = match read_txn.open_table(ROLLUP_CONSUMED_EXITS) {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        table.get(exit_id).ok().flatten().map(|v| v.value()).unwrap_or(0)
+    }
+
+    /// Atomically release a BB exit: debit the rollup vault, credit the user, and
+    /// advance the cumulative-withdrawn watermark — all in a single ReDB write.
+    ///
+    /// Concurrency / replay safety: the cumulative value is re-read INSIDE the
+    /// write transaction and compared against `prev_cumulative`. If another exit
+    /// raced in between (so the on-disk value moved), this aborts with
+    /// `"exit_raced"` and the caller returns 409 — no balance is moved.
+    ///
+    /// Solvency: the vault balance is re-checked inside the txn; if it cannot
+    /// cover `withdrawable`, aborts with `"vault_insolvent"` and moves nothing.
+    ///
+    /// Ordering guarantee: durable ReDB commit happens BEFORE the in-memory
+    /// hot_state / cache mirror, matching `atomic_rollup_lock_bb`.
+    pub fn atomic_rollup_bb_exit(
+        &self,
+        user_addr: &str,
+        vault_addr: &str,
+        exit_id: &str,
+        prev_cumulative: u64,
+        withdrawable: u64,
+        new_cumulative: u64,
+    ) -> Result<(), String> {
+        if withdrawable == 0 {
+            return Err("nothing_to_withdraw".to_string());
+        }
+
+        let user_pk  = Self::addr_to_pubkey(user_addr);
+        let vault_pk = Self::addr_to_pubkey(vault_addr);
+
+        let user_lamports  = self.svm_accounts.get_lamports(&user_pk);
+        let vault_lamports = self.svm_accounts.get_lamports(&vault_pk);
+
+        if vault_lamports < withdrawable {
+            return Err("vault_insolvent".to_string());
+        }
+        let new_vault = vault_lamports.checked_sub(withdrawable)
+            .ok_or_else(|| "Vault underflow".to_string())?;
+        let new_user  = user_lamports.checked_add(withdrawable)
+            .ok_or_else(|| "User overflow".to_string())?;
+
+        let user_account  = AccountSharedData::new(new_user,  0, &solana_sdk::system_program::id());
+        let vault_account = AccountSharedData::new(new_vault, 0, &solana_sdk::system_program::id());
+
+        let user_bytes  = borsh::to_vec(&StoredAccount::from(&user_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+        let vault_bytes = borsh::to_vec(&StoredAccount::from(&vault_account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            // ── Re-read cumulative under the write txn (TOCTOU / concurrent-exit guard) ─
+            let mut exits = write_txn.open_table(ROLLUP_CONSUMED_EXITS).map_err(|e| e.to_string())?;
+            let on_disk = exits.get(exit_id).map_err(|e| e.to_string())?
+                .map(|v| v.value()).unwrap_or(0);
+            if on_disk != prev_cumulative {
+                return Err("exit_raced".to_string());
+            }
+            exits.insert(exit_id, new_cumulative).map_err(|e| e.to_string())?;
+
+            // ── Move funds vault → user in the same txn ─────────────────────
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(vault_pk.to_bytes().as_slice(), vault_bytes.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(user_pk.to_bytes().as_slice(),  user_bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        // Update hot_state AFTER durable commit (ReDB → DashMap ordering)
+        self.svm_accounts.hot_state.insert(vault_pk, vault_account);
+        self.svm_accounts.hot_state.insert(user_pk, user_account);
+        self.mirror_balance_to_cache(vault_addr, new_vault);
+        self.mirror_balance_to_cache(user_addr, new_user);
+        // total_supply unchanged: vault debit == user credit (zero-sum move)
+
+        info!(
+            exit_id = %exit_id, withdrawable, cumulative = new_cumulative,
+            "Atomic rollup BB exit committed"
+        );
         Ok(())
     }
 

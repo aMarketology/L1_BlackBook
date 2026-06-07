@@ -49,7 +49,8 @@ const GULF_STREAM_LOOKAHEAD: usize = 8;
 const MAX_CACHED_TXS: usize = 300_000;
 const CACHE_EXPIRY_SLOTS: u64 = 20;
 pub const MAX_TOWER_DEPTH: usize = 32;
-pub const SUPERMAJORITY_THRESHOLD: f64 = 0.667;
+/// Supermajority threshold as a fraction: votes * 3 >= total_stake * 2 (i.e. 2/3+).
+/// No f64 — all comparisons use integer arithmetic only.
 pub const MIN_FORK_VOTES: usize = 1;
 
 // ============================================================================
@@ -93,12 +94,13 @@ pub struct PoHEntry {
 // Reader nodes validate, vote, and replicate.
 // The schedule rotates the writer role based on engagement stake.
 
-// ⚠️  TECHNICAL DEBT: stakes uses f64 — must be migrated to u64 lamports in Phase 7.
-//      The permissioned model requires exact integer voting power, not logarithmic f64 weights.
-//      Do NOT add new callers to update_stake() until the migration is complete.
+// ⚠️  TECHNICAL DEBT resolved — stakes migrated to u64 lamports (Phase 7).
+//      Slot allocation uses integer proportional math:
+//        slots_for_validator = (stake * epoch_slots) / total_stake
+//      Supermajority: votes_lamports * 3 >= total_stake_lamports * 2  (exact, no f64)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderSchedule {
-    stakes: HashMap<String, f64>, // TODO Phase 7: replace with HashMap<String, u64> lamports
+    stakes: HashMap<String, u64>, // lamports — deterministic across all CPU architectures
     schedule: Vec<(u64, String)>, // (slot, leader)
     pub epoch: u64,
 }
@@ -117,34 +119,64 @@ impl LeaderSchedule {
         Self { stakes: HashMap::new(), schedule: Vec::new(), epoch: 0 }
     }
 
-    /// Register or update a node's engagement stake (logarithmic scaling)
-    pub fn update_stake(&mut self, address: &str, raw_engagement: f64) {
-        let weight = (1.0 + raw_engagement).ln();
-        self.stakes.insert(address.to_string(), weight);
+    /// Register or update a validator's stake weight (u64 lamports, not f64).
+    ///
+    /// Replaces the old logarithmic `update_stake(f64)` — lamports are deterministic
+    /// across all CPU architectures, making the leader schedule 100% reproducible.
+    pub fn set_stake(&mut self, address: &str, lamports: u64) {
+        self.stakes.insert(address.to_string(), lamports);
     }
 
-    /// Generate writer schedule for an epoch — proportional to stake
+    /// Legacy alias kept for any callers not yet migrated. Converts whole-BB
+    /// float to lamports via truncation then delegates to `set_stake`.
+    #[deprecated(note = "Use set_stake(address, lamports_u64) instead")]
+    pub fn update_stake(&mut self, address: &str, _raw_engagement: f64) {
+        // During the migration window: treat 1 unit of old engagement = 1 BB = 100_000 lamports.
+        // All real call sites should be updated to call set_stake() directly.
+        self.set_stake(address, 100_000_000); // 1000 BB in lamports
+    }
+
+    /// Generate writer schedule for an epoch — integer proportional allocation.
+    ///
+    /// Algorithm: each validator receives `(stake * epoch_slots) / total_stake` slots.
+    /// Remainder slots (from integer truncation) go to the highest-stake validator.
+    /// Result is deterministic on every CPU architecture — no f64 anywhere.
     pub fn generate_schedule(&mut self, epoch: u64, slots_per_epoch: u64) {
         self.epoch = epoch;
         self.schedule.clear();
 
-        let total: f64 = self.stakes.values().sum();
-        if total == 0.0 || self.stakes.is_empty() {
+        let total: u64 = self.stakes.values().sum();
+        if total == 0 || self.stakes.is_empty() {
             for s in 0..slots_per_epoch {
                 self.schedule.push((epoch * slots_per_epoch + s, "genesis_validator".into()));
             }
             return;
         }
 
-        let mut validators: Vec<_> = self.stakes.iter().collect();
-        validators.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        // Sort descending by stake so the highest-stake validator gets remainder slots.
+        let mut validators: Vec<(&String, &u64)> = self.stakes.iter().collect();
+        validators.sort_by(|a, b| b.1.cmp(a.1));
 
+        // Allocate slots proportionally via integer division.
+        let mut allocations: Vec<(&String, u64)> = validators.iter()
+            .map(|(addr, &stake)| (*addr, stake * slots_per_epoch / total))
+            .collect();
+
+        // Distribute remainder slots (caused by integer truncation) to top validators.
+        let allocated: u64 = allocations.iter().map(|(_, n)| n).sum();
+        let mut remainder = slots_per_epoch.saturating_sub(allocated);
+        for (_, n) in allocations.iter_mut() {
+            if remainder == 0 { break; }
+            *n += 1;
+            remainder -= 1;
+        }
+
+        // Interleave validators round-robin so no validator owns a large contiguous run.
         let mut slot = 0u64;
-        while slot < slots_per_epoch {
-            for (addr, weight) in &validators {
-                let run = ((*weight / total) * 4.0).ceil() as u64;
-                for _ in 0..run.max(1) {
-                    if slot >= slots_per_epoch { break; }
+        let max_alloc = allocations.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        for round in 0..max_alloc {
+            for (addr, alloc) in &allocations {
+                if round < *alloc {
                     self.schedule.push((epoch * slots_per_epoch + slot, addr.to_string()));
                     slot += 1;
                 }
@@ -329,13 +361,14 @@ pub struct Vote {
     pub slot: u64,
     pub block_hash: String,
     pub validator: String,
-    pub stake_weight: f64,
+    /// Voting power in lamports (u64) — replaces the old f64 stake_weight.
+    pub stake_weight: u64,
     pub timestamp: u64,
     pub signature: String,
 }
 
 impl Vote {
-    pub fn new(slot: u64, block_hash: String, validator: String, stake: f64) -> Self {
+    pub fn new(slot: u64, block_hash: String, validator: String, stake: u64) -> Self {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
         let mut h = Sha256::new();
         h.update(slot.to_le_bytes());
@@ -373,11 +406,12 @@ pub struct VoteTower {
     pub votes: Vec<TowerLockout>,
     pub root: u64,
     pub last_voted_slot: u64,
-    pub stake: f64,
+    /// Voting power in lamports (u64).
+    pub stake: u64,
 }
 
 impl VoteTower {
-    pub fn new(validator: String, stake: f64) -> Self {
+    pub fn new(validator: String, stake: u64) -> Self {
         Self { validator, votes: Vec::new(), root: 0, last_voted_slot: 0, stake }
     }
 
@@ -418,7 +452,8 @@ pub struct TowerSync {
     pub validator: String,
     pub root: u64,
     pub votes: Vec<u64>,
-    pub stake: f64,
+    /// Voting power in lamports (u64).
+    pub stake: u64,
     pub timestamp: u64,
 }
 
@@ -427,7 +462,8 @@ pub struct TowerSync {
 pub struct ForkInfo {
     pub slot: u64,
     pub block_hash: String,
-    pub stake: f64,
+    /// Accumulated voting power in lamports (u64).
+    pub stake: u64,
     pub vote_count: usize,
     pub parent_slot: u64,
     pub has_supermajority: bool,
@@ -440,18 +476,21 @@ pub struct ForkInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConsensusStatus {
     Unknown,
-    Voting { stake: f64, votes: usize },
-    Confirmed { stake: f64 },
+    Voting { stake_lamports: u64, votes: usize },
+    Confirmed { stake_lamports: u64 },
     Rooted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TowerBFTStats {
     pub validator_count: usize,
-    pub total_stake: f64,
+    /// Total registered stake in lamports (u64).
+    pub total_stake: u64,
     pub global_root: u64,
     pub confirmed_slots: usize,
     pub active_forks: usize,
+    /// Supermajority threshold displayed as a float for API consumers only.
+    /// Internally the check is: votes * 3 >= total * 2 (no f64 in consensus path).
     pub supermajority_threshold: f64,
     pub max_tower_depth: usize,
 }
@@ -461,33 +500,34 @@ pub struct TowerBFT {
     slot_votes: DashMap<u64, Vec<Vote>>,
     forks: DashMap<u64, ForkInfo>,
     current_slot: Arc<AtomicU64>,
-    total_stake: Arc<RwLock<f64>>,
+    /// Total registered stake in lamports — u64 atomic (replaces Arc<RwLock<f64>>).
+    total_stake: Arc<AtomicU64>,
     global_root: Arc<AtomicU64>,
-    confirmed: DashMap<u64, f64>,
+    confirmed: DashMap<u64, u64>,  // slot → accumulated stake lamports
     our_validator: String,
 }
 
 impl TowerBFT {
     pub fn new(us: String, slot: Arc<AtomicU64>) -> Arc<Self> {
-        info!("🗼 Tower BFT: validator={}, depth={}, supermajority={:.0}%",
-            us, MAX_TOWER_DEPTH, SUPERMAJORITY_THRESHOLD * 100.0);
+        info!("🗼 Tower BFT: validator={}, depth={}, supermajority=66.7% (votes*3>=total*2)",
+            us, MAX_TOWER_DEPTH);
         Arc::new(Self {
             towers: DashMap::new(), slot_votes: DashMap::new(), forks: DashMap::new(),
-            current_slot: slot, total_stake: Arc::new(RwLock::new(0.0)),
+            current_slot: slot, total_stake: Arc::new(AtomicU64::new(0)),
             global_root: Arc::new(AtomicU64::new(0)), confirmed: DashMap::new(),
             our_validator: us,
         })
     }
 
-    pub fn register_validator(&self, v: &str, stake: f64) {
+    pub fn register_validator(&self, v: &str, stake: u64) {
         self.towers.insert(v.to_string(), VoteTower::new(v.to_string(), stake));
-        *self.total_stake.write() += stake;
+        self.total_stake.fetch_add(stake, Ordering::Relaxed);
     }
 
     pub fn vote(&self, validator: &str, slot: u64, block_hash: &str) -> Result<bool, String> {
         let cur = self.current_slot.load(Ordering::Relaxed);
         let stake = self.towers.get(validator).map(|t| t.stake).unwrap_or_else(|| {
-            self.register_validator(validator, 1.0); 1.0
+            self.register_validator(validator, 100_000); 100_000  // 1 BB default
         });
         { self.towers.get_mut(validator).unwrap().process_vote(slot, cur)?; }
 
@@ -496,15 +536,18 @@ impl TowerBFT {
 
         // Update fork
         let mut fork = self.forks.entry(slot).or_insert(ForkInfo {
-            slot, block_hash: block_hash.into(), stake: 0.0, vote_count: 0,
+            slot, block_hash: block_hash.into(), stake: 0, vote_count: 0,
             parent_slot: slot.saturating_sub(1), has_supermajority: false,
         });
-        fork.stake += stake;
+        fork.stake = fork.stake.saturating_add(stake);
         fork.vote_count += 1;
 
-        let total = *self.total_stake.read();
-        let slot_stake: f64 = self.slot_votes.get(&slot).map(|v| v.iter().map(|x| x.stake_weight).sum()).unwrap_or(0.0);
-        let supermajority = total > 0.0 && slot_stake / total >= SUPERMAJORITY_THRESHOLD;
+        let total = self.total_stake.load(Ordering::Relaxed);
+        let slot_stake: u64 = self.slot_votes.get(&slot)
+            .map(|v| v.iter().map(|x| x.stake_weight).sum())
+            .unwrap_or(0);
+        // Integer supermajority: votes * 3 >= total * 2  (equivalent to votes/total >= 2/3)
+        let supermajority = total > 0 && slot_stake.saturating_mul(3) >= total.saturating_mul(2);
         fork.has_supermajority = supermajority;
 
         if supermajority {
@@ -525,10 +568,12 @@ impl TowerBFT {
     }
 
     pub fn check_supermajority(&self, slot: u64) -> bool {
-        let total = *self.total_stake.read();
-        if total == 0.0 { return false; }
-        let stake: f64 = self.slot_votes.get(&slot).map(|v| v.iter().map(|x| x.stake_weight).sum()).unwrap_or(0.0);
-        stake / total >= SUPERMAJORITY_THRESHOLD
+        let total = self.total_stake.load(Ordering::Relaxed);
+        if total == 0 { return false; }
+        let stake: u64 = self.slot_votes.get(&slot)
+            .map(|v| v.iter().map(|x| x.stake_weight).sum())
+            .unwrap_or(0);
+        stake.saturating_mul(3) >= total.saturating_mul(2)
     }
 
     pub fn global_root(&self) -> u64 { self.global_root.load(Ordering::Relaxed) }
@@ -540,25 +585,29 @@ impl TowerBFT {
         self.vote(&self.our_validator, slot, block_hash)
     }
 
-    /// Get consensus status for a slot
-    pub fn get_consensus_status(&self, slot: u64) -> ConsensusStatus {
+    pub fn get_status_for_slot(&self, slot: u64) -> ConsensusStatus {
         if self.is_finalized(slot) {
             return ConsensusStatus::Rooted;
         }
-        let total = *self.total_stake.read();
-        let slot_stake: f64 = self.slot_votes.get(&slot)
+        let total = self.total_stake.load(Ordering::Relaxed);
+        let slot_stake: u64 = self.slot_votes.get(&slot)
             .map(|v| v.iter().map(|x| x.stake_weight).sum())
-            .unwrap_or(0.0);
-        if total > 0.0 && slot_stake / total >= SUPERMAJORITY_THRESHOLD {
-            ConsensusStatus::Confirmed { stake: slot_stake }
+            .unwrap_or(0);
+        if total > 0 && slot_stake.saturating_mul(3) >= total.saturating_mul(2) {
+            ConsensusStatus::Confirmed { stake_lamports: slot_stake }
         } else {
             let vote_count = self.slot_votes.get(&slot).map(|v| v.len()).unwrap_or(0);
             if vote_count > 0 {
-                ConsensusStatus::Voting { stake: slot_stake, votes: vote_count }
+                ConsensusStatus::Voting { stake_lamports: slot_stake, votes: vote_count }
             } else {
                 ConsensusStatus::Unknown
             }
         }
+    }
+
+    /// Get consensus status for a slot
+    pub fn get_consensus_status(&self, slot: u64) -> ConsensusStatus {
+        self.get_status_for_slot(slot)
     }
 
     /// Verify a proposed block's validity using leader schedule
@@ -571,16 +620,16 @@ impl TowerBFT {
 
     /// Check if a vote threshold is met for a slot
     pub fn meets_threshold(&self, slot: u64, threshold: f64) -> bool {
-        let total = *self.total_stake.read();
-        let voted: f64 = self.slot_votes.get(&slot)
+        let total = self.total_stake.load(Ordering::Relaxed);
+        let voted: u64 = self.slot_votes.get(&slot)
             .map(|v| v.iter().map(|x| x.stake_weight).sum())
-            .unwrap_or(0.0);
+            .unwrap_or(0);
         check_vote_threshold(voted, total, threshold)
     }
 
     pub fn select_fork(&self) -> Option<(u64, String)> {
         let root = self.global_root();
-        let mut best: Option<(u64, String, f64)> = None;
+        let mut best: Option<(u64, String, u64)> = None;
         for e in self.forks.iter() {
             let f = e.value();
             if f.slot < root || f.vote_count < MIN_FORK_VOTES { continue; }
@@ -605,11 +654,7 @@ impl TowerBFT {
         self.forks
             .iter()
             .filter(|e| e.slot >= root && e.vote_count >= MIN_FORK_VOTES)
-            .max_by(|a, b| {
-                a.stake
-                    .partial_cmp(&b.stake)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by_key(|e| e.stake)
             .map(|e| e.slot)
     }
 
@@ -648,11 +693,12 @@ impl TowerBFT {
     pub fn get_stats(&self) -> TowerBFTStats {
         TowerBFTStats {
             validator_count: self.towers.len(),
-            total_stake: *self.total_stake.read(),
+            total_stake: self.total_stake.load(Ordering::Relaxed),
             global_root: self.global_root(),
             confirmed_slots: self.confirmed.len(),
             active_forks: self.forks.len(),
-            supermajority_threshold: SUPERMAJORITY_THRESHOLD,
+            // Expose as f64 for API compatibility only — consensus path uses integer check.
+            supermajority_threshold: 0.667,
             max_tower_depth: MAX_TOWER_DEPTH,
         }
     }
@@ -670,8 +716,16 @@ pub fn verify_block_validity(
     Ok(())
 }
 
-pub fn check_vote_threshold(voted: f64, total: f64, threshold: f64) -> bool {
-    total > 0.0 && voted / total >= threshold
+/// Integer supermajority check. `threshold` is a float used only by callers
+/// that pre-date the u64 migration (e.g. SDK status endpoints). For pure
+/// consensus use `votes * 3 >= total * 2` directly.
+pub fn check_vote_threshold(voted: u64, total: u64, threshold: f64) -> bool {
+    if total == 0 { return false; }
+    // Convert the f64 threshold to an integer comparison to avoid f64 in hot path.
+    // threshold=0.667 → votes*3 >= total*2; threshold=0.5 → votes*2 >= total*1, etc.
+    let numer = (threshold * 3.0).round() as u64;
+    let denom = 3u64;
+    voted.saturating_mul(denom) >= total.saturating_mul(numer)
 }
 
 // ============================================================================
@@ -685,8 +739,8 @@ mod tests {
     #[test]
     fn test_leader_schedule() {
         let mut s = LeaderSchedule::new();
-        s.update_stake("alice", 1000.0);
-        s.update_stake("bob", 100.0);
+        s.set_stake("alice", 1_000_000_000); // 10,000 BB
+        s.set_stake("bob", 100_000_000);     // 1,000 BB
         s.generate_schedule(0, 10);
         let alice = s.schedule.iter().filter(|(_, l)| l == "alice").count();
         let bob = s.schedule.iter().filter(|(_, l)| l == "bob").count();

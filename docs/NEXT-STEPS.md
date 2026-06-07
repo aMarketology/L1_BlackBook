@@ -1,59 +1,67 @@
 ﻿# BlackBook — Next Steps
 
-> **Updated: June 2026 — v1.0.0 shipped. L2 sequencer live on Hetzner.**
-> All pre-v1.0 P0 items are COMPLETE. These are the new priorities.
+> **Updated: June 2026 — v1.0.1. L2 sequencer live on Hetzner. Permissioned Turbine 7A/7B/7C live.**
+> The frontend↔L2 wiring and L2-on-Hetzner items are DONE. Current focus is the
+> Cherry migration and finishing the block-shred mesh.
+>
+> **The L1 is an asset-custody ledger, state machine, and transaction execution environment** —
+> nothing more. It stores balances against public keys, advances state via PoH, and executes
+> Ed25519-signed transactions after verifying them. It never touches user private keys.
 
 ---
 
-## P0 — NOW: Wire React Frontend to L2 (1–2 weeks)
+## P0 — NOW: Cherry Bare-Metal Migration (2–3 days)
 
-The `blackbook-wallet/` React app already talks to L1. It needs to talk to L2 as well.
+Hetzner flagged blockchain workloads. Move the L1 node to the Cherry bare-metal host.
+
+**What to do:**
+
+1. **Provision Cherry** — 32-core / 64 GB / NVMe, EU colocation (see [docs/cherry.md](docs/cherry.md)).
+2. **Open firewall** — TCP `8080` (RPC), `50051` (gRPC relay), `8899` (JSON-RPC), UDP `8003` (TPU) all public; UDP `8004` (Turbine) **whitelist only**.
+3. **Populate `config.toml`** — copy `config.toml.example`, set `[[validators]]` to the Cherry Writer pubkey (`keys/writer.key`) + `addr` on `:8004`. Add reader nodes.
+4. **Set `VALIDATOR_KEYPAIR_PATH`** — point at `keys/writer.key` so the Writer signs tick-shreds with its consortium identity.
+5. **Deploy** — `deployment/setup-cherry.sh` + `docker-compose.prod.yml`; verify `GET /health` and Turbine identity in startup logs.
+6. **Repoint DNS / wallet** — update `blackbook-wallet` L1 URL and L2 sequencer `L1_URL` to the Cherry IP once healthy.
+
+**Definition of done:** L1 node runs on Cherry, Writer signs shreds with `keys/writer.key`, the local reader receives and PoH-verifies them, and the wallet/L2 talk to the new host.
+
+---
+
+## P1 — NEXT: Finish the Block-Shred VIP Mesh (Phase 7D) (1–2 weeks)
+
+Phases 7A (registry), 7B (IP gate), 7C (signed tick-shreds + u64 stake) are live. Remaining:
 
 **What to build:**
 
-1. **`VITE_L2_URL` env variable** — `blackbook-wallet/.env.local`: `VITE_L2_URL=http://localhost:7072`
-2. **L2 balance display** — call `GET {L2_URL}/balances/{address}` and show alongside L1 balance.
-3. **Lock BB into L2** — button calls `POST /rollup/L2/lock_bb` on L1 (Ed25519 signed by user wallet).
-4. **Market list page** — fetch `GET {L2_URL}/markets`, display active markets with current odds.
-5. **Place bet flow** — user picks outcome, wallet signs, `POST {L2_URL}/markets/:id/bet`.
-6. **Exit / Claim page** — user calls `POST /rollup/L2/exit` on L1 with Merkle proof fetched from L2.
-7. **Transaction history** — pull recent transfers from `GET /history/:address` on L1.
+1. **Round-robin shred assignment** — Writer assigns each 1,232-byte block shred to a different approved node instead of broadcasting every tick-shred to all targets.
+2. **Peer re-broadcast** — each receiving node re-signs and blasts its shred to all other whitelisted peers (turning the star into a mesh).
+3. **Block reassembly + Reed-Solomon FEC decode** — receivers buffer shreds per slot, reconstruct the block once the FEC threshold is met, then feed the Reader ingest pipeline.
+4. **`GET /validators`** — return the current approved set (pubkey, addr, label) for ops visibility.
+5. **`POST /admin/validators/add` + `DELETE /admin/validators/:pubkey`** — `unsafe_admin`-gated hot registry edits (optional; static config is the default).
 
-**Files to touch:**
-- `blackbook-wallet/src/` — add `l2.ts` service client, new pages: `MarketsPage`, `BetPage`, `ClaimPage`
-- `blackbook-wallet/.env.local` — add `VITE_L2_URL`
-- `sdk/wallet.sdk.ts` — add `lockBB`, `exitL2` helper functions
+**Files:** `runtime/turbine.rs`, new `runtime/shred_reassembly.rs`, `src/main.rs` (route wiring).
 
-**Definition of done:** A logged-in user can see their L1 balance, lock BB into L2, place a bet, and claim winnings back to L1 — all from the wallet UI.
+**Definition of done:** Two approved nodes propagate a block among themselves via round-robin + re-broadcast, reassemble it via FEC, and `GET /validators` lists the set.
 
 ---
 
-## P1 — NOW: Deploy L2 Sequencer to Hetzner (2 days)
+## P2 — HIGH: Rollup Trust-Minimization (Phase 12) (1–2 weeks)
 
-The L2 sequencer currently only runs locally. It needs to be on the server.
+Phase 3.5 stopped double-spend/insolvency, but a malicious sequencer can still sign a
+*false* root. Close that without waiting for full ZK.
 
-**Steps:**
+**What to build:**
 
-1. **Create `sequencer/Dockerfile`** — Node 20 base, `npm ci`, `npm run build`, `ENTRYPOINT ["node", "l2/dist/index.js"]`
-2. **Add L2 service to `deployment/docker-compose.prod.yml`:**
-   ```yaml
-   l2-sequencer:
-     build: ../sequencer
-     env_file: .env
-     ports: ["7072:7072"]
-     restart: unless-stopped
-     volumes: ["l2_data:/app/l2/data"]
-   ```
-3. **Add env vars to `/opt/blackbook/.env` on Hetzner:**
-   - `L2_SEQUENCER_PRIVKEY=47d8d397...`
-   - `DB_PATH=/app/l2/data/l2.sqlite`
-   - `L1_URL=http://l1-node:8080`
-4. **Nginx proxy** — route `https://api.blackbook.gg/l2/` → `http://l2-sequencer:7072/`
-5. **Health endpoint** — add `GET /health` to L2 that returns `{"status":"ok","slot":N}`
+1. **Challenge/dispute window on `submit_root`** — reuse the `settlement/mod.rs` 2h `SubmitPendingRoot` pattern; roots are pending, not final, until the window elapses.
+2. **Forced-inclusion / escape hatch** — users can exit against the last *finalized* root even if the sequencer censors them, so funds are never trapped.
+3. **Sequencer bond** — sequencer stakes `$BB`, slashed on a proven invalid root.
+4. **DA publication** — sequencer publishes the full balance set behind each root so anyone can reconstruct proofs and detect fraud.
+
+**Files:** `src/contracts/rollup/mod.rs`, `src/settlement/mod.rs`, `src/storage/mod.rs`.
 
 ---
 
-## P2 — HIGH: XDP Kernel Bypass on UDP TPU (:8003)
+## P3 — HIGH: XDP Kernel Bypass on UDP TPU (:8003)
 
 Current bottleneck: Linux kernel processes every UDP packet before Rust sees it. This adds ~50µs per packet and caps throughput.
 
@@ -72,7 +80,7 @@ Current bottleneck: Linux kernel processes every UDP packet before Rust sees it.
 
 ---
 
-## P3 — HIGH: ZK Validity Proofs on L2 Batch Submission
+## P4 — HIGH: ZK Validity Proofs on L2 Batch Submission
 
 Currently the L2 sequencer is trusted by authority (Ed25519 key). ZK proofs replace that with mathematics.
 
@@ -90,7 +98,7 @@ Currently the L2 sequencer is trusted by authority (Ed25519 key). ZK proofs repl
 
 ---
 
-## P4 — MEDIUM: DA Layer + State Pruning
+## P5 — MEDIUM: DA Layer + State Pruning
 
 At 502 tx/s, ReDB grows ~100MB/day. At scale, it will fill the Hetzner disk.
 
@@ -105,7 +113,7 @@ At 502 tx/s, ReDB grows ~100MB/day. At scale, it will fill the Hetzner disk.
 
 ---
 
-## P5 — MEDIUM: Active-Passive L2 Sequencer HA
+## P6 — MEDIUM: Active-Passive L2 Sequencer HA
 
 The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 is down for minutes.
 
@@ -122,7 +130,7 @@ The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 i
 
 ---
 
-## Completed (v1.0.0)
+## Completed (through v1.0.1)
 
 - ✅ PoH + Tower BFT + Gulf Stream + Sealevel
 - ✅ Sealevel O(N) scheduler + Local Fee Market
@@ -134,3 +142,9 @@ The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 i
 - ✅ `unsafe_admin` production compile-time gate
 - ✅ 502 tx/s validated (UDP TPU, 10,060 packets, 0 errors)
 - ✅ v1.0.0 tagged and pushed (`aMarketology/L1_BlackBook`)
+- ✅ React wallet wired to live L2 sequencer (`layer2.blackbook.id/seq`)
+- ✅ L2 sequencer Dockerized + deployed to Hetzner (compose + nginx HTTPS)
+- ✅ Rollup exit path hardened (batch-agnostic keys, cumulative accounting, atomic exit)
+- ✅ Permissioned Turbine 7A/7B/7C: `ValidatorRegistry`, UDP IP gate, signed tick-shreds
+- ✅ `LeaderSchedule` f64 → u64 lamport rewrite (deterministic integer schedule)
+- ✅ **v1.0.1 pure-L1 cleanup** — removed dead fiat-onramp code (Lightning/BTCPay gateway + Transak webhook) and the server-side keygen endpoint; build is warning-clean

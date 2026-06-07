@@ -1,86 +1,87 @@
-//! Turbine Tick Streaming — per-tick PoH broadcast to Reader nodes.
+//! Turbine Tick Streaming — Phase 7A/7B/7C permissioned VIP mesh.
 //!
-//! The Writer node emits one `TickShred` per PoH tick (~9.375ms) via UDP on
-//! port 8004.  Reader nodes receive these shreds and re-derive the SHA-256
-//! chain in real-time, verifying each tick *while the slot is still being
-//! produced* rather than waiting for the full-block gRPC relay.
+//! The Writer node emits one `TickShred` per PoH tick (~9.375ms) over UDP on
+//! port 8004.  Only nodes in the `ValidatorRegistry` whitelist receive shreds.
 //!
-//! Production invariants enforced here:
+//! Security layers applied in cheapest→costliest order on the Receiver:
 //!
-//! * **Bounded channel** (10 000 capacity) between the PoH OS thread and this
-//!   async broadcaster.  If the broadcaster is ever stalled, `try_send` fails
-//!   silently and the shred is dropped — the PoH clock **never blocks** and the
-//!   Writer node **never OOMs**.  Readers fall back to the existing gRPC
-//!   full-block relay for any ticks they miss.
+//! 1. **Source-IP gate (7B)** — `recv_from` drops packets whose source IP is
+//!    not in the approved registry.  No data is ever parsed from unknown IPs.
 //!
-//! * **Heartbeat TTL**: Readers that have not sent a heartbeat within
-//!   `READER_TTL_SECS` are pruned from the registry by a background task that
-//!   runs every 30 seconds.  The HTTP surface is two thin endpoints:
-//!   `POST /turbine/register` and `POST /turbine/heartbeat`.
+//! 2. **Signer-known check (7C)** — the `SignedTickShred.signer` pubkey must
+//!    be in the registry.  Prevents impersonation from a whitelisted IP.
 //!
-//! * **Best-effort UDP**: no ACK, no retransmit, no ordered delivery.  Shreds
-//!   are small (~200 bytes) and sent as single datagrams.
+//! 3. **Ed25519 signature verify (7C)** — the writer's signature over the raw
+//!    shred bytes is verified before any PoH math.
+//!
+//! 4. **PoH chain verify** — SHA-256 replay confirms the hash chain integrity.
+//!
+//! The Writer signs in the async broadcaster thread, keeping the PoH OS thread
+//! fully crypto-free so tick rate is never affected.
+//!
+//! `POST /turbine/register` and `POST /turbine/heartbeat` have been removed
+//! (Phase 7A hard cutover).  The registry is static, loaded at startup from
+//! `config.toml` or `APPROVED_VALIDATORS` env var.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::poh_service::TickShred;
+use super::validator_registry::ValidatorRegistry;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// UDP port for PoH tick shred broadcasting.
-/// Kept separate from the TPU ingest port (8003) to avoid mixing bincode formats.
 pub const TURBINE_TICK_PORT: u16 = 8004;
 
 /// Bounded channel capacity between the PoH OS thread and `TurbineTickService`.
-/// At 64 ticks/slot × ~1.7 slots/sec = ~107 ticks/sec.  10 000 gives ~93s of
-/// headroom before drops begin — vastly more than any reasonable stall window.
 pub const TICK_CHANNEL_CAPACITY: usize = 10_000;
 
-/// Seconds without a heartbeat before a Reader is pruned from the registry.
-pub const READER_TTL_SECS: u64 = 60;
+// ── SignedTickShred (7C wire format) ──────────────────────────────────────────
 
-// ── ReaderRecord ──────────────────────────────────────────────────────────────
-
-/// Registry entry for a connected Reader node.
-#[derive(Debug, Clone)]
-pub struct ReaderRecord {
-    /// UDP address the Writer sends TickShreds to.
-    pub udp_addr: SocketAddr,
-    /// Unix timestamp (seconds) of the last registration or heartbeat.
-    pub last_seen: u64,
+/// Wire format for a signed PoH tick shred.
+///
+/// The receiver verifies the Ed25519 signature over `shred_bytes` before
+/// deserializing the inner `TickShred`.  This means any tampering of the
+/// payload is caught before PoH math runs.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SignedTickShred {
+    /// bincode-serialized [`TickShred`].
+    pub shred_bytes: Vec<u8>,
+    /// Ed25519 pubkey of the signer (32 bytes, must be in `ValidatorRegistry`).
+    pub signer: Vec<u8>,
+    /// Ed25519 signature over `shred_bytes` (64 bytes).
+    pub signature: Vec<u8>,
 }
 
 // ── TurbineTickService (Writer-side broadcaster) ──────────────────────────────
 
-/// Receives `TickShred` events from the PoH clock thread and UDP-broadcasts
-/// them to all registered Reader nodes on port `TURBINE_TICK_PORT`.
+/// Receives `TickShred` events from the PoH clock thread, signs them, and
+/// UDP-broadcasts the `SignedTickShred` to every node in the registry.
 pub struct TurbineTickService {
     tick_rx: mpsc::Receiver<TickShred>,
-    /// Shared with the HTTP `/turbine/register` and `/turbine/heartbeat` handlers.
-    pub readers: Arc<DashMap<String, ReaderRecord>>,
+    registry: Arc<ValidatorRegistry>,
+    signing_key: Arc<SigningKey>,
 }
 
 impl TurbineTickService {
-    /// Create a new service.
-    ///
-    /// The caller is responsible for spawning the reader pruner via
-    /// [`spawn_reader_pruner`] with the same `readers` handle.
     pub fn new(
         tick_rx: mpsc::Receiver<TickShred>,
-        readers: Arc<DashMap<String, ReaderRecord>>,
+        registry: Arc<ValidatorRegistry>,
+        signing_key: Arc<SigningKey>,
     ) -> Self {
-        Self { tick_rx, readers }
+        Self { tick_rx, registry, signing_key }
     }
 
     /// Run the broadcaster.  Binds UDP on `0.0.0.0:TURBINE_TICK_PORT`.
-    /// This is a long-running async task — spawn with `tokio::spawn`.
+    /// Long-running async task — spawn with `tokio::spawn`.
     pub async fn run(mut self) {
         let bind_addr: SocketAddr = format!("0.0.0.0:{}", TURBINE_TICK_PORT)
             .parse()
@@ -94,38 +95,61 @@ impl TurbineTickService {
             }
         };
 
+        let signer_pubkey = self.signing_key.verifying_key().to_bytes().to_vec();
+
         info!(
-            "📡 TurbineTickService bound on UDP {} (capacity={})",
-            bind_addr, TICK_CHANNEL_CAPACITY
+            "📡 TurbineTickService bound on UDP {} — {} approved target(s), signer={}",
+            bind_addr,
+            self.registry.len(),
+            hex::encode(&signer_pubkey[..8])
         );
+
+        if self.registry.is_empty() {
+            warn!("⚠️  TurbineTickService: registry is empty — shreds will not be propagated");
+        }
 
         let mut shreds_sent: u64 = 0;
 
         while let Some(shred) = self.tick_rx.recv().await {
-            let bytes = match bincode::serialize(&shred) {
+            // Serialize the inner shred.
+            let shred_bytes = match bincode::serialize(&shred) {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!("TurbineTickService: serialize error: {}", e);
+                    warn!("TurbineTickService: serialize TickShred error: {}", e);
                     continue;
                 }
             };
 
-            for entry in self.readers.iter() {
-                let addr = entry.value().udp_addr;
-                if let Err(e) = socket.send_to(&bytes, addr).await {
-                    // Transient errors (ICMP unreachable, etc.) are expected.
-                    // Do NOT remove the reader — let the heartbeat pruner handle TTL.
+            // Sign the raw shred bytes (7C).
+            let sig: ed25519_dalek::Signature = self.signing_key.sign(&shred_bytes);
+
+            let signed = SignedTickShred {
+                shred_bytes,
+                signer: signer_pubkey.clone(),
+                signature: sig.to_bytes().to_vec(),
+            };
+
+            let wire_bytes = match bincode::serialize(&signed) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("TurbineTickService: serialize SignedTickShred error: {}", e);
+                    continue;
+                }
+            };
+
+            // Broadcast to all approved targets.
+            for addr in self.registry.udp_targets() {
+                if let Err(e) = socket.send_to(&wire_bytes, addr).await {
                     warn!("TurbineTickService: send_to {} failed: {}", addr, e);
                 }
             }
 
             shreds_sent += 1;
-            // Periodic log every 1000 slot-end shreds (~600 s)
             if shred.is_slot_end && shreds_sent % 1_000 == 0 {
                 info!(
-                    "⛓  TurbineTickService: {} slot-end shreds sent, {} active readers",
+                    "⛓  TurbineTickService: {} slot-end shreds sent to {} target(s)",
                     shreds_sent,
-                    self.readers.len()
+                    self.registry.len()
                 );
             }
         }
@@ -134,19 +158,15 @@ impl TurbineTickService {
 
 // ── TurbineTickReceiver (Reader-side verifier) ────────────────────────────────
 
-/// Listens on UDP port `TURBINE_TICK_PORT` and verifies the SHA-256 PoH chain
-/// in real-time as ticks arrive from the Writer.
-///
-/// A chain-break logs a warning and leaves `expected_hash` unchanged so the
-/// Reader continues trying the next tick.  The gRPC full-block relay
-/// (`WriterRelayService`) handles slot-level catch-up.
+/// Listens on UDP `TURBINE_TICK_PORT`, enforces 7B IP gate + 7C signature
+/// verify, then validates the PoH chain in real-time.
 pub struct TurbineTickReceiver {
     listen_addr: SocketAddr,
     /// Rolling tip of the verified SHA-256 chain.
     expected_hash: std::sync::Mutex<String>,
-    /// SHA-256 iterations per tick entry — must match the Writer's
-    /// `PoHConfig.hashes_per_tick` (default 12 500).
+    /// SHA-256 iterations per tick entry — must match the Writer's config.
     hashes_per_tick: u64,
+    registry: Arc<ValidatorRegistry>,
 }
 
 impl TurbineTickReceiver {
@@ -154,16 +174,17 @@ impl TurbineTickReceiver {
         listen_addr: SocketAddr,
         genesis_hash: String,
         hashes_per_tick: u64,
+        registry: Arc<ValidatorRegistry>,
     ) -> Arc<Self> {
         Arc::new(Self {
             listen_addr,
             expected_hash: std::sync::Mutex::new(genesis_hash),
             hashes_per_tick,
+            registry,
         })
     }
 
-    /// Run the receiver.  Binds UDP on `listen_addr`.
-    /// This is a long-running async task — spawn with `tokio::spawn`.
+    /// Run the receiver.  Long-running async task — spawn with `tokio::spawn`.
     pub async fn run(self: Arc<Self>) {
         let socket = match UdpSocket::bind(self.listen_addr).await {
             Ok(s) => s,
@@ -176,43 +197,109 @@ impl TurbineTickReceiver {
             }
         };
 
-        info!("👂 TurbineTickReceiver listening on UDP {}", self.listen_addr);
+        info!(
+            "👂 TurbineTickReceiver listening on UDP {} ({} approved source(s))",
+            self.listen_addr,
+            self.registry.len()
+        );
 
-        // 4 KiB is more than enough for a TickShred (~200 bytes serialized).
-        let mut buf = vec![0u8; 4096];
+        // Buffer sized for a SignedTickShred (~500 bytes serialized).
+        let mut buf = vec![0u8; 8192];
 
         loop {
-            let size = match socket.recv(&mut buf).await {
-                Ok(n) => n,
+            // Use recv_from to obtain the sender address for IP gating (7B).
+            let (size, src) = match socket.recv_from(&mut buf).await {
+                Ok(r) => r,
                 Err(e) => {
-                    error!("TurbineTickReceiver recv error: {}", e);
+                    error!("TurbineTickReceiver recv_from error: {}", e);
                     continue;
                 }
             };
 
-            let shred: TickShred = match bincode::deserialize(&buf[..size]) {
+            // ── Phase 7B: Source-IP gate ─────────────────────────────────────
+            // Drop before ANY deserialization — protects against parse-bomb DoS.
+            if !self.registry.is_approved_ip(&src.ip()) {
+                // Intentionally silent — do not log per-packet to avoid log flooding.
+                continue;
+            }
+
+            // ── Deserialize signed envelope ──────────────────────────────────
+            let signed: SignedTickShred = match bincode::deserialize(&buf[..size]) {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(
-                        "TurbineTickReceiver: malformed shred ({} bytes): {}",
-                        size, e
+                        "TurbineTickReceiver: malformed envelope ({} bytes) from {}: {}",
+                        size, src, e
                     );
                     continue;
                 }
             };
 
-            if !self.verify_entry(&shred) {
+            // ── Phase 7C: Signer-known check ─────────────────────────────────
+            if signed.signer.len() != 32 {
+                warn!("TurbineTickReceiver: bad signer length from {}", src);
+                continue;
+            }
+            let mut signer_bytes = [0u8; 32];
+            signer_bytes.copy_from_slice(&signed.signer);
+
+            if self.registry.get_by_pubkey(&signer_bytes).is_none() {
                 warn!(
-                    "⚠️  PoH chain break at slot={} tick={} — hash mismatch. \
-                     gRPC relay will resync this slot.",
-                    shred.slot, shred.tick_index
+                    "TurbineTickReceiver: unknown signer {} from {} — dropping",
+                    hex::encode(&signed.signer[..8]),
+                    src
                 );
-                // Leave expected_hash unchanged; the next valid tick will fix it
-                // or the gRPC relay will provide the authoritative slot hash.
                 continue;
             }
 
-            // Advance the verified chain tip
+            // ── Phase 7C: Ed25519 signature verify ───────────────────────────
+            let vk = match VerifyingKey::from_bytes(&signer_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("TurbineTickReceiver: invalid verifying key from {}: {}", src, e);
+                    continue;
+                }
+            };
+
+            if signed.signature.len() != 64 {
+                warn!("TurbineTickReceiver: bad signature length from {}", src);
+                continue;
+            }
+            let mut sig_bytes = [0u8; 64];
+            sig_bytes.copy_from_slice(&signed.signature);
+            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            if let Err(e) = vk.verify(&signed.shred_bytes, &sig) {
+                warn!(
+                    "TurbineTickReceiver: signature verification FAILED from {} — {}",
+                    src, e
+                );
+                continue;
+            }
+
+            // ── Deserialize inner shred ──────────────────────────────────────
+            let shred: TickShred = match bincode::deserialize(&signed.shred_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "TurbineTickReceiver: malformed inner TickShred from {}: {}",
+                        src, e
+                    );
+                    continue;
+                }
+            };
+
+            // ── PoH chain verification ───────────────────────────────────────
+            if !self.verify_entry(&shred) {
+                warn!(
+                    "⚠️  PoH chain break at slot={} tick={} — hash mismatch (src={}). \
+                     gRPC relay will resync.",
+                    shred.slot, shred.tick_index, src
+                );
+                continue;
+            }
+
+            // Advance the verified chain tip.
             {
                 let mut tip = self.expected_hash.lock().unwrap();
                 *tip = shred.entry.hash.clone();
@@ -220,8 +307,7 @@ impl TurbineTickReceiver {
         }
     }
 
-    /// Replay the PoH hash derivation from the current expected tip and compare
-    /// against the incoming entry's hash.
+    /// Replay the PoH hash derivation from the current expected tip.
     fn verify_entry(&self, shred: &TickShred) -> bool {
         use sha2::{Digest, Sha256};
 
@@ -231,14 +317,12 @@ impl TurbineTickReceiver {
         };
         let mut current = tip;
 
-        // Step 1: replay hashes_per_tick SHA-256 iterations (the VDF)
         for _ in 0..self.hashes_per_tick {
             let mut h = Sha256::new();
             h.update(current.as_bytes());
             current = format!("{:x}", h.finalize());
         }
 
-        // Step 2: mix in any transaction IDs that were stamped into this entry
         if !shred.entry.transactions.is_empty() {
             let mut h = Sha256::new();
             h.update(current.as_bytes());
@@ -252,31 +336,6 @@ impl TurbineTickReceiver {
     }
 }
 
-// ── Heartbeat pruner ──────────────────────────────────────────────────────────
-
-/// Spawns a background Tokio task that removes stale Reader nodes from the
-/// registry every 30 seconds.  A Reader is considered stale when its
-/// `last_seen` timestamp is older than `READER_TTL_SECS`.
-pub fn spawn_reader_pruner(readers: Arc<DashMap<String, ReaderRecord>>) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let now = now_unix_secs();
-            let before = readers.len();
-            readers.retain(|_, rec| now.saturating_sub(rec.last_seen) < READER_TTL_SECS);
-            let pruned = before.saturating_sub(readers.len());
-            if pruned > 0 {
-                info!(
-                    "🧹 Turbine pruner: removed {} stale reader(s), {} active",
-                    pruned,
-                    readers.len()
-                );
-            }
-        }
-    });
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Current Unix timestamp in seconds.
@@ -287,3 +346,4 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+

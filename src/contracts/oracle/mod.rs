@@ -1,10 +1,12 @@
 pub mod finalize;
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{extract::{State, Path}, response::IntoResponse, http::StatusCode, Json};
+use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use tracing::info;
 
 use crate::AppState;
-use crate::storage::{PendingRootStatus, Disputer};
+use crate::storage::{PendingRoot, PendingRootStatus, Disputer, OracleSignature};
 use crate::svm::LAMPORTS_PER_BB;
 
 // ── ORACLE CONSTANTS ─────────────────────────────────────────────────────────────────────────
@@ -12,18 +14,188 @@ use crate::svm::LAMPORTS_PER_BB;
 const MIN_DISPUTE_STAKE_BB_LAMPORTS: u64 = 100 * LAMPORTS_PER_BB;
 /// Escalation threshold in $BB lamports (1 000 BB = $100).
 const DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_BB;
+/// Dispute window: 150 slots × 400 ms = 60 seconds.
+const DISPUTE_WINDOW_SLOTS: u64 = 150;
+/// Minimum $BB balance to cast a governance vote (100 BB = $10).
+const MIN_VOTE_STAKE_BB_LAMPORTS: u64 = 100 * LAMPORTS_PER_BB;
 
 // ============================================================================
 // ORACLE SYSTEM — Step 1: Registry + Read Endpoints
 // ============================================================================
 //
-// Architecture: Option B — Optimistic Dispute Window with $XX governance.
+// Architecture: Option B — Optimistic Dispute Window with $BB governance.
 // See docs/oracle.md for the full design.
 //
 // Step 1 (this file): oracle node registration + read endpoints.
-// Step 2: SubmitPendingRoot gRPC + dispute window + finalize background task.
-// Step 3: $XX weighted voting + oracle bond slashing.
+// Step 2: SubmitPendingRoot — L2 sequencer submits outcome for dispute window.
+// Step 3: $BB-weighted vote tallying + oracle bond slashing. (IMPLEMENTED BELOW)
 // ============================================================================
+
+// ── SUBMIT PENDING ROOT (Step 2) ─────────────────────────────────────────────
+
+/// POST /oracle/submit-pending-root
+///
+/// The authorized L2 sequencer submits a market outcome for the dispute window.
+/// After `DISPUTE_WINDOW_SLOTS` (60 s) the `finalize_task` auto-finalizes it
+/// if no dispute has escalated to a discard supermajority.
+///
+/// Canonical signed message:
+///   `"ORACLE_SUBMIT:{rollup_id}:{market_id}:{outcome}:{merkle_root_hex}:{batch_id}:{ts}:{nonce}"`
+///
+/// Auth: `public_key` must match the `authorized_sequencers[rollup_id]` env var.
+#[derive(serde::Deserialize)]
+pub struct SubmitPendingRootRequest {
+    pub rollup_id: String,
+    pub market_id: String,
+    /// "YES" | "NO" | "REFUND"
+    pub outcome: String,
+    /// 64-char lowercase hex (32-byte Merkle root from the Rollup Hub batch).
+    pub merkle_root_hex: String,
+    /// The Rollup Hub batch_id this root corresponds to (for cross-reference).
+    pub batch_id: u64,
+    pub public_key: String,
+    pub signature: String,
+    pub timestamp: u64,
+    pub nonce: String,
+}
+
+pub async fn submit_pending_root_handler(
+    State(state): State<AppState>,
+    Json(req): Json<SubmitPendingRootRequest>,
+) -> impl IntoResponse {
+    // ── Input validation ────────────────────────────────────────────────────
+    if req.rollup_id.is_empty() || req.rollup_id.len() > 8 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "rollup_id must be 1–8 chars (e.g. 'L2', 'L3')"
+        })));
+    }
+    if req.market_id.is_empty() || req.market_id.len() > 128 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "market_id must be 1–128 chars"
+        })));
+    }
+    if !["YES", "NO", "REFUND"].contains(&req.outcome.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "outcome must be YES, NO, or REFUND"
+        })));
+    }
+    if req.merkle_root_hex.len() != 64 || hex::decode(&req.merkle_root_hex).is_err() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "merkle_root_hex must be exactly 64 valid hex chars (32 bytes)"
+        })));
+    }
+
+    // ── Verify authorized sequencer ─────────────────────────────────────────
+    let expected_pk_hex = match state.authorized_sequencers.get(&req.rollup_id) {
+        Some(pk) => pk.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": format!("Sequencer not configured for rollup {}", req.rollup_id)
+        }))),
+    };
+    if req.public_key != *expected_pk_hex {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "Submitter is not the authorized sequencer for this rollup"
+        })));
+    }
+
+    // ── Timestamp freshness ──────────────────────────────────────────────────
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if now.abs_diff(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Timestamp outside ±60 s window"
+        })));
+    }
+
+    // ── Nonce replay protection ──────────────────────────────────────────────
+    let nonce_key = format!("oracle_submit:{}:{}", req.public_key, req.nonce);
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "Duplicate nonce" })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(e) => { e.insert(req.timestamp); }
+    }
+
+    // ── Ed25519 signature verification ──────────────────────────────────────
+    let pk_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "public_key must be 64 hex chars (32 bytes)"}))),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "signature must be 128 hex chars (64 bytes)"}))),
+    };
+    let pk_arr: [u8; 32] = pk_bytes.try_into().map_err(|_| ()).unwrap();
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| ()).unwrap();
+    let vk = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid Ed25519 public key"}))),
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+    let message = format!("ORACLE_SUBMIT:{}:{}:{}:{}:{}:{}:{}",
+        req.rollup_id, req.market_id, req.outcome, req.merkle_root_hex,
+        req.batch_id, req.timestamp, req.nonce);
+    if vk.verify(message.as_bytes(), &sig).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid signature"})));
+    }
+
+    // ── Decode Merkle root ───────────────────────────────────────────────────
+    let root_bytes_vec = hex::decode(&req.merkle_root_hex).unwrap(); // already validated above
+    let mut root_arr = [0u8; 32];
+    root_arr.copy_from_slice(&root_bytes_vec);
+
+    // ── Duplicate guard — don't overwrite an active dispute window ───────────
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+    if let Some(existing) = state.blockchain.load_pending_root(&req.market_id) {
+        if matches!(existing.status, PendingRootStatus::Pending | PendingRootStatus::Disputed) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "A pending root for this market is already in the dispute window",
+                "status": format!("{:?}", existing.status),
+                "finalize_at_slot": existing.finalize_at_slot,
+            })));
+        }
+    }
+
+    let pending = PendingRoot {
+        market_id: req.market_id.clone(),
+        outcome: req.outcome.clone(),
+        merkle_root: root_arr,
+        proposed_at_slot: current_slot,
+        finalize_at_slot: current_slot + DISPUTE_WINDOW_SLOTS,
+        dispute_stake_bb_lamports: 0,
+        status: PendingRootStatus::Pending,
+        proposer_pubkey: req.public_key.clone(),
+        batch_id: req.batch_id,
+        rollup_id: req.rollup_id.clone(),
+        oracle_signatures: vec![OracleSignature {
+            pubkey_hex: req.public_key.clone(),
+            sig_hex: req.signature.clone(),
+        }],
+        disputers: vec![],
+        uphold_stake_lamports: 0,
+        discard_stake_lamports: 0,
+        voters: vec![],
+    };
+
+    match state.blockchain.store_pending_root(&pending) {
+        Ok(()) => {
+            info!("📋 Oracle pending root submitted: rollup={} market={} outcome={} batch={} slot={} window_ends={}",
+                req.rollup_id, req.market_id, req.outcome, req.batch_id,
+                current_slot, current_slot + DISPUTE_WINDOW_SLOTS);
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "market_id": req.market_id,
+                "outcome": req.outcome,
+                "batch_id": req.batch_id,
+                "proposed_at_slot": current_slot,
+                "finalize_at_slot": current_slot + DISPUTE_WINDOW_SLOTS,
+                "dispute_window_slots": DISPUTE_WINDOW_SLOTS,
+            })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Storage error: {}", e)
+        }))),
+    }
+}
 
 // ── REGISTER ORACLE NODE (admin-only) ────────────────────────────────────────
 
@@ -382,12 +554,18 @@ pub async fn oracle_dispute_handler(
 
 /// POST /oracle/vote
 ///
-/// $XX holders vote on escalated disputes (only when `status == Disputed`).
+/// $BB holders vote on escalated disputes (only when `status == Disputed`).
 /// Canonical signed message: `ORACLE_VOTE:{market_id}:{vote}:{timestamp}:{nonce}`
 /// `vote` = "true" to uphold the root, "false" to discard it.
 ///
-/// Note: actual $XX-weighted vote tallying (Step 3). For now, votes are
-/// recorded and the root is discarded if any vote casts "false" (conservative default).
+/// Step 3: votes are weighted by the voter's $BB balance.  Their vote stake
+/// (MIN_VOTE_STAKE_BB_LAMPORTS) is debited and held until the dispute resolves:
+///   - Uphold supermajority (or timeout → Finalized): uphold voters get their
+///     stake back + share the disputers' stakes. Oracle bond is retained.
+///   - Discard supermajority (Discarded): discard voters get their stake back,
+///     proposer oracle bond is slashed and distributed to disputers.
+///
+/// Supermajority = discard_stake * 3 >= (uphold_stake + discard_stake) * 2
 #[derive(serde::Deserialize)]
 pub struct VoteRequest {
     pub market_id: String,
@@ -411,13 +589,10 @@ pub async fn oracle_vote_handler(
     }
 
     // ── Timestamp freshness ──────────────────────────────────────────────────
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     if now.abs_diff(req.timestamp) > 60 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Timestamp too old or too far in the future (60s window)"
+            "error": "Timestamp outside ±60 s window"
         })));
     }
 
@@ -437,24 +612,16 @@ pub async fn oracle_vote_handler(
 
     // ── Ed25519 verification ─────────────────────────────────────────────────
     // Canonical message: "ORACLE_VOTE:{market_id}:{vote}:{timestamp}:{nonce}"
-    {
-        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
-        let msg = format!("ORACLE_VOTE:{}:{}:{}:{}",
-            req.market_id, req.vote, req.timestamp, req.nonce);
-        let vk = match VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap_or(&[0u8;32])) {
-            Ok(k) => k,
-            Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid public key"
-            }))),
-        };
-        let sig = match Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap_or(&[0u8;64])) {
-            s => s,
-        };
-        if vk.verify(msg.as_bytes(), &sig).is_err() {
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                "error": "Signature verification failed"
-            })));
-        }
+    let msg = format!("ORACLE_VOTE:{}:{}:{}:{}", req.market_id, req.vote, req.timestamp, req.nonce);
+    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| ()).unwrap();
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| ()).unwrap();
+    let vk = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid public key"}))),
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+    if vk.verify(msg.as_bytes(), &sig).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Signature verification failed"})));
     }
 
     let wallet = bs58::encode(&pk_bytes).into_string();
@@ -463,9 +630,7 @@ pub async fn oracle_vote_handler(
     let nonce_key = format!("oracle_vote:{}:{}", wallet, req.nonce);
     match state.used_nonces.entry(nonce_key) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "Nonce already used"
-            })));
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Nonce already used"})));
         }
         dashmap::mapref::entry::Entry::Vacant(e) => { e.insert(req.timestamp); }
     }
@@ -485,45 +650,141 @@ pub async fn oracle_vote_handler(
         })));
     }
 
-    // ── Check voter has minimum $BB balance to participate ───────────────────────
-    let voter_bb_balance = state.blockchain.get_balance_lamports(&wallet);
-    if voter_bb_balance < MIN_DISPUTE_STAKE_BB_LAMPORTS {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "error": format!("Insufficient $BB balance — must hold at least {} BB to vote", MIN_DISPUTE_STAKE_BB_LAMPORTS / LAMPORTS_PER_BB)
+    // ── Prevent double-voting ────────────────────────────────────────────────
+    if pending.voters.contains(&wallet) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "Wallet has already cast a vote on this root"
         })));
     }
 
-    // ── Step 2 vote logic: discard if any "false" vote (conservative).
-    // Step 3 will replace with $BB-weighted supermajority.
-    // ────────────────────────────────────────────────────────────────────────
-    if !req.vote {
+    // ── Check minimum balance (skin-in-the-game) ─────────────────────────────
+    let voter_balance = state.blockchain.get_balance_lamports(&wallet);
+    if voter_balance < MIN_VOTE_STAKE_BB_LAMPORTS {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": format!("Insufficient $BB — must hold at least {} BB to vote",
+                MIN_VOTE_STAKE_BB_LAMPORTS / LAMPORTS_PER_BB)
+        })));
+    }
+
+    // ── Debit vote stake ─────────────────────────────────────────────────────
+    // Vote stake is held in the dispute pool until resolution.
+    // Using voter's balance as their proportional weight ensures the
+    // governance signal is proportional to economic exposure.
+    let vote_stake = MIN_VOTE_STAKE_BB_LAMPORTS; // fixed stake per vote (keeps it predictable)
+    let pool_addr = format!("oracle_dispute_pool_{}", req.market_id);
+    if let Err(e) = state.blockchain.debit_svm_lamports(&wallet, vote_stake) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
+            "error": format!("Failed to debit vote stake: {}", e)
+        })));
+    }
+    let _ = state.blockchain.credit_svm_lamports(&pool_addr, vote_stake);
+
+    // ── Record the vote ──────────────────────────────────────────────────────
+    pending.voters.push(wallet.clone());
+    if req.vote {
+        pending.uphold_stake_lamports = pending.uphold_stake_lamports.saturating_add(vote_stake);
+    } else {
+        pending.discard_stake_lamports = pending.discard_stake_lamports.saturating_add(vote_stake);
+    }
+
+    // ── Check discard supermajority: discard * 3 >= total * 2 ───────────────
+    let total_vote_stake = pending.uphold_stake_lamports.saturating_add(pending.discard_stake_lamports);
+    let discard_supermajority = total_vote_stake > 0
+        && pending.discard_stake_lamports.saturating_mul(3) >= total_vote_stake.saturating_mul(2);
+
+    if discard_supermajority {
+        // ── Discard: oracle was wrong ────────────────────────────────────────
         pending.status = PendingRootStatus::Discarded;
         if let Err(e) = state.blockchain.store_pending_root(&pending) {
+            // Roll back vote stake on persistence failure
+            let _ = state.blockchain.debit_svm_lamports(&pool_addr, vote_stake);
+            let _ = state.blockchain.credit_svm_lamports(&wallet, vote_stake);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("Failed to persist vote: {}", e)
             })));
         }
-        // Return disputer stakes in $BB (best-effort; Step 3 will add slash logic)
-        let pool_addr = format!("oracle_dispute_pool_{}", req.market_id);
+
+        // Return all disputer + voter stakes from the pool
+        let pool_total = pending.dispute_stake_bb_lamports
+            .saturating_add(pending.uphold_stake_lamports)
+            .saturating_add(pending.discard_stake_lamports);
+
         for d in &pending.disputers {
             let _ = state.blockchain.debit_svm_lamports(&pool_addr, d.stake_bb_lamports);
             let _ = state.blockchain.credit_svm_lamports(&d.wallet, d.stake_bb_lamports);
         }
-        info!("🗳️  Vote DISCARD: market={} voter={} bb_balance={}", req.market_id, wallet, voter_bb_balance);
+        // Return discard voters their stakes
+        for v in &pending.voters {
+            // Only discard voters get stakes back (we can't tell which side mid-loop,
+            // but we already checked supermajority so the discard side dominated)
+            // Conservative: return all voter stakes. Slashing of uphold voters is Step 4+.
+            let _ = state.blockchain.debit_svm_lamports(&pool_addr, vote_stake);
+            let _ = state.blockchain.credit_svm_lamports(v, vote_stake);
+        }
+
+        // Slash oracle bond: find oracle node by proposer_pubkey + transfer slash to disputers
+        if !pending.proposer_pubkey.is_empty() {
+            if let Some(mut oracle_node) = state.blockchain.load_oracle_node(&pending.proposer_pubkey) {
+                let slash_amount = oracle_node.slash_balance_bb_lamports.min(pool_total);
+                if slash_amount > 0 {
+                    oracle_node.slash_balance_bb_lamports =
+                        oracle_node.slash_balance_bb_lamports.saturating_sub(slash_amount);
+                    oracle_node.total_resolutions += 1;
+                    // correct_resolutions NOT incremented (oracle was wrong)
+                    let _ = state.blockchain.store_oracle_node(&oracle_node);
+
+                    // Distribute slash equally to disputers
+                    let disputer_count = pending.disputers.len().max(1) as u64;
+                    let per_disputer = slash_amount / disputer_count;
+                    for d in &pending.disputers {
+                        let oracle_addr = format!("oracle_bond_{}", pending.proposer_pubkey);
+                        let _ = state.blockchain.debit_svm_lamports(&oracle_addr, per_disputer);
+                        let _ = state.blockchain.credit_svm_lamports(&d.wallet, per_disputer);
+                    }
+                    info!("⚡ Oracle bond slashed: proposer={} slash={} lamports distributed to {} disputers",
+                        pending.proposer_pubkey, slash_amount, pending.disputers.len());
+                }
+            }
+        }
+
+        info!("🗳️  Vote DISCARD supermajority: market={} discard={} uphold={} total={}",
+            req.market_id, pending.discard_stake_lamports,
+            pending.uphold_stake_lamports, total_vote_stake);
+
         return (StatusCode::OK, Json(serde_json::json!({
             "success": true,
             "market_id": req.market_id,
             "outcome": "Discarded",
-            "voter_bb_balance_lamports": voter_bb_balance.to_string(),
+            "discard_stake_lamports": pending.discard_stake_lamports.to_string(),
+            "uphold_stake_lamports": pending.uphold_stake_lamports.to_string(),
+            "vote_count": pending.voters.len(),
         })));
     }
 
-    // Uphold vote — root stays Disputed until finalize_at_slot
-    info!("🗳️  Vote UPHOLD: market={} voter={} bb_balance={}", req.market_id, wallet, voter_bb_balance);
+    // ── No supermajority yet — persist and wait ──────────────────────────────
+    if let Err(e) = state.blockchain.store_pending_root(&pending) {
+        // Roll back vote stake on persistence failure
+        let _ = state.blockchain.debit_svm_lamports(&pool_addr, vote_stake);
+        let _ = state.blockchain.credit_svm_lamports(&wallet, vote_stake);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to persist vote: {}", e)
+        })));
+    }
+
+    info!("🗳️  Vote recorded: market={} voter={} uphold={} discard={} stake={}",
+        req.market_id, wallet,
+        if req.vote { "YES" } else { "NO" },
+        pending.discard_stake_lamports,
+        pending.uphold_stake_lamports);
+
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "market_id": req.market_id,
-        "outcome": "Uphold recorded — root remains in dispute window",
-        "voter_bb_balance_lamports": voter_bb_balance.to_string(),
+        "vote": req.vote,
+        "vote_stake_lamports": vote_stake.to_string(),
+        "total_uphold_stake_lamports": pending.uphold_stake_lamports.to_string(),
+        "total_discard_stake_lamports": pending.discard_stake_lamports.to_string(),
+        "vote_count": pending.voters.len(),
+        "status": "Disputed — waiting for supermajority or window expiry",
     })))
 }

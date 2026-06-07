@@ -1,5 +1,5 @@
 /**
- * BlackBook L1 — Dealer SDK (Layer 2 Prediction Market Operator)
+ * BlackBook L1 — Dealer + Escrow SDK (combined)
  * ============================================================================
  * The Dealer is the L2 operator hot-wallet that:
  *   - Manages its own BB balance (the "house bankroll")
@@ -9,21 +9,30 @@
  *   - Batch-settles winner payouts
  *   - Releases withdrawals (BB → Solana USDC cashout)
  *   - Mints / burns BB tokens as needed
- *   - Sends wUSDC to user ATAs
+ *   - Sends wUSDT to user ATAs
  *   - Monitors L1 node health, escrow invariants, and supply audits
  *
- * Settlement cycle:
- *   1. initContestReserve()   → lock dealer BB into escrow PDA
- *   2. L2 receives live balance via SubscribeBalances gRPC stream
- *      (or calls getBalanceCached() which falls back to GetBalance on cache miss)
- *   3. (L2 game plays out)
- *   4. submitStateRoot()      → anchor Merkle root + zero-sum proof
- *   5. settleWinners()        → batch-pay winners from dealer balance
- *   6. getContestStatus()     → poll until all claims are resolved
+ * EscrowSDK (also in this file) is the end-user counterpart:
+ *   - User calls escrow.deposit()  → lock BB into escrow PDA
+ *   - User plays on L2
+ *   - Sequencer calls DealerSDK.submitStateRoot()
+ *   - User calls escrow.withdraw() with Merkle proof → receive BB
  *
- * Merkle tree format (must match L1 verification):
- *   Leaf:   SHA256( bs58_decode(wallet)[32] || amount_spl_u64_le[8] )
- *   Parent: SHA256( min(left, right) || max(left, right) )
+ * Dealer settlement cycle:
+ *   1. lockBB()              → lock dealer BB into rollup vault PDA
+ *   2. (L2 game plays out)
+ *   3. buildMerkleTree()     → build Rollup Hub leaf tree (SHA256 string preimage)
+ *   4. submitStateRoot()     → anchor Merkle root to Universal Rollup Hub
+ *   5. settleWinners()       → batch-pay winners from dealer balance
+ *   6. getProofForWinner()   → hand proof to each winner for on-chain exit
+ *
+ * Merkle tree format (must match L1 rollup/mod.rs verification):
+ *   BB  Leaf: SHA256( "{rollup_id}:BB:{address}:{balance_lamports}" )
+ *   Parent:   SHA256( min(left, right) || max(left, right) )   ← sorted pair
+ *
+ * Token units:
+ *   BB  : 5 decimals, 1 BB = 100,000 lamports (LAMPORTS_PER_BB)
+ *   wUSDT: 6 decimals; rate 10 BB = 1 wUSDT
  *
  * Dependencies: npm install @noble/ed25519 @noble/hashes bs58
  * ============================================================================
@@ -40,15 +49,6 @@ export interface Keypair {
   publicKeyHex: string;
 }
   
-// ── Constants ──────────────────────────────────────────────────────────────
-
-/** 1 BB = 1,000,000 SPL units (6 decimals, same as USDC on Solana) */
-const BB_DECIMALS = 6;
-const SPL_MULTIPLIER = 10 ** BB_DECIMALS;
-
-/** Deposit gateway rate: 1 USDC = 10 BB */
-const BB_PER_USDC = 10;
-
 // ── Response Types ─────────────────────────────────────────────────────────
 
 export interface HealthResponse {
@@ -178,6 +178,19 @@ export interface EscrowDepositResponse {
   escrow_balance: number;
 }
 
+/** Returned when a user withdraws winnings from the escrow contract. */
+export interface EscrowWithdrawResponse {
+  success: boolean;
+  withdrawn: number;
+  market_id: string;
+  wallet_address: string;
+  /** User's BB balance after the withdrawal */
+  new_balance: number;
+}
+
+/** Array of 64-char hex sibling hashes that form a Merkle path. */
+export type MerkleProof = string[];
+
 export interface StateRootResponse {
   success: boolean;
   market_id: string;
@@ -255,9 +268,11 @@ export interface GrpcSyncBridgeResponse {
 
 // ── Merkle types ───────────────────────────────────────────────────────────
 
+/** BB payout entry for Merkle tree construction. Amounts in lamports (u64). */
 export interface MerkleLeafData {
   walletAddress: string;
-  amountBB: number;
+  /** Raw lamports (1 BB = 100,000). Use bbToLamports() to convert. */
+  balanceLamports: bigint;
 }
 
 export interface MerkleTreeResult {
@@ -289,14 +304,9 @@ function randomNonce(): string {
     .join("");
 }
 
-/** Convert human-readable BB to raw SPL u64 */
-export function toSplUnits(bb: number): bigint {
-  return BigInt(Math.round(bb * SPL_MULTIPLIER));
-}
-
-/** Convert raw SPL u64 to human-readable BB */
-export function fromSplUnits(spl: bigint): number {
-  return Number(spl) / SPL_MULTIPLIER;
+/** Convert raw lamports back to whole-BB (display boundary only). */
+export function fromSplUnits(lamports: bigint): number {
+  return lamportsToBb(lamports);
 }
 
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -388,24 +398,13 @@ export class DealerSDK {
 
   /**
    * Sign a UTF-8 message with the dealer's Ed25519 private key.
-   * Used for escrow deposits, withdrawals, and transfer signing.
+   * All signed messages on BlackBook L1 are UTF-8 strings.
    */
   private async signMessage(message: string): Promise<string> {
     const { ed, hexToBytes, bytesToHex } = await getCrypto();
     const privBytes = hexToBytes(this.wallet.privateKeyHex);
     const msgBytes = new TextEncoder().encode(message);
     const sigBytes = await ed.signAsync(msgBytes, privBytes);
-    return bytesToHex(sigBytes);
-  }
-
-  /**
-   * Sign a binary-packed message (for state root submission).
-   * Format: contest_id_bytes ++ l2_block_number_le(8) ++ merkle_root(32)
-   */
-  private async signBinaryMessage(payload: Uint8Array): Promise<string> {
-    const { ed, hexToBytes, bytesToHex } = await getCrypto();
-    const privBytes = hexToBytes(this.wallet.privateKeyHex);
-    const sigBytes = await ed.signAsync(payload, privBytes);
     return bytesToHex(sigBytes);
   }
 
@@ -418,23 +417,26 @@ export class DealerSDK {
     return this.get(`/balance/${this.wallet.address}`);
   }
 
-  /** Get the dealer wallet's wUSDC balance. */
-  async getUsdcBalance(): Promise<UsdcBalanceResponse> {
+  /** Get the dealer wallet's wUSDT balance. */
+  async getUsdtBalance(): Promise<UsdcBalanceResponse> {
     return this.get(`/usdc/balance/${this.wallet.address}`);
   }
 
   /**
-   * Get the dealer's BB, wUSDT, $XX, and $DECAY balances in a single call.
-   * Returns HTTP 503 if DEALER_PRIVATE_KEY is not set on the node.
+   * Get the dealer's BB and wUSDT balances.
    */
   async getAllBalances(): Promise<{
-    dealer_address: string;
-    bb: { balance: number; lamports: number; unit: string };
-    wusdt: { balance: number; raw: number; unit: string };
-    maxx: { balance: number; raw: number; unit: string };
-    decay: { token_count: number; token_ids: number[]; unit: string };
+    bb: { balance: number; unit: string };
+    wusdt: { balance: number; unit: string };
   }> {
-    return this.get("/dealer/balances");
+    const [bb, wusdt] = await Promise.all([
+      this.getBalance(),
+      this.getUsdtBalance(),
+    ]);
+    return {
+      bb: { balance: bb.balance, unit: "BB" },
+      wusdt: { balance: wusdt.usdc_balance, unit: "wUSDT" },
+    };
   }
 
   /**
@@ -623,70 +625,75 @@ export class DealerSDK {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Submit a Merkle state root to L1 after an L2 prediction market resolves.
+   * Submit a Merkle state root to the Universal Rollup Hub after L2 resolves a batch.
    *
-   * This is the critical finalization step. L1 enforces:
-   *   - Ed25519 signature from the configured L2 sequencer
-   *   - Zero-sum invariant: total_deposited == total_payout + house_rake
-   *   - Merkle root is stored permanently; opens a 30-day claim window
+   * This replaces the old `/escrow/submit-state-root` endpoint. The L1 enforces:
+   *   - Ed25519 signature from the configured rollup sequencer
+   *   - Monotonically increasing batch_id (replays rejected with 409)
+   *   - Signature is a UTF-8 string (not binary)
    *
-   * The signed message is BINARY (not UTF-8):
-   *   contest_id_bytes ++ l2_block_number_le(8) ++ merkle_root(32)
+   * Canonical signed message (must match L1 Rust exactly):
+   *   `"ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{merkleRootHex}:{timestamp}"`
    *
-   * @param marketId        L2 market identifier (e.g. "market_btc_42")
-   * @param tree            MerkleTreeResult from buildMerkleTree()
-   * @param l2BlockNumber   Monotonic L2 block counter
-   * @param totalDeposited  Total BB deposited by all users (SPL units)
-   * @param totalPayout     Total BB going to winners (SPL units)
-   * @param houseRake       Dealer's commission (SPL units)
+   * @param rollupId     "L2", "L3", or "L5"
+   * @param batchId      Monotonically increasing batch counter
+   * @param merkleRoot   64-char hex SHA-256 Merkle root from buildRollupMerkleRoot()
    */
   async submitStateRoot(
-    marketId: string,
-    tree: MerkleTreeResult,
-    l2BlockNumber: bigint,
-    totalDeposited: bigint,
-    totalPayout: bigint,
-    houseRake: bigint
+    rollupId: string,
+    batchId: number,
+    merkleRoot: string
   ): Promise<StateRootResponse> {
-    // Enforce zero-sum before sending to L1
-    if (totalDeposited !== totalPayout + houseRake) {
-      throw new Error(
-        `Zero-sum violation: deposited(${totalDeposited}) != payout(${totalPayout}) + rake(${houseRake})`
-      );
-    }
+    const timestamp = nowSecs();
+    const message = `ROLLUP_SUBMIT_ROOT:${rollupId}:${batchId}:${merkleRoot}:${timestamp}`;
+    const signature = await this.signMessage(message);
 
-    // Binary-pack the signing payload
-    const contestIdBytes = new TextEncoder().encode(marketId);
-    const blockNumberBytes = new Uint8Array(8);
-    new DataView(blockNumberBytes.buffer).setBigUint64(
-      0,
-      l2BlockNumber,
-      true // little-endian
-    );
-
-    const payload = new Uint8Array(
-      contestIdBytes.length + 8 + 32
-    );
-    payload.set(contestIdBytes, 0);
-    payload.set(blockNumberBytes, contestIdBytes.length);
-    payload.set(tree.root, contestIdBytes.length + 8);
-
-    const signature = await this.signBinaryMessage(payload);
-
-    return this.post("/escrow/submit-state-root", {
-      market_id: marketId,
-      merkle_root: tree.rootHex,
+    return this.post(`/rollup/${rollupId}/submit_root`, {
+      batch_id: batchId,
+      merkle_root_hex: merkleRoot,
+      sequencer_public_key: this.wallet.publicKeyHex,
       signature,
-      l2_block_number: Number(l2BlockNumber),
-      total_deposited: Number(totalDeposited),
-      total_payout: Number(totalPayout),
-      house_rake: Number(houseRake),
-      winner_count: tree.leaves.length,
+      timestamp,
     });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  7. SETTLEMENT — Batch-pay winners from dealer balance
+  //  7. UNIVERSAL ROLLUP HUB — Lock BB into vault, track lock status
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Lock BB into the rollup vault PDA (dealer-side entry point).
+   *
+   * Signs: `"ROLLUP_LOCK_BB:{rollupId}:{wallet}:{bbLamports}:{symbolHint}:{ts}:{nonce}"`
+   *
+   * @param rollupId    "L2", "L3", or "L5"
+   * @param bbLamports  Amount in lamports (use bbToLamports() helper)
+   * @param symbolHint  Optional market hint e.g. "BTC-USD"
+   */
+  async lockBB(
+    rollupId: string,
+    bbLamports: bigint,
+    symbolHint = ""
+  ): Promise<{ success: boolean; lock_id: string; slot: number }> {
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const message =
+      `ROLLUP_LOCK_BB:${rollupId}:${this.wallet.address}:${bbLamports}:${symbolHint}:${timestamp}:${nonce}`;
+    const signature = await this.signMessage(message);
+
+    return this.post(`/rollup/${rollupId}/lock_bb`, {
+      wallet: this.wallet.address,
+      bb_lamports: Number(bbLamports),
+      symbol_hint: symbolHint,
+      public_key: this.wallet.publicKeyHex,
+      signature,
+      timestamp,
+      nonce,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  8. SETTLEMENT — Batch-pay winners from dealer balance
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
@@ -710,42 +717,42 @@ export class DealerSDK {
   }
 
   /**
-   * Send wUSDC to a user's associated token account.
+   * Send wUSDT to a user's associated token account.
    *
    * @param to           Recipient base58 address
-   * @param wusdcAmount  wUSDC amount (human-readable)
+   * @param wusdtAmount  wUSDT amount (human-readable)
    */
-  async sendWusdc(
+  async sendWusdt(
     to: string,
-    wusdcAmount: number
+    wusdtAmount: number
   ): Promise<SendWusdcResponse> {
-    return this.post("/admin/dealer/send_wusdc", {
+    return this.post("/admin/dealer/send_wusdt", {
       to,
-      wusdc_amount: wusdcAmount,
+      wusdt_amount: wusdtAmount,
     });
   }
 
   /**
    * Transfer BB from the dealer wallet to another address (signed).
    *
-   * Signs: the JSON payload { "to": "...", "amount": ... }
+   * Signs: `"TRANSFER:{from}:{to}:{amount}:{timestamp}:{nonce}"`
    *
    * @param to      Recipient base58 address
-   * @param amount  BB amount (human-readable)
+   * @param amount  BB amount (human-readable, e.g. 10.5)
    */
   async transfer(to: string, amount: number): Promise<TransferResponse> {
     const timestamp = nowSecs();
     const nonce = randomNonce();
-    const payload = JSON.stringify({ to, amount });
-    const signature = await this.signMessage(payload);
+    const message = `TRANSFER:${this.wallet.address}:${to}:${amount}:${timestamp}:${nonce}`;
+    const signature = await this.signMessage(message);
 
     return this.post("/transfer/simple", {
       public_key: this.wallet.publicKeyHex,
       wallet_address: this.wallet.address,
-      payload,
+      payload: JSON.stringify({ to, amount }),
       timestamp,
       nonce,
-      chain_id: "blackbook-mainnet",
+      chain_id: 1,
       signature,
     });
   }
@@ -755,48 +762,39 @@ export class DealerSDK {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Build a Merkle tree from L2 winner payouts.
+   * Build a Merkle tree from user balances for the Universal Rollup Hub.
    *
-   * Leaf format (matches L1 verification exactly):
-   *   SHA256( bs58_decode(wallet_address)[32] || amount_spl_u64_le[8] )
+   * Leaf format (must match L1 Rust `rollup/mod.rs` exactly):
+   *   BB leaf:  SHA256( "{rollupId}:BB:{address}:{balance_lamports}" )
    *
    * Parent hashing (sorted-pair, deterministic):
    *   SHA256( min(left, right) || max(left, right) )
    *
-   * @param winners  Array of { walletAddress, amountBB } — BB in human units
-   * @returns        MerkleTreeResult with root, leaves, and per-wallet proofs
+   * @param rollupId  "L2", "L3", or "L5"
+   * @param winners   Array of { walletAddress, balanceLamports } — lamports (u64 bigint)
+   * @returns         MerkleTreeResult with root, leaves, and per-wallet proofs
    */
-  async buildMerkleTree(winners: MerkleLeafData[]): Promise<MerkleTreeResult> {
+  async buildMerkleTree(
+    rollupId: string,
+    winners: Array<{ walletAddress: string; balanceLamports: bigint }>
+  ): Promise<MerkleTreeResult> {
     if (winners.length === 0) {
       throw new Error("Cannot build Merkle tree with zero winners");
     }
 
-    const { default: bs58 } = await import("bs58");
     const { sha256 } = await import("@noble/hashes/sha256");
-    const { bytesToHex } = (await import("@noble/hashes/utils"));
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const enc = new TextEncoder();
 
-    // ── Build leaves ─────────────────────────────────────────────────────
+    // ── Build leaves (canonical string preimage) ──────────────────────────
     const leaves: Uint8Array[] = [];
     const walletToIndex = new Map<string, number>();
 
     for (let i = 0; i < winners.length; i++) {
-      const { walletAddress, amountBB } = winners[i];
-      const walletRaw = bs58.decode(walletAddress);
-      if (walletRaw.length !== 32) {
-        throw new Error(
-          `Wallet ${walletAddress} decodes to ${walletRaw.length} bytes, expected 32`
-        );
-      }
-
-      const amountSpl = toSplUnits(amountBB);
-      const amountBytes = new Uint8Array(8);
-      new DataView(amountBytes.buffer).setBigUint64(0, amountSpl, true);
-
-      const preimage = new Uint8Array(40);
-      preimage.set(walletRaw, 0);
-      preimage.set(amountBytes, 32);
-
-      leaves.push(sha256(preimage));
+      const { walletAddress, balanceLamports } = winners[i];
+      // Canonical: "{rollupId}:BB:{address}:{balance_lamports}"
+      const preimage = `${rollupId}:BB:${walletAddress}:${balanceLamports}`;
+      leaves.push(sha256(enc.encode(preimage)));
       walletToIndex.set(walletAddress, i);
     }
 
@@ -865,141 +863,8 @@ export class DealerSDK {
     return sha256Fn(combined);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  8b. ROLLUP HUB (System B) — Merkle tree + root submission
-  //      Leaf format: SHA256("L2:BB:{address}:{balance_lamports}")
-  //      Sig format:  "ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{rootHex}:{ts}"
-  // ═══════════════════════════════════════════════════════════════════════════
-
   /**
-   * Build a Rollup Hub (System B) Merkle tree.
-   *
-   * Leaf format (matches L1 `rollup/mod.rs` verification exactly):
-   *   SHA256( UTF8("{rollupId}:BB:{address}:{balance_lamports}") )
-   *
-   * IMPORTANT: This is incompatible with buildMerkleTree() (System A).
-   *   - No bs58 decoding.
-   *   - No SPL unit conversion — lamports are passed as-is.
-   *   - Pure UTF-8 string hashing.
-   *
-   * Parent hashing: same sorted-pair combiner as System A.
-   *   SHA256( min(left, right) || max(left, right) )
-   *
-   * @param rollupId  Rollup identifier: "L2", "L3", or "L5"
-   * @param entries   Array of { address, lamports } — lamports as bigint
-   * @returns         MerkleTreeResult with root, leaves, and per-address proofs
-   */
-  async buildRollupMerkleTree(
-    rollupId: string,
-    entries: Array<{ address: string; lamports: bigint }>
-  ): Promise<MerkleTreeResult> {
-    if (entries.length === 0) {
-      throw new Error("Cannot build Rollup Merkle tree with zero entries");
-    }
-
-    const { sha256 } = await import("@noble/hashes/sha256");
-    const { bytesToHex } = await import("@noble/hashes/utils");
-    const enc = new TextEncoder();
-
-    // Build leaves: SHA256( "{rollupId}:BB:{address}:{lamports}" )
-    const leaves: Uint8Array[] = [];
-    const addressToIndex = new Map<string, number>();
-
-    for (let i = 0; i < entries.length; i++) {
-      const { address, lamports } = entries[i];
-      // L1 verifier lowercases the address before hashing — must match exactly.
-      const leafInput = `${rollupId}:BB:${address.toLowerCase()}:${lamports}`;
-      leaves.push(sha256(enc.encode(leafInput)));
-      addressToIndex.set(address, i);
-    }
-
-    // Build tree level by level (same algorithm as buildMerkleTree)
-    let currentLevel = [...leaves];
-    const levelData: Uint8Array[][] = [currentLevel];
-
-    while (currentLevel.length > 1) {
-      const next: Uint8Array[] = [];
-      for (let i = 0; i < currentLevel.length; i += 2) {
-        if (i + 1 < currentLevel.length) {
-          next.push(this.merkleHash(sha256, currentLevel[i], currentLevel[i + 1]));
-        } else {
-          next.push(currentLevel[i]);
-        }
-      }
-      currentLevel = next;
-      levelData.push(currentLevel);
-    }
-
-    const root = currentLevel[0];
-
-    // Build per-address Merkle proofs
-    const proofs = new Map<string, string[]>();
-    for (const [address, idx] of addressToIndex) {
-      const proof: string[] = [];
-      let index = idx;
-      for (let level = 0; level < levelData.length - 1; level++) {
-        const levelNodes = levelData[level];
-        const siblingIndex = index % 2 === 0 ? index + 1 : index - 1;
-        if (siblingIndex < levelNodes.length) {
-          proof.push(bytesToHex(levelNodes[siblingIndex]));
-        }
-        index = Math.floor(index / 2);
-      }
-      proofs.set(address, proof);
-    }
-
-    return {
-      root,
-      rootHex: bytesToHex(root),
-      leaves,
-      proofs,
-    };
-  }
-
-  /**
-   * Submit a Rollup Hub (System B) Merkle root to L1.
-   *
-   * Signed message format (UTF-8 — NOT binary-packed):
-   *   "ROLLUP_SUBMIT_ROOT:{rollupId}:{batchId}:{rootHex}:{timestamp}"
-   *
-   * @param rollupId  Rollup identifier: "L2", "L3", or "L5"
-   * @param batchId   Strictly monotonic batch counter (bigint)
-   * @param tree      MerkleTreeResult from buildRollupMerkleTree()
-   */
-  async submitRollupRoot(
-    rollupId: string,
-    batchId: bigint,
-    tree: MerkleTreeResult
-  ): Promise<{ success: boolean; batch_id: number; merkle_root_hex: string }> {
-    const timestamp = Date.now();
-    const message = `ROLLUP_SUBMIT_ROOT:${rollupId}:${batchId}:${tree.rootHex}:${timestamp}`;
-    const signature = await this.signMessage(message);
-
-    const body = {
-      batch_id: Number(batchId),
-      merkle_root_hex: tree.rootHex,
-      sequencer_public_key: this.wallet.publicKeyHex,
-      signature,
-      timestamp,
-    };
-
-    const res = await fetch(`${this.rpcUrl}/rollup/${rollupId}/submit_root`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`submitRollupRoot failed (${res.status}): ${err}`);
-    }
-
-    return res.json();
-  }
-
-  /**
-   * Get the Merkle proof for a specific winner in a tree.
-   * Returns the proof array ready to submit to POST /escrow/withdraw.
+   * Get the Merkle proof for a specific wallet address in a tree.
    */
   getProofForWinner(
     tree: MerkleTreeResult,
@@ -1043,64 +908,41 @@ export class DealerSDK {
   /**
    * Resolve a market end-to-end:
    *   1. Build Merkle tree from winner list
-   *   2. Verify zero-sum invariant
-   *   3. Submit state root to L1
-   *   4. Return the tree (with proofs for each winner)
+   *   2. Submit state root to L1 via Universal Rollup Hub
+   *   3. Return the tree (with proofs for each winner)
    *
-   * @param marketId          L2 market identifier
-   * @param winners           Array of { walletAddress, amountBB }
-   * @param l2BlockNumber     Monotonic L2 block counter
-   * @param totalDepositedBB  Total BB deposited by all users (human-readable)
-   * @param houseRakeBB       Dealer's commission (human-readable)
+   * @param rollupId      "L2", "L3", or "L5"
+   * @param batchId       Monotonically increasing batch counter
+   * @param winners       Array of { walletAddress, balanceLamports }
    */
   async resolveMarket(
-    marketId: string,
-    winners: MerkleLeafData[],
-    l2BlockNumber: bigint,
-    totalDepositedBB: number,
-    houseRakeBB: number
+    rollupId: string,
+    batchId: number,
+    winners: MerkleLeafData[]
   ): Promise<{
     tree: MerkleTreeResult;
     stateRootReceipt: StateRootResponse;
   }> {
-    const tree = await this.buildMerkleTree(winners);
-
-    const totalPayoutBB = winners.reduce((sum, w) => sum + w.amountBB, 0);
-    const totalDeposited = toSplUnits(totalDepositedBB);
-    const totalPayout = toSplUnits(totalPayoutBB);
-    const houseRake = toSplUnits(houseRakeBB);
-
-    const stateRootReceipt = await this.submitStateRoot(
-      marketId,
-      tree,
-      l2BlockNumber,
-      totalDeposited,
-      totalPayout,
-      houseRake
-    );
-
+    const tree = await this.buildMerkleTree(rollupId, winners);
+    const stateRootReceipt = await this.submitStateRoot(rollupId, batchId, tree.rootHex);
     return { tree, stateRootReceipt };
   }
 
   /**
    * Full settlement pipeline for a resolved market:
    *   1. Resolve market (build tree + submit state root)
-   *   2. Batch-settle winners via dealer balance
+   *   2. Batch-settle winners via dealer balance transfers
    *   3. Return all receipts
    *
-   * @param marketId          L2 market identifier
-   * @param winners           Array of { walletAddress, amountBB }
-   * @param l2BlockNumber     Monotonic L2 block counter
-   * @param totalDepositedBB  Total pool (human-readable)
-   * @param houseRakeBB       Dealer commission (human-readable)
+   * @param rollupId          "L2", "L3", or "L5"
+   * @param batchId           Monotonically increasing batch counter
+   * @param winners           Array of { walletAddress, balanceLamports }
    * @param batchReceiptId    Optional idempotency key
    */
   async settleMarket(
-    marketId: string,
+    rollupId: string,
+    batchId: number,
     winners: MerkleLeafData[],
-    l2BlockNumber: bigint,
-    totalDepositedBB: number,
-    houseRakeBB: number,
     batchReceiptId?: string
   ): Promise<{
     tree: MerkleTreeResult;
@@ -1108,21 +950,19 @@ export class DealerSDK {
     settleReceipt: SettleResponse;
   }> {
     const { tree, stateRootReceipt } = await this.resolveMarket(
-      marketId,
-      winners,
-      l2BlockNumber,
-      totalDepositedBB,
-      houseRakeBB
+      rollupId,
+      batchId,
+      winners
     );
 
     const payouts: SettlePayoutEntry[] = winners.map((w) => ({
       address: w.walletAddress,
-      amount: w.amountBB,
+      amount: lamportsToBb(w.balanceLamports),
     }));
 
     const settleReceipt = await this.settleWinners(
       payouts,
-      batchReceiptId ?? `settle_${marketId}_${Date.now()}`
+      batchReceiptId ?? `settle_${rollupId}_${batchId}_${Date.now()}`
     );
 
     return { tree, stateRootReceipt, settleReceipt };
@@ -1204,7 +1044,7 @@ export class DealerSDK {
   async getL1Balance(address: string): Promise<{ lamports: number; bb: number }> {
     const res: BalanceResponse = await this.get(`/balance/${encodeURIComponent(address)}`);
     // /balance/:addr returns { balance: number } in whole BB units
-    const lamports = Math.round(res.balance * SPL_MULTIPLIER);
+    const lamports = Math.round(res.balance * 100_000); // 1 BB = 100_000 lamports
     return { lamports, bb: res.balance };
   }
 
@@ -1375,6 +1215,179 @@ export class BalanceCache {
   /** Current number of addresses in the cache. */
   get size(): number {
     return this.entries.size;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  EscrowSDK — End-user escrow interactions (deposit, withdraw, verify proof)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * User-facing SDK for the BlackBook Global Escrow contract.
+ *
+ * This is the counterpart to DealerSDK — used by *end-users* to:
+ *   1. Lock BB into the escrow vault before playing on L2
+ *   2. Withdraw winnings with a Merkle proof after the sequencer settles
+ *
+ * ```ts
+ * const escrow = new EscrowSDK("http://localhost:8080", userKeypair);
+ * await escrow.deposit(50);                                    // lock 50 BB
+ * const proof = await l2Api.getMerkleProof(marketId, wallet);  // from L2
+ * await escrow.withdraw("market_btc_42", 75, proof);           // claim 75 BB
+ * ```
+ */
+export class EscrowSDK {
+  private rpcUrl: string;
+  private wallet?: Keypair;
+
+  constructor(rpcUrl: string, wallet?: Keypair) {
+    this.rpcUrl = rpcUrl.replace(/\/$/, "");
+    this.wallet = wallet;
+  }
+
+  setWallet(wallet: Keypair): void { this.wallet = wallet; }
+
+  private requireWallet(): Keypair {
+    if (!this.wallet) throw new Error("No wallet set. Call setWallet(keypair) first.");
+    return this.wallet;
+  }
+
+  private async post<T>(path: string, body: unknown): Promise<T> {
+    const res = await fetch(`${this.rpcUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(`${path} failed (${res.status}): ${(json as any).error ?? JSON.stringify(json)}`);
+    return json as T;
+  }
+
+  private async get<T>(path: string): Promise<T> {
+    const res = await fetch(`${this.rpcUrl}${path}`);
+    const json = await res.json();
+    if (!res.ok) throw new Error(`${path} failed (${res.status}): ${(json as any).error ?? JSON.stringify(json)}`);
+    return json as T;
+  }
+
+  // ── Read ─────────────────────────────────────────────────────────────────
+
+  /** GET /escrow/status — Vault address, locked balance, settled market count. */
+  status(): Promise<EscrowStatusResponse> {
+    return this.get("/escrow/status");
+  }
+
+  /**
+   * GET /escrow/market/:market_id — Merkle root anchored on L1 for a market.
+   * Use this to confirm the L2 has settled before calling withdraw().
+   */
+  marketRoot(marketId: string): Promise<EscrowMarketResponse> {
+    return this.get(`/escrow/market/${encodeURIComponent(marketId)}`);
+  }
+
+  // ── Writes (Ed25519 signed) ───────────────────────────────────────────────
+
+  /**
+   * POST /escrow/deposit — Lock $BB into the global escrow vault.
+   *
+   * Tokens move: user wallet → escrow PDA.
+   * Signs: `"ESCROW_DEPOSIT:{wallet}:{amount}:{timestamp}:{nonce}"`
+   */
+  async deposit(amount: number): Promise<EscrowDepositResponse> {
+    if (amount <= 0) throw new Error("amount must be > 0");
+    const kp = this.requireWallet();
+    const { ed, hexToBytes, bytesToHex } = await getCrypto();
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const message = `ESCROW_DEPOSIT:${kp.address}:${amount}:${timestamp}:${nonce}`;
+    const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
+    return this.post<EscrowDepositResponse>("/escrow/deposit", {
+      wallet_address: kp.address, amount,
+      public_key: kp.publicKeyHex, signature: bytesToHex(sigBytes), timestamp, nonce,
+    });
+  }
+
+  /**
+   * POST /escrow/withdraw — Claim winnings with a Merkle proof.
+   *
+   * Tokens move: escrow PDA → user wallet.
+   * Each (market_id, wallet) pair can only withdraw once.
+   * Signs: `"ESCROW_WITHDRAW:{market_id}:{wallet}:{amount}:{timestamp}:{nonce}"`
+   *
+   * @param marketId    L2 market identifier (must match a settled state root)
+   * @param amount      Exact amount entitled (must match the Merkle leaf)
+   * @param merkleProof Array of 64-char hex sibling hashes from L2
+   */
+  async withdraw(
+    marketId: string,
+    amount: number,
+    merkleProof: MerkleProof
+  ): Promise<EscrowWithdrawResponse> {
+    if (!marketId) throw new Error("marketId is required");
+    if (amount <= 0) throw new Error("amount must be > 0");
+    const kp = this.requireWallet();
+    const { ed, hexToBytes, bytesToHex } = await getCrypto();
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const message = `ESCROW_WITHDRAW:${marketId}:${kp.address}:${amount}:${timestamp}:${nonce}`;
+    const sigBytes = await ed.signAsync(new TextEncoder().encode(message), hexToBytes(kp.privateKeyHex));
+    return this.post<EscrowWithdrawResponse>("/escrow/withdraw", {
+      market_id: marketId, amount,
+      wallet_address: kp.address, merkle_proof: merkleProof,
+      public_key: kp.publicKeyHex, signature: bytesToHex(sigBytes), timestamp, nonce,
+    });
+  }
+
+  // ── Proof Utilities ───────────────────────────────────────────────────────
+
+  /**
+   * Build the SHA-256 Merkle leaf for the GLOBAL ESCROW contract (legacy format).
+   *
+   * Leaf = SHA256( UTF8(walletAddress) || Float64LE(amount) )
+   *
+   * For Universal Rollup Hub exits use:
+   *   SHA256( "{rollupId}:BB:{address}:{balance_lamports}" )
+   *
+   * @returns 64-char hex string
+   */
+  static async buildLeaf(walletAddress: string, amount: number): Promise<string> {
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex } = await import("@noble/hashes/utils");
+    const addrBytes = new TextEncoder().encode(walletAddress);
+    const amountBuffer = new ArrayBuffer(8);
+    new DataView(amountBuffer).setFloat64(0, amount, true);
+    const amountBytes = new Uint8Array(amountBuffer);
+    const leaf = new Uint8Array(addrBytes.length + 8);
+    leaf.set(addrBytes, 0);
+    leaf.set(amountBytes, addrBytes.length);
+    return bytesToHex(sha256(leaf));
+  }
+
+  /**
+   * Compute the Merkle root from a leaf + proof path.
+   * Compare against marketRoot().merkle_root to validate before calling withdraw().
+   *
+   * Uses sorted-pair hashing: SHA256( min(a,b) || max(a,b) )
+   *
+   * @param leafHex  64-char hex leaf hash (from buildLeaf or sequencer API)
+   * @param proof    Sibling proof path (from L2 sequencer)
+   * @returns 64-char hex computed root
+   */
+  static async verifyProof(leafHex: string, proof: MerkleProof): Promise<string> {
+    const { sha256 } = await import("@noble/hashes/sha256");
+    const { bytesToHex, hexToBytes } = await import("@noble/hashes/utils");
+    let current = hexToBytes(leafHex);
+    for (const sibHex of proof) {
+      const sibling = hexToBytes(sibHex.startsWith("0x") ? sibHex.slice(2) : sibHex);
+      let a: Uint8Array, b: Uint8Array;
+      if (compareBytes(current, sibling) <= 0) { a = current; b = sibling; }
+      else                                      { a = sibling; b = current; }
+      const combined = new Uint8Array(64);
+      combined.set(a, 0);
+      combined.set(b, 32);
+      current = sha256(combined);
+    }
+    return bytesToHex(current);
   }
 }
 

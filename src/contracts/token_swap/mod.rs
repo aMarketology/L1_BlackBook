@@ -212,6 +212,20 @@ pub async fn swap_bb_for_usdc_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
     }
 
+    // ── PERSIST TO REDB BEFORE RESPONDING ─────────────────────────────────
+    // Do NOT return 200 until balance changes are durable on disk.
+    // If flush fails, rollback DashMap so the in-memory state stays consistent
+    // with what is on disk (the crash-safe invariant).
+    if let Err(e) = state.blockchain.flush_svm_accounts_now() {
+        tracing::error!("🚨 Swap BB→wUSDT: ReDB flush failed: {} — rolling back", e);
+        let _ = state.blockchain.debit_svm_lamports(&pool_address, req.bb_amount);
+        let _ = state.blockchain.credit_svm_lamports(&req.wallet_address, req.bb_amount);
+        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, &pool_pubkey, usdc_raw_output);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Storage flush failed — swap rolled back, no funds moved"
+        })));
+    }
+
     info!("🔄 SWAP: {} swapped {} lamports BB for {} micro-wUSDT", req.wallet_address, req.bb_amount, usdc_raw_output);
 
     (StatusCode::OK, Json(serde_json::json!({
@@ -338,6 +352,18 @@ pub async fn swap_usdc_for_bb_handler(
         let _ = state.blockchain.debit_svm_lamports(&req.wallet_address, bb_lamports_output);
         let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "Pool invariant violated — transaction rolled back" })));
+    }
+
+    // ── PERSIST TO REDB BEFORE RESPONDING ─────────────────────────────────
+    // Same guarantee as BB→wUSDT: durability before HTTP 200.
+    if let Err(e) = state.blockchain.flush_svm_accounts_now() {
+        tracing::error!("🚨 Swap wUSDT→BB: ReDB flush failed: {} — rolling back", e);
+        let _ = state.blockchain.credit_svm_lamports(&pool_address, bb_lamports_output);
+        let _ = state.blockchain.debit_svm_lamports(&req.wallet_address, bb_lamports_output);
+        let _ = SplTokenEngine::transfer_tokens(&state.blockchain.svm_accounts, &mint, &pool_pubkey, &wallet_pubkey, req.usdc_amount);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Storage flush failed — swap rolled back, no funds moved"
+        })));
     }
 
     info!("🔄 SWAP: {} swapped {} micro-wUSDT for {} BB lamports", req.wallet_address, req.usdc_amount, bb_lamports_output);

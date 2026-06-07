@@ -18,6 +18,12 @@ with the security guarantees of a private enterprise network and the auditabilit
 
 The Layer 1 does not try to do everything. It **perfectly anchors everything**.
 
+At its core, the Layer 1 is exactly three things: an **asset-custody ledger**, a **state machine**,
+and a **transaction execution environment**. It stores balances against public keys, advances state
+deterministically via Proof of History, and executes Ed25519-signed transactions after verifying
+them. It never generates or holds a user's private key — keys live only on the client. There are no
+fiat onramps, no custodial key handling, and no off-ledger payment rails on the L1.
+
 ---
 
 ## Layer 1 — The Vessel

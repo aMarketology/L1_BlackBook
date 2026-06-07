@@ -148,44 +148,42 @@ Check "POST /faucet with bad signature returns 400 or 401 (auth layer live)" {
     }
 } { param($r) $r.status_code -in @(400, 401, 405) }
 
-# ── 5. TURBINE REGISTER / HEARTBEAT ────────────────────────────────────────
+# ── 5. TURBINE (Phase 7A — permissioned registry) ──────────────────────────
 Write-Host ""
-Write-Host "[5/6] Turbine Reader registration (UDP 8004)"
+Write-Host "[5/6] Turbine (permissioned VIP mesh — public registration removed)"
 
-$NodeId = "smoke-test-reader-$(Get-Random)"
-
-Check "POST /turbine/register with valid UDP addr succeeds" {
+Check "POST /turbine/register returns 404 (hard cutover Phase 7A)" {
     try {
         Invoke-RestMethod "$BaseUrl/turbine/register" -Method POST -ContentType "application/json" -Body (@{
-            node_id  = $NodeId
+            node_id  = "smoke-test"
             udp_addr = "127.0.0.1:8004"
         } | ConvertTo-Json) -ErrorAction Stop
+        return [PSCustomObject]@{ status = 200 }  # unexpected 200 = fail
     } catch {
         $code = $_.Exception.Response.StatusCode.value__
-        if ($code -eq 405) {
-            Write-Host -NoNewline " (WARN 405 - nginx blocking POSTs; fix: reload nginx-blackbook.conf) "
-            return [PSCustomObject]@{ registered = $true }
+        if ($code -eq 404) {
+            return [PSCustomObject]@{ status = 404 }
         }
         throw
     }
-} { param($r) $r.registered -eq $true }
+} { param($r) $r.status -eq 404 }
 
-Check "POST /turbine/heartbeat refreshes registered reader" {
+Check "POST /turbine/heartbeat returns 404 (removed Phase 7A)" {
     try {
         Invoke-RestMethod "$BaseUrl/turbine/heartbeat" -Method POST -ContentType "application/json" -Body (@{
-            node_id = $NodeId
+            node_id = "smoke-test"
         } | ConvertTo-Json) -ErrorAction Stop
+        return [PSCustomObject]@{ status = 200 }
     } catch {
         $code = $_.Exception.Response.StatusCode.value__
-        if ($code -eq 405) {
-            Write-Host -NoNewline " (WARN 405 - nginx blocking POSTs) "
-            return [PSCustomObject]@{ ok = $true }
+        if ($code -eq 404) {
+            return [PSCustomObject]@{ status = 404 }
         }
         throw
     }
-} { param($r) $r.ok -eq $true }
+} { param($r) $r.status -eq 404 }
 
-Check "GET /turbine/status shows at least 1 reader" {
+Check "GET /turbine/status still accessible" {
     Invoke-RestMethod "$BaseUrl/turbine/status" -Method GET
 } { param($r) $null -ne $r }
 
@@ -211,10 +209,10 @@ if ($fail -gt 0) {
     Write-Host "      cp /opt/blackbook/deployment/nginx-blackbook.conf /etc/nginx/sites-available/blackbook"
     Write-Host "      ln -sf /etc/nginx/sites-available/blackbook /etc/nginx/sites-enabled/blackbook"
     Write-Host "      nginx -t && systemctl reload nginx"
-    Write-Host "  - If turbine/register fails: node may not be in Writer mode (check NODE_MODE=writer)"
+    Write-Host "  - If turbine/register returns 200 (not 404): rebuild with Phase 7A changes"
     Write-Host "  - If health returns degraded: check PoH clock with GET /poh/status"
     Write-Host ""
     exit 1
 }
 Write-Host ""
-Write-Host "All smoke tests passed. UDP 8004 registration live. Deprecated f64 paths respond correctly." -ForegroundColor Green
+Write-Host "All smoke tests passed. Phase 7A permissioned Turbine mesh active." -ForegroundColor Green

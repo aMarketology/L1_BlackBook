@@ -52,7 +52,7 @@ impl std::fmt::Display for NodeMode {
     }
 }
 
-/// BlackBook L1 — Digital Central Bank
+/// BlackBook L1 — Consortium / Permissioned Settlement Layer
 #[derive(Parser, Debug)]
 #[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
 pub struct NodeConfig {
@@ -343,10 +343,10 @@ pub struct AppState {
     pub backup_last_at: Arc<AtomicU64>,
     pub backup_last_size: Arc<AtomicU64>,
 
-    // ===== Turbine Tick Streaming =====
-    /// Registered Reader nodes for per-tick PoH shred broadcasting.
-    /// node_id → ReaderRecord { udp_addr, last_seen }
-    pub turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>>,
+    // ===== Turbine Tick Streaming (Phase 7A — static permissioned registry) =====
+    /// Approved validator / reader nodes for Turbine shred delivery.
+    /// Loaded from config.toml or APPROVED_VALIDATORS env var at startup.
+    pub approved_validators: Arc<runtime::validator_registry::ValidatorRegistry>,
 
     // ===== Reader Mode: Writer Proxy =====
     /// When running as a Reader node, this holds the Writer's HTTP base URL
@@ -932,48 +932,8 @@ async fn tower_bft_handler(
 
 // ── Turbine Tick Streaming HTTP handlers ─────────────────────────────────────
 
-#[derive(serde::Deserialize)]
-struct TurbineRegisterRequest {
-    node_id: String,
-    udp_addr: String,
-}
-
-/// POST /turbine/register — Reader registers its UDP address for tick shred delivery.
-async fn turbine_register_handler(
-    State(state): State<AppState>,
-    Json(req): Json<TurbineRegisterRequest>,
-) -> impl IntoResponse {
-    let addr: std::net::SocketAddr = match req.udp_addr.parse() {
-        Ok(a) => a,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid udp_addr" }))).into_response();
-        }
-    };
-    let rec = runtime::turbine::ReaderRecord {
-        udp_addr: addr,
-        last_seen: runtime::turbine::now_unix_secs(),
-    };
-    state.turbine_readers.insert(req.node_id, rec);
-    Json(serde_json::json!({ "registered": true, "reader_count": state.turbine_readers.len() })).into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct TurbineHeartbeatRequest {
-    node_id: String,
-}
-
-/// POST /turbine/heartbeat — Reader refreshes its TTL in the registry.
-async fn turbine_heartbeat_handler(
-    State(state): State<AppState>,
-    Json(req): Json<TurbineHeartbeatRequest>,
-) -> impl IntoResponse {
-    if let Some(mut rec) = state.turbine_readers.get_mut(&req.node_id) {
-        rec.last_seen = runtime::turbine::now_unix_secs();
-        Json(serde_json::json!({ "ok": true })).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not registered" }))).into_response()
-    }
-}
+// turbine_register_handler and turbine_heartbeat_handler removed (Phase 7A).
+// The Turbine mesh is now a static permissioned registry — see config.toml / APPROVED_VALIDATORS.
 
 /// GET /turbine/status — Turbine shred propagation status
 async fn turbine_status_handler(
@@ -1380,18 +1340,28 @@ async fn faucet_handler(
         })));
     }
 
-    // ── EPOCH RATE LIMITING ─────────────────────────────────────────────────
+    // ── EPOCH RATE LIMITING (atomic via entry() — prevents concurrent-request bypass) ──
     let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
     let current_epoch = current_slot / POH_SLOTS_PER_EPOCH;
-    if let Some(entry) = state.faucet_claims.get(&req.wallet_address) {
-        let (claimed_epoch, _claimed_amount) = *entry;
-        if claimed_epoch >= current_epoch {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-                "error": "Faucet: already claimed this epoch",
-                "wallet": req.wallet_address,
-                "epoch": current_epoch,
-                "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
-            })));
+    // Use entry() to atomically check-and-reserve the claim slot.
+    // This prevents two simultaneous requests from both passing the `get()` check
+    // before either writes the `insert()` — the classic TOCTOU race.
+    match state.faucet_claims.entry(req.wallet_address.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(occ) => {
+            let (claimed_epoch, _) = *occ.get();
+            if claimed_epoch >= current_epoch {
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                    "error": "Faucet: already claimed this epoch",
+                    "wallet": req.wallet_address,
+                    "epoch": current_epoch,
+                    "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
+                })));
+            }
+            // Stale entry from a previous epoch — allow, will be overwritten at success path.
+        }
+        dashmap::mapref::entry::Entry::Vacant(_) => {
+            // No prior claim — proceed. Entry is NOT inserted yet;
+            // we only write it after the mint succeeds (below).
         }
     }
 
@@ -2861,8 +2831,7 @@ fn build_router(state: AppState) -> Router {
         .route("/consensus/tower", get(tower_bft_handler))
         // Turbine
         .route("/turbine/status", get(turbine_status_handler))
-        .route("/turbine/register", post(turbine_register_handler))
-        .route("/turbine/heartbeat", post(turbine_heartbeat_handler))
+        // /turbine/register and /turbine/heartbeat removed (Phase 7A hard cutover)
         // Sealevel
         .route("/sealevel/submit", post(gulf_stream_submit_handler))
         // Global Escrow Smart Contract
@@ -2914,6 +2883,7 @@ fn build_router(state: AppState) -> Router {
         // Oracle
         .route("/oracle/nodes", get(contracts::oracle::list_oracle_nodes_handler))
         .route("/oracle/event/:market_id", get(contracts::oracle::oracle_event_handler))
+        .route("/oracle/submit-pending-root", post(contracts::oracle::submit_pending_root_handler))
         .route("/oracle/dispute", post(contracts::oracle::oracle_dispute_handler))
         .route("/oracle/vote", post(contracts::oracle::oracle_vote_handler))
         // L5 rollup bridge endpoints (lock $BB, query lock, consume lock, submit state root, exit)
@@ -3029,7 +2999,7 @@ async fn main() {
     };
 
     info!("╔══════════════════════════════════════════════════════╗");
-    info!("║       BLACKBOOK L1 — DIGITAL CENTRAL BANK           ║");
+    info!("║   BLACKBOOK L1 — CONSORTIUM PERMISSIONED SETTLEMENT  ║");
     info!("╠══════════════════════════════════════════════════════╣");
     info!("║  Version:   {} ({})                          ║", VERSION, NETWORK);
     info!("║  Mode:      {:44}║", mode_label);
@@ -3278,7 +3248,8 @@ async fn main() {
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
     {
         let mut schedule = leader_schedule.write();
-        schedule.update_stake(&validator_id, 1000.0);
+        // 10,000 BB in lamports — genesis validator's starting stake weight.
+        schedule.set_stake(&validator_id, 1_000_000_000u64);
         let epoch = recovered_slot / POH_SLOTS_PER_EPOCH;
         schedule.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
     }
@@ -3315,9 +3286,9 @@ async fn main() {
 
     let finality_tracker = Arc::new(FinalityTracker::new(current_slot.clone()));
 
-    // Tower BFT — single-validator mode with genesis stake
+    // Tower BFT — single-validator mode with genesis stake (1,000,000,000 lamports = 10,000 BB)
     let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
-    tower_bft.register_validator(&validator_id, 1000.0);
+    tower_bft.register_validator(&validator_id, 1_000_000_000u64);
     info!("🗼 Tower BFT initialized (single-validator mode, id={})", &validator_id);
 
     // 4a.1 Pipeline commit drain — record finality for committed pipeline txs
@@ -3333,10 +3304,53 @@ async fn main() {
         });
     }
 
-    // Turbine reader registry — shared with HTTP handlers and TurbineTickService.
-    // Initialized early so the Writer mode block can reference it.
-    let turbine_readers: Arc<dashmap::DashMap<String, runtime::turbine::ReaderRecord>> =
-        Arc::new(dashmap::DashMap::new());
+    // ── Permissioned Turbine registry (Phase 7A) ──────────────────────────
+    let approved_validators = Arc::new(
+        runtime::validator_registry::ValidatorRegistry::load(
+            None,
+            std::env::var("APPROVED_VALIDATORS").ok().as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            error!("❌ ValidatorRegistry load error: {} — continuing with empty registry", e);
+            runtime::validator_registry::ValidatorRegistry::empty()
+        }),
+    );
+
+    // ── Validator identity keypair (Phase 7C) ─────────────────────────────
+    // Used to sign outgoing Turbine shreds. Absent = ephemeral key (dev only).
+    let turbine_signing_key: Arc<ed25519_dalek::SigningKey> = Arc::new(
+        match std::env::var("VALIDATOR_KEYPAIR_PATH") {
+            Ok(path) => {
+                let raw = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| { panic!("VALIDATOR_KEYPAIR_PATH '{}' unreadable: {}", path, e); });
+                let trimmed = raw.trim();
+                let seed_bytes: Vec<u8> = if trimmed.len() == 64 {
+                    hex::decode(trimmed).unwrap_or_else(|e| panic!("VALIDATOR_KEYPAIR_PATH hex decode: {}", e))
+                } else {
+                    // treat as raw 32-byte binary
+                    trimmed.as_bytes().to_vec()
+                };
+                if seed_bytes.len() != 32 {
+                    panic!("VALIDATOR_KEYPAIR_PATH: expected 32-byte seed (64 hex chars), got {} bytes", seed_bytes.len());
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&seed_bytes);
+                let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+                info!("🔑 Turbine identity: pubkey={}", hex::encode(sk.verifying_key().to_bytes()));
+                sk
+            }
+            Err(_) => {
+                use ed25519_dalek::SigningKey;
+                let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+                warn!(
+                    "⚠️  VALIDATOR_KEYPAIR_PATH not set — using ephemeral turbine identity: {}. \
+                     Add this pubkey to other nodes' registries for shred verification.",
+                    hex::encode(sk.verifying_key().to_bytes())
+                );
+                sk
+            }
+        }
+    );
 
     // 4b. Block Production Loop + Relay (WRITER MODE ONLY)
     // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
@@ -3404,10 +3418,14 @@ async fn main() {
 
         // ── Turbine Tick Streaming service (Writer mode only) ──────────────────
         if let Some(tick_rx) = tick_rx_for_service {
-            let svc = runtime::turbine::TurbineTickService::new(tick_rx, turbine_readers.clone());
+            let svc = runtime::turbine::TurbineTickService::new(
+                tick_rx,
+                approved_validators.clone(),
+                turbine_signing_key.clone(),
+            );
             tokio::spawn(svc.run());
-            runtime::turbine::spawn_reader_pruner(turbine_readers.clone());
-            info!("📡 Turbine tick service started on UDP port {}", runtime::turbine::TURBINE_TICK_PORT);
+            info!("📡 Turbine tick service started on UDP port {} ({} approved targets)",
+                runtime::turbine::TURBINE_TICK_PORT, approved_validators.len());
         }
         {
             let bp = block_producer.clone();
@@ -3657,32 +3675,14 @@ async fn main() {
                 .parse()
                 .expect("valid turbine listen addr");
         let tick_recv = runtime::turbine::TurbineTickReceiver::new(
-            tick_listen, genesis_hash, POH_HASHES_PER_TICK,
+            tick_listen,
+            genesis_hash,
+            POH_HASHES_PER_TICK,
+            approved_validators.clone(),
         );
         tokio::spawn(tick_recv.run());
-        // Register this Reader with the Writer's /turbine/register endpoint
-        let writer_http = config.writer_addr.replace(":50051", ":8080");
-        let my_udp_addr = std::env::var("TURBINE_MY_UDP_ADDR")
-            .unwrap_or_else(|_| format!("0.0.0.0:{}", runtime::turbine::TURBINE_TICK_PORT));
-        let reg_body = serde_json::json!({ "node_id": validator_id.clone(), "udp_addr": my_udp_addr });
-        let writer_url = format!("http://{}/turbine/register", writer_http);
-        tokio::spawn(async move {
-            for attempt in 1u64..=5 {
-                match reqwest::Client::new().post(&writer_url).json(&reg_body).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        info!("✅ Registered with Writer Turbine at {}", writer_url);
-                        break;
-                    }
-                    _ => {
-                        if attempt < 5 {
-                            tokio::time::sleep(std::time::Duration::from_secs(attempt * 2)).await;
-                        } else {
-                            warn!("⚠️  Failed to register with Writer Turbine after 5 attempts");
-                        }
-                    }
-                }
-            }
-        });
+        info!("👂 Turbine tick receiver started — {} approved source(s)",
+            approved_validators.len());
     }
 
     // ── Custody Watcher — Solana RPC balance poller + auto-approver ───────────
@@ -3790,7 +3790,7 @@ async fn main() {
         rollup_lock_records: Arc::new(dashmap::DashMap::new()),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
-        turbine_readers: turbine_readers.clone(),
+        approved_validators: approved_validators.clone(),
         vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
         writer_http_url: if config.mode == NodeMode::Reader {
             // Derive the Writer's HTTP URL from its gRPC address.

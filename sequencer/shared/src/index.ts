@@ -11,7 +11,8 @@ export { buildLeafPreimage, hashLeaf, buildMerkleTree, verifyProof } from './mer
 // getLock     = read a lock record from L1 (network call)
 // consumeLock = mark a lock consumed on L1 (authenticated, network call)
 // submitRoot  = anchor a Merkle root on L1  (authenticated, network call)
-export { L1Error, getLock, consumeLock, submitRoot } from './l1Client.js';
+// submitOraclePendingRoot = submit market outcome to Oracle dispute window
+export { L1Error, getLock, consumeLock, submitRoot, submitOraclePendingRoot } from './l1Client.js';
 
 // ─── Local SQLite helpers ─────────────────────────────────────────────────────
 // "Local" prefix distinguishes DB reads from the L1 network calls above.

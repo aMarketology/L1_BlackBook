@@ -55,7 +55,7 @@ pub struct LockBbRequest {
     /// Ed25519 public key of the creator (hex, 32 bytes).
     pub public_key: String,
     /// Ed25519 signature (hex, 64 bytes).
-    /// Signed message: "ROLLUP_LOCK_BB:{wallet_address}:{bb_lamports}:{token_symbol_hint}:{timestamp}:{nonce}"
+    /// Signed message: "ROLLUP_LOCK_BB:{rollup_id}:{wallet_address}:{bb_lamports}:{token_symbol_hint}:{timestamp}:{nonce}"
     pub signature: String,
     /// Unix timestamp (seconds) for freshness check (±60 s window).
     pub timestamp: u64,
@@ -381,7 +381,7 @@ pub struct SubmitRootRequest {
     pub merkle_root_hex: String,
     /// Ed25519 public key of the sequencer (hex, 32 bytes).
     pub sequencer_public_key: String,
-    /// Ed25519 signature over "ROLLUP_SUBMIT_ROOT:{batch_id}:{merkle_root_hex}:{timestamp}".
+    /// Ed25519 signature over "ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{timestamp}".
     pub signature: String,
     /// Unix timestamp (seconds) — freshness window ±60 s.
     pub timestamp: u64,
@@ -667,7 +667,9 @@ pub async fn exit_handler(
             };
             // BB leaf:  "{rollup_id}:BB:{address}:{balance_lamports}"
             let leaf = format!("{}:BB:{}:{}", rollup_id, addr_lower, lamports);
-            let exit_id = format!("{}:{}:BB:{}", rollup_id, req.batch_id, addr_lower);
+            // Exit key is batch-agnostic: a balance can be exited (cumulatively)
+            // only up to its latest proven amount, never once-per-batch.
+            let exit_id = format!("{}:BB:{}", rollup_id, addr_lower);
             (leaf, exit_id)
         }
         "NFT" => {
@@ -691,8 +693,10 @@ pub async fn exit_handler(
             };
             // NFT leaf:  "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}"
             let leaf = format!("{}:NFT:{}:{}:{}:{}", rollup_id, col, tok, addr_lower, mhash);
-            // NFT exit_id keyed by (collection, token) — not by owner — since an NFT is unique
-            let exit_id = format!("{}:{}:NFT:{}:{}", rollup_id, req.batch_id, col, tok);
+            // NFT exit_id keyed by (collection, token) — not by owner, not by batch —
+            // since an NFT is unique: once exited it can never be exited again
+            // regardless of which historical root a user tries to prove against.
+            let exit_id = format!("{}:NFT:{}:{}", rollup_id, col, tok);
             (leaf, exit_id)
         }
         _ => unreachable!(),
@@ -708,72 +712,83 @@ pub async fn exit_handler(
         })));
     }
 
-    // ── Double-spend guard ─────────────────────────────────────────────────
+    // ── Compute the batch-agnostic exit key ────────────────────────────────
     let exit_id = sha256_hex(&exit_id_input);
-    if state.blockchain.is_exit_consumed(&exit_id) {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "error": "This exit has already been claimed. Double-spend rejected.",
-            "rollup_id": rollup_id,
-            "batch_id": req.batch_id,
-        })));
-    }
 
     // ── Route to asset-specific execution ─────────────────────────────────
     let vault_addr = rollup_vault_address(&rollup_id);
 
     match asset_type.as_str() {
-        // ── BB branch: debit per-rollup vault → credit user ────────────────
+        // ── BB branch: cumulative-capped release from per-rollup vault ──────
         "BB" => {
-            let lamports = req.balance_lamports.unwrap(); // validated above
+            let proven = req.balance_lamports.unwrap(); // validated above
+
+            // How much has this address already withdrawn across all batches?
+            let cumulative = state.blockchain.get_cumulative_exit(&exit_id);
+
+            // Release only the unclaimed delta of the latest proven balance.
+            // Replaying an old root, or re-proving an unchanged balance, yields 0.
+            let withdrawable = proven.saturating_sub(cumulative);
+            if withdrawable == 0 {
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+                    "error": "Already exited up to the proven balance — nothing to withdraw.",
+                    "rollup_id": rollup_id,
+                    "proven_balance_lamports": proven,
+                    "already_withdrawn_lamports": cumulative,
+                })));
+            }
+            let new_cumulative = match cumulative.checked_add(withdrawable) {
+                Some(v) => v,
+                None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": "Cumulative withdrawal overflow."
+                }))),
+            };
+
+            // Solvency: vault must cover the delta (also re-checked inside the txn).
             let vault_balance = state.blockchain.get_balance_lamports(&vault_addr);
-            if vault_balance < lamports {
+            if vault_balance < withdrawable {
                 return (StatusCode::CONFLICT, Json(serde_json::json!({
                     "error": format!(
-                        "{} vault has {} lamports, exit requests {} lamports.",
-                        rollup_id, vault_balance, lamports
+                        "{} vault has {} lamports, exit requires {} lamports.",
+                        rollup_id, vault_balance, withdrawable
                     )
                 })));
             }
 
-            if let Err(e) = state.blockchain.debit_svm_lamports(&vault_addr, lamports) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": format!("Vault debit failed: {}", e)
-                })));
-            }
-            if let Err(e) = state.blockchain.credit_svm_lamports(&req.address, lamports) {
-                let _ = state.blockchain.credit_svm_lamports(&vault_addr, lamports);
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": format!("User credit failed: {}", e)
-                })));
-            }
-
-            // Persist double-spend seal AFTER balance moves
-            if let Err(e) = state.blockchain.mark_exit_consumed(&exit_id, now) {
-                let _ = state.blockchain.debit_svm_lamports(&req.address, lamports);
-                let _ = state.blockchain.credit_svm_lamports(&vault_addr, lamports);
-                if e == "already_consumed" {
-                    return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-                        "error": "Concurrent double-spend detected and rolled back."
-                    })));
-                }
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "error": format!("Failed to persist exit record: {}", e)
-                })));
+            // Atomic: re-check race + solvency, debit vault, credit user, advance
+            // cumulative — single durable ReDB commit before any cache mirror.
+            if let Err(e) = state.blockchain.atomic_rollup_bb_exit(
+                &req.address, &vault_addr, &exit_id, cumulative, withdrawable, new_cumulative,
+            ) {
+                let (code, msg) = match e.as_str() {
+                    "exit_raced" => (StatusCode::CONFLICT,
+                        "Concurrent exit detected — retry with a fresh proof.".to_string()),
+                    "vault_insolvent" => (StatusCode::CONFLICT,
+                        format!("{} vault cannot cover the exit.", rollup_id)),
+                    "nothing_to_withdraw" => (StatusCode::FORBIDDEN,
+                        "Nothing to withdraw.".to_string()),
+                    other => (StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Exit failed: {}", other)),
+                };
+                return (code, Json(serde_json::json!({ "error": msg })));
             }
 
             state.used_nonces.insert(replay_key, now);
             let bal_after = state.blockchain.get_balance_lamports(&req.address);
 
             info!(
-                "🚀 BB EXIT: {} lamports → {} (rollup={} batch={} proof_depth={})",
-                lamports, req.address, rollup_id, req.batch_id, req.proof_siblings.len()
+                "🚀 BB EXIT: {} lamports → {} (rollup={} batch={} proven={} cumulative={} proof_depth={})",
+                withdrawable, req.address, rollup_id, req.batch_id, proven, new_cumulative,
+                req.proof_siblings.len()
             );
 
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "asset_type": "BB",
-                "released_lamports": lamports,
-                "released_bb": lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
+                "released_lamports": withdrawable,
+                "released_bb": withdrawable as f64 / crate::svm::LAMPORTS_PER_BB as f64,
+                "proven_balance_lamports": proven,
+                "cumulative_withdrawn_lamports": new_cumulative,
                 "recipient": req.address,
                 "rollup_id": rollup_id,
                 "batch_id": req.batch_id,
@@ -794,6 +809,17 @@ pub async fn exit_handler(
                 }))),
             };
             let metadata_hash = req.metadata_hash.as_ref().unwrap().clone(); // validated above
+
+            // Batch-agnostic double-spend seal: once this (collection, token) has
+            // exited, it can never exit again regardless of historical root.
+            if state.blockchain.is_exit_consumed(&exit_id) {
+                return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+                    "error": "This NFT has already been exited.",
+                    "rollup_id": rollup_id,
+                    "collection_id": col,
+                    "token_id": tok,
+                })));
+            }
 
             // Defense-in-depth: reject if NFT already exists on L1
             if crate::contracts::nft_bridge::get_nft(&state.blockchain.db, &col, &tok).is_some() {

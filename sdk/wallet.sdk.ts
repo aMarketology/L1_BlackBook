@@ -20,6 +20,21 @@
  * ============================================================================
  */
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/** 1 BB = 100,000 lamports (5 decimals). All financial math is in lamports. */
+export const LAMPORTS_PER_BB = 100_000n;
+
+/** Convert whole-BB amount to lamports (bigint). */
+export function bbToLamports(bb: number): bigint {
+  return BigInt(Math.round(bb * 100_000));
+}
+
+/** Convert lamports to whole BB (for display only — do not use for math). */
+export function lamportsToBb(lamports: bigint): number {
+  return Number(lamports) / 100_000;
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export interface Keypair {
@@ -188,6 +203,56 @@ export interface EscrowStatusResponse {
   escrow_balance: number;
   total_markets: number;
   l2_sequencer_configured: boolean;
+}
+
+// ── Universal Rollup Hub types ─────────────────────────────────────────────
+
+/**
+ * Response from POST /rollup/:rollup_id/lock_bb
+ * Lock $BB into a per-rollup vault PDA before the rollup runs.
+ */
+export interface RollupLockResponse {
+  success: boolean;
+  lock_id: string;
+  rollup_id: string;
+  wallet: string;
+  bb_lamports: number;
+  symbol_hint?: string;
+  slot: number;
+}
+
+/**
+ * Response from GET /rollup/:rollup_id/locks/:lock_id
+ */
+export interface RollupLockStatusResponse {
+  lock_id: string;
+  rollup_id: string;
+  wallet: string;
+  bb_lamports: number;
+  symbol_hint?: string;
+  consumed: boolean;
+  created_slot: number;
+}
+
+/**
+ * Response from POST /rollup/:rollup_id/exit
+ * Exit $BB (or NFT) back to L1 with a Merkle proof.
+ */
+export interface RollupExitResponse {
+  success: boolean;
+  rollup_id: string;
+  asset_type: "BB" | "NFT";
+  address: string;
+  released_lamports?: number;
+  nft_token_id?: string;
+  new_balance?: number;
+}
+
+export interface TxHistoryResponse {
+  address: string;
+  transactions: Array<Record<string, unknown>>;
+  total: number;
+  page: number;
 }
 
 export interface EscrowMarketResponse {
@@ -628,6 +693,151 @@ export class BlackBookSDK {
       to,
       amount,
     });
+  }
+
+  // ── Universal Rollup Hub ───────────────────────────────────────────────────
+
+  /**
+   * GET /address/:address/transactions — Paginated transaction history.
+   *
+   * @param address  Wallet address (defaults to loaded wallet)
+   * @param page     Page number (default 1)
+   * @param limit    Results per page (default 50)
+   */
+  txHistory(
+    address?: string,
+    page = 1,
+    limit = 50
+  ): Promise<TxHistoryResponse> {
+    const addr = address ?? this.requireWallet().address;
+    return this.get(
+      `/address/${encodeURIComponent(addr)}/transactions?page=${page}&limit=${limit}`
+    );
+  }
+
+  /**
+   * POST /rollup/:rollupId/lock_bb — Lock $BB into a rollup vault PDA.
+   *
+   * Call this before the rollup runs (e.g. before placing a bet on L2).
+   * Tokens move: user wallet → rollup vault PDA.
+   *
+   * Signs: `"ROLLUP_LOCK_BB:{rollupId}:{wallet}:{bbLamports}:{symbolHint}:{ts}:{nonce}"`
+   *
+   * @param rollupId    "L2", "L3", or "L5"
+   * @param bbLamports  Amount in lamports (1 BB = 100,000). Use bbToLamports() helper.
+   * @param symbolHint  Optional market hint string (e.g. "BTC-USD")
+   */
+  async lockBB(
+    rollupId: string,
+    bbLamports: bigint,
+    symbolHint = ""
+  ): Promise<RollupLockResponse> {
+    const kp = this.requireWallet();
+    const { ed, hexToBytes, bytesToHex } = await getCrypto();
+
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const message =
+      `ROLLUP_LOCK_BB:${rollupId}:${kp.address}:${bbLamports}:${symbolHint}:${timestamp}:${nonce}`;
+
+    const sigBytes = await ed.signAsync(
+      new TextEncoder().encode(message),
+      hexToBytes(kp.privateKeyHex)
+    );
+
+    return this.post<RollupLockResponse>(`/rollup/${rollupId}/lock_bb`, {
+      wallet: kp.address,
+      bb_lamports: Number(bbLamports),
+      symbol_hint: symbolHint,
+      public_key: kp.publicKeyHex,
+      signature: bytesToHex(sigBytes),
+      timestamp,
+      nonce,
+    });
+  }
+
+  /**
+   * GET /rollup/:rollupId/locks/:lockId — Check status of a single lock record.
+   *
+   * @param rollupId  "L2", "L3", or "L5"
+   * @param lockId    UUID returned by lockBB()
+   */
+  rollupLockStatus(
+    rollupId: string,
+    lockId: string
+  ): Promise<RollupLockStatusResponse> {
+    return this.get(
+      `/rollup/${rollupId}/locks/${encodeURIComponent(lockId)}`
+    );
+  }
+
+  /**
+   * POST /rollup/:rollupId/exit — Exit assets from a rollup back to L1.
+   *
+   * Provide a Merkle proof obtained from the L2/L3/L5 sequencer after
+   * the batch containing your balance has been anchored on L1.
+   *
+   * BB exit signs:  `"ROLLUP_EXIT:{rollupId}:BB:{address}:{batchId}:{ts}:{nonce}"`
+   * NFT exit signs: `"ROLLUP_EXIT:{rollupId}:NFT:{address}:{batchId}:{ts}:{nonce}"`
+   *
+   * BB  Merkle leaf preimage: `"{rollupId}:BB:{address}:{balance_lamports}"`
+   * NFT Merkle leaf preimage: `"{rollupId}:NFT:{collection}:{token}:{owner}:{metadata_hash}"`
+   *
+   * @param rollupId    "L2", "L3", or "L5"
+   * @param assetType   "BB" or "NFT"
+   * @param batchId     Batch identifier from the sequencer's submit_root call
+   * @param merkleProof Array of 64-char hex sibling hashes (from sequencer API)
+   * @param opts        Asset-specific fields — see below
+   */
+  async rollupExit(
+    rollupId: string,
+    assetType: "BB" | "NFT",
+    batchId: number,
+    merkleProof: string[],
+    opts: {
+      /** BB exit: balance in lamports as proven in the Merkle leaf */
+      bbLamports?: bigint;
+      /** NFT exit: collection identifier */
+      collectionId?: string;
+      /** NFT exit: token identifier */
+      tokenId?: string;
+      /** NFT exit: 64-char hex SHA-256 of off-chain metadata */
+      metadataHash?: string;
+    } = {}
+  ): Promise<RollupExitResponse> {
+    const kp = this.requireWallet();
+    const { ed, hexToBytes, bytesToHex } = await getCrypto();
+
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const message =
+      `ROLLUP_EXIT:${rollupId}:${assetType}:${kp.address}:${batchId}:${timestamp}:${nonce}`;
+
+    const sigBytes = await ed.signAsync(
+      new TextEncoder().encode(message),
+      hexToBytes(kp.privateKeyHex)
+    );
+
+    const body: Record<string, unknown> = {
+      asset_type: assetType,
+      address: kp.address,
+      batch_id: batchId,
+      merkle_proof: merkleProof,
+      public_key: kp.publicKeyHex,
+      signature: bytesToHex(sigBytes),
+      timestamp,
+      nonce,
+    };
+
+    if (assetType === "BB") {
+      body.bb_lamports = Number(opts.bbLamports ?? 0n);
+    } else {
+      body.collection_id = opts.collectionId;
+      body.token_id = opts.tokenId;
+      body.metadata_hash = opts.metadataHash;
+    }
+
+    return this.post<RollupExitResponse>(`/rollup/${rollupId}/exit`, body);
   }
 
   // ── Gulf Stream (advanced) ───────────────────────────────────────────────

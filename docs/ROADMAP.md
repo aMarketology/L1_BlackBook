@@ -1,11 +1,27 @@
 ﻿# BlackBook — Engineering Roadmap
 
-> **Last updated: June 2026 — v1.0.0 production milestone tagged.**
-> Production node: `91.98.196.34:8080` · Tag: `v1.0.0` (commit `4224b0c`)
+> **Last updated: June 2026 — v1.0.1; permissioned Turbine 7A/7B/7C live.**
+> Production node: `91.98.196.34:8080` (migrating to Cherry bare-metal) · Last tag: `v1.0.0` (commit `4224b0c`)
+>
+> **What the L1 is:** an **asset-custody ledger, state machine, and transaction execution environment**.
+> Its only relationship with keys is to (1) store a balance against a public key, (2) receive an
+> Ed25519-signed transaction, and (3) verify the signature before executing. It never generates,
+> holds, or transmits user private keys or mnemonics — those are created and kept client-side only.
 >
 > **Network model: Consortium / Permissioned Layer 1.**
 > Only whitelisted Ed25519-keyed validator nodes participate in consensus and receive block shreds.
 > This is the architectural north star for all P2P and consensus work.
+>
+> **v1.0.1 — pure-L1 hardening:**
+> - 🧹 **Removed off-mission fiat-onramp code** — the dead Bitcoin Lightning / BTCPayServer gateway (`contracts/lightning_gateway/`, orphaned, never compiled) and the dead Transak JWT webhook (`watcher/webhook.rs`). The L1 is settlement + execution, not a fiat payment aggregator. Build is now warning-clean.
+> - 🔑 **No server-side key generation** — an experimental `POST /keypair/generate` endpoint was removed. Key generation must be client-side only: no custodial keys, no unauthenticated CPU-DoS surface against the PoH clock.
+>
+> **Post-v1.0.0 changes:**
+> - 🔐 Sequencer keys rotated (compromised keys retired). Live L2 sequencer pubkey is now `fb78242e…` (was `bc9359a9…`).
+> - 🛡️ **Rollup exit path hardened** against cross-batch double-exit — see Phase 3.5 below.
+> - 🔧 L3 NFT sequencer transfer-ownership bug fixed; L3 mint/transfer SDK helpers added.
+> - 📡 **Permissioned Turbine 7A/7B/7C live** — static `ValidatorRegistry`, UDP source-IP gate, Ed25519-signed tick-shreds, and the f64→u64 `LeaderSchedule` rewrite (Phase 7 below).
+> - 🚚 **Cherry bare-metal migration in progress** — Hetzner flagged blockchain workloads; node moving to a Cherry host (Phase 7.5).
 
 ---
 
@@ -44,7 +60,7 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 | Sealevel parallel execution (Rayon thread pool) | ✅ |
 | **O(N) per-account queue scheduler** | ✅ v1.0.0 |
 | **Local Fee Market (priority lanes on hot accounts)** | ✅ v1.0.0 |
-| Turbine shredding (1,232-byte UDP shreds, RS FEC 32+32) | ✅ Shredding works; permissioned gossip planned Phase 7 |
+| Turbine shredding (1,232-byte UDP shreds, RS FEC 32+32) | ✅ Shredding works; permissioned auth live (7A/7B/7C), full block-shred mesh = Phase 7D |
 | SvmAccountsDB (DashMap hot + ReDB durable) | ✅ |
 | SPL Token engine (Mint, TokenAccount, ATA) | ✅ |
 | JSON-RPC (28 Solana-compatible methods, port 8899) | ✅ |
@@ -94,8 +110,31 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 | Multi-asset exit (BB + NFT) | ✅ |
 | Permanent double-spend seal (`ROLLUP_CONSUMED_EXITS`) | ✅ |
 | Monotonic batch_id enforcement | ✅ |
-| L2 sequencer pubkey locked: `bc9359a9…` | ✅ |
+| L2 sequencer pubkey (rotated): `fb78242e…` | ✅ |
 | L3/L5 sequencer pubkeys registered | ✅ |
+
+---
+
+## ✅ PHASE 3.5 — Rollup Exit Security Hardening (COMPLETE — post-v1.0.0)
+
+**Closed a CRITICAL money-loss bug: the same locked balance could be exited once
+per historical Merkle root, draining the vault.**
+
+| Item | Status |
+|------|--------|
+| Batch-agnostic BB exit key: `SHA256("{rollup}:BB:{addr}")` | ✅ |
+| Cumulative-withdrawn accounting — exit releases `proven − already_withdrawn` | ✅ |
+| Re-deposit increments handled (lock more → exit only the delta) | ✅ |
+| `atomic_rollup_bb_exit()` — single ReDB txn (re-read cumulative, re-check vault solvency, debit+credit+seal, then mirror cache) | ✅ |
+| Concurrent double-exit race → `exit_raced` 409 | ✅ |
+| Vault solvency re-checked inside the write txn → `vault_insolvent` 409 | ✅ |
+| NFT exit key batch-agnostic: `SHA256("{rollup}:NFT:{col}:{tok}")` + binary seal | ✅ |
+| `cargo build --release` clean | ✅ |
+| End-to-end exit replay test on live node | 🔲 Pending |
+
+> **Still trusted-by-authority:** these fixes stop double-spend and insolvency, but a
+> malicious sequencer can still post a false root. True trust-minimization needs the
+> challenge window + ZK proofs (Phases 9 / future Phase 12). Tracked below.
 
 ---
 
@@ -145,27 +184,65 @@ React wallet wired to live L2 sequencer at `https://layer2.blackbook.id/seq`.
 
 ---
 
-## 🔄 PHASE 7 — Permissioned P2P Gossip (Turbine Rewrite) — CURRENT PRIORITY
+## 🔄 PHASE 7 — Permissioned P2P Gossip (Turbine Rewrite) — IN PROGRESS
 
-Convert the star-topology Turbine from 1-Writer→N-Reader broadcast to a closed-loop
-**VIP Mesh** gossip protocol among the whitelisted consortium validator set.
+Convert the star-topology Turbine from an unauthenticated 1-Writer→N-Reader broadcast
+into an **authenticated, whitelist-gated** propagation layer among the consortium
+validator set. Phases **7A / 7B / 7C are live**; the full block-shred mesh (round-robin
++ peer re-broadcast + FEC reassembly) is the remaining work.
 
 ### Design: The Three Laws of the Consortium Network
 1. **IP Whitelist as First Defence** — UDP socket drops unknown-source packets in <1 µs, before any crypto.
 2. **Shred & Share** — Writer splits block into 1,232-byte shreds, assigns each to a different approved node. Those nodes immediately re-broadcast to the full peer set.
 3. **u64 Stake, no f64** — The `LeaderSchedule` f64 staking weights are ripped out and replaced with exact u64 lamport-denominated voting power.
 
+### 7A — Static Permissioned Registry (✅ DONE)
 | Item | Status |
 |------|--------|
-| `APPROVED_VALIDATORS` registry: `Vec<(Ed25519Pubkey, SocketAddr)>` in AppState | ❌ |
-| UDP source-IP gate on `:8004` receiver — drop non-whitelisted before crypto | ❌ |
-| Ed25519-signed shred envelope (`ShredEnvelope { shred, slot, index, sig }`) | ❌ |
-| Writer → shred distribution (round-robin assign shreds to peer set) | ❌ |
-| Peer re-broadcast — each node blasts its shred to all other whitelisted peers | ❌ |
-| Shred reassembly + FEC decode on receiver nodes | ❌ |
-| `LeaderSchedule` f64 → u64 lamport staking rewrite | ❌ |
-| `GET /validators` endpoint — returns current approved set | ❌ |
-| `POST /admin/validators/add` + `/remove` (feature-gated) | ❌ |
+| `ValidatorRegistry` in AppState (`approved_validators: Arc<ValidatorRegistry>`) | ✅ `runtime/validator_registry.rs` |
+| Load from `config.toml` `[[validators]]` or `APPROVED_VALIDATORS` env (env overrides) | ✅ |
+| Fast `by_ip` + `by_pubkey` lookup maps; `empty()` dev fallback (never panics) | ✅ |
+| `config.toml.example` template + `VALIDATOR_KEYPAIR_PATH` signing key | ✅ |
+| `POST /turbine/register` + `/heartbeat` removed (hard cutover to static set) | ✅ |
+
+### 7B — UDP Source-IP Gate (✅ DONE)
+| Item | Status |
+|------|--------|
+| `recv_from` on `:8004` drops non-whitelisted source IPs before deserialization | ✅ `is_approved_ip()` |
+| Silent drop (no per-packet logging) — parse-bomb / log-flood resistant | ✅ |
+
+### 7C — Signed Tick-Shred Wire Format (✅ DONE)
+| Item | Status |
+|------|--------|
+| `SignedTickShred { shred_bytes, signer, signature }` Ed25519 envelope | ✅ |
+| Writer signs in async broadcaster thread — PoH OS thread stays crypto-free | ✅ |
+| Receiver: signer-known check → Ed25519 verify → PoH SHA-256 chain replay | ✅ |
+| `LeaderSchedule` f64 → u64 lamport rewrite (`set_stake`, deterministic schedule) | ✅ `runtime/consensus.rs` |
+
+### 7D — Full Block-Shred VIP Mesh (🔲 REMAINING)
+| Item | Status |
+|------|--------|
+| Writer → round-robin shred assignment (each shred to a different approved node) | 🔲 today: signed tick-shreds broadcast to all targets (star + auth) |
+| Peer re-broadcast — each node blasts its shred to all other whitelisted peers | 🔲 |
+| Block shred reassembly + Reed-Solomon FEC decode on receiver nodes | 🔲 today: per-tick PoH verify, no block reassembly |
+| `GET /validators` endpoint — returns current approved set | 🔲 |
+| `POST /admin/validators/add` + `/remove` (feature-gated, hot registry) | 🔲 |
+
+---
+
+## 🚚 PHASE 7.5 — Cherry Bare-Metal Migration (IN PROGRESS — June 2026)
+
+Hetzner flagged blockchain workloads, so the node is migrating to a **Cherry bare-metal**
+host (no blockchain restrictions, NVMe, EU colocation). Phase 7A keypairs were generated
+for the new Writer + Reader mesh on this host.
+
+| Item | Status |
+|------|--------|
+| Cherry server provisioned (32-core / 64 GB / NVMe) | 🔄 |
+| Firewall: TCP 8080/50051/8899 public · UDP 8003 public · UDP 8004 whitelist | 🔄 |
+| Phase 7A keypairs generated (`keys/writer.key`, `keys/reader-local.key`) | ✅ |
+| `config.toml` populated with Cherry Writer pubkey + addr | 🔲 |
+| `docs/cherry.md` migration guide + `deployment/setup-cherry.sh` | ✅ |
 
 ---
 
@@ -226,14 +303,36 @@ Eliminate the L2 sequencer as a single point of failure.
 
 ---
 
+## 📋 PHASE 12 — Rollup Trust-Minimization: Challenge Window + Escape Hatch
+
+Phase 3.5 stopped double-spend/insolvency, but a sequencer that signs a *false* root
+can still mis-credit exits. These items remove the "honest sequencer" assumption
+without waiting for full ZK (Phase 9).
+
+| Upgrade | Impact |
+|---------|--------|
+| **Challenge/dispute window** on `submit_root` (reuse `settlement/mod.rs` 2h `SubmitPendingRoot` pattern) | Roots are pending, not final — fraudulent roots can be contested before exits unlock |
+| **Forced-inclusion / escape hatch** — user can exit against the last *finalized* root even if the sequencer censors them | Liveness: funds are never trapped by an offline/malicious sequencer |
+| **Sequencer bond** — sequencer stakes $BB, slashed on a proven invalid root | Economic deterrent; aligns sequencer incentives |
+| **Data-availability publication** — sequencer must publish the full balance set behind each root | Anyone can reconstruct proofs and detect fraud |
+
+**Why before Phase 7/8:** this protects user funds at launch. P2P gossip and kernel
+bypass are scaling/decentralization — important, but they don't guard the money path.
+
+---
+
 ## Priority Summary
 
 | Phase | Priority | Effort | Unlocks |
 |-------|----------|--------|---------|
+| 3.5 — Exit Security Hardening | ✅ Done | — | No cross-batch vault drain |
 | 5 — Frontend | ✅ Done | — | — |
 | 6 — L2 on Hetzner | ✅ Done | — | — |
-| 7 — Permissioned P2P Gossip | **NOW** | 1–2 weeks | Multi-node consortium, remove Writer bandwidth SPOF |
-| 8 — XDP / io_uring | High | 2–3 weeks | 240K TPS ceiling on Hetzner |
-| 9 — ZK Proofs | High | 4–8 weeks | Trustless L2 |
+| 7A/7B/7C — Registry + IP gate + signed shreds + u64 stake | ✅ Done | — | Authenticated, whitelist-gated propagation |
+| **7.5 — Cherry bare-metal migration** | **NOW** | 2–3 days | Node off Hetzner, mesh on owned keys |
+| 7D — Full block-shred mesh + `/validators` | **NEXT** | 1–2 weeks | True multi-node consortium, remove Writer SPOF |
+| 12 — Challenge Window + Escape Hatch | High | 1–2 weeks | Trust-minimized exits, no trapped funds |
+| 8 — XDP / io_uring | High | 2–3 weeks | 240K TPS ceiling (Linux node) |
+| 9 — ZK Proofs | High | 4–8 weeks | Fully trustless L2 |
 | 10 — DA + Pruning | Medium | 2–3 weeks | Infinite scale |
 | 11 — HA Failover | Medium | 1–2 weeks | 99.99% uptime |
