@@ -24,7 +24,7 @@ function pubkeyHexToAddress(hex: string): string {
   }
   return result;
 }
-import { buildLeafPreimage, hashLeaf, buildMerkleTree } from '@bb/shared';
+import { buildMerkleTree } from '@bb/shared';
 import type { NftEntry } from '@bb/shared';
 import {
   mintNft,
@@ -224,7 +224,6 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
       token_id: e.tokenId,
       owner: e.owner,
       metadata_hash: e.metadataHash,
-      leaf_preimage: buildLeafPreimage('L3', e),
       siblings: proofs[i],
       // sibling_is_right is all false — sorted-pair hash_pair is commutative,
       // so direction is irrelevant to the L1 Rust verifier.

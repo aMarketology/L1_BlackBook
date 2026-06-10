@@ -33,6 +33,8 @@ export interface MarketRow {
   total_no_pool: number;
   created_at_ts: number;
   resolved_at_ts: number | null;
+  batch_id?: number | null;
+  merkle_root?: string | null;
 }
 
 export interface PositionRow {

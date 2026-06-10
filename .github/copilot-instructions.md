@@ -2,11 +2,8 @@
 
 ## What This Codebase Is
 
-BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (engine v5.0.0, release v1.0.1, edition 2021).
-It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain for L2
-prediction markets — modeled after institutional-grade private networks (Visa backbone, Swift, HFT
-settlement rails), NOT a permissionless public chain. Only cryptographically whitelisted validator
-nodes may participate in consensus or receive block shreds.
+BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (engine v5.0.0, release v1.0.1, edition 2026).
+It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain all rollup layers l2 l3 & l5 
 
 **Core identity:** the L1 is an **asset-custody ledger, state machine, and transaction execution
 environment** — nothing else. Its only relationship with keys is to (1) store a balance against a
@@ -38,8 +35,8 @@ Solana internals but fully custom-implemented:
 | `$BB` | 5 | `LAMPORTS_PER_BB = 100_000` | Native gas token, betting collateral, oracle staking |
 | `wUSDT` | 6 | `USDC_UNIT = 1_000_000` | Wrapped stablecoin, swap reserve |
 
-**BB ↔ wUSDT fixed rate**: 10 BB = 1 wUSDT (dealer market maker, not AMM).
-**MAXX / DECAY / OZ**: removed from L1. Archived in `archive/contracts/`. Do NOT add them back.
+**BB ↔ wUSDT fixed rate**: 10 BB = 1 wUSDT 
+**MAXX / DECAY / OZ**: removed from L1. Archived in `archive/contracts/`. Do NOT add them back yet.
 
 ---
 

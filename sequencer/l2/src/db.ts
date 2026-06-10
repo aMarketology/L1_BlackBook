@@ -17,7 +17,9 @@ const L2_SCHEMA = `
     total_yes_pool  INTEGER NOT NULL DEFAULT 0,       -- lamports staked YES
     total_no_pool   INTEGER NOT NULL DEFAULT 0,       -- lamports staked NO
     created_at_ts   INTEGER NOT NULL DEFAULT (unixepoch()),
-    resolved_at_ts  INTEGER                           -- unix ts, null until resolved
+    resolved_at_ts  INTEGER,                          -- unix ts, null until resolved
+    batch_id        INTEGER,
+    merkle_root     TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_markets_status ON l2_markets(status);
@@ -47,5 +49,14 @@ const L2_SCHEMA = `
 export function openL2Db(dbPath: string): DatabaseType {
   const db = openDb(dbPath);
   db.exec(L2_SCHEMA);
+
+  // Upgrade schema if existing database doesn't have batch_id / merkle_root columns
+  try {
+    db.exec(`ALTER TABLE l2_markets ADD COLUMN batch_id INTEGER`);
+  } catch (_e) {}
+  try {
+    db.exec(`ALTER TABLE l2_markets ADD COLUMN merkle_root TEXT`);
+  } catch (_e) {}
+
   return db;
 }

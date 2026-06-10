@@ -97,7 +97,11 @@ async function doSeal(
   await submitRoot(config, batchId, root);
 
   // Record the batch locally.
-  sealBatch(db, 'L2', batchId, root, entries.length, slot);
+  const balancesJson = JSON.stringify(balances.map(b => ({
+    address: b.address,
+    lamports: b.lamports.toString()
+  })));
+  sealBatch(db, 'L2', batchId, root, entries.length, slot, balancesJson);
   setSlotWatermark(db, 'L2', slot);
 
   // Only advance the cache after a fully successful submit + local write.

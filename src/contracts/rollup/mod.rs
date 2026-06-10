@@ -32,12 +32,53 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use borsh::BorshSerialize;
 use sha2::{Sha256, Digest};
 use tracing::info;
 
 use crate::AppState;
 use crate::storage::RollupLockRecord;
 use crate::svm::pda::rollup_vault_address;
+
+// ─── Borsh-canonical Merkle leaf structs ──────────────────────────────────────
+//
+// These structs define the wire format for Merkle leaf serialization.
+// Using Borsh (not JSON or UTF-8 strings) guarantees byte-identical output
+// between this Rust verifier and the TypeScript L2 sequencer (merkle.ts).
+//
+// Borsh encoding rules:
+//   String  → u32_LE(len) || utf8_bytes
+//   [u8;32] → 32 raw bytes (fixed-size, no length prefix)
+//   u64     → 8 bytes little-endian
+//
+// CRITICAL: field order must match `buildLeafBytes()` in merkle.ts exactly.
+
+/// Canonical BB balance leaf.
+#[derive(BorshSerialize)]
+struct BbClaimLeaf<'a> {
+    /// "L2", "L3", or "L5"
+    rollup_id: &'a str,
+    /// Always "BB"
+    token: &'a str,
+    /// 32-byte Ed25519 public key (bs58-decoded wallet address)
+    address: [u8; 32],
+    /// Balance in $BB lamports (1 BB = 100_000 lamports)
+    lamports: u64,
+}
+
+/// Canonical NFT ownership leaf.
+#[derive(BorshSerialize)]
+struct NftClaimLeaf<'a> {
+    rollup_id: &'a str,
+    /// Always "NFT"
+    token: &'a str,
+    collection_id: &'a str,
+    token_id: u64,
+    /// 32-byte Ed25519 public key of the current owner
+    owner: [u8; 32],
+    /// SHA-256 hex of the NFT metadata JSON (64 ASCII chars)
+    metadata_hash: &'a str,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Request / response shapes
@@ -489,16 +530,16 @@ pub async fn submit_root_handler(
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /rollup/:rollup_id/exit
-//  Universal exit handler: verifies Merkle proof, then routes to either
-//  $BB lamport release or L3 NFT mint depending on asset_type.
+//  Universal exit handler: verifies Borsh-canonical Merkle proof, then routes
+//  to either $BB lamport release or L3 NFT mint depending on asset_type.
 //
-//  Leaf encoding (canonical — sequencer MUST match exactly):
+//  Leaf encoding (Borsh binary — sequencer MUST use buildLeafBytes() in merkle.ts):
 //
-//   BB leaf:   SHA-256( "{rollup_id}:BB:{address}:{balance_lamports}" )
-//   NFT leaf:  SHA-256( "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}" )
+//   BB leaf:  SHA-256( borsh(BbClaimLeaf { rollup_id, "BB", address[32], lamports }) )
+//   NFT leaf: SHA-256( borsh(NftClaimLeaf { rollup_id, "NFT", collection_id, token_id, owner[32], metadata_hash }) )
 //
-//  Using strict colon-separated strings avoids JSON parser whitespace/ordering
-//  ambiguity between TypeScript sequencers and this Rust verifier.
+//  Borsh guarantees identical byte layout across Rust + TypeScript:
+//   String → u32_LE(len) || utf8  |  [u8;32] → raw bytes  |  u64 → 8 bytes LE
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -539,14 +580,20 @@ pub struct ExitRequest {
     pub nonce: String,
 }
 
-/// Computes SHA-256 and returns the lowercase hex digest.
+/// SHA-256 of raw bytes → lowercase hex digest.
+fn sha256_hex_bytes(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
+}
+
+/// SHA-256 of a UTF-8 string → lowercase hex (used for sibling combines only).
 fn sha256_hex(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
+    sha256_hex_bytes(data.as_bytes())
 }
 
 /// Hash two sibling nodes sorted so order is deterministic (same as sequencer logic).
+/// Siblings are 64-char hex strings; concatenated as ASCII then SHA-256'd.
 fn hash_pair(a: &str, b: &str) -> String {
     if a <= b {
         sha256_hex(&format!("{}{}", a, b))
@@ -555,13 +602,40 @@ fn hash_pair(a: &str, b: &str) -> String {
     }
 }
 
+/// Compute the Borsh-canonical leaf hash for a BB balance entry.
+/// leaf_hash = SHA-256( borsh(BbClaimLeaf) )
+pub(crate) fn bb_leaf_hash(rollup_id: &str, address_bytes: [u8; 32], lamports: u64) -> String {
+    let leaf = BbClaimLeaf { rollup_id, token: "BB", address: address_bytes, lamports };
+    let bytes = borsh::to_vec(&leaf).expect("BbClaimLeaf borsh serialize is infallible");
+    sha256_hex_bytes(&bytes)
+}
+
+/// Compute the Borsh-canonical leaf hash for an NFT ownership entry.
+/// leaf_hash = SHA-256( borsh(NftClaimLeaf) )
+pub(crate) fn nft_leaf_hash(
+    rollup_id: &str,
+    collection_id: &str,
+    token_id: u64,
+    owner_bytes: [u8; 32],
+    metadata_hash: &str,
+) -> String {
+    let leaf = NftClaimLeaf {
+        rollup_id, token: "NFT", collection_id, token_id,
+        owner: owner_bytes, metadata_hash,
+    };
+    let bytes = borsh::to_vec(&leaf).expect("NftClaimLeaf borsh serialize is infallible");
+    sha256_hex_bytes(&bytes)
+}
+
 /// Walk the Merkle proof and return the computed root hash.
+/// The leaf_hash is already a 64-char hex string (output of bb_leaf_hash / nft_leaf_hash).
+/// Sibling combine uses sorted-pair hex-string SHA-256 (same as merkle.ts hashPair).
 fn verify_merkle_proof(
-    leaf: &str,
+    leaf_hash: &str,
     siblings: &[String],
     is_right: &[bool],
 ) -> String {
-    let mut current = sha256_hex(leaf);
+    let mut current = leaf_hash.to_string();
     for (i, sibling) in siblings.iter().enumerate() {
         let sib_is_right = is_right.get(i).copied().unwrap_or(false);
         current = if sib_is_right {
@@ -655,9 +729,15 @@ pub async fn exit_handler(
     };
 
     // ── Build and verify the leaf based on asset_type ──────────────────────
-    let addr_lower = req.address.to_lowercase();
+    // ── Decode address bytes (base58 → [u8;32]) — shared by BB and NFT ──────
+    let addr_bytes: [u8; 32] = match bs58::decode(&req.address).into_vec() {
+        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "address must be a base58-encoded 32-byte Ed25519 public key."
+        }))),
+    };
 
-    let (leaf_data, exit_id_input) = match asset_type.as_str() {
+    let (leaf_hash, exit_id_input) = match asset_type.as_str() {
         "BB" => {
             let lamports = match req.balance_lamports {
                 Some(v) if v > 0 => v,
@@ -665,10 +745,10 @@ pub async fn exit_handler(
                     "error": "balance_lamports is required and must be > 0 for BB exits."
                 }))),
             };
-            // BB leaf:  "{rollup_id}:BB:{address}:{balance_lamports}"
-            let leaf = format!("{}:BB:{}:{}", rollup_id, addr_lower, lamports);
-            // Exit key is batch-agnostic: a balance can be exited (cumulatively)
-            // only up to its latest proven amount, never once-per-batch.
+            // Borsh leaf: SHA-256( borsh(BbClaimLeaf { rollup_id, "BB", address[32], lamports }) )
+            let leaf = bb_leaf_hash(&rollup_id, addr_bytes, lamports);
+            // Exit key is batch-agnostic — cumulative withdrawal guard.
+            let addr_lower = req.address.to_lowercase();
             let exit_id = format!("{}:BB:{}", rollup_id, addr_lower);
             (leaf, exit_id)
         }
@@ -691,18 +771,16 @@ pub async fn exit_handler(
                     "error": "metadata_hash must be a 64-char hex string (SHA-256 of metadata JSON)."
                 }))),
             };
-            // NFT leaf:  "{rollup_id}:NFT:{collection_id}:{token_id}:{owner}:{metadata_hash}"
-            let leaf = format!("{}:NFT:{}:{}:{}:{}", rollup_id, col, tok, addr_lower, mhash);
-            // NFT exit_id keyed by (collection, token) — not by owner, not by batch —
-            // since an NFT is unique: once exited it can never be exited again
-            // regardless of which historical root a user tries to prove against.
+            // Borsh leaf: SHA-256( borsh(NftClaimLeaf { rollup_id, "NFT", collection_id, token_id, owner[32], metadata_hash }) )
+            let leaf = nft_leaf_hash(&rollup_id, &col, tok, addr_bytes, &mhash);
+            // NFT exit_id: keyed by (collection, token) — once exited, never again.
             let exit_id = format!("{}:NFT:{}:{}", rollup_id, col, tok);
             (leaf, exit_id)
         }
         _ => unreachable!(),
     };
 
-    let computed_root = verify_merkle_proof(&leaf_data, &req.proof_siblings, &req.sibling_is_right);
+    let computed_root = verify_merkle_proof(&leaf_hash, &req.proof_siblings, &req.sibling_is_right);
 
     if computed_root != stored_root {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({
@@ -712,7 +790,7 @@ pub async fn exit_handler(
         })));
     }
 
-    // ── Compute the batch-agnostic exit key ────────────────────────────────
+    // ── Compute the batch-agnostic exit key (SHA-256 of the exit_id_input string) ───
     let exit_id = sha256_hex(&exit_id_input);
 
     // ── Route to asset-specific execution ─────────────────────────────────

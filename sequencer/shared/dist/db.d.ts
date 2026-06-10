@@ -61,7 +61,7 @@ export declare function getBalance(db: DatabaseType, rollupId: string, address: 
  * Record a sealed batch.  Overwrites any existing row for the same
  * (rollup_id, batch_id) — safe to call on retry after a partial failure.
  */
-export declare function sealBatch(db: DatabaseType, rollupId: string, batchId: number, merkleRoot: string, entryCount: number, slot: number): void;
+export declare function sealBatch(db: DatabaseType, rollupId: string, batchId: number, merkleRoot: string, entryCount: number, slot: number, balancesSnapshot?: string): void;
 /** Return the highest sealed batch_id for this rollup, or 0 if none exist. */
 export declare function getLatestBatchId(db: DatabaseType, rollupId: string): number;
 /** Return the last L1 slot fully processed by this sequencer, or 0. */

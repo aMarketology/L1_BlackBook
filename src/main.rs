@@ -2892,7 +2892,14 @@ fn build_router(state: AppState) -> Router {
         .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
         .route("/rollup/:rollup_id/roots/:batch_id", get(contracts::rollup::get_root_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
-        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler));
+        .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler))
+        // DA (Data Availability) settlement layer
+        // GET  /da/:market_id         — Oracle-finalized state root for a market
+        // GET  /da/:rollup_id/pool    — Dealer vault $BB balance (house bankroll)
+        // POST /da/claim              — Merkle proof → vault release (relayer path)
+        .route("/da/:market_id", get(contracts::da::get_da_market_handler))
+        .route("/da/:rollup_id/pool", get(contracts::da::get_da_pool_handler))
+        .route("/da/claim", post(contracts::da::da_claim_handler));
 
     #[cfg(feature = "unsafe_admin")]
     {

@@ -1,19 +1,24 @@
 import type { MerkleEntry, MerkleTree } from './types.js';
+/** Build the canonical Borsh bytes for any MerkleEntry. */
+export declare function buildLeafBytes(rollupId: string, entry: MerkleEntry): Uint8Array;
 /**
- * Build the canonical UTF-8 leaf preimage string.
- * Must match the L1 Rust exit verifier exactly. The L1 handler lowercases the
- * address/owner (`addr_lower`) before building the leaf, so we lowercase here
- * too — otherwise mixed-case base58 addresses would hash to a different leaf
- * and the exit proof would fail verification.
- *   BB:  "{rollupId}:BB:{address_lowercased}:{lamports}"
- *   NFT: "{rollupId}:NFT:{collectionId}:{tokenId}:{owner_lowercased}:{metadataHash}"
+ * @deprecated Use `buildLeafBytes` + `hashLeafBytes` instead.
+ * Kept for any callers that still pass a preimage string directly.
  */
-export declare function buildLeafPreimage(rollupId: string, entry: MerkleEntry): string;
-/** Hash a leaf preimage string to a 64-char lowercase hex digest. */
-export declare function hashLeaf(preimage: string): string;
+export declare function buildLeafPreimage(_rollupId: string, _entry: MerkleEntry): string;
+/**
+ * Hash a Borsh-serialized leaf to a 64-char lowercase hex digest.
+ * This is the canonical leaf hash used in the Merkle tree.
+ */
+export declare function hashLeafBytes(leafBytes: Uint8Array): string;
+/**
+ * @deprecated Use `hashLeafBytes(buildLeafBytes(rollupId, entry))` instead.
+ */
+export declare function hashLeaf(_preimage: string): string;
 /**
  * Build a complete sorted-pair SHA-256 Merkle tree from an entry list.
  *
+ * Leaf digest = SHA-256( borsh(ClaimLeaf) )  ← deterministic binary, not a string
  * All node hashes are 64-char lowercase hex strings (matching the L1 verifier).
  * The list is padded to the next power of two (by duplicating the last leaf)
  * so that every leaf has a uniform-depth inclusion proof. Only the original
@@ -23,10 +28,12 @@ export declare function hashLeaf(preimage: string): string;
  */
 export declare function buildMerkleTree(rollupId: string, entries: MerkleEntry[]): MerkleTree;
 /**
- * Verify a Merkle inclusion proof against a known root, using the same
- * sorted-pair hex-string combine as the L1 verifier.
+ * Verify a Merkle inclusion proof against a known root.
  *
- * @param rollupId Rollup ID used to reconstruct the leaf preimage.
+ * Leaf hash = SHA-256( borsh(ClaimLeaf) ) — Borsh-canonical, not a string.
+ * Sibling combine uses sorted-pair hex-string SHA-256 (same as L1 Rust verifier).
+ *
+ * @param rollupId Rollup ID used to reconstruct the Borsh leaf bytes.
  * @param entry    Entry whose inclusion is being verified.
  * @param proof    Sibling hex digests from leaf up to (but not including) root.
  * @param root     Expected 64-char lowercase hex root.

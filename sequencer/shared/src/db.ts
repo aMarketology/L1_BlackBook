@@ -103,12 +103,13 @@ function applySchema(db: DatabaseType): void {
     -- Sealed batches: one row per (rollup, batch_id).
     -- batch_id is monotonically increasing per rollup.
     CREATE TABLE IF NOT EXISTS batches (
-      batch_id       INTEGER NOT NULL,
-      rollup_id      TEXT    NOT NULL,
-      merkle_root    TEXT    NOT NULL,
-      entry_count    INTEGER NOT NULL,
-      sealed_at_slot INTEGER NOT NULL,
-      sealed_at_ts   INTEGER NOT NULL DEFAULT (unixepoch()),
+      batch_id          INTEGER NOT NULL,
+      rollup_id         TEXT    NOT NULL,
+      merkle_root       TEXT    NOT NULL,
+      entry_count       INTEGER NOT NULL,
+      sealed_at_slot    INTEGER NOT NULL,
+      sealed_at_ts      INTEGER NOT NULL DEFAULT (unixepoch()),
+      balances_snapshot TEXT,
       PRIMARY KEY (rollup_id, batch_id)
     );
 
@@ -120,6 +121,12 @@ function applySchema(db: DatabaseType): void {
       slot      INTEGER NOT NULL DEFAULT 0
     );
   `);
+
+  try {
+    db.exec(`ALTER TABLE batches ADD COLUMN balances_snapshot TEXT`);
+  } catch (_e) {
+    // Ignore error if column already exists
+  }
 }
 
 // ─── Open ──────────────────────────────────────────────────────────────────────
@@ -238,12 +245,13 @@ export function sealBatch(
   merkleRoot: string,
   entryCount: number,
   slot: number,
+  balancesSnapshot?: string,
 ): void {
   db.prepare(`
     INSERT OR REPLACE INTO batches
-      (batch_id, rollup_id, merkle_root, entry_count, sealed_at_slot)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(batchId, rollupId, merkleRoot, entryCount, slot);
+      (batch_id, rollup_id, merkle_root, entry_count, sealed_at_slot, balances_snapshot)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(batchId, rollupId, merkleRoot, entryCount, slot, balancesSnapshot ?? null);
 }
 
 /** Return the highest sealed batch_id for this rollup, or 0 if none exist. */

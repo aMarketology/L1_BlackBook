@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn test_vote_tower() {
-        let mut t = VoteTower::new("v1".into(), 100.0);
+        let mut t = VoteTower::new("v1".into(), 100);
         assert!(t.process_vote(100, 100).is_ok());
         assert!(t.process_vote(101, 101).is_ok());
         assert!(t.process_vote(99, 102).is_err()); // can't go back
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_vote_signature() {
-        let v = Vote::new(100, "hash".into(), "v1".into(), 50.0);
+        let v = Vote::new(100, "hash".into(), "v1".into(), 50);
         assert!(v.verify());
         let mut bad = v.clone();
         bad.slot = 999;
@@ -776,9 +776,9 @@ mod tests {
     fn test_supermajority() {
         let slot = Arc::new(AtomicU64::new(100));
         let bft = TowerBFT::new("v1".into(), slot);
-        bft.register_validator("v1", 100.0);
-        bft.register_validator("v2", 100.0);
-        bft.register_validator("v3", 100.0);
+        bft.register_validator("v1", 100);
+        bft.register_validator("v2", 100);
+        bft.register_validator("v3", 100);
         bft.vote("v1", 100, "block").unwrap();
         bft.vote("v2", 100, "block").unwrap();
         bft.vote("v3", 100, "block").unwrap();

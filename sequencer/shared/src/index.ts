@@ -5,7 +5,7 @@ export * from './types.js';
 export { signMessage } from './signing.js';
 
 // ─── Merkle tree ──────────────────────────────────────────────────────────────
-export { buildLeafPreimage, hashLeaf, buildMerkleTree, verifyProof } from './merkle.js';
+export { buildLeafBytes, hashLeafBytes, buildMerkleTree, verifyProof } from './merkle.js';
 
 // ─── L1 HTTP client ───────────────────────────────────────────────────────────
 // getLock     = read a lock record from L1 (network call)

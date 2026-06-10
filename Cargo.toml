@@ -169,10 +169,6 @@ path = "src/lib.rs"
 name = "layer1"
 path = "src/main.rs"
 
-[[example]]
-name = "export_keypair"
-path = "examples/export_keypair.rs"
-
 # ═══════════════════════════════════════════════════════════════
 # PROFILE CONFIGURATION - Fix Windows linker crashes
 # ═══════════════════════════════════════════════════════════════

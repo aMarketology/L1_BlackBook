@@ -14,8 +14,11 @@ use crate::svm::LAMPORTS_PER_BB;
 const MIN_DISPUTE_STAKE_BB_LAMPORTS: u64 = 100 * LAMPORTS_PER_BB;
 /// Escalation threshold in $BB lamports (1 000 BB = $100).
 const DISPUTE_ESCALATION_THRESHOLD_BB_LAMPORTS: u64 = 1_000 * LAMPORTS_PER_BB;
-/// Dispute window: 150 slots × 400 ms = 60 seconds.
-const DISPUTE_WINDOW_SLOTS: u64 = 150;
+/// Dispute window: 2250 slots × 400 ms = 15 minutes.
+/// 60 seconds was too short — a single L1 congestion spike could prevent a
+/// valid dispute from being mined in time.  15 minutes gives ample room while
+/// keeping the UX tight enough for intra-day prediction markets.
+const DISPUTE_WINDOW_SLOTS: u64 = 2_250;
 /// Minimum $BB balance to cast a governance vote (100 BB = $10).
 const MIN_VOTE_STAKE_BB_LAMPORTS: u64 = 100 * LAMPORTS_PER_BB;
 

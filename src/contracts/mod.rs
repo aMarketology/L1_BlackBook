@@ -8,3 +8,4 @@ pub mod vault_gateway;
 pub mod nft_bridge;
 pub mod oracle;
 pub mod rollup;
+pub mod da;

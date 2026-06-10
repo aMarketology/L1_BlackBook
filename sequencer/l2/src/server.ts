@@ -268,6 +268,15 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
       // Immediately anchor the updated balances on L1 (Rollup Hub submit_root).
       const sealResult = await sealAndSubmit(config, db, 0);
 
+      if (sealResult) {
+        // Record the batch sealing details on the resolved market
+        db.prepare(`
+          UPDATE l2_markets
+          SET batch_id = ?, merkle_root = ?
+          WHERE market_id = ?
+        `).run(sealResult.batchId, sealResult.merkleRoot, req.params.id);
+      }
+
       // Submit to Oracle dispute window (non-blocking — failure is logged but
       // does not roll back the market resolution or the Rollup Hub anchor).
       if (sealResult) {
@@ -293,6 +302,151 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: msg });
+    }
+  });
+
+  // ── GET /da/:market_id ───────────────────────────────────────────────────
+  // Returns the full DA receipt with market details, status, outcome, and list of winners with pro-rata payouts.
+  app.get('/da/:market_id', (req, res) => {
+    try {
+      const market = getMarket(db, req.params.market_id);
+      if (!market) {
+        res.status(404).json({ error: `Market ${req.params.market_id} not found` });
+        return;
+      }
+
+      if (market.status !== 'RESOLVED') {
+        res.json({
+          market_id: market.market_id,
+          question: market.question,
+          status: market.status,
+          outcome: null,
+          total_yes_pool: market.total_yes_pool.toString(),
+          total_no_pool: market.total_no_pool.toString(),
+          winners: [],
+          note: "Market is not resolved — no winners or DA receipt available yet"
+        });
+        return;
+      }
+
+      const outcome = market.outcome!;
+      const totalPool = BigInt(market.total_yes_pool) + BigInt(market.total_no_pool);
+      const winningPool = outcome === 'YES' ? BigInt(market.total_yes_pool) : BigInt(market.total_no_pool);
+      const losingSide = outcome === 'YES' ? 'NO' : 'YES';
+
+      const dealerFeeBps = Number(process.env.DEALER_FEE_BPS ?? '100');
+      const dealerFee = totalPool * BigInt(dealerFeeBps) / 10_000n;
+      const distributedPool = totalPool - dealerFee;
+
+      const winners: { wallet_address: string; payout_lamports: string }[] = [];
+
+      if (winningPool === 0n) {
+        // Refund losers
+        const losers = db.prepare(`
+          SELECT wallet_address, amount_lamports FROM l2_positions
+          WHERE market_id = ? AND bet_side = ?
+        `).all(market.market_id, losingSide) as { wallet_address: string; amount_lamports: number }[];
+
+        for (const pos of losers) {
+          winners.push({
+            wallet_address: pos.wallet_address,
+            payout_lamports: pos.amount_lamports.toString(),
+          });
+        }
+      } else {
+        const dbWinners = db.prepare(`
+          SELECT wallet_address, amount_lamports FROM l2_positions
+          WHERE market_id = ? AND bet_side = ?
+        `).all(market.market_id, outcome) as { wallet_address: string; amount_lamports: number }[];
+
+        for (const pos of dbWinners) {
+          const payout = (BigInt(pos.amount_lamports) * distributedPool) / winningPool;
+          winners.push({
+            wallet_address: pos.wallet_address,
+            payout_lamports: payout.toString(),
+          });
+        }
+      }
+
+      res.json({
+        market_id: market.market_id,
+        question: market.question,
+        status: market.status,
+        outcome,
+        total_yes_pool: market.total_yes_pool.toString(),
+        total_no_pool: market.total_no_pool.toString(),
+        batch_id: market.batch_id ?? null,
+        merkle_root: market.merkle_root ?? null,
+        winners,
+        note: "Full DA receipt (winner list + proofs) is archived. Use GET /da/:market_id/claim/:address to generate individual Merkle claim tickets for L1."
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // ── GET /da/:market_id/claim/:address ─────────────────────────────────────
+  // Returns a per-winner Merkle claim ticket that can be directly submitted to POST /da/claim on L1.
+  app.get('/da/:market_id/claim/:address', (req, res) => {
+    try {
+      const { market_id, address } = req.params;
+      const market = getMarket(db, market_id);
+      if (!market) {
+        res.status(404).json({ error: `Market ${market_id} not found` });
+        return;
+      }
+
+      if (market.status !== 'RESOLVED') {
+        res.status(400).json({ error: `Market ${market_id} is in status ${market.status} — only resolved markets have claimable states` });
+        return;
+      }
+
+      const batchId = market.batch_id;
+      if (!batchId) {
+        res.status(409).json({ error: `Market ${market_id} is resolved but its state batch ID was not recorded` });
+        return;
+      }
+
+      // Load the batch to retrieve the balances snapshot
+      const batch = db.prepare(`
+        SELECT balances_snapshot FROM batches
+        WHERE rollup_id = 'L2' AND batch_id = ?
+      `).get(batchId) as { balances_snapshot: string | null } | undefined;
+
+      if (!batch || !batch.balances_snapshot) {
+        res.status(404).json({ error: `Could not load balances snapshot for batch #${batchId}` });
+        return;
+      }
+
+      const balances = JSON.parse(batch.balances_snapshot) as { address: string; lamports: string }[];
+      const entries: BbEntry[] = balances.map(b => ({
+        type: 'BB',
+        address: b.address,
+        lamports: BigInt(b.lamports),
+      }));
+
+      const idx = entries.findIndex(e => e.address === address);
+      if (idx === -1) {
+        res.status(404).json({ error: `No balance found for address ${address} in batch #${batchId} representing resolved market ${market_id}` });
+        return;
+      }
+
+      const { root, proofs } = buildMerkleTree('L2', entries);
+      const siblings = proofs[idx];
+
+      res.json({
+        rollup_id: 'L2',
+        market_id,
+        wallet_address: address,
+        balance_lamports: entries[idx].lamports.toString(),
+        proof_siblings: siblings,
+        sibling_is_right: siblings.map(() => false),
+        merkle_root: root,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: msg });
     }
   });
 

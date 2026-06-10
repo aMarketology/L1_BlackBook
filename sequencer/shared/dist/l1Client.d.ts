@@ -35,4 +35,21 @@ export declare function consumeLock(config: SequencerConfig, lockId: string): Pr
  * @param merkleRootHex  64-char lowercase hex SHA-256 Merkle root.
  */
 export declare function submitRoot(config: SequencerConfig, batchId: number, merkleRootHex: string): Promise<void>;
+/**
+ * Submit a market outcome to the L1 Oracle dispute window.
+ * `POST /oracle/submit-pending-root`
+ *
+ * Call this AFTER `submitRoot()` succeeds for a resolved market.
+ * The L1 Oracle opens a 60-second dispute window; if no discard supermajority
+ * forms the outcome auto-finalizes and becomes queryable via GET /oracle/event/:id.
+ *
+ * Canonical signed message (no separate nonce — batchId + timestamp is unique):
+ *   `"ORACLE_SUBMIT:{rollup_id}:{market_id}:{outcome}:{merkle_root_hex}:{batch_id}:{ts}:{nonce}"`
+ *
+ * @param marketId       L2 market ID (same as used in createMarket / resolveMarket).
+ * @param outcome        "YES" | "NO" | "REFUND"
+ * @param merkleRootHex  64-char hex root — must match the submitRoot call exactly.
+ * @param batchId        Rollup Hub batch_id from the sealAndSubmit result.
+ */
+export declare function submitOraclePendingRoot(config: SequencerConfig, marketId: string, outcome: 'YES' | 'NO' | 'REFUND', merkleRootHex: string, batchId: number): Promise<void>;
 //# sourceMappingURL=l1Client.d.ts.map
