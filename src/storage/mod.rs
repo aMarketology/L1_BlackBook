@@ -1206,6 +1206,15 @@ impl ConcurrentBlockchain {
         latest_tx.map(|tx| tx.tx_hash)
     }
 
+    fn sort_transactions_newest_first(transactions: &mut [TransactionRecord]) {
+        transactions.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| b.block_height.cmp(&a.block_height))
+                .then_with(|| b.tx_id.cmp(&a.tx_id))
+        });
+    }
+
     /// Get all transactions (optionally filtered by address)
     pub fn get_transactions(&self, address: Option<&str>, limit: usize, offset: usize) -> Result<Vec<TransactionRecord>, String> {
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
@@ -1229,12 +1238,31 @@ impl ConcurrentBlockchain {
             }
         }
         
-        // Sort by timestamp (newest first)
-        transactions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Self::sort_transactions_newest_first(&mut transactions);
         
         // Apply pagination
         let end = std::cmp::min(offset + limit, transactions.len());
         Ok(transactions.get(offset..end).unwrap_or(&[]).to_vec())
+    }
+
+    /// Get recent transactions across the whole chain, optionally before a timestamp cursor.
+    pub fn get_recent_transactions(&self, limit: usize, before_ts: Option<u64>) -> Result<Vec<TransactionRecord>, String> {
+        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+        let table = read_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+        let mut transactions = Vec::new();
+
+        for result in table.iter().map_err(|e| e.to_string())? {
+            let (_, value) = result.map_err(|e| e.to_string())?;
+            if let Ok(tx_record) = serde_json::from_slice::<TransactionRecord>(value.value()) {
+                if before_ts.map_or(true, |ts| tx_record.timestamp < ts) {
+                    transactions.push(tx_record);
+                }
+            }
+        }
+
+        Self::sort_transactions_newest_first(&mut transactions);
+        transactions.truncate(limit);
+        Ok(transactions)
     }
 
     /// Get all recent transactions (for ledger display)
@@ -1452,6 +1480,86 @@ impl ConcurrentBlockchain {
             None => Ok(None),
         };
         result
+    }
+
+    /// Prune blocks and transactions older than `retention_secs` seconds.
+    ///
+    /// Blocks are keyed by slot (u64) in ReDB; we scan all blocks and drop
+    /// any whose `timestamp` field is older than the cutoff.  The matching
+    /// transactions in the TRANSACTIONS table are then also purged (matched
+    /// by `block_height` == pruned slot).
+    ///
+    /// Returns `(blocks_pruned, txs_pruned)`.
+    pub fn prune_old_data(&self, retention_secs: u64) -> Result<(usize, usize), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff = now.saturating_sub(retention_secs);
+
+        // --- Collect stale block slots ---
+        let stale_slots: Vec<u64> = {
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+            let table = read_txn.open_table(BLOCKS).map_err(|e| e.to_string())?;
+            let mut slots = Vec::new();
+            for result in table.iter().map_err(|e| e.to_string())? {
+                let (key, val) = result.map_err(|e| e.to_string())?;
+                if let Ok(block) = serde_json::from_slice::<crate::poh_blockchain::FinalizedBlock>(val.value()) {
+                    if block.timestamp < cutoff {
+                        slots.push(key.value());
+                    }
+                }
+            }
+            slots
+        };
+
+        let blocks_pruned = stale_slots.len();
+        if blocks_pruned == 0 {
+            return Ok((0, 0));
+        }
+
+        // --- Delete stale blocks ---
+        {
+            let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut table = write_txn.open_table(BLOCKS).map_err(|e| e.to_string())?;
+                for slot in &stale_slots {
+                    let _ = table.remove(slot);
+                }
+            }
+            write_txn.commit().map_err(|e| e.to_string())?;
+        }
+
+        // --- Delete transactions belonging to pruned blocks ---
+        let stale_slot_set: std::collections::HashSet<u64> = stale_slots.into_iter().collect();
+        let stale_tx_ids: Vec<String> = {
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+            let table = read_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+            let mut ids = Vec::new();
+            for result in table.iter().map_err(|e| e.to_string())? {
+                let (key, val) = result.map_err(|e| e.to_string())?;
+                if let Ok(tx) = serde_json::from_slice::<crate::storage::TransactionRecord>(val.value()) {
+                    if stale_slot_set.contains(&tx.block_height) || tx.timestamp < cutoff {
+                        ids.push(key.value().to_owned());
+                    }
+                }
+            }
+            ids
+        };
+
+        let txs_pruned = stale_tx_ids.len();
+        if txs_pruned > 0 {
+            let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut table = write_txn.open_table(TRANSACTIONS).map_err(|e| e.to_string())?;
+                for id in &stale_tx_ids {
+                    let _ = table.remove(id.as_str());
+                }
+            }
+            write_txn.commit().map_err(|e| e.to_string())?;
+        }
+
+        Ok((blocks_pruned, txs_pruned))
     }
 
     // ========================================================================

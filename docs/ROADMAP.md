@@ -1,16 +1,24 @@
 ﻿# BlackBook — Engineering Roadmap
 
-> **Last updated: June 2026 — v1.0.1; permissioned Turbine 7A/7B/7C live.**
-> Production node: `91.98.196.34:8080` (migrating to Cherry bare-metal) · Last tag: `v1.0.0` (commit `4224b0c`)
+> **Last updated: June 2026 — v1.0.2. Rotating Leader Schedule live. Multi-validator consensus.**
+> Production node: `91.98.196.34:8080` (migrating to Cherry bare-metal) · Last tag: `v1.0.2`
 >
 > **What the L1 is:** an **asset-custody ledger, state machine, and transaction execution environment**.
 > Its only relationship with keys is to (1) store a balance against a public key, (2) receive an
 > Ed25519-signed transaction, and (3) verify the signature before executing. It never generates,
 > holds, or transmits user private keys or mnemonics — those are created and kept client-side only.
 >
-> **Network model: Consortium / Permissioned Layer 1.**
-> Only whitelisted Ed25519-keyed validator nodes participate in consensus and receive block shreds.
-> This is the architectural north star for all P2P and consensus work.
+> **Network model: Consortium / Permissioned Layer 1 with Rotating Leaders.**
+> Every validator runs `--mode validator`, consults the same deterministic `LeaderSchedule` from
+> `config.toml`, and dynamically switches between Writer (produce blocks) and Reader (sync + verify)
+> at slot boundaries. Leaders rotate in contiguous 4-slot tenures (1.6s each).
+>
+> **v1.0.2 — rotating leader consensus:**
+> - 👑 **Rotating Leader Schedule** — `--mode validator`, multi-validator `LeaderSchedule` from
+>   `config.toml` stakes, contiguous 4-slot tenures, dynamic role switching, `GET /validators`
+> - 🧹 **Zero log spam** — leadership transitions logged once, not every slot
+> - 📡 **Dynamic reader proxy** — non-leader POSTs forward to current leader automatically
+> - 🌊 **Gulf Stream tx forwarding** — non-leader nodes forward txs to upcoming leaders
 >
 > **v1.0.1 — pure-L1 hardening:**
 > - 🧹 **Removed off-mission fiat-onramp code** — the dead Bitcoin Lightning / BTCPayServer gateway (`contracts/lightning_gateway/`, orphaned, never compiled) and the dead Transak JWT webhook (`watcher/webhook.rs`). The L1 is settlement + execution, not a fiat payment aggregator. Build is now warning-clean.
@@ -55,7 +63,7 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 | Component | Status |
 |-----------|--------|
 | PoH Clock (400ms slots, SHA-256, 64 ticks/slot) | ✅ |
-| Tower BFT (exponential lockout, 2/3 supermajority design) | ✅ Single-writer today |
+| Tower BFT (exponential lockout, 2/3 supermajority design) | ✅ Multi-validator from registry stakes |
 | Gulf Stream (8-leader lookahead, 300K tx cache) | ✅ |
 | Sealevel parallel execution (Rayon thread pool) | ✅ |
 | **O(N) per-account queue scheduler** | ✅ v1.0.0 |
@@ -67,6 +75,10 @@ Every rollup layer settles to L1 via the Universal Rollup Hub:
 | Writer/Reader relay (gRPC SubscribeBlocks, ForwardTx) | ✅ |
 | Ed25519 all write endpoints + replay protection | ✅ |
 | UDP TPU (port 8003, bincode, 8 workers) | ✅ |
+| **Rotating Leader Schedule** — `--mode validator`, multi-validator from `config.toml` | ✅ v1.0.2 |
+| **Contiguous leader tenures** — 4 slots (1.6s) per leader, stake-proportional | ✅ v1.0.2 |
+| **`GET /validators`** — full validator set with stakes + current leader | ✅ v1.0.2 |
+| **Dynamic reader proxy** — non-leader POSTs forward to current leader | ✅ v1.0.2 |
 
 ---
 
@@ -225,8 +237,33 @@ validator set. Phases **7A / 7B / 7C are live**; the full block-shred mesh (roun
 | Writer → round-robin shred assignment (each shred to a different approved node) | 🔲 today: signed tick-shreds broadcast to all targets (star + auth) |
 | Peer re-broadcast — each node blasts its shred to all other whitelisted peers | 🔲 |
 | Block shred reassembly + Reed-Solomon FEC decode on receiver nodes | 🔲 today: per-tick PoH verify, no block reassembly |
-| `GET /validators` endpoint — returns current approved set | 🔲 |
+| `GET /validators` endpoint — returns current approved set | ✅ v1.0.2 (Phase 1) |
 | `POST /admin/validators/add` + `/remove` (feature-gated, hot registry) | 🔲 |
+
+---
+
+## ✅ PHASE 7.6 — Rotating Leader Schedule (COMPLETE — v1.0.2)
+
+**Multi-validator consensus with dynamic role switching.** Every validator runs the same
+binary, consults the deterministic `LeaderSchedule` from `config.toml`, and switches
+between Writer and Reader at slot boundaries.
+
+| Item | Status |
+|------|--------|
+| `--mode validator` CLI flag | ✅ |
+| `stake_lamports` + `http_port` in `config.toml` `[[validators]]` | ✅ |
+| `LeaderSchedule` populated from `ValidatorRegistry` (not hardcoded) | ✅ |
+| `TowerBFT` multi-validator from registry stakes | ✅ |
+| Contiguous leader tenures (`LEADER_TENURE_SLOTS = 4`, 1.6s per leader) | ✅ |
+| `GET /validators` — pubkeys, stakes, current leader | ✅ |
+| `GET /health` — `current_leader`, `is_leader`, `validators_registered` | ✅ |
+| Zero log spam — leadership transitions logged once | ✅ |
+| Dynamic reader proxy — non-leader POSTs forward to current leader | ✅ |
+| Gulf Stream tx forwarding to upcoming leaders | ✅ |
+| Leader handoff — Validator syncs as Reader when not leader | ✅ |
+| Leader timeout detection foundation (tracking in block loop) | ✅ |
+
+**Next:** Phase 6 — Leader timeout auto-skip (detect offline leader, advance schedule).
 
 ---
 

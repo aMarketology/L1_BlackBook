@@ -1,5 +1,5 @@
 # ============================================================================
-# BlackBook — Production Docker Compose (Cherry Servers)
+# BlackBook — Production Docker Compose (Cherry Servers) — v1.0.2
 # ============================================================================
 # Usage:
 #   docker compose -f deployment/docker-compose.prod.yml up -d --build
@@ -8,6 +8,7 @@
 #   docker compose -f deployment/docker-compose.prod.yml down
 #
 # Requires: /opt/blackbook/.env (copy from .env.template and fill in values)
+#   Set BLACKBOOK_MODE=validator and BLACKBOOK_IDENTITY=cherry-writer in .env
 # ============================================================================
 
 services:
@@ -27,6 +28,14 @@ services:
       - RUST_LOG=${RUST_LOG:-info,layer1=info,tower_http=warn}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - REDB_PATH=${REDB_PATH:-/data/blockchain_data/blockchain.redb}
+
+    # Run in validator mode by default (override via BLACKBOOK_MODE in .env)
+    command: >
+      /app/layer1
+      --mode ${BLACKBOOK_MODE:-validator}
+      --identity ${BLACKBOOK_IDENTITY:-cherry-writer}
+      --http-port ${BLACKBOOK_HTTP_PORT:-8080}
+      --grpc-port ${BLACKBOOK_GRPC_PORT:-50051}
 
     ports:
       - "8080:8080"    # HTTP API (wallet, escrow, admin)

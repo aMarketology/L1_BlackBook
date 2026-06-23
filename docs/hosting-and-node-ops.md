@@ -1,9 +1,13 @@
-# Hosting & Node Operations
+# Hosting & Node Operations  (v1.0.2)
 
 > **TL;DR:** Hetzner terminates blockchain nodes without warning. Move the writer to
-> **Latitude.sh Dallas, TX** — same setup scripts, same Docker workflow, crypto-explicit ToS,
+> **Cherry bare-metal** — same setup scripts, same Docker workflow, crypto-friendly ToS,
 > and you're in the same state as the team. Migration is zero-downtime because of the
-> reader/writer architecture already built into the L1 node.
+> multi-validator rotating leader architecture already built into the L1 node.
+>
+> **v1.0.2:** Run `--mode validator` for multi-validator consensus. Leaders rotate in
+> contiguous 4-slot tenures (1.6s each). Non-leader nodes auto-forward writes to the
+> current leader. `GET /validators` shows the full validator set.
 
 ---
 
@@ -24,10 +28,9 @@ permanent home for a production writer node.
 
 ---
 
-## Two-Node Mental Model
+## Multi-Validator Mental Model (v1.0.2)
 
-Think of the network as nodes, not servers. Every server runs one L1 binary in either
-Writer or Reader mode:
+Every server runs the same L1 binary in one of three modes:
 
 ```
 Node 1 — Writer (block producer)

@@ -23,7 +23,7 @@ APP_DIR="/opt/blackbook"
 PRE_ENV="/opt/blackbook-env.tmp"
 
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║    BlackBook L1 — Hetzner Server Setup               ║"
+echo "║    BlackBook L1 — Hetzner Server Setup  v1.0.2       ║"
 echo "╚═══════════════════════════════════════════════════════╝"
 
 # ── 1. System update ─────────────────────────────────────────

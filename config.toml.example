@@ -1,33 +1,44 @@
-# BlackBook L1 — Turbine Validator Registry (Phase 7A)
+# BlackBook L1 — Turbine Validator Registry (Phase 7A + Rotating Leaders)
 #
 # Copy this file to config.toml and populate with your approved validator nodes.
 # Alternatively, set the APPROVED_VALIDATORS env var to replace this file entirely.
 #
 # APPROVED_VALIDATORS format:
-#   "label:pubkey_hex@ip:port;pubkey_hex@ip:port"
-#   (label is optional — bare "pubkey_hex@ip:port" is also accepted)
+#   "label:pubkey_hex@ip:port:stake:http_port;pubkey_hex@ip:port"
+#   (label, stake, http_port are optional — bare "pubkey_hex@ip:port" is accepted)
 #
 # Rules:
 #   - pubkey must be 64 lowercase hex characters (32-byte Ed25519 public key)
-#   - addr must be a valid UDP SocketAddr (ip:port)
+#   - addr must be a valid UDP SocketAddr (ip:port) for Turbine :8004
+#   - stake_lamports: voting/schedule weight in lamports (default 1B = 10,000 BB)
+#   - http_port: REST API port (default 8080)
 #   - Duplicate pubkeys are silently skipped
 #   - Unknown source IPs are dropped at the socket layer (no deserialization)
 #
-# The writer's OWN pubkey (logged at startup as "Turbine identity: pubkey=...")
-# MUST appear in this list so reader nodes can verify its signed shreds.
+# The leader schedule is deterministic — all validators compute it identically
+# from these stakes. Higher stake = more leader slots.
 #
 # VALIDATOR_KEYPAIR_PATH: path to a file containing the Ed25519 signing key
 #   - 64 hex chars (32-byte seed) — preferred
 #   - Or 32 raw bytes
 #   - If unset, an ephemeral key is generated (dev mode only)
+#
+# To run in multi-validator mode:
+#   cargo run -- --mode validator --identity cherry-writer
+#
+# The --identity must match a [[validators]] label.
 
 [[validators]]
 label  = "genesis-writer"
 pubkey = "REPLACE_WITH_64_HEX_CHAR_WRITER_PUBKEY"
 addr   = "91.98.196.34:8004"
+stake_lamports = 1_000_000_000
+http_port = 8080
 
 # Add reader nodes below:
 # [[validators]]
 # label  = "reader-eu-1"
 # pubkey = "REPLACE_WITH_64_HEX_CHAR_READER_PUBKEY"
 # addr   = "10.0.0.2:8004"
+# stake_lamports = 500_000_000
+# http_port = 8080

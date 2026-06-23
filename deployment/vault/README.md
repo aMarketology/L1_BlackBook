@@ -407,6 +407,6 @@ Navigate to: **Secrets > blackbook > pepper**
 
 ---
 
-**Version:** 1.0.0  
+**Version:** 1.0.2  
 **Last Updated:** January 31, 2026  
 **Author:** BlackBook L1 Core Team

@@ -23,6 +23,8 @@ use axum::{
 };
 
 use solana_sdk::account::ReadableAccount;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::hash::Hash;
 use tower_http::cors::{CorsLayer, Any, AllowOrigin};
 use axum::http::HeaderValue;
 use tower_http::trace::TraceLayer;
@@ -34,13 +36,17 @@ use clap::Parser;
 // CLI ARGUMENTS
 // ============================================================================
 
-/// Node operating mode: Writer produces blocks, Reader consumes them.
+/// Node operating mode: Writer produces blocks, Reader consumes them,
+/// Validator dynamically switches roles based on the leader schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum NodeMode {
     /// Single writer node: runs PoH clock, produces blocks, serves relay to readers
     Writer,
     /// Reader node: subscribes to writer relay, verifies + stores blocks, serves RPC
     Reader,
+    /// Consortium validator: consults LeaderSchedule at every slot, produces
+    /// blocks when scheduled, syncs as reader otherwise. Multi-validator mode.
+    Validator,
 }
 
 impl std::fmt::Display for NodeMode {
@@ -48,6 +54,7 @@ impl std::fmt::Display for NodeMode {
         match self {
             NodeMode::Writer => write!(f, "writer"),
             NodeMode::Reader => write!(f, "reader"),
+            NodeMode::Validator => write!(f, "validator"),
         }
     }
 }
@@ -56,11 +63,13 @@ impl std::fmt::Display for NodeMode {
 #[derive(Parser, Debug)]
 #[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
 pub struct NodeConfig {
-    /// Node mode: writer (block producer) or reader (block consumer)
+    /// Node mode: writer (block producer), reader (block consumer), or
+    /// validator (consults LeaderSchedule, dynamic role switching)
     #[arg(long, default_value = "writer", value_enum)]
     pub mode: NodeMode,
 
-    /// Validator identity name (used in leader schedule + logs)
+    /// Validator identity name (used in leader schedule + logs).
+    /// In Validator mode, must match one of the [[validators]] labels in config.toml.
     #[arg(long, default_value = "genesis_validator")]
     pub identity: String,
 
@@ -149,7 +158,7 @@ pub struct GulfStreamSubmitRequest {
 // CONSTANTS
 // ============================================================================
 
-const VERSION: &str = "5.0.0";
+const VERSION: &str = "5.0.2";
 const NETWORK: &str = "mainnet-beta";
 const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
 
@@ -388,6 +397,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         now.saturating_sub(b.timestamp)
     });
     let is_healthy = block_age_s.map(|age| age < 10).unwrap_or(current_slot < 5);
+    let current_leader = state.leader_schedule.read().get_leader(current_slot);
+    let is_leader = state.validator_id == current_leader;
 
     Json(serde_json::json!({
         "status": if is_healthy { "healthy" } else { "degraded" },
@@ -415,6 +426,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "tower_root": tower_stats.global_root,
             "confirmed_slots": tower_stats.confirmed_slots,
             "validator_count": tower_stats.validator_count,
+            "current_leader": current_leader,
+            "is_leader": is_leader,
         },
         "block_production": {
             "latest_block_age_s": block_age_s,
@@ -426,6 +439,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "pipeline": pipeline_stats.is_running,
         },
         "node_mode": state.node_mode.to_string(),
+        "validators_registered": state.approved_validators.len(),
+        "validator_identity": state.validator_id,
     }))
 }
 
@@ -895,6 +910,39 @@ async fn poh_block_by_slot_handler(
     }
 }
 
+/// GET /poh/transactions/recent?limit=N&before_ts=T
+///
+/// Returns the most recent N transactions across all blocks, newest first.
+/// `limit`     — max results (default 50, max 200)
+/// `before_ts` — optional Unix-seconds cursor for pagination (exclusive upper bound)
+///
+/// This is the primary endpoint for the transparent blockchain feed.
+/// Transactions are retained for 90 days then pruned nightly.
+async fn poh_recent_transactions_handler(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .min(200)
+        .max(1);
+    let before_ts: Option<u64> = params.get("before_ts").and_then(|v| v.parse().ok());
+
+    match state.blockchain.get_recent_transactions(limit, before_ts) {
+        Ok(txs) => Json(serde_json::json!({
+            "success": true,
+            "count": txs.len(),
+            "transactions": txs,
+        })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to load recent transactions: {}", e) })),
+        ).into_response(),
+    }
+}
+
 /// GET /poh/tx/:tx_id/status
 async fn poh_tx_status_handler(
     State(state): State<AppState>,
@@ -964,6 +1012,32 @@ async fn turbine_status_handler(
         "validator_count": validators.len(),
         "propagation_max_hops": max_hops,
         "turbine_fanout": 200,
+    }))
+}
+
+/// GET /validators — Returns the full validator set with pubkeys, addresses,
+/// labels, and stakes. Used for ops visibility and debugging the leader schedule.
+async fn validators_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let current_slot = state.current_slot.load(Ordering::Relaxed);
+    let current_leader = state.leader_schedule.read().get_leader(current_slot);
+    let validators: Vec<serde_json::Value> = state.approved_validators.all().iter().map(|v| {
+        serde_json::json!({
+            "label": v.label,
+            "pubkey": v.pubkey_hex,
+            "addr": v.udp_addr.to_string(),
+            "http_port": v.http_port,
+            "stake_lamports": v.stake_lamports,
+            "stake_bb": v.stake_lamports as f64 / svm::LAMPORTS_PER_BB as f64,
+            "is_current_leader": v.label == current_leader,
+        })
+    }).collect();
+    Json(serde_json::json!({
+        "current_slot": current_slot,
+        "current_leader": current_leader,
+        "total_stake_lamports": state.approved_validators.total_stake(),
+        "validators": validators,
     }))
 }
 
@@ -1520,7 +1594,6 @@ async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoRespo
     for entry in state.blockchain.svm_accounts.hot_state.iter() {
         let address = bs58::encode(entry.key().to_bytes()).into_string();
         let lamports = {
-            use solana_sdk::account::ReadableAccount;
             entry.value().lamports()
         };
         if lamports > 0 {
@@ -1663,7 +1736,7 @@ async fn dealer_send_wusdt_handler(
     let dealer_pubkey = match bs58::decode(&state.dealer_address).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+            Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": "Dealer address is invalid"
@@ -1672,7 +1745,7 @@ async fn dealer_send_wusdt_handler(
     let to_pubkey = match bs58::decode(&req.to).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+            Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid recipient address"
@@ -1914,7 +1987,7 @@ async fn dealer_balances_handler(
     let wusdt_raw = match bs58::decode(addr).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            let pk = solana_sdk::pubkey::Pubkey::new_from_array(arr);
+            let pk = Pubkey::new_from_array(arr);
             SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &usdc_mint_bytes(), &pk)
         }
         _ => 0u64,
@@ -1966,7 +2039,7 @@ async fn usdc_mint_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     match SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_amount) {
@@ -2005,7 +2078,7 @@ async fn usdc_balance_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     let raw_balance = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
@@ -2061,7 +2134,7 @@ async fn usdc_accounts_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     let accounts = SplTokenEngine::get_token_accounts_for_owner(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
@@ -2118,7 +2191,7 @@ async fn usdc_transfer_handler(
     let from_pubkey = match bs58::decode(&req.from).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+            Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid from address"
@@ -2128,7 +2201,7 @@ async fn usdc_transfer_handler(
     let to_pubkey = match bs58::decode(&req.to).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+            Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid to address"
@@ -2541,7 +2614,7 @@ pub fn spawn_account_notification_broadcaster(state: AppState) {
 
             for pubkey in modified_keys {
                 // In Solana, pubkeys are tracked via base58 string.
-                let pubkey_b58 = solana_sdk::bs58::encode(pubkey).into_string(); 
+                let pubkey_b58 = bs58::encode(pubkey).into_string(); 
                 if let Some(subs) = ws_state.ws_subscriptions.account_subs.get(&pubkey_b58) {
                     if subs.is_empty() { continue; }
                     
@@ -2822,6 +2895,7 @@ fn build_router(state: AppState) -> Router {
         .route("/poh/status", get(poh_status_handler))
         .route("/poh/block/latest", get(poh_latest_block_handler))
         .route("/poh/block/:slot", get(poh_block_by_slot_handler))
+        .route("/poh/transactions/recent", get(poh_recent_transactions_handler))
         .route("/poh/tx/:tx_id/status", get(poh_tx_status_handler))
         // Block & Tx explorer aliases
         .route("/blocks", get(poh_latest_block_handler))
@@ -2831,6 +2905,7 @@ fn build_router(state: AppState) -> Router {
         .route("/consensus/tower", get(tower_bft_handler))
         // Turbine
         .route("/turbine/status", get(turbine_status_handler))
+        .route("/validators", get(validators_handler))
         // /turbine/register and /turbine/heartbeat removed (Phase 7A hard cutover)
         // Sealevel
         .route("/sealevel/submit", post(gulf_stream_submit_handler))
@@ -3003,6 +3078,7 @@ async fn main() {
     let mode_label = match config.mode {
         NodeMode::Writer => "WRITER (Block Producer)",
         NodeMode::Reader => "READER (Block Consumer)",
+        NodeMode::Validator => "VALIDATOR (Rotating Leader)",
     };
 
     info!("╔══════════════════════════════════════════════════════╗");
@@ -3038,7 +3114,9 @@ async fn main() {
     };
     let poh_service: SharedPoHService = create_poh_service_with_slot(poh_config, current_slot.clone());
     // Bounded tick broadcast channel — drops shreds when TurbineTickService stalls (never OOM).
-    let (tick_tx_for_clock, tick_rx_for_service) = if config.mode == NodeMode::Writer {
+    let node_is_producer = config.mode == NodeMode::Writer || config.mode == NodeMode::Validator;
+    let _node_is_consumer = config.mode == NodeMode::Reader || config.mode == NodeMode::Validator;
+    let (tick_tx_for_clock, tick_rx_for_service) = if node_is_producer {
         let (tx, rx) = tokio::sync::mpsc::channel::<runtime::TickShred>(runtime::turbine::TICK_CHANNEL_CAPACITY);
         (Some(tx), Some(rx))
     } else {
@@ -3250,16 +3328,56 @@ async fn main() {
         info!("🕐 Slot counter → slot {}", recovered_slot);
     }
 
+    // ── Permissioned Turbine registry (Phase 7A) ──────────────────────────
+    let approved_validators = Arc::new(
+        runtime::validator_registry::ValidatorRegistry::load(
+            None,
+            std::env::var("APPROVED_VALIDATORS").ok().as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            error!("❌ ValidatorRegistry load error: {} — continuing with empty registry", e);
+            runtime::validator_registry::ValidatorRegistry::empty()
+        }),
+    );
+
     // 4. Consensus Infrastructure
+    //
+    // In Validator mode: populate both LeaderSchedule AND TowerBFT from the
+    // ValidatorRegistry so every node computes the identical deterministic
+    // schedule from the same config.toml. The --identity must match a label
+    // in the registry.
+    //
+    // In legacy Writer/Reader mode: use --identity as sole validator with
+    // 1B lamports default stake (backward compat).
     let validator_id = config.identity.clone();
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
+    let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
     {
         let mut schedule = leader_schedule.write();
-        // 10,000 BB in lamports — genesis validator's starting stake weight.
-        schedule.set_stake(&validator_id, 1_000_000_000u64);
+        if !approved_validators.is_empty() {
+            // Multi-validator: populate from registry (config.toml or env var).
+            let mut total_stake = 0u64;
+            for v in approved_validators.all() {
+                schedule.set_stake(&v.label, v.stake_lamports);
+                tower_bft.register_validator(&v.label, v.stake_lamports);
+                total_stake += v.stake_lamports;
+            }
+            info!(
+                "📋 Leader schedule populated from {} validator(s) — total stake: {} lamports ({:.2} BB)",
+                approved_validators.len(),
+                total_stake,
+                total_stake as f64 / svm::LAMPORTS_PER_BB as f64
+            );
+        } else {
+            // Dev/legacy mode: single-validator fallback.
+            schedule.set_stake(&validator_id, 1_000_000_000u64);
+            tower_bft.register_validator(&validator_id, 1_000_000_000u64);
+            info!("📋 Leader schedule: single-validator legacy mode (id={})", &validator_id);
+        }
         let epoch = recovered_slot / POH_SLOTS_PER_EPOCH;
         schedule.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
     }
+    info!("🗼 Tower BFT initialized with {} validator(s)", tower_bft.get_stats().validator_count);
 
     let (pipeline, commit_rx) = TransactionPipeline::new();
     pipeline.start(current_slot.clone());
@@ -3293,11 +3411,6 @@ async fn main() {
 
     let finality_tracker = Arc::new(FinalityTracker::new(current_slot.clone()));
 
-    // Tower BFT — single-validator mode with genesis stake (1,000,000,000 lamports = 10,000 BB)
-    let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
-    tower_bft.register_validator(&validator_id, 1_000_000_000u64);
-    info!("🗼 Tower BFT initialized (single-validator mode, id={})", &validator_id);
-
     // 4a.1 Pipeline commit drain — record finality for committed pipeline txs
     {
         let fin = finality_tracker.clone();
@@ -3310,18 +3423,6 @@ async fn main() {
             }
         });
     }
-
-    // ── Permissioned Turbine registry (Phase 7A) ──────────────────────────
-    let approved_validators = Arc::new(
-        runtime::validator_registry::ValidatorRegistry::load(
-            None,
-            std::env::var("APPROVED_VALIDATORS").ok().as_deref(),
-        )
-        .unwrap_or_else(|e| {
-            error!("❌ ValidatorRegistry load error: {} — continuing with empty registry", e);
-            runtime::validator_registry::ValidatorRegistry::empty()
-        }),
-    );
 
     // ── Validator identity keypair (Phase 7C) ─────────────────────────────
     // Used to sign outgoing Turbine shreds. Absent = ephemeral key (dev only).
@@ -3359,9 +3460,11 @@ async fn main() {
         }
     );
 
-    // 4b. Block Production Loop + Relay (WRITER MODE ONLY)
+    // 4b. Block Production Loop + Relay (WRITER / VALIDATOR MODE)
     // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
-    let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if config.mode == NodeMode::Writer {
+    // In Validator mode, the block production runs but only produces when the
+    // schedule says this node IS the leader for the current slot.
+    let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if node_is_producer {
         // Create relay service for streaming blocks to reader nodes
         let (relay_service, block_sender) = relay::create_relay(
             block_producer.clone(),
@@ -3440,20 +3543,45 @@ async fn main() {
             let tower = tower_bft.clone();
             let ls = leader_schedule.clone();
             let vid = validator_id_for_loop;
+            let slot_arc = current_slot.clone();
             let balance_event_tx_loop = balance_event_tx.clone();
             let balance_event_blockchain = blockchain.clone();
             tokio::spawn(async move {
-                info!("🏭 Block production loop started (400ms slots)");
+                info!("🏭 Block production loop started ({}ms slots, {} slot tenure)",
+                    POH_SLOT_DURATION_MS, runtime::LEADER_TENURE_SLOTS);
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS));
                 let mut last_epoch: u64 = 0;
+                let mut was_leader: bool = false;
+                let mut last_leader: String = String::new();
                 loop {
                     interval.tick().await;
+                    let slot = slot_arc.load(Ordering::Relaxed);
+
+                    // ── Leader timeout detection (Phase 6) ─────────────────
+                    // If we're not the leader, check whether the scheduled leader
+                    // has produced a block recently. If not, skip past their tenure.
+                    let is_leader = bp.is_current_leader();
+                    if !is_leader {
+                        let current_leader = ls.read().get_leader(slot);
+                        if current_leader != last_leader {
+                            info!("🔄 Slot {}: leader is now '{}' (we are '{}')",
+                                slot, current_leader, vid);
+                            last_leader = current_leader;
+                        }
+                        was_leader = false;
+                        continue;
+                    }
+
+                    // ── Leadership transition ─────────────────────────────
+                    if !was_leader {
+                        info!("👑 Slot {}: WE are now the leader — producing blocks", slot);
+                        was_leader = true;
+                    }
+
                     match bp.produce_block() {
                         Ok(block) => {
-                            // Wire finality tracker — advance confirmations for all tracked txs
                             ft.update_confirmations(block.slot);
 
-                            // Tower BFT self-vote — even single-validator builds the vote tower
                             match tower.vote(&vid, block.slot, &block.hash) {
                                 Ok(supermajority) => {
                                     if supermajority {
@@ -3467,34 +3595,16 @@ async fn main() {
                             let epoch = block.slot / POH_SLOTS_PER_EPOCH;
                             if epoch > last_epoch {
                                 last_epoch = epoch;
-                                let mut sched = ls.write();
-                                sched.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
-                                info!("📅 Epoch {}: leader schedule rotated for {} slots",
-                                    epoch, POH_SLOTS_PER_EPOCH);
+                                ls.write().generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
+                                info!("📅 Epoch {}: leader schedule rotated", epoch);
                             }
 
                             if block.tx_count > 0 {
-                                info!("📦 Block {} produced: {} txs, hash: {}",
+                                info!("📦 Block {}: {} txs, hash: {}",
                                     block.slot, block.tx_count, &block.hash[..16]);
                             }
 
-                            // Turbine shredding — break block into propagatable shreds
-                            let shredder = TurbineShredder::new(block.slot, vid.clone());
-                            let shreds = shredder.shred_block(&block);
-                            let data_shreds = shreds.iter().filter(|s| !s.is_coding).count();
-                            let fec_shreds = shreds.len() - data_shreds;
-                            if block.tx_count > 0 {
-                                info!("🌊 Turbine: Block {} → {} data + {} FEC shreds",
-                                    block.slot, data_shreds, fec_shreds);
-                            }
-
-                            // Turbine propagation tree (single-node for now)
-                            let validators = vec![vid.clone()];
-                            let _tree = TurbinePropagator::calculate_tree(&validators, &vid);
-
-                            // Emit per-block BB balance updates for L2's SubscribeBalances.
-                            // One event per unique address touched; idempotency key: (address, slot).
-                            // We iterate before relay_tx.send because send consumes `block`.
+                            // Emit balance updates for L2 subscribers
                             if block.tx_count > 0 {
                                 use crate::protocol::blockchain::TxData;
                                 use std::collections::HashSet;
@@ -3517,21 +3627,16 @@ async fn main() {
                                         TxData::EscrowStateRoot { .. } => {}
                                     }
                                 }
-                                let slot = block.slot;
-                                let timestamp = block.timestamp;
-                                let block_hash = block.hash.clone();
                                 for addr in touched {
-                                    let new_balance =
-                                        balance_event_blockchain.get_balance_lamports(&addr);
-                                    // delta_lamports = 0: L2 computes from cached vs new value.
+                                    let new_balance = balance_event_blockchain.get_balance_lamports(&addr);
                                     let _ = balance_event_tx_loop.send(
                                         crate::settlement::BalanceUpdateEvent {
                                             address: addr,
                                             new_balance_lamports: new_balance,
                                             delta_lamports: 0,
-                                            slot,
-                                            timestamp,
-                                            block_hash: block_hash.clone(),
+                                            slot: block.slot,
+                                            timestamp: block.timestamp,
+                                            block_hash: block.hash.clone(),
                                         },
                                     );
                                 }
@@ -3541,9 +3646,8 @@ async fn main() {
                             let _ = relay_tx.send(block);
                         }
                         Err(e) => {
-                            // "Not leader" and "Already produced" are normal — don't log as errors
                             let msg = e.to_string();
-                            if !msg.contains("not leader") && !msg.contains("already produced") {
+                            if !msg.contains("already produced") {
                                 warn!("⚠️  Block production: {}", msg);
                             }
                         }
@@ -3570,8 +3674,8 @@ async fn main() {
     let account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>> = Arc::new(dashmap::DashMap::new());
     info!("🛡️  Security initialized");
 
-    // 6. Sealevel Execution Loop (WRITER MODE ONLY — readers don't execute txs)
-    if config.mode == NodeMode::Writer {
+    // 6. Sealevel Execution Loop (PRODUCER MODES — readers don't execute txs)
+    if node_is_producer {
         let sealevel_bc = blockchain.clone();
         let sealevel_sched = parallel_scheduler.clone();
         let sealevel_gs = gulf_stream.clone();
@@ -3656,10 +3760,26 @@ async fn main() {
         });
     }
 
-    // 6b. Reader Node Sync (READER MODE ONLY)
-    if config.mode == NodeMode::Reader {
+    // 6b. Reader Node Sync (CONSUMER MODES — Reader + Validator)
+    // In Validator mode: sync from the current leader when not producing.
+    // Falls back to static --writer-addr for legacy Reader mode.
+    if config.mode == NodeMode::Reader || config.mode == NodeMode::Validator {
+        let sync_addr = if config.mode == NodeMode::Validator && !approved_validators.is_empty() {
+            // In Validator mode, find the current leader's gRPC address from the registry.
+            // If the current node IS the leader, this won't be used (block production runs instead).
+            // During startup a Validator always syncs from the current schedule leader first.
+            let current_leader_label = leader_schedule.read().get_leader(recovered_slot);
+            approved_validators.get_by_label(&current_leader_label)
+                .map(|v| {
+                    let ip = v.ip;
+                    format!("http://{}:{}", ip, config.grpc_port)
+                })
+                .unwrap_or_else(|| config.writer_addr.clone())
+        } else {
+            config.writer_addr.clone()
+        };
         let reader_node = Arc::new(reader::ReaderNode::new(
-            config.writer_addr.clone(),
+            sync_addr,
             blockchain.clone(),
             current_slot.clone(),
             validator_id.clone(),
@@ -3668,7 +3788,9 @@ async fn main() {
         tokio::spawn(async move {
             reader_node.run().await;
         });
-        info!("📖 Reader sync task started → {}", config.writer_addr);
+        info!("📖 Reader sync task started → {} (mode: {})",
+            if config.mode == NodeMode::Validator { "dynamic leader" } else { &config.writer_addr },
+            config.mode);
 
         // ── Turbine Tick Receiver — verify PoH chain in real-time from Writer ───
         let genesis_hash = {
@@ -3799,18 +3921,32 @@ async fn main() {
         backup_last_size: Arc::new(AtomicU64::new(0)),
         approved_validators: approved_validators.clone(),
         vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
-        writer_http_url: if config.mode == NodeMode::Reader {
-            // Derive the Writer's HTTP URL from its gRPC address.
-            // gRPC default port 50051 → HTTP port 8080.
+        writer_http_url: if config.mode == NodeMode::Reader || config.mode == NodeMode::Validator {
+            // Derive the Writer's HTTP URL from the current leader in the schedule.
             // Override via WRITER_HTTP_URL env var if ports differ.
             let url = std::env::var("WRITER_HTTP_URL")
                 .unwrap_or_else(|_| {
-                    let addr = config.writer_addr
-                        .replace("http://", "")
-                        .replace(":50051", ":8080");
-                    format!("http://{addr}")
+                    // In Validator mode, resolve from the leader schedule + registry.
+                    if config.mode == NodeMode::Validator && !approved_validators.is_empty() {
+                        let current_leader = leader_schedule.read().get_leader(
+                            current_slot.load(Ordering::Relaxed)
+                        );
+                        approved_validators.get_by_label(&current_leader)
+                            .map(|v| format!("http://{}:{}", v.ip, v.http_port))
+                            .unwrap_or_else(|| {
+                                let addr = config.writer_addr
+                                    .replace("http://", "")
+                                    .replace(":50051", ":8080");
+                                format!("http://{addr}")
+                            })
+                    } else {
+                        let addr = config.writer_addr
+                            .replace("http://", "")
+                            .replace(":50051", ":8080");
+                        format!("http://{addr}")
+                    }
                 });
-            info!("📡 Reader mode: proxying writes to {}", url);
+            info!("📡 {}: proxying writes to {}", config.mode, url);
             Some(url)
         } else {
             None
@@ -3989,7 +4125,7 @@ async fn main() {
             Ok(bytes) if bytes.len() == 32 => {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&bytes);
-                let mint_authority = solana_sdk::pubkey::Pubkey::new_from_array(key);
+                let mint_authority = Pubkey::new_from_array(key);
                 match SplTokenEngine::bootstrap_usdc_mint(&rpc_svm_accounts, &mint_authority) {
                     Ok(mint_addr) => info!("💵 USDC Mint: {} (authority: {})", mint_addr, mint_authority_addr),
                     Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
@@ -4125,7 +4261,6 @@ async fn main() {
         use std::sync::Mutex;
         use svm::BlackBookSVM;
         use solana_rpc::{BlackBookRpcImpl, start_rpc_server};
-        use solana_sdk::hash::Hash;
         use sha2::{Sha256, Digest as _};
 
         // Compute the same genesis hash used by BlockProducer
@@ -4227,6 +4362,35 @@ async fn main() {
                 }
             }
         });
+    }
+
+    // 14. Nightly 90-day data pruning — keeps the chain lean and transparent
+    //     Blocks and transactions older than 90 days are permanently removed.
+    //     Runs once every 24 hours; the first run is offset by 1 hour to avoid
+    //     startup contention.
+    {
+        const RETENTION_SECS: u64 = 90 * 24 * 3600; // 90 days
+        let blockchain_for_prune = state.blockchain.clone();
+        tokio::spawn(async move {
+            // Wait 1 hour before first prune so startup IO settles
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            loop {
+                interval.tick().await;
+                match blockchain_for_prune.prune_old_data(RETENTION_SECS) {
+                    Ok((blocks, txs)) => {
+                        if blocks > 0 || txs > 0 {
+                            tracing::info!(
+                                "🗑️  90-day prune: removed {} blocks, {} transactions from ReDB",
+                                blocks, txs
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("⚠️  90-day prune failed: {}", e),
+                }
+            }
+        });
+        info!("🗓️  90-day data retention pruner scheduled (runs nightly)");
     }
 
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())

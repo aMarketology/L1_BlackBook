@@ -1,8 +1,11 @@
 # ============================================================================
-# BlackBook L1 — Production Docker Image (Multi-Stage)
+# BlackBook L1 — Production Docker Image (Multi-Stage) — v1.0.2
 # ============================================================================
 # Stage 1: Build  (ubuntu:22.04 + rustup → cached toolchain layer)
 # Stage 2: Runtime (ubuntu:22.04 → ~100MB final image)
+#
+# Run with --mode validator for multi-validator rotating leader consensus:
+#   docker run ... /app/layer1 --mode validator --identity cherry-writer
 # ============================================================================
 
 # ── Stage 1: Builder ──────────────────────────────────────────

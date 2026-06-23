@@ -1,14 +1,15 @@
 #!/bin/bash
 # ============================================================================
-# BlackBook L1 — Start Local Reader Node (syncs from Hetzner Writer)
+# BlackBook L1 — Start Local Validator Node (syncs from Cherry Writer) — v1.0.2
 # ============================================================================
 # Usage:
-#   bash deployment/start-local-reader.sh <HETZNER_IP> [--release]
+#   bash deployment/start-local-reader.sh <CHERRY_IP> [--release]
 #
 # Prerequisites:
-#   - Port 50051 on Hetzner must allow your local IP:
-#       ssh root@<HETZNER_IP> "ufw allow from $(curl -s ifconfig.me) to any port 50051"
-#   - .env exists with GENESIS_SEEDS filled in (same as Hetzner .env)
+#   - Port 50051 on Cherry must allow your local IP:
+#       ssh root@<CHERRY_IP> "ufw allow from $(curl -s ifconfig.me) to any port 50051"
+#   - .env exists with GENESIS_SEEDS filled in (same as Cherry .env)
+#   - config.toml lists this node's pubkey + stake
 # ============================================================================
 set -euo pipefail
 

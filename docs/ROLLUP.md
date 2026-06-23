@@ -1,6 +1,6 @@
 # BlackBook — Rollup Architecture & L1 Interaction Reference
 
-> **Ground truth documentation.** Describes the actual deployed codebase as of May 2026,
+> **Ground truth documentation.** Describes the actual deployed codebase as of June 2026 (v1.0.2),
 > not a proposal. All file paths, endpoint names, and data types are verified against source.
 
 ---

@@ -152,6 +152,12 @@ export interface AddressTxPage {
   transactions: TransactionRecord[];
 }
 
+export interface RecentTransactionsPage {
+  success: boolean;
+  count: number;
+  transactions: TransactionRecord[];
+}
+
 export interface TxDetail {
   success: boolean;
   status: "Finalized" | "Pending" | string;
@@ -296,6 +302,13 @@ export interface PageOptions {
   limit?: number;
 }
 
+export interface RecentTransactionsOptions {
+  /** Results to return, max 200 (default: 50) */
+  limit?: number;
+  /** Return transactions strictly before this Unix timestamp */
+  beforeTs?: number;
+}
+
 export interface SignaturesOptions {
   /** Max signatures to return, max 1000 (default: 20) */
   limit?: number;
@@ -432,6 +445,34 @@ export class ExplorerSDK {
     const page = options.page ?? 1;
     const limit = Math.min(options.limit ?? 50, 100);
     return this.restGet(`/address/${address}/transactions?page=${page}&limit=${limit}`);
+  }
+
+  /**
+   * GET /poh/transactions/recent — Chain-wide recent transaction feed.
+   *
+   * Returns finalized TransactionRecord entries across all wallets, ordered newest-first.
+   * Use `beforeTs` for cursor pagination through the retained transparent ledger window.
+   *
+   * @example
+   * const feed = await explorer.recentTransactions({ limit: 50 });
+   * const next = await explorer.recentTransactions({ limit: 50, beforeTs: feed.transactions.at(-1)?.timestamp });
+   */
+  recentTransactions(
+    options: RecentTransactionsOptions = {}
+  ): Promise<RecentTransactionsPage> {
+    const limit = Math.max(1, Math.min(options.limit ?? 50, 200));
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (options.beforeTs !== undefined) {
+      params.set("before_ts", String(options.beforeTs));
+    }
+    return this.restGet(`/poh/transactions/recent?${params.toString()}`);
+  }
+
+  /** Alias matching the SDK's existing get* method style. */
+  getRecentTransactions(
+    options: RecentTransactionsOptions = {}
+  ): Promise<RecentTransactionsPage> {
+    return this.recentTransactions(options);
   }
 
   /**

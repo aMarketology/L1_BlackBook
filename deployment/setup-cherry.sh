@@ -20,7 +20,7 @@ L2_DIR="/opt/blackbook/L2_BlackBook"
 PRE_ENV="/opt/blackbook-env.tmp"
 
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║    BlackBook — Cherry Servers Setup                  ║"
+echo "║    BlackBook — Cherry Servers Setup  v1.0.2          ║"
 echo "╚═══════════════════════════════════════════════════════╝"
 
 # ── 1. System update ─────────────────────────────────────────

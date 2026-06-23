@@ -1,7 +1,7 @@
 # BlackBook — Rollup Layers 2–5 Roadmap
 
 > **L1 is the settlement layer. Layers 2–5 are rollup execution environments that post state roots back to L1.**
-> Last updated: June 2026 — Rollup exit path security-hardened (cross-batch double-exit closed). L3 transfer fix + SDK helpers landed.
+> Last updated: June 2026 — v1.0.2. Rotating Leader Schedule live. Multi-validator consensus.
 
 ---
 

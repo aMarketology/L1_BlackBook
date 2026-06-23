@@ -1,9 +1,10 @@
 # ============================================================================
-# BlackBook L1 -- Local Dev Launcher
+# BlackBook L1 -- Local Dev Launcher (v1.0.2)
 # ============================================================================
 # Usage:
 #   .\dev.ps1              (writer mode, dev.redb)
 #   .\dev.ps1 reader       (reader mode, reader.redb, syncs from Hetzner)
+#   .\dev.ps1 validator    (validator mode, consults LeaderSchedule)
 #   .\dev.ps1 build        (build only, no run)
 # ============================================================================
 
@@ -17,15 +18,19 @@ Get-Process -Name layer1, cargo, rustc -ErrorAction SilentlyContinue | Stop-Proc
 Start-Sleep -Milliseconds 600
 
 # 2. Set environment based on mode
+$cliArgs = @()
 if ($Mode -eq "reader") {
-    $env:NODE_MODE       = "reader"
     $env:REDB_PATH       = "blockchain_data/reader.redb"
-    $env:WRITER_ADDR     = "http://91.98.196.34:50051"
     $env:WRITER_HTTP_URL = "http://91.98.196.34:8080"
+    $cliArgs = @("--mode", "reader", "--writer-addr", "http://91.98.196.34:50051")
     Write-Host "Mode: READER (syncing from 91.98.196.34)" -ForegroundColor Cyan
-} else {
-    $env:NODE_MODE  = "writer"
+} elseif ($Mode -eq "validator") {
     $env:REDB_PATH  = "blockchain_data/dev.redb"
+    $cliArgs = @("--mode", "validator", "--identity", "cherry-writer")
+    Write-Host "Mode: VALIDATOR (rotating leader schedule)" -ForegroundColor Magenta
+} else {
+    $env:REDB_PATH  = "blockchain_data/dev.redb"
+    $cliArgs = @("--mode", "writer")
     Write-Host "Mode: WRITER (dev.redb)" -ForegroundColor Green
 }
 
@@ -46,5 +51,5 @@ if ($Mode -eq "build") {
 }
 
 # 4. Run
-Write-Host "Starting BlackBook L1..." -ForegroundColor Green
-.\target\debug\layer1.exe
+Write-Host "Starting BlackBook L1 v1.0.2..." -ForegroundColor Green
+& .\target\debug\layer1.exe @cliArgs

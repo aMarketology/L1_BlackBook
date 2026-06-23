@@ -31,7 +31,7 @@ pub use poh_service::{
 pub use tpu::TpuService;
 
 // Consensus — Tower BFT + PoH + Gulf Stream
-pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService};
+pub use consensus::{PoHConfig, PoHEntry, LeaderSchedule, GulfStreamService, LEADER_TENURE_SLOTS};
 pub use consensus::TowerBFT;
 
 // Sealevel Parallel Execution

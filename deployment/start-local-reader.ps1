@@ -1,19 +1,21 @@
 # ============================================================================
-# BlackBook L1 — Start Local Reader Node (syncs from Hetzner Writer)
+# BlackBook L1 — Start Local Validator Node (syncs from Cherry Writer) — v1.0.2
 # ============================================================================
 # Usage:
-#   .\deployment\start-local-reader.ps1 -WriterIP <HETZNER_IP>
+#   .\deployment\start-local-reader.ps1 -WriterIP <CHERRY_IP>
 #
 # What it does:
 #   - Builds the release binary (if needed)
-#   - Starts a Reader node that mirrors the Hetzner Writer's chain state
+#   - Starts a Validator node that mirrors the Cherry Writer's chain state
 #   - Applies the same GENESIS_SEEDS so the initial state matches
 #   - Streams all subsequent blocks in real-time via gRPC (port 50051)
+#   - Participates in rotating leader schedule when it's this node's turn
 #
 # Prerequisites:
-#   - HETZNER port 50051 must be open from your local IP.
+#   - Cherry port 50051 must be open from your local IP.
 #     On the server run: ufw allow from <YOUR_IP> to any port 50051
 #   - .env must exist in the repo root with GENESIS_SEEDS filled in
+#   - config.toml must list this node's pubkey + stake
 # ============================================================================
 param(
     [Parameter(Mandatory=$true)]

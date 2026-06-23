@@ -87,17 +87,24 @@ pub struct PoHEntry {
 }
 
 // ============================================================================
-// LEADER SCHEDULE — 1-Writer Rotation
+// LEADER SCHEDULE — Rotating Leader with Contiguous Tenures
 // ============================================================================
 //
-// In the 1-writer model, only ONE node produces blocks per slot.
-// Reader nodes validate, vote, and replicate.
-// The schedule rotates the writer role based on engagement stake.
+// Leaders rotate in contiguous tenure blocks (default: 4 slots = 1.6s).
+// Within a tenure, the same validator produces every slot. This avoids
+// thrashing between leaders and gives each leader time to build meaningful
+// blocks.
+//
+// Slot allocation uses integer proportional math:
+//   slots_for_validator = (stake * epoch_slots) / total_stake
+// Tenures are computed as: tenures = slots / LEADER_TENURE_SLOTS
+// (minimum 1 tenure per validator with any stake).
+// Supermajority: votes_lamports * 3 >= total_stake_lamports * 2  (exact, no f64)
 
-// ⚠️  TECHNICAL DEBT resolved — stakes migrated to u64 lamports (Phase 7).
-//      Slot allocation uses integer proportional math:
-//        slots_for_validator = (stake * epoch_slots) / total_stake
-//      Supermajority: votes_lamports * 3 >= total_stake_lamports * 2  (exact, no f64)
+/// Number of consecutive slots a leader produces before handing off.
+/// 4 slots × 400ms = 1.6 seconds per tenure.
+pub const LEADER_TENURE_SLOTS: u64 = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderSchedule {
     stakes: HashMap<String, u64>, // lamports — deterministic across all CPU architectures
@@ -106,41 +113,31 @@ pub struct LeaderSchedule {
 }
 
 impl LeaderSchedule {
-    /// Finds the next unique writer in the schedule after the current slot
-    pub fn nominate_next_writer(&self, current_slot: u64) -> String {
-        let current_leader = self.get_leader(current_slot);
-        
-        self.schedule.iter()
-            .find(|(s, l)| *s > current_slot && *l != current_leader)
-            .map(|(_, l)| l.clone())
-            .unwrap_or_else(|| "genesis_validator".to_string())
-    }
     pub fn new() -> Self {
         Self { stakes: HashMap::new(), schedule: Vec::new(), epoch: 0 }
     }
 
-    /// Register or update a validator's stake weight (u64 lamports, not f64).
-    ///
-    /// Replaces the old logarithmic `update_stake(f64)` — lamports are deterministic
-    /// across all CPU architectures, making the leader schedule 100% reproducible.
+    /// Find the next leader after the current slot that differs from the current one.
+    pub fn nominate_next_writer(&self, current_slot: u64) -> String {
+        let current_leader = self.get_leader(current_slot);
+        self.schedule.iter()
+            .find(|(s, l)| *s > current_slot && *l != current_leader)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| "genesis_validator".into())
+    }
+
+    /// Register or update a validator's stake weight (u64 lamports).
     pub fn set_stake(&mut self, address: &str, lamports: u64) {
         self.stakes.insert(address.to_string(), lamports);
     }
 
-    /// Legacy alias kept for any callers not yet migrated. Converts whole-BB
-    /// float to lamports via truncation then delegates to `set_stake`.
-    #[deprecated(note = "Use set_stake(address, lamports_u64) instead")]
-    pub fn update_stake(&mut self, address: &str, _raw_engagement: f64) {
-        // During the migration window: treat 1 unit of old engagement = 1 BB = 100_000 lamports.
-        // All real call sites should be updated to call set_stake() directly.
-        self.set_stake(address, 100_000_000); // 1000 BB in lamports
-    }
-
-    /// Generate writer schedule for an epoch — integer proportional allocation.
+    /// Generate writer schedule for an epoch — integer proportional allocation
+    /// with contiguous leader tenures.
     ///
-    /// Algorithm: each validator receives `(stake * epoch_slots) / total_stake` slots.
-    /// Remainder slots (from integer truncation) go to the highest-stake validator.
-    /// Result is deterministic on every CPU architecture — no f64 anywhere.
+    /// Each validator gets `(stake * epoch_slots) / total_stake` slots.
+    /// Slots are grouped into tenures of `LEADER_TENURE_SLOTS` (default 4).
+    /// The highest-stake validator gets any remainder slots as an extra partial
+    /// tenure. Validators rotate in stake-descending order.
     pub fn generate_schedule(&mut self, epoch: u64, slots_per_epoch: u64) {
         self.epoch = epoch;
         self.schedule.clear();
@@ -153,16 +150,16 @@ impl LeaderSchedule {
             return;
         }
 
-        // Sort descending by stake so the highest-stake validator gets remainder slots.
+        // Sort descending by stake.
         let mut validators: Vec<(&String, &u64)> = self.stakes.iter().collect();
         validators.sort_by(|a, b| b.1.cmp(a.1));
 
-        // Allocate slots proportionally via integer division.
+        // Proportional slot allocation.
         let mut allocations: Vec<(&String, u64)> = validators.iter()
             .map(|(addr, &stake)| (*addr, stake * slots_per_epoch / total))
             .collect();
 
-        // Distribute remainder slots (caused by integer truncation) to top validators.
+        // Distribute remainder slots to top validators.
         let allocated: u64 = allocations.iter().map(|(_, n)| n).sum();
         let mut remainder = slots_per_epoch.saturating_sub(allocated);
         for (_, n) in allocations.iter_mut() {
@@ -171,16 +168,39 @@ impl LeaderSchedule {
             remainder -= 1;
         }
 
-        // Interleave validators round-robin so no validator owns a large contiguous run.
-        let mut slot = 0u64;
-        let max_alloc = allocations.iter().map(|(_, n)| *n).max().unwrap_or(0);
-        for round in 0..max_alloc {
-            for (addr, alloc) in &allocations {
-                if round < *alloc {
-                    self.schedule.push((epoch * slots_per_epoch + slot, addr.to_string()));
+        // Build contiguous tenures: each validator gets ceil(slots / TENURE) tenures.
+        // Within each tenure, all LEADER_TENURE_SLOTS (or the remainder) go to
+        // the same leader. Rotate in stake-descending order.
+        let epoch_base = epoch * slots_per_epoch;
+        let mut slot: u64 = 0;
+        loop {
+            let mut assigned_this_round = false;
+            // Walk validators in stake order each round.
+            let mut order: Vec<usize> = (0..allocations.len()).collect();
+            order.sort_by(|&a, &b| allocations[b].1.cmp(&allocations[a].1));
+            for &i in &order {
+                let remaining = allocations[i].1;
+                if remaining == 0 { continue; }
+                // How many slots to give this validator this tenure?
+                let tenure_slots = LEADER_TENURE_SLOTS.min(remaining);
+                let addr = allocations[i].0.to_string();
+                for _t in 0..tenure_slots {
+                    self.schedule.push((epoch_base + slot, addr.clone()));
                     slot += 1;
                 }
+                allocations[i].1 -= tenure_slots;
+                assigned_this_round = true;
             }
+            if !assigned_this_round || slot >= slots_per_epoch { break; }
+        }
+
+        // Safety: if any slots remain (rounding), fill with first validator.
+        let fill_leader = validators.first()
+            .map(|(a, _)| a.to_string())
+            .unwrap_or_else(|| "genesis_validator".into());
+        while slot < slots_per_epoch {
+            self.schedule.push((epoch_base + slot, fill_leader.clone()));
+            slot += 1;
         }
     }
 

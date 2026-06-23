@@ -27,7 +27,7 @@ http://91.98.196.34:8080
   "slot": 3730123,
   "total_supply": 1000.0,
   "uptime_seconds": 86400,
-  "version": "5.0.0",
+  "version": "5.0.2",
   "network": "mainnet",
   "blockchain": { ... },
   "poh_clock": { "current_slot": 3730123, ... }

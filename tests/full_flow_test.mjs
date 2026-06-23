@@ -349,6 +349,40 @@ await test('Global ledger', async () => {
   ok('Global ledger', `${txs.length} recent txs`);
 });
 
+await test('Recent transaction feed', async () => {
+  const data = await api('/poh/transactions/recent?limit=5');
+  const txs = data.transactions || [];
+  if (data.success !== true) throw new Error('success flag missing');
+  if (!Array.isArray(txs)) throw new Error('transactions is not an array');
+  if (data.count !== txs.length) throw new Error(`count mismatch: ${data.count} vs ${txs.length}`);
+  if (txs.length > 5) throw new Error(`limit exceeded: ${txs.length}`);
+  for (let i = 1; i < txs.length; i++) {
+    if ((txs[i - 1].timestamp || 0) < (txs[i].timestamp || 0)) {
+      throw new Error('transactions are not newest-first');
+    }
+  }
+  ok('Recent feed', `${txs.length} txs`);
+});
+
+await test('Recent transaction cursor', async () => {
+  const firstPage = await api('/poh/transactions/recent?limit=5');
+  const firstPageTxs = firstPage.transactions || [];
+  if (firstPageTxs.length < 2) {
+    warn('Recent feed cursor', 'not enough transactions to exercise before_ts');
+    return;
+  }
+
+  const cursor = firstPageTxs[firstPageTxs.length - 1].timestamp;
+  const data = await api(`/poh/transactions/recent?limit=5&before_ts=${cursor}`);
+  const txs = data.transactions || [];
+  if (data.success !== true) throw new Error('success flag missing');
+  if (!Array.isArray(txs)) throw new Error('transactions is not an array');
+  if (txs.some((tx) => tx.timestamp >= cursor)) {
+    throw new Error('cursor response included a transaction at or after before_ts');
+  }
+  ok('Recent cursor', `${txs.length} txs before ${cursor}`);
+});
+
 // ── 12. ESCROW ──
 console.log('\n┌─ 12. ESCROW (L2 Bridge) ──────────────────────');
 await test('Escrow status', async () => {

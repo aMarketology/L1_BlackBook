@@ -201,20 +201,6 @@ pub async fn lock_bb_handler(
         dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
     }
 
-    // ── BALANCE CHECK ──────────────────────────────────────────────────────
-    let creator_balance = state.blockchain.get_balance_lamports(&req.wallet_address);
-    if creator_balance < req.bb_lamports {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!(
-                "Insufficient $BB balance: have {} lamports ({:.5} BB), need {} lamports ({:.5} BB)",
-                creator_balance,
-                creator_balance as f64 / crate::svm::LAMPORTS_PER_BB as f64,
-                req.bb_lamports,
-                req.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
-            )
-        })));
-    }
-
     // ── ATOMIC: debit user + credit vault + persist lock record — single ReDB txn ─
     let vault_addr = rollup_vault_address(&rollup_id);
     // Replaces the previous three-step write (debit hot, credit hot, persist ReDB).
@@ -234,6 +220,11 @@ pub async fn lock_bb_handler(
         &req.wallet_address, &vault_addr, req.bb_lamports, &record,
     ) {
         tracing::error!("Atomic rollup lock failed: {}", e);
+        if e.contains("Insufficient funds") {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": e
+            })));
+        }
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("Lock aborted — {}", e)
         })));
@@ -251,19 +242,13 @@ pub async fn lock_bb_handler(
         lock_id,
     );
 
-    let creator_balance_after = state.blockchain.get_balance_lamports(&req.wallet_address);
-
     (StatusCode::OK, Json(serde_json::json!({
         "success": true,
         "lock_id": lock_id,
-        "creator_address": req.wallet_address,
-        "locked_bb_lamports": req.bb_lamports,
-        "locked_bb": req.bb_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64,
-        "token_symbol_hint": req.token_symbol_hint,
         "vault_address": vault_addr,
-        "creator_balance_after_lamports": creator_balance_after,
-        "creator_balance_after_bb": creator_balance_after as f64 / crate::svm::LAMPORTS_PER_BB as f64,
-        "message": "Lock recorded. Submit this lock_id to the L5 sequencer to receive rollup-$BB."
+        "creator_address": req.wallet_address,
+        "delta_lamports": req.bb_lamports,
+        "token_symbol_hint": req.token_symbol_hint
     })))
 }
 

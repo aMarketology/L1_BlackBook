@@ -1,9 +1,18 @@
-# BlackBook L1 — Cherry Bare-Metal Migration Guide
+# BlackBook L1 — Cherry Bare-Metal Migration Guide  (v1.0.2)
 
 ## Why Cherry?
 Hetzner has been flagged as rejecting blockchain workloads. Cherry provides
 bare-metal servers with no blockchain restrictions, low-latency European
 colocation, and NVMe storage suitable for ReDB's write throughput.
+
+## What's New in v1.0.2
+
+- **Rotating Leader Schedule** — run `--mode validator` for multi-validator consensus.
+  Leaders rotate in contiguous 4-slot tenures (1.6s each), stake-proportional.
+- **`config.toml`** now has `stake_lamports` and `http_port` per validator.
+- **`GET /validators`** returns the full validator set with stakes + current leader.
+- **Dynamic reader proxy** — non-leader POSTs auto-forward to the current leader.
+- **Zero log spam** — leadership transitions logged once, not every slot.
 
 ---
 

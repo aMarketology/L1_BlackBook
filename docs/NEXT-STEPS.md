@@ -1,12 +1,42 @@
 ﻿# BlackBook — Next Steps
 
-> **Updated: June 2026 — v1.0.1. L2 sequencer live on Hetzner. Permissioned Turbine 7A/7B/7C live.**
-> The frontend↔L2 wiring and L2-on-Hetzner items are DONE. Current focus is the
-> Cherry migration and finishing the block-shred mesh.
+> **Updated: June 2026 — v1.0.2. Rotating Leader Schedule (Phase 1) live. Multi-validator consensus.**
+> L2 sequencer live on Hetzner. Permissioned Turbine 7A/7B/7C live.
 >
 > **The L1 is an asset-custody ledger, state machine, and transaction execution environment** —
 > nothing more. It stores balances against public keys, advances state via PoH, and executes
 > Ed25519-signed transactions after verifying them. It never touches user private keys.
+
+---
+
+## ✅ P0 — DONE: Rotating Leader Schedule (Phase 1)
+
+**Multi-validator consensus is live.** Every validator runs `--mode validator`, consults the
+same deterministic `LeaderSchedule` from `config.toml`, and dynamically switches between
+Writer (produce blocks) and Reader (sync + verify) at slot boundaries.
+
+| Item | Status |
+|------|--------|
+| `--mode validator` CLI flag | ✅ |
+| `stake_lamports` + `http_port` in `config.toml` `[[validators]]` | ✅ |
+| `LeaderSchedule` populated from `ValidatorRegistry` (not hardcoded) | ✅ |
+| `TowerBFT` multi-validator from registry stakes | ✅ |
+| Contiguous leader tenures (4 slots = 1.6s per leader) | ✅ |
+| `GET /validators` endpoint (pubkeys, stakes, current leader) | ✅ |
+| `GET /health` shows `current_leader`, `is_leader`, `validators_registered` | ✅ |
+| Zero log spam — leadership transitions logged once, not every slot | ✅ |
+| Dynamic reader proxy — non-leader POSTs forward to current leader | ✅ |
+| Gulf Stream tx forwarding to upcoming leaders | ✅ |
+| Leader handoff — Validator syncs as Reader when not leader, state always current | ✅ |
+
+**How to run multi-validator:**
+```powershell
+# Node 1 (Cherry)
+.\target\release\layer1.exe --mode validator --identity cherry-writer --http-port 8080
+
+# Node 2 (Reader)
+.\target\release\layer1.exe --mode validator --identity local-reader --http-port 8081 --redb-path blockchain_data/reader.redb
+```
 
 ---
 
@@ -27,7 +57,25 @@ Hetzner flagged blockchain workloads. Move the L1 node to the Cherry bare-metal 
 
 ---
 
-## P1 — NEXT: Finish the Block-Shred VIP Mesh (Phase 7D) (1–2 weeks)
+## P1 — NEXT: Leader Timeout & Auto-Skip (Phase 6) (1–2 days)
+
+When a scheduled leader is offline, the network should detect the timeout and advance
+to the next leader automatically. Foundation is laid (leadership tracking in block loop).
+
+**What to build:**
+
+1. **Leader timeout detection** — if no block received within `slot_duration * 1.5` (600ms),
+   declare the current leader as timed out.
+2. **Skip-to-next-leader** — advance `current_slot` past the dead leader's tenure.
+   Next leader detects it's now leader and starts producing.
+3. **Rejoin detection** — when the dead leader comes back online, it syncs as Reader
+   then resumes when its next turn comes.
+
+**Files:** `src/main.rs` (block loop), `runtime/consensus.rs` (LeaderSchedule).
+
+---
+
+## P2 — HIGH: Finish the Block-Shred VIP Mesh (Phase 7D) (1–2 weeks)
 
 Phases 7A (registry), 7B (IP gate), 7C (signed tick-shreds + u64 stake) are live. Remaining:
 
@@ -36,7 +84,7 @@ Phases 7A (registry), 7B (IP gate), 7C (signed tick-shreds + u64 stake) are live
 1. **Round-robin shred assignment** — Writer assigns each 1,232-byte block shred to a different approved node instead of broadcasting every tick-shred to all targets.
 2. **Peer re-broadcast** — each receiving node re-signs and blasts its shred to all other whitelisted peers (turning the star into a mesh).
 3. **Block reassembly + Reed-Solomon FEC decode** — receivers buffer shreds per slot, reconstruct the block once the FEC threshold is met, then feed the Reader ingest pipeline.
-4. **`GET /validators`** — return the current approved set (pubkey, addr, label) for ops visibility.
+4. **`GET /validators`** — ✅ DONE (Phase 1). Returns full validator set with stakes + current leader.
 5. **`POST /admin/validators/add` + `DELETE /admin/validators/:pubkey`** — `unsafe_admin`-gated hot registry edits (optional; static config is the default).
 
 **Files:** `runtime/turbine.rs`, new `runtime/shred_reassembly.rs`, `src/main.rs` (route wiring).
@@ -45,7 +93,7 @@ Phases 7A (registry), 7B (IP gate), 7C (signed tick-shreds + u64 stake) are live
 
 ---
 
-## P2 — HIGH: Rollup Trust-Minimization (Phase 12) (1–2 weeks)
+## P3 — HIGH: Rollup Trust-Minimization (Phase 12) (1–2 weeks)
 
 Phase 3.5 stopped double-spend/insolvency, but a malicious sequencer can still sign a
 *false* root. Close that without waiting for full ZK.
@@ -61,7 +109,7 @@ Phase 3.5 stopped double-spend/insolvency, but a malicious sequencer can still s
 
 ---
 
-## P3 — HIGH: XDP Kernel Bypass on UDP TPU (:8003)
+## P4 — HIGH: XDP Kernel Bypass on UDP TPU (:8003)
 
 Current bottleneck: Linux kernel processes every UDP packet before Rust sees it. This adds ~50µs per packet and caps throughput.
 
@@ -80,7 +128,7 @@ Current bottleneck: Linux kernel processes every UDP packet before Rust sees it.
 
 ---
 
-## P4 — HIGH: ZK Validity Proofs on L2 Batch Submission
+## P5 — HIGH: ZK Validity Proofs on L2 Batch Submission
 
 Currently the L2 sequencer is trusted by authority (Ed25519 key). ZK proofs replace that with mathematics.
 
@@ -98,7 +146,7 @@ Currently the L2 sequencer is trusted by authority (Ed25519 key). ZK proofs repl
 
 ---
 
-## P5 — MEDIUM: DA Layer + State Pruning
+## P6 — MEDIUM: DA Layer + State Pruning
 
 At 502 tx/s, ReDB grows ~100MB/day. At scale, it will fill the Hetzner disk.
 
@@ -113,7 +161,7 @@ At 502 tx/s, ReDB grows ~100MB/day. At scale, it will fill the Hetzner disk.
 
 ---
 
-## P6 — MEDIUM: Active-Passive L2 Sequencer HA
+## P7 — MEDIUM: Active-Passive L2 Sequencer HA
 
 The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 is down for minutes.
 
@@ -130,8 +178,9 @@ The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 i
 
 ---
 
-## Completed (through v1.0.1)
+## Completed (through v1.0.2)
 
+- ✅ **Rotating Leader Schedule** — `--mode validator`, multi-validator `LeaderSchedule` from `config.toml`, contiguous 4-slot tenures, dynamic role switching, `GET /validators`
 - ✅ PoH + Tower BFT + Gulf Stream + Sealevel
 - ✅ Sealevel O(N) scheduler + Local Fee Market
 - ✅ `Transaction.priority` plumbed from UDP TPU
@@ -141,10 +190,11 @@ The L2 sequencer is a single SQLite process. If the Hetzner server reboots, L2 i
 - ✅ Ed25519 on all write endpoints + nonce replay protection
 - ✅ `unsafe_admin` production compile-time gate
 - ✅ 502 tx/s validated (UDP TPU, 10,060 packets, 0 errors)
-- ✅ v1.0.0 tagged and pushed (`aMarketology/L1_BlackBook`)
+- ✅ v1.0.2 tagged and pushed (`aMarketology/L1_BlackBook`)
 - ✅ React wallet wired to live L2 sequencer (`layer2.blackbook.id/seq`)
 - ✅ L2 sequencer Dockerized + deployed to Hetzner (compose + nginx HTTPS)
 - ✅ Rollup exit path hardened (batch-agnostic keys, cumulative accounting, atomic exit)
 - ✅ Permissioned Turbine 7A/7B/7C: `ValidatorRegistry`, UDP IP gate, signed tick-shreds
 - ✅ `LeaderSchedule` f64 → u64 lamport rewrite (deterministic integer schedule)
+- ✅ **v1.0.2 rotating leader consensus** — `--mode validator`, multi-validator `LeaderSchedule` from `config.toml`, contiguous 4-slot tenures, dynamic role switching, `GET /validators`, zero log spam
 - ✅ **v1.0.1 pure-L1 cleanup** — removed dead fiat-onramp code (Lightning/BTCPay gateway + Transak webhook) and the server-side keygen endpoint; build is warning-clean

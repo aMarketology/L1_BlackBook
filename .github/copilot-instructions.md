@@ -2,8 +2,8 @@
 
 ## What This Codebase Is
 
-BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (engine v5.0.0, release v1.0.1, edition 2026).
-It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain all rollup layers l2 l3 & l5 
+BlackBook is a **Consortium / Permissioned Layer 1** blockchain written in Rust (engine v5.0.0, release v1.0.2, edition 2026).
+It is NOT Solana, NOT Ethereum. It is a purpose-built, high-frequency settlement chain for all rollup layers (L2, L3, L5). 
 
 **Core identity:** the L1 is an **asset-custody ledger, state machine, and transaction execution
 environment** — nothing else. Its only relationship with keys is to (1) store a balance against a
@@ -17,14 +17,29 @@ Solana internals but fully custom-implemented:
 
 - **Proof of History (PoH)** clock in `runtime/poh_service.rs`
 - **Sealevel parallel execution** (read/write lock scheduling) in `runtime/sealevel.rs`
-- **Gulf Stream** mempool in `runtime/consensus.rs`
-- **Tower BFT** consensus in `runtime/consensus.rs`
+- **Gulf Stream** mempool + tx forwarding in `runtime/consensus.rs`
+- **Tower BFT** multi-validator consensus in `runtime/consensus.rs`
+- **Rotating Leader Schedule** — deterministic stake-weighted schedule, contiguous 4-slot tenures, `--mode validator`
 - **Turbine** permissioned shred gossip — whitelisted VIP mesh only in `runtime/turbine.rs`
 - **SPL Token engine** (custom, not the real Solana one) in `src/svm/spl_token.rs`
 - **ReDB** as the persistent KV store (`blockchain_data/blockchain.redb`)
 - **DashMap** for in-memory state (write-behind cache over ReDB)
 - **Axum 0.7** HTTP server on `:8080`
 - **UDP TPU** on `:8003` (bincode binary protocol, 8 workers)
+
+---
+
+## Node Modes
+
+| Mode | CLI Flag | Behavior |
+|------|----------|----------|
+| **Writer** | `--mode writer` | Single writer: always produces blocks (legacy/dev) |
+| **Reader** | `--mode reader` | Always syncs from a writer via gRPC (legacy/dev) |
+| **Validator** | `--mode validator` | **Production mode.** Consults `LeaderSchedule` at every slot. Produces blocks when scheduled, syncs as reader otherwise. Dynamic role switching. |
+
+In Validator mode, `--identity` must match a `label` in `config.toml` `[[validators]]`.
+The `LeaderSchedule` is populated from all validators' `stake_lamports` in the registry.
+Leaders rotate in contiguous 4-slot tenures (`LEADER_TENURE_SLOTS = 4`, 1.6s each).
 
 ---
 
@@ -106,7 +121,9 @@ runtime/
   tpu.rs                       — UDP TPU (TpuPacket: amount is u64 lamports)
   sealevel.rs                  — Parallel execution engine (read/write lock scheduler)
   poh_service.rs               — PoH clock, PipelinePacket, TransactionPipeline
-  consensus.rs                 — GulfStreamService, TowerBFT
+  consensus.rs                 — LeaderSchedule, GulfStreamService, TowerBFT, LEADER_TENURE_SLOTS
+  turbine.rs                   — Permissioned Turbine tick shred broadcast + receive
+  validator_registry.rs        — ApprovedValidator (pubkey, stake_lamports, http_port), static whitelist
 
 sdk/
   dealer.sdk.ts                — TypeScript SDK for L2 Dealer (Merkle, escrow, settlement)

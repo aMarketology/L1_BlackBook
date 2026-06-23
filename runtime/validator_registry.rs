@@ -1,12 +1,13 @@
-//! Permissioned Validator Registry — Phase 7A
+//! Permissioned Validator Registry — Phase 7A + Phase 1 (Rotating Leaders)
 //!
 //! Maintains the static whitelist of approved validator / reader nodes that
-//! are allowed to send or receive Turbine tick shreds.
+//! are allowed to send or receive Turbine tick shreds, AND tracks stake
+//! weights for deterministic leader-schedule generation.
 //!
 //! Config sources (in priority order):
 //! 1. `APPROVED_VALIDATORS` env var (if set, REPLACES TOML entirely).
-//!    Format: `"label:pubkey_hex@ip:port;pubkey_hex@ip:port;..."`
-//!    (label is optional — bare `pubkey_hex@ip:port` is also accepted)
+//!    Format: `"label:pubkey_hex@ip:port:stake;..."`  (stake in lamports, optional)
+//!    (label, stake, and http_port are optional — bare `pubkey_hex@ip:port` is accepted)
 //! 2. TOML file at the path given by `VALIDATOR_CONFIG_PATH` env var,
 //!    or `config.toml` in the working directory by default.
 //!
@@ -16,12 +17,14 @@
 //! label  = "genesis-writer"
 //! pubkey = "abcd1234..."   # 64 hex chars = 32-byte Ed25519 pubkey
 //! addr   = "91.98.196.34:8004"
+//! stake_lamports = 1_000_000_000   # optional, default 1B = 10,000 BB
+//! http_port = 8080                 # optional, default 8080
 //! ```
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 // ── TOML schema ───────────────────────────────────────────────────────────────
@@ -38,12 +41,19 @@ struct TomlValidator {
     label: String,
     pubkey: String,
     addr: String,
+    #[serde(default = "default_stake")]
+    stake_lamports: u64,
+    #[serde(default = "default_http_port")]
+    http_port: u16,
 }
+
+fn default_stake() -> u64 { 1_000_000_000 } // 10,000 BB
+fn default_http_port() -> u16 { 8080 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A single approved validator / reader node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ApprovedValidator {
     /// Ed25519 pubkey bytes (32 bytes).
     pub pubkey: [u8; 32],
@@ -55,6 +65,11 @@ pub struct ApprovedValidator {
     pub ip: IpAddr,
     /// Human-readable label (from config or auto-generated).
     pub label: String,
+    /// Stake weight in lamports for leader schedule + Tower BFT voting.
+    /// Default: 1_000_000_000 (10,000 BB).
+    pub stake_lamports: u64,
+    /// HTTP port for RPC forwarding. Default: 8080.
+    pub http_port: u16,
 }
 
 /// Immutable whitelist of approved validators.
@@ -91,7 +106,7 @@ impl ValidatorRegistry {
     /// Returns `Err` only for parse errors that would silently misconfigure the
     /// node. An empty registry is allowed (returns `Ok` with a warning).
     pub fn load(toml_path: Option<&str>, env_override: Option<&str>) -> Result<Self, String> {
-        let raw_entries: Vec<(String, String, String)>; // (label, pubkey_hex, addr)
+        let raw_entries: Vec<RawEntry>;
 
         if let Some(env_val) = env_override {
             if !env_val.is_empty() {
@@ -145,11 +160,30 @@ impl ValidatorRegistry {
     pub fn all(&self) -> &[ApprovedValidator] {
         &self.validators
     }
+
+    /// Look up by label.
+    pub fn get_by_label(&self, label: &str) -> Option<&ApprovedValidator> {
+        self.validators.iter().find(|v| v.label == label)
+    }
+
+    /// Total stake across all validators.
+    pub fn total_stake(&self) -> u64 {
+        self.validators.iter().map(|v| v.stake_lamports).sum()
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn load_toml(path_override: Option<&str>) -> Result<Vec<(String, String, String)>, String> {
+/// Intermediate parsed entry before building the final ApprovedValidator.
+struct RawEntry {
+    label: String,
+    pubkey_hex: String,
+    addr: String,
+    stake_lamports: u64,
+    http_port: u16,
+}
+
+fn load_toml(path_override: Option<&str>) -> Result<Vec<RawEntry>, String> {
     let path = path_override
         .map(str::to_string)
         .unwrap_or_else(|| {
@@ -159,7 +193,6 @@ fn load_toml(path_override: Option<&str>) -> Result<Vec<(String, String, String)
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Missing config file is non-fatal — node may run with empty registry (dev mode).
             warn!(
                 "⚠️  ValidatorRegistry: config file '{}' not found — registry is empty. \
                  Set APPROVED_VALIDATORS or create config.toml to enable Turbine shred delivery.",
@@ -173,10 +206,16 @@ fn load_toml(path_override: Option<&str>) -> Result<Vec<(String, String, String)
     let cfg: TomlConfig =
         toml::from_str(&contents).map_err(|e| format!("TOML parse error in '{}': {}", path, e))?;
 
-    let entries = cfg
+    let entries: Vec<RawEntry> = cfg
         .validators
         .into_iter()
-        .map(|v| (v.label, v.pubkey, v.addr))
+        .map(|v| RawEntry {
+            label: v.label,
+            pubkey_hex: v.pubkey,
+            addr: v.addr,
+            stake_lamports: v.stake_lamports,
+            http_port: v.http_port,
+        })
         .collect();
 
     info!("🔐 ValidatorRegistry: loaded entries from '{}'", path);
@@ -184,20 +223,29 @@ fn load_toml(path_override: Option<&str>) -> Result<Vec<(String, String, String)
 }
 
 /// Parse `APPROVED_VALIDATORS` env value.
-/// Accepts: `"label:hex@ip:port;hex@ip:port"` (semicolon-separated; label optional).
-fn parse_env_var(raw: &str) -> Result<Vec<(String, String, String)>, String> {
+/// Accepts: `"label:hex@ip:port:stake;hex@ip:port"` (semicolon-separated; label + stake optional).
+fn parse_env_var(raw: &str) -> Result<Vec<RawEntry>, String> {
     raw.split(';')
         .filter(|s| !s.trim().is_empty())
         .enumerate()
         .map(|(i, entry)| {
             let entry = entry.trim();
-            // Split on '@' to separate (label:pubkey) from addr.
             let at_pos = entry
                 .rfind('@')
                 .ok_or_else(|| format!("APPROVED_VALIDATORS entry #{}: missing '@' separator in '{}'", i, entry))?;
 
             let left = &entry[..at_pos];
-            let addr = entry[at_pos + 1..].to_string();
+            let addr_part = entry[at_pos + 1..].to_string();
+
+            // addr_part may be "ip:port" or "ip:port:stake" or "ip:port:stake:http_port"
+            let addr_parts: Vec<&str> = addr_part.splitn(4, ':').collect();
+            let addr = if addr_parts.len() >= 2 {
+                format!("{}:{}", addr_parts[0], addr_parts[1])
+            } else {
+                return Err(format!("APPROVED_VALIDATORS entry #{}: bad addr '{}'", i, addr_part));
+            };
+            let stake: u64 = addr_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000);
+            let http_port: u16 = addr_parts.get(3).and_then(|p| p.parse().ok()).unwrap_or(8080);
 
             // Left part: optional "label:" prefix.
             let (label, pubkey_hex) = if let Some(colon) = left.find(':') {
@@ -206,26 +254,26 @@ fn parse_env_var(raw: &str) -> Result<Vec<(String, String, String)>, String> {
                 (format!("validator-{}", i), left.to_string())
             };
 
-            Ok((label, pubkey_hex, addr))
+            Ok(RawEntry { label, pubkey_hex, addr, stake_lamports: stake, http_port })
         })
         .collect()
 }
 
 fn build_registry(
-    raw: Vec<(String, String, String)>,
+    raw: Vec<RawEntry>,
 ) -> Result<ValidatorRegistry, String> {
     let mut validators: Vec<ApprovedValidator> = Vec::new();
     let mut by_ip: HashMap<IpAddr, usize> = HashMap::new();
     let mut by_pubkey: HashMap<[u8; 32], usize> = HashMap::new();
     let mut seen_pubkeys: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
 
-    for (label, pubkey_hex, addr_str) in raw {
+    for entry in raw {
         // Validate pubkey hex.
-        let pubkey_hex = pubkey_hex.trim().to_lowercase();
+        let pubkey_hex = entry.pubkey_hex.trim().to_lowercase();
         if pubkey_hex.len() != 64 {
             return Err(format!(
                 "ValidatorRegistry: pubkey '{}' for '{}' must be 64 hex chars (got {})",
-                pubkey_hex, label, pubkey_hex.len()
+                pubkey_hex, entry.label, pubkey_hex.len()
             ));
         }
         let pubkey_bytes = hex::decode(&pubkey_hex)
@@ -237,15 +285,15 @@ fn build_registry(
         if !seen_pubkeys.insert(pubkey) {
             warn!(
                 "⚠️  ValidatorRegistry: duplicate pubkey '{}' (label='{}') — skipping",
-                pubkey_hex, label
+                pubkey_hex, entry.label
             );
             continue;
         }
 
         // Validate UDP address.
-        let udp_addr: SocketAddr = addr_str
+        let udp_addr: SocketAddr = entry.addr
             .parse()
-            .map_err(|e| format!("ValidatorRegistry: bad addr '{}' for '{}': {}", addr_str, label, e))?;
+            .map_err(|e| format!("ValidatorRegistry: bad addr '{}' for '{}': {}", entry.addr, entry.label, e))?;
 
         let ip = udp_addr.ip();
         let idx = validators.len();
@@ -255,7 +303,9 @@ fn build_registry(
             pubkey_hex,
             udp_addr,
             ip,
-            label,
+            label: entry.label,
+            stake_lamports: entry.stake_lamports,
+            http_port: entry.http_port,
         });
 
         by_ip.insert(ip, idx);
