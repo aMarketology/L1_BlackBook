@@ -2,6 +2,7 @@ mod contracts;
 mod auth;
 #[path = "watcher/webhook.rs"]
 mod watcher_webhook;
+mod state;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,69 +33,14 @@ use axum::extract::DefaultBodyLimit;
 use serde::Deserialize;
 use clap::Parser;
 
-// ============================================================================
-// CLI ARGUMENTS
-// ============================================================================
-
-/// Node operating mode: Writer produces blocks, Reader consumes them,
-/// Validator dynamically switches roles based on the leader schedule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum NodeMode {
-    /// Single writer node: runs PoH clock, produces blocks, serves relay to readers
-    Writer,
-    /// Reader node: subscribes to writer relay, verifies + stores blocks, serves RPC
-    Reader,
-    /// Consortium validator: consults LeaderSchedule at every slot, produces
-    /// blocks when scheduled, syncs as reader otherwise. Multi-validator mode.
-    Validator,
-}
-
-impl std::fmt::Display for NodeMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeMode::Writer => write!(f, "writer"),
-            NodeMode::Reader => write!(f, "reader"),
-            NodeMode::Validator => write!(f, "validator"),
-        }
-    }
-}
-
-/// BlackBook L1 — Consortium / Permissioned Settlement Layer
-#[derive(Parser, Debug)]
-#[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
-pub struct NodeConfig {
-    /// Node mode: writer (block producer), reader (block consumer), or
-    /// validator (consults LeaderSchedule, dynamic role switching)
-    #[arg(long, default_value = "writer", value_enum)]
-    pub mode: NodeMode,
-
-    /// Validator identity name (used in leader schedule + logs).
-    /// In Validator mode, must match one of the [[validators]] labels in config.toml.
-    #[arg(long, default_value = "genesis_validator")]
-    pub identity: String,
-
-    /// Address of the writer node's gRPC relay (reader mode only)
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
-    pub writer_addr: String,
-
-    /// Port for the gRPC relay service (writer) or gRPC client target (reader)
-    #[arg(long, default_value_t = 50051)]
-    pub grpc_port: u16,
-
-    /// HTTP port (wallet UI, REST endpoints)
-    #[arg(long, default_value_t = 8080)]
-    pub http_port: u16,
-
-    /// Solana JSON-RPC port
-    #[arg(long, default_value_t = 8899)]
-    pub rpc_port: u16,
-
-    /// Override the ReDB database path (defaults to REDB_PATH env var)
-    /// Useful for running a Reader node alongside a local Writer without
-    /// sharing the same database file.
-    #[arg(long)]
-    pub redb_path: Option<String>,
-}
+// Re-export state types for convenience
+use state::{
+    NodeMode, NodeConfig, AppState, WsSubscriptions,
+    GulfStreamSubmitRequest, RpcRequest, RpcResponse, RpcParams,
+    RpcAccountResult, RpcContext, RpcAccountValue,
+    VERSION, NETWORK, REDB_DATA_PATH_DEFAULT,
+    POH_SLOT_DURATION_MS, POH_HASHES_PER_TICK, POH_TICKS_PER_SLOT, POH_SLOTS_PER_EPOCH,
+};
 
 // ============================================================================
 // MODULES
@@ -133,244 +79,7 @@ use poh_blockchain::{
     TurbineShredder, TurbinePropagator,
 };
 
-
 use runtime::tpu::TpuService;
-
-/// JSON request body for the HTTP `/sealevel/submit` endpoint.
-/// For the binary UDP equivalent, see `runtime::tpu::TpuPacket`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct GulfStreamSubmitRequest {
-    pub from: String,
-    pub to: String,
-    pub amount: f64,
-    pub public_key: String,
-    pub signature: String,
-    pub timestamp: u64,
-    pub nonce: String,
-    pub chain_id: u8,
-    #[serde(default)]
-    pub priority: Option<u64>,
-    #[serde(default)]
-    pub tx_type: Option<String>,
-}
-
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-const VERSION: &str = "5.0.2";
-const NETWORK: &str = "mainnet-beta";
-const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
-
-/// PoH Configuration (400ms slots — matching Solana for max TPS)
-const POH_SLOT_DURATION_MS: u64 = 400;
-const POH_HASHES_PER_TICK: u64 = 12500;
-const POH_TICKS_PER_SLOT: u64 = 64;
-const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
-
-// No hardcoded test accounts — this is a zero-sum stablecoin.
-// All accounts are created at runtime via wallet creation endpoints.
-
-// ============================================================================
-// SVM LIVE-SYNC HELPER
-// ============================================================================
-
-// ============================================================================
-// APPLICATION STATE
-// ============================================================================
-
-use tokio::sync::mpsc;
-
-#[derive(serde::Deserialize)]
-struct RpcRequest {
-    method: String,
-    params: Option<Vec<serde_json::Value>>,
-    id: Option<u64>,
-}
-
-#[derive(serde::Serialize)]
-struct RpcResponse {
-    jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<u64>, // Subscription ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    method: Option<String>, // "accountNotification"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<RpcParams>,
-}
-
-#[derive(serde::Serialize)]
-struct RpcParams {
-    subscription: u64,
-    result: RpcAccountResult,
-}
-
-#[derive(serde::Serialize)]
-struct RpcAccountResult {
-    context: RpcContext,
-    value: RpcAccountValue,
-}
-
-#[derive(serde::Serialize)]
-struct RpcContext {
-    slot: u64,
-}
-
-#[derive(serde::Serialize)]
-struct RpcAccountValue {
-    lamports: u64,
-    data: Vec<String>,
-    owner: String,
-    executable: bool,
-    #[serde(rename = "rentEpoch")]
-    rent_epoch: u64,
-}
-
-pub type WsSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
-pub struct WsSubscriptions {
-    pub clients: dashmap::DashMap<std::net::SocketAddr, WsSender>,
-    pub account_subs: dashmap::DashMap<String, dashmap::DashSet<std::net::SocketAddr>>,
-    /// Clients subscribed to PoH slot notifications (`slotSubscribe`).
-    pub slot_subs: dashmap::DashSet<std::net::SocketAddr>,
-}
-
-impl WsSubscriptions {
-    pub fn new() -> Self {
-        Self {
-            clients: dashmap::DashMap::new(),
-            account_subs: dashmap::DashMap::new(),
-            slot_subs: dashmap::DashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    // Core blockchain (ReDB + DashMap cache)
-    pub blockchain: ConcurrentBlockchain,
-
-    // Solana-style consensus
-    pub poh: SharedPoHService,
-    pub current_slot: Arc<AtomicU64>,
-    pub leader_schedule: Arc<RwLock<LeaderSchedule>>,
-    pub pipeline: Arc<TransactionPipeline>,
-    pub parallel_scheduler: Arc<ParallelScheduler>,
-    pub gulf_stream: Arc<GulfStreamService>,
-    pub block_producer: Arc<BlockProducer>,
-    pub finality_tracker: Arc<FinalityTracker>,
-    pub tower_bft: Arc<TowerBFT>,
-
-    // Node identity
-    pub node_mode: NodeMode,
-    pub validator_id: String,
-
-    // Security infrastructure
-    pub throttler: Arc<NetworkThrottler>,
-    pub ws_subscriptions: Arc<WsSubscriptions>,
-    pub block_tx: tokio::sync::broadcast::Sender<FinalizedBlock>,
-    /// Broadcast channel for per-block BB balance update events pushed to L2 subscribers.
-    pub balance_event_tx: tokio::sync::broadcast::Sender<settlement::BalanceUpdateEvent>,
-    pub circuit_breaker: Arc<CircuitBreaker>,
-    pub fee_market: Arc<LocalizedFeeMarket>,
-    pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
-    pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
-
-    // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
-    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, u64)>>,
-
-    // ===== Global Escrow Smart Contract =====
-    /// Ed25519 public key of the authorized L2 sequencer (hex)
-    pub l2_sequencer_pubkey: String,
-    /// Allowlist of L2 sequencer hex pubkeys (superset of l2_sequencer_pubkey).
-    /// Loaded from L2_SEQUENCER_ALLOWLIST env var (comma-separated) at startup.
-    /// A state-root submission is accepted iff the signing key is in this set.
-    pub l2_sequencer_allowlist: std::collections::HashSet<String>,
-    /// Per-market merkle roots: market_id → [u8; 32] (raw SHA-256 root)
-    /// L1 stores ONLY the 32-byte math. Metadata lives in L2 PostgreSQL.
-    pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
-    /// Double-withdrawal protection: "{market_id}:{address}" → true
-    pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
-
-    // ===== Universal Rollup Hub Auth =====
-    /// Maps rollup_id ("L2", "L3", "L5") → authorized sequencer pubkey (64-char hex).
-    /// Loaded from {L2,L3,L5}_SEQUENCER_PUBKEY env vars at startup.
-    /// Only the registered key for a given rollup_id may submit roots or consume locks.
-    pub authorized_sequencers: Arc<dashmap::DashMap<String, String>>,
-
-    // ===== Contest Settlement State =====
-    /// Per-contest lifecycle state: contest_id → ContestState
-    /// Hot cache, ReDB-backed via ConcurrentBlockchain.store_contest_state().
-    pub contest_states: Arc<dashmap::DashMap<String, storage::ContestState>>,
-
-    // ===== Deposit Gateway =====
-    /// Custody wallet address users send wUSDT/wUSDT to (from CUSTODY_WALLET_ADDRESS env)
-    pub custody_wallet_address: String,
-    /// All deposit requests: external_tx_hash → DepositRecord (hot cache, ReDB-backed)
-    pub deposit_requests: Arc<dashmap::DashMap<String, storage::DepositRecord>>,
-    /// Background watcher that polls Solana RPC for custody wallet USDC/USDT balances.
-    /// None when CUSTODY_WALLET_ADDRESS is not set.
-    pub custody_watcher: Option<Arc<watcher::CustodyWatcher>>,
-    /// Background watcher that polls BSC (BNB Chain) for BEP-20 USDC/USDT transfers.
-    /// None when BSC_CUSTODY_WALLET is not set.
-    pub bsc_watcher: Option<Arc<watcher::BscWatcher>>,
-    /// Ed25519 public key (hex, 64 chars) of the off-chain Bridge Watcher authority.
-    /// Only this key may drive `POST /bridge/deposit` (Model A onramp).
-    /// Empty string disables the bridge-authority endpoint (returns 503).
-    pub bridge_authority_pubkey: String,
-
-    // ===== Withdrawal Gateway =====
-    /// Dealer address (base58) derived from DEALER_PRIVATE_KEY at startup.
-    /// Empty string when DEALER_PRIVATE_KEY is not set.
-    pub dealer_address: String,
-    /// All withdrawal requests: withdrawal_id (UUID) → WithdrawalRecord (hot cache, ReDB-backed)
-    pub withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>>,
-    /// Monotonic sequence counter for withdrawal records.
-    /// Loaded from ReDB at startup; incremented atomically inside every
-    /// `atomic_withdrawal_flush_and_record` call.  The bridge watcher uses
-    /// `GET /withdraw/since/:seq` to resume polling after a crash without
-    /// needing a full table scan.
-    pub withdrawal_seq_counter: Arc<std::sync::atomic::AtomicU64>,
-    /// Rolling 24h withdrawal cap enforcement.
-    /// window_start: Unix timestamp (seconds) of when the current window opened.
-    pub withdrawal_window_start: Arc<std::sync::atomic::AtomicU64>,
-    /// Rolling 24h withdrawal cap enforcement.
-    /// window_total: cumulative wUSDT micro-units withdrawn in the current window.
-    pub withdrawal_window_total: Arc<std::sync::atomic::AtomicU64>,
-    /// Per-24h cap in wUSDT micro-units. Loaded from WITHDRAWAL_DAILY_CAP_WUSDT env var.
-    /// Default: 10_000 wUSDT = 10_000_000_000 micro. 0 means unlimited.
-    pub withdrawal_daily_cap_micro: u64,
-
-    // ===== Layer 5: Rollup Liquidity Bridge =====
-    /// Hot cache of all $BB lock records — lock_id → RollupLockRecord.
-    /// Durable copy is in ReDB (ROLLUP_LIQUIDITY_LOCKS table).
-    /// The L5 sequencer polls GET /rollup/locks/:creator to read new entries.
-    pub rollup_lock_records: Arc<dashmap::DashMap<String, storage::RollupLockRecord>>,
-
-    // ===== Backup State =====
-    pub backup_last_at: Arc<AtomicU64>,
-    pub backup_last_size: Arc<AtomicU64>,
-
-    // ===== Turbine Tick Streaming (Phase 7A — static permissioned registry) =====
-    /// Approved validator / reader nodes for Turbine shred delivery.
-    /// Loaded from config.toml or APPROVED_VALIDATORS env var at startup.
-    pub approved_validators: Arc<runtime::validator_registry::ValidatorRegistry>,
-
-    // ===== Reader Mode: Writer Proxy =====
-    /// When running as a Reader node, this holds the Writer's HTTP base URL
-    /// (e.g. "http://1.2.3.4:8080"). All state-changing POST requests are
-    /// forwarded to the Writer so local and Hetzner state stay identical.
-    /// `None` when running as a Writer node.
-    pub writer_http_url: Option<String>,
-
-    // ===== Vault Claim Signer (KMS / Local Ed25519) =====
-    /// Signs "CLAIM:{poh_slot}:{amount}:{user_pubkey}" attestations verified
-    /// by the Solana Anchor vault program via the Ed25519 sysvar.
-    /// Loaded from AWS_KMS_KEY_ID (KMS) or VAULT_SIGNER_PRIVATE_KEY (local).
-    /// `None` when neither env var is set — vault claim endpoints return 503.
-    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
-}
 
 // ============================================================================
 // HEALTH & STATUS
@@ -530,6 +239,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     gauge!("pool_wusdt_micro",              "Swap pool wUSDT balance in micro-units",              pool_wusdt_micro);
     gauge!("circuit_breaker_tripped",       "1 if circuit breaker is open (halted), else 0",       cb_tripped);
     gauge!("withdrawal_window_total_micro", "wUSDT withdrawn in current 24h window (micro-units)", withdrawal_window_total);
+    gauge!("skip_slot_total",               "Cumulative slots skipped due to leader timeout (Phase 6)", state.skip_slot_total.load(Ordering::Relaxed));
 
     (
         StatusCode::OK,
@@ -3464,6 +3174,11 @@ async fn main() {
     // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
     // In Validator mode, the block production runs but only produces when the
     // schedule says this node IS the leader for the current slot.
+
+    // ── Skip-slot counter (Phase 6) — created here so both the block production
+    // loop and AppState can reference the same Arc.
+    let skip_slot_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if node_is_producer {
         // Create relay service for streaming blocks to reader nodes
         let (relay_service, block_sender) = relay::create_relay(
@@ -3546,6 +3261,7 @@ async fn main() {
             let slot_arc = current_slot.clone();
             let balance_event_tx_loop = balance_event_tx.clone();
             let balance_event_blockchain = blockchain.clone();
+            let skip_slot = skip_slot_total.clone();
             tokio::spawn(async move {
                 info!("🏭 Block production loop started ({}ms slots, {} slot tenure)",
                     POH_SLOT_DURATION_MS, runtime::LEADER_TENURE_SLOTS);
@@ -3566,8 +3282,37 @@ async fn main() {
                         if current_leader != last_leader {
                             info!("🔄 Slot {}: leader is now '{}' (we are '{}')",
                                 slot, current_leader, vid);
-                            last_leader = current_leader;
+                            last_leader = current_leader.clone();
                         }
+
+                        // ── Skip-slot: detect silent leader ────────────────
+                        // If the latest block is older than one full tenure
+                        // (LEADER_TENURE_SLOTS * POH_SLOT_DURATION_MS + 2s grace),
+                        // the scheduled leader is unresponsive. Fast-forward the
+                        // shared slot counter to the end of their tenure so the
+                        // PoH clock naturally reaches the next validator's slot.
+                        let max_block_age_s = (runtime::LEADER_TENURE_SLOTS * POH_SLOT_DURATION_MS / 1000) + 2;
+                        let latest_block_age_s = bp.get_latest_block().map(|b| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            now.saturating_sub(b.timestamp)
+                        });
+                        if let Some(age_s) = latest_block_age_s {
+                            if age_s > max_block_age_s {
+                                if let Some(skipped) = tower.skip_past_tenure(slot) {
+                                    warn!(
+                                        "⏭  SKIP-SLOT: leader '{}' silent for {}s (max {}s) — \
+                                         fast-forwarded {} slots to tenure boundary",
+                                        current_leader, age_s, max_block_age_s, skipped
+                                    );
+                                    // Accumulate for observability
+                                    skip_slot.fetch_add(skipped, Ordering::Relaxed);
+                                }
+                            }
+                        }
+
                         was_leader = false;
                         continue;
                     }
@@ -3919,6 +3664,8 @@ async fn main() {
         rollup_lock_records: Arc::new(dashmap::DashMap::new()),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
+        // Cumulative count of slots skipped due to leader timeout (Phase 6 skip-slot).
+        skip_slot_total: skip_slot_total.clone(),
         approved_validators: approved_validators.clone(),
         vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
         writer_http_url: if config.mode == NodeMode::Reader || config.mode == NodeMode::Validator {

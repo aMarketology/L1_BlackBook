@@ -9,6 +9,32 @@ default-run = "layer1"
 # cargo run --features unsafe_admin
 unsafe_admin = []
 
+[package.metadata.cargo-machete]
+# These are false positives — used transitively or in build scripts:
+# - curve25519-dalek: required by ed25519-dalek
+# - getrandom: required by rand ecosystem
+# - num_cpus: used in runtime/sealevel.rs
+# - openssl: required by solana-sdk on Windows
+# - prost: required by tonic (gRPC)
+# - rand_core: required by ed25519-dalek
+# - solana-program / solana-program-runtime / solana-system-program / solana_rbpf: SVM execution layer
+# - toml: used in runtime/validator_registry.rs
+# - tonic-build: build-dependency for proto compilation
+ignored = [
+    "curve25519-dalek",
+    "getrandom",
+    "num_cpus",
+    "openssl",
+    "prost",
+    "rand_core",
+    "solana-program",
+    "solana-program-runtime",
+    "solana-system-program",
+    "solana_rbpf",
+    "toml",
+    "tonic-build",
+]
+
 [dependencies]
 # Core async runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "signal", "macros", "net", "time", "sync"] }

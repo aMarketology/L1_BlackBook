@@ -710,6 +710,46 @@ impl TowerBFT {
         None
     }
 
+    /// Skip-slot: fast-forward the shared slot counter to the **end of the
+    /// current leader's tenure** when the scheduled leader is silent.
+    ///
+    /// This is deliberately bounded — it only skips to the tenure boundary,
+    /// never further. The PoH clock continues ticking through the empty slots
+    /// naturally so that when the next healthy validator's scheduled slot
+    /// arrives, its cryptographic hashes line up with the rest of the network.
+    ///
+    /// # Tenure boundary math
+    /// ```text
+    /// tenure_index = slot / LEADER_TENURE_SLOTS
+    /// tenure_end   = (tenure_index + 1) * LEADER_TENURE_SLOTS
+    /// ```
+    /// If `slot` is already at or past `tenure_end`, this is a no-op (the
+    /// tenure already ended naturally).
+    ///
+    /// Returns the number of slots skipped, or `None` if no skip was needed.
+    pub fn skip_past_tenure(&self, current_leader_slot: u64) -> Option<u64> {
+        let tenure_end = ((current_leader_slot / LEADER_TENURE_SLOTS) + 1) * LEADER_TENURE_SLOTS;
+        let local = self.current_slot.load(Ordering::Relaxed);
+
+        // Only skip if we're still inside the dead leader's tenure.
+        if local >= tenure_end {
+            return None;
+        }
+
+        // fetch_max: atomically advance only if tenure_end > current.
+        // Safe against races with the normal PoH clock advance.
+        let prev = self.current_slot.fetch_max(tenure_end, Ordering::Relaxed);
+        if tenure_end > prev {
+            let delta = tenure_end - prev;
+            warn!(
+                "⏭  SKIP-SLOT: leader tenure timed out — \
+                 local_slot={prev} → tenure_end={tenure_end} (+{delta} slots skipped)"
+            );
+            return Some(delta);
+        }
+        None
+    }
+
     pub fn get_stats(&self) -> TowerBFTStats {
         TowerBFTStats {
             validator_count: self.towers.len(),
