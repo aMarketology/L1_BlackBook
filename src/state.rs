@@ -1,4 +1,4 @@
-//! BlackBook L1 — Application state, CLI config, constants, and request/response types.
+﻿//! BlackBook L1 ΓÇö Application state, CLI config, constants, and request/response types.
 //!
 //! This module contains all the type definitions used across the codebase:
 //! - CLI argument parsing (`NodeConfig`, `NodeMode`)
@@ -30,7 +30,7 @@ pub const VERSION: &str = "5.0.2";
 pub const NETWORK: &str = "mainnet-beta";
 pub const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
 
-/// PoH Configuration (400ms slots — matching Solana for max TPS)
+/// PoH Configuration (400ms slots ΓÇö matching Solana for max TPS)
 pub const POH_SLOT_DURATION_MS: u64 = 400;
 pub const POH_HASHES_PER_TICK: u64 = 12500;
 pub const POH_TICKS_PER_SLOT: u64 = 64;
@@ -63,7 +63,7 @@ impl std::fmt::Display for NodeMode {
     }
 }
 
-/// BlackBook L1 — Consortium / Permissioned Settlement Layer
+/// BlackBook L1 ΓÇö Consortium / Permissioned Settlement Layer
 #[derive(Parser, Debug)]
 #[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
 pub struct NodeConfig {
@@ -229,7 +229,7 @@ pub struct AppState {
     pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
     pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
 
-    // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
+    // Faucet rate-limiter: address ΓåÆ (epoch_at_claim, total_minted_this_epoch)
     pub faucet_claims: Arc<dashmap::DashMap<String, (u64, u64)>>,
 
     // ===== Global Escrow Smart Contract =====
@@ -237,13 +237,13 @@ pub struct AppState {
     pub l2_sequencer_pubkey: String,
     /// Allowlist of L2 sequencer hex pubkeys (superset of l2_sequencer_pubkey).
     pub l2_sequencer_allowlist: std::collections::HashSet<String>,
-    /// Per-market merkle roots: market_id → [u8; 32] (raw SHA-256 root)
+    /// Per-market merkle roots: market_id ΓåÆ [u8; 32] (raw SHA-256 root)
     pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
-    /// Double-withdrawal protection: "{market_id}:{address}" → true
+    /// Double-withdrawal protection: "{market_id}:{address}" ΓåÆ true
     pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
 
     // ===== Universal Rollup Hub Auth =====
-    /// Maps rollup_id ("L2", "L3", "L5") → authorized sequencer pubkey (64-char hex).
+    /// Maps rollup_id ("L2", "L3", "L5") ΓåÆ authorized sequencer pubkey (64-char hex).
     pub authorized_sequencers: Arc<dashmap::DashMap<String, String>>,
 
     // ===== Contest Settlement State =====
@@ -257,7 +257,6 @@ pub struct AppState {
     pub bridge_authority_pubkey: String,
 
     // ===== Withdrawal Gateway =====
-    pub dealer_address: String,
     pub withdrawal_requests: Arc<dashmap::DashMap<String, layer1::storage::WithdrawalRecord>>,
     pub withdrawal_seq_counter: Arc<std::sync::atomic::AtomicU64>,
     pub withdrawal_window_start: Arc<std::sync::atomic::AtomicU64>,

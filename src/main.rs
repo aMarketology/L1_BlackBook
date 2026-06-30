@@ -1412,84 +1412,6 @@ struct UsdcTransferRequest {
     nonce: String,
 }
 
-#[derive(Deserialize)]
-#[cfg(feature = "unsafe_admin")]
-struct DealerSendWusdcRequest {
-    /// Recipient wallet address (base58) — the buyer's BB wallet
-    to: String,
-    /// Amount of wUSDT to send (human units, e.g. 5.0 = 5 wUSDT)
-    amount: f64,
-}
-
-/// POST /admin/dealer/send_wusdt — Transfer wUSDT from the dealer's ATA to a buyer's ATA.
-///
-/// Used when a user has purchased wUSDT and the dealer owes them the on-chain tokens.
-/// Requires DEALER_PRIVATE_KEY to be set — the dealer address is the sender.
-#[cfg(feature = "unsafe_admin")]
-async fn dealer_send_wusdt_handler(
-    State(state): State<AppState>,
-    Json(req): Json<DealerSendWusdcRequest>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "DEALER_PRIVATE_KEY not configured on this node"
-        })));
-    }
-    if req.amount <= 0.0 || req.to.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "amount must be > 0 and to must not be empty"
-        })));
-    }
-
-    let dealer_pubkey = match bs58::decode(&state.dealer_address).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            Pubkey::new_from_array(arr)
-        }
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Dealer address is invalid"
-        }))),
-    };
-    let to_pubkey = match bs58::decode(&req.to).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            Pubkey::new_from_array(arr)
-        }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Invalid recipient address"
-        }))),
-    };
-
-    let mint       = usdc_mint_bytes();
-    let raw_amount = (req.amount * USDC_UNIT as f64).round() as u64;
-
-    match SplTokenEngine::transfer_tokens(
-        &state.blockchain.svm_accounts, &mint, &dealer_pubkey, &to_pubkey, raw_amount,
-    ) {
-        Ok(result) => {
-            info!("💸 DEALER→BUYER wUSDT: {:.6} to {} (dealer bal: {:.6})",
-                req.amount, req.to,
-                result.from_balance as f64 / USDC_UNIT as f64);
-            let _ = state.blockchain.svm_accounts.flush_block();
-            (StatusCode::OK, Json(serde_json::json!({
-                "success": true,
-                "sent_wusdt": req.amount,
-                "from": state.dealer_address,
-                "to": req.to,
-                "dealer_ata": result.from_ata,
-                "recipient_ata": result.to_ata,
-                "dealer_remaining_wusdt": result.from_balance as f64 / USDC_UNIT as f64,
-                "recipient_wusdt_balance": result.to_balance as f64 / USDC_UNIT as f64,
-            })))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("{:?}", e)
-        }))),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SWAP POOL PDA ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1672,57 +1594,9 @@ async fn admin_set_swap_rate_handler(
     })))
 }
 
-/// GET /dealer/balances — Returns the dealer's BB and wUSDT balances.
-///
-/// This is a read-only health/monitoring endpoint. Returns HTTP 503 if the dealer
-/// address is not configured (DEALER_PRIVATE_KEY env var not set).
-async fn dealer_balances_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT, LAMPORTS_PER_BB};
-
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "Dealer not configured — set DEALER_PRIVATE_KEY environment variable"
-        }))).into_response();
-    }
-
-    let addr = &state.dealer_address;
-
-    // BB balance
-    let bb_lamports = state.blockchain.get_balance_lamports(addr);
-    let bb_balance  = bb_lamports as f64 / LAMPORTS_PER_BB as f64;
-
-    // wUSDT balance (via SPL token engine)
-    let wusdt_raw = match bs58::decode(addr).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            let pk = Pubkey::new_from_array(arr);
-            SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &usdc_mint_bytes(), &pk)
-        }
-        _ => 0u64,
-    };
-    let wusdt_balance = wusdt_raw as f64 / USDC_UNIT as f64;
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "dealer_address": addr,
-        "bb": {
-            "balance": bb_balance,
-            "lamports": bb_lamports,
-            "unit": "BB"
-        },
-        "wusdt": {
-            "balance": wusdt_balance,
-            "raw": wusdt_raw,
-            "unit": "wUSDT"
-        }
-    }))).into_response()
-}
-
 /// POST /admin/usdc/mint — Mint USDC tokens to a wallet's ATA
 ///
 /// Called when bridge deposits arrive or for initial liquidity seeding.
-/// Only the Dealer (mint authority) should call this in production.
 #[cfg(feature = "unsafe_admin")]
 async fn usdc_mint_handler(
     State(state): State<AppState>,
@@ -2590,7 +2464,6 @@ fn build_router(state: AppState) -> Router {
         .route("/chain/volume", get(chain_volume_handler))
         .route("/supply/audit", get(supply_audit_handler))
         .route("/balance/:address", get(balance_handler))
-        .route("/dealer/balances", get(dealer_balances_handler))
         .route("/tx/:tx_id", get(transaction_details_handler))
         .route("/address/:address/transactions", get(address_transactions_handler))
         .route("/ledger", get(ledger_handler))
@@ -2699,7 +2572,6 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/backup/status", get(backup_status_handler))
             // Admin USDC
             .route("/admin/usdc/mint", post(usdc_mint_handler))
-            .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
             .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
             .route("/admin/swap/set_rate", post(admin_set_swap_rate_handler))
             // Oracle (admin-only registration)
@@ -2960,26 +2832,6 @@ async fn main() {
         blockchain.load_withdrawal_seq_counter(),
     ));
 
-    // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
-    let dealer_address: String = match std::env::var("DEALER_PRIVATE_KEY") {
-        Ok(hex_key) if hex_key.len() == 64 => {
-            match hex::decode(&hex_key) {
-                Ok(bytes) => match bytes.as_slice().try_into() as Result<[u8; 32], _> {
-                    Ok(arr) => {
-                        use ed25519_dalek::SigningKey;
-                        let sk = SigningKey::from_bytes(&arr);
-                        let addr = bs58::encode(sk.verifying_key().to_bytes()).into_string();
-                        info!("💼 Dealer address: {}", addr);
-                        addr
-                    }
-                    Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY wrong length"); String::new() }
-                },
-                Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY invalid hex"); String::new() }
-            }
-        }
-        _ => { info!("ℹ️  DEALER_PRIVATE_KEY not set — dealer swap/withdrawal disabled"); String::new() }
-    };
-
     // Recover escrow state from ReDB (market roots + claims)
     let market_roots: Arc<dashmap::DashMap<String, [u8; 32]>> = Arc::new(dashmap::DashMap::new());
     let withdrawal_claims: Arc<dashmap::DashMap<String, bool>> = Arc::new(dashmap::DashMap::new());
@@ -3064,7 +2916,10 @@ async fn main() {
     let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
     {
         let mut schedule = leader_schedule.write();
-        if !approved_validators.is_empty() {
+        // In Validator mode, populate multi-validator schedule from config.toml.
+        // In Writer/Reader mode, use single-validator fallback (always produce).
+        let use_multi_validator = config.mode == NodeMode::Validator && !approved_validators.is_empty();
+        if use_multi_validator {
             // Multi-validator: populate from registry (config.toml or env var).
             let mut total_stake = 0u64;
             for v in approved_validators.all() {
@@ -3240,6 +3095,7 @@ async fn main() {
 
         let validator_id_for_loop = validator_id.clone();
         let relay_tx = block_sender.clone();
+        let is_writer_mode = config.mode == NodeMode::Writer;
 
         // ── Turbine Tick Streaming service (Writer mode only) ──────────────────
         if let Some(tick_rx) = tick_rx_for_service {
@@ -3273,10 +3129,9 @@ async fn main() {
                     interval.tick().await;
                     let slot = slot_arc.load(Ordering::Relaxed);
 
-                    // ── Leader timeout detection (Phase 6) ─────────────────
-                    // If we're not the leader, check whether the scheduled leader
-                    // has produced a block recently. If not, skip past their tenure.
-                    let is_leader = bp.is_current_leader();
+                    // In Writer mode: always produce blocks (single-writer legacy).
+                    // In Validator mode: only produce when scheduled as leader.
+                    let is_leader = is_writer_mode || bp.is_current_leader();
                     if !is_leader {
                         let current_leader = ls.read().get_leader(slot);
                         if current_leader != last_leader {
@@ -3647,7 +3502,6 @@ async fn main() {
         custody_watcher: custody_watcher.clone(),
         bsc_watcher: bsc_watcher_arc.clone(),
         bridge_authority_pubkey: std::env::var("BRIDGE_AUTHORITY_PUBKEY").unwrap_or_default(),
-        dealer_address,
         withdrawal_requests,
         withdrawal_seq_counter,
         withdrawal_window_start: Arc::new(std::sync::atomic::AtomicU64::new(0)),

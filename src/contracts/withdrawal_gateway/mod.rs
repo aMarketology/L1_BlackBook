@@ -6,6 +6,7 @@ use crate::AppState;
 use crate::storage::WithdrawalRecord;
 use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
 use crate::svm::spl_token::derive_ata_address;
+use crate::svm::swap_pool_pda;
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
@@ -139,12 +140,7 @@ pub async fn withdraw_request_handler(
         })));
     }
 
-    // ── Check dealer address is configured ───────────────────────────────
-    if state.dealer_address.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "Withdrawal gateway not configured (DEALER_PRIVATE_KEY missing)"
-        })));
-    }
+    // ── Protocol reserve PDA (replaces legacy dealer address) ────────────
 
     // ── Rolling 24h withdrawal cap ────────────────────────────────────────
     // Prevents a compromised DEALER_PRIVATE_KEY from draining all wUSDT.
@@ -178,12 +174,7 @@ pub async fn withdraw_request_handler(
             "error": "Invalid wallet_address (must be base58)"
         }))),
     };
-    let dealer_pubkey = match Pubkey::from_str(&state.dealer_address) {
-        Ok(pk) => pk,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Dealer address configuration error"
-        }))),
-    };
+    let dealer_pubkey = swap_pool_pda();
 
     // ── Check user wUSDT balance ──────────────────────────────────────────
     let mint = usdc_mint_bytes();
@@ -348,23 +339,22 @@ pub async fn withdraw_release_handler(
         .unwrap_or_default()
         .as_secs();
 
-    // ── BURN wUSDT from dealer (zero-sum: real USDC leaves custody, wUSDT leaves supply) ─
+    // ── BURN wUSDT from protocol reserve (zero-sum: real USDC leaves custody, wUSDT leaves supply) ─
     {
         let mint = usdc_mint_bytes();
         let raw_amount = record.wusdt_amount_micro;
-        if let Ok(dealer_pubkey) = state.dealer_address.parse::<solana_sdk::pubkey::Pubkey>() {
-            match crate::svm::SplTokenEngine::burn(
-                &state.blockchain.svm_accounts,
-                &mint,
-                &dealer_pubkey,
-                raw_amount,
-            ) {
-                Ok(_) => {
-                    let _ = state.blockchain.svm_accounts.flush_block();
-                    info!("🔥 Burned {:.6} wUSDT from dealer (withdrawal {})", record.wusdt_amount_micro as f64 / USDC_UNIT as f64, &req.withdrawal_id[..8]);
-                }
-                Err(e) => tracing::warn!("⚠️  wUSDT burn on release failed — supply may be inflated: {:?}", e),
+        let dealer_pubkey = swap_pool_pda();
+        match crate::svm::SplTokenEngine::burn(
+            &state.blockchain.svm_accounts,
+            &mint,
+            &dealer_pubkey,
+            raw_amount,
+        ) {
+            Ok(_) => {
+                let _ = state.blockchain.svm_accounts.flush_block();
+                info!("🔥 Burned {:.6} wUSDT from protocol reserve (withdrawal {})", record.wusdt_amount_micro as f64 / USDC_UNIT as f64, &req.withdrawal_id[..8]);
             }
+            Err(e) => tracing::warn!("⚠️  wUSDT burn on release failed — supply may be inflated: {:?}", e),
         }
     }
 
