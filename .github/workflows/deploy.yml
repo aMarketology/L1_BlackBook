@@ -1,30 +1,30 @@
 # ============================================================================
-# BlackBook L1 — CI/CD: Build on GitHub Actions → Deploy pre-built to Hetzner
+# BlackBook L1 — CI/CD: Build on GitHub Actions → Deploy pre-built to production
 # ============================================================================
 #
-# HOW IT WORKS (hot upgrade — no Rust compile on Hetzner):
+# HOW IT WORKS (hot upgrade — no Rust compile on the server):
 #   [build job]  GitHub Actions runner (ubuntu-latest, 2-core) compiles Rust
 #                and builds a Docker image with layer caching via GitHub Cache.
 #                Pushes image to GitHub Container Registry (GHCR).
-#   [deploy job] SSH to Hetzner: pulls the pre-built image (~30 s), tags it
+#   [deploy job] SSH to the server: pulls the pre-built image (~30 s), tags it
 #                as the local compose image, restarts the container, polls /live.
 #
 # DEPLOY TIMES:
 #   First push   — ~15 min  (cold compile, no cache)
 #   Subsequent   — ~3-5 min (incremental, Docker layer cache restored from GHA)
-#   Hetzner step — ~30-60 s (just docker pull + restart, no compile)
+#   Server step  — ~30-60 s (just docker pull + restart, no compile)
 #
 # REQUIRED GITHUB SECRETS  (Settings → Secrets and variables → Actions):
-#   HETZNER_HOST      — VPS hostname or IP, e.g. layer1.blackbook.id
-#   HETZNER_USER      — SSH user, e.g. root
-#   HETZNER_SSH_KEY   — Full private SSH key (including -----BEGIN/END----- lines)
+#   SSH_HOST          — server hostname or IP, e.g. 74.50.74.126
+#   SSH_USER          — SSH user, e.g. root
+#   DEPLOY_SSH_KEY    — Full private SSH key (including -----BEGIN/END----- lines)
 #
 # GHCR auth uses the automatic GITHUB_TOKEN — no extra secrets needed.
 # The image is private by default (same visibility as the repo).
 # To make it public: https://github.com/orgs/aMarketology/packages → Change visibility
 # ============================================================================
 
-name: CI/CD → Hetzner
+name: CI/CD → Production (L1)
 
 on:
   push:
@@ -72,9 +72,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Job 2: Pull pre-built image on Hetzner and restart ────────────────────
+  # ── Job 2: Pull pre-built image on the server and restart ─────────────────
   deploy:
-    name: Deploy to Hetzner
+    name: Deploy to Production
     runs-on: ubuntu-latest
     needs: build          # only run after image is pushed
     timeout-minutes: 10
@@ -85,15 +85,15 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
-          # Pass GITHUB_TOKEN + actor into the SSH session so Hetzner can
+          # Pass GITHUB_TOKEN + actor into the SSH session so the server can
           # authenticate to GHCR (the token is valid for the duration of this job).
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
           IMAGE_REF: ${{ env.IMAGE }}:${{ github.sha }}
         with:
-          host: ${{ secrets.HETZNER_HOST }}
-          username: ${{ secrets.HETZNER_USER }}
-          key: ${{ secrets.HETZNER_SSH_KEY }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
           envs: GH_TOKEN,GH_ACTOR,IMAGE_REF
           command_timeout: 8m
           script: |
