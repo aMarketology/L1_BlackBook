@@ -2347,6 +2347,17 @@ async fn reader_proxy_middleware(
         return next.run(req).await;
     };
 
+    // In validator mode the writer_http_url is always set, but when this node
+    // IS the current leader it must handle writes itself — not proxy to itself.
+    // Without this check a single-validator setup creates a self-loop → 502.
+    {
+        let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
+        let current_leader = state.leader_schedule.read().get_leader(current_slot);
+        if state.validator_id == current_leader {
+            return next.run(req).await;
+        }
+    }
+
     let method = req.method().clone();
     // Only proxy state-changing methods
     if !matches!(
@@ -3076,6 +3087,7 @@ async fn main() {
                 block_producer.clone(),
                 deposit_requests.clone(),
                 balance_event_tx.clone(),
+                withdrawal_claims.clone(),
             );
             tokio::spawn(async move {
                 let addr: std::net::SocketAddr = match format!("0.0.0.0:{}", settlement_port).parse() {

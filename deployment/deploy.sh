@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# BlackBook L1 — Deploy to Hetzner (run from your local machine)
+# BlackBook L1 — Deploy to production server (run from your local machine)
 # ============================================================================
 # Usage (first deploy OR after secrets change):
 #   bash deployment/deploy.sh <SERVER_IP> --push-env
@@ -29,7 +29,7 @@ done
 
 echo ""
 echo "╔═══════════════════════════════════════════════════════╗"
-echo "║    BlackBook L1 — Deploy to Hetzner                  ║"
+echo "║    BlackBook L1 — Deploy to production server         ║"
 echo "╠═══════════════════════════════════════════════════════╣"
 echo "║  Target : $SERVER_IP"
 echo "╚═══════════════════════════════════════════════════════╝"

@@ -45,6 +45,7 @@ use proto::{
     SubmitPendingRootRequest, SubmitPendingRootResponse,
     ContestStatusRequest, ContestStatusResponse,
     SyncBridgeRequest, SyncBridgeResponse,
+    DistributePayoutsRequest, DistributePayoutsResponse, PayoutResult,
 };
 use crate::storage::{OracleSignature, PendingRoot, PendingRootStatus};
 
@@ -91,6 +92,10 @@ pub struct BlackBookSettlementService {
     pub deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
     /// Broadcast channel for per-block balance update events (L2 streaming feed).
     pub balance_event_tx: broadcast::Sender<BalanceUpdateEvent>,
+    /// Shared double-payout guard (same `Arc` as the HTTP /escrow/withdraw path).
+    /// Keyed by "{contest_id}:{wallet}" — prevents paying a winner twice across
+    /// the dealer-push (DistributePayouts) and manual-withdraw paths.
+    pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
     start_time: Instant,
 }
 
@@ -106,6 +111,7 @@ impl BlackBookSettlementService {
         block_producer: Arc<BlockProducer>,
         deposit_requests: Arc<dashmap::DashMap<String, crate::storage::DepositRecord>>,
         balance_event_tx: broadcast::Sender<BalanceUpdateEvent>,
+        withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
     ) -> Self {
         Self {
             blockchain,
@@ -117,6 +123,7 @@ impl BlackBookSettlementService {
             block_producer,
             deposit_requests,
             balance_event_tx,
+            withdrawal_claims,
             start_time: Instant::now(),
         }
     }
@@ -706,6 +713,232 @@ impl SettlementService for BlackBookSettlementService {
             node_id: req.node_id,
             latest_slot,
             uptime_secs,
+        }))
+    }
+
+    // ── DistributePayouts ──────────────────────────────────────────────────
+    //
+    // Dealer-pushed automatic settlement. Mirrors the /escrow/withdraw claim
+    // path, but the sequencer triggers it once for all winners instead of each
+    // winner submitting their own tx.
+    //
+    // Security:
+    //   1. Contest must be SETTLED (root already posted via SubmitMerkleRoot).
+    //   2. Sequencer signs contest_id ++ STORED_root ++ timestamp_le8. L1 uses
+    //      its OWN stored root, so the dealer can never sign against a forged
+    //      root, and pubkey must be in the L2 sequencer allowlist.
+    //   3. Each winner's payout is bound by a Merkle proof against the stored
+    //      root (dealer can't alter amounts), and the wallet is inside the leaf
+    //      hash (dealer can't redirect funds).
+    //   4. The same `withdrawal_claims` guard as /escrow/withdraw prevents a
+    //      winner from being paid twice across the push and manual paths.
+    async fn distribute_payouts(
+        &self,
+        request: Request<DistributePayoutsRequest>,
+    ) -> Result<Response<DistributePayoutsResponse>, Status> {
+        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+        use sha2::{Sha256, Digest};
+
+        let req = request.into_inner();
+        info!("💸 DistributePayouts: contest={} winners={}", req.contest_id, req.payouts.len());
+
+        // ── Validate ──────────────────────────────────────────────────────
+        if req.contest_id.is_empty() {
+            return Err(Status::invalid_argument("contest_id is required"));
+        }
+        if req.sequencer_pubkey.len() != 32 {
+            return Err(Status::invalid_argument("sequencer_pubkey must be 32 bytes"));
+        }
+        if req.sequencer_sig.len() != 64 {
+            return Err(Status::invalid_argument("sequencer_sig must be 64 bytes"));
+        }
+        if req.payouts.is_empty() {
+            return Err(Status::invalid_argument("payouts must not be empty"));
+        }
+
+        // ── Load the settled contest + its STORED Merkle root ─────────────
+        let contest = match self.contest_states.get(&req.contest_id) {
+            Some(c) => c.clone(),
+            None => match self.blockchain.load_contest_state(&req.contest_id) {
+                Ok(Some(c)) => c,
+                _ => return Err(Status::not_found("Contest not found")),
+            },
+        };
+        if contest.status != ContestStatus::Settled {
+            return Err(Status::failed_precondition(format!(
+                "Contest not settled (status: {:?}) — root must be posted first",
+                contest.status
+            )));
+        }
+        let stored_root: [u8; 32] = contest.merkle_root;
+
+        // ── Timestamp freshness (120s window) ─────────────────────────────
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if (now as i64 - req.timestamp).abs() > 120 {
+            return Err(Status::unauthenticated("Timestamp outside 120s freshness window"));
+        }
+
+        // ── Sequencer allowlist ───────────────────────────────────────────
+        let pubkey_hex = hex::encode(&req.sequencer_pubkey);
+        if !self.l2_sequencer_allowlist.is_empty()
+            && !self.l2_sequencer_allowlist.contains(&pubkey_hex)
+        {
+            return Err(Status::permission_denied(format!(
+                "Sequencer pubkey {} is not in the allowlist", pubkey_hex
+            )));
+        }
+
+        // ── Verify signature over contest_id ++ stored_root ++ timestamp_le8 ─
+        {
+            let verifying_key = VerifyingKey::from_bytes(
+                req.sequencer_pubkey.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_pubkey must be 32 bytes"))?
+            ).map_err(|e| Status::internal(format!("Bad sequencer key: {}", e)))?;
+
+            let mut msg: Vec<u8> = Vec::with_capacity(req.contest_id.len() + 32 + 8);
+            msg.extend_from_slice(req.contest_id.as_bytes());
+            msg.extend_from_slice(&stored_root);
+            msg.extend_from_slice(&req.timestamp.to_le_bytes());
+
+            let sig = Signature::from_bytes(
+                req.sequencer_sig.as_slice().try_into()
+                    .map_err(|_| Status::invalid_argument("sequencer_sig must be 64 bytes"))?
+            );
+            verifying_key.verify(&msg, &sig)
+                .map_err(|_| Status::unauthenticated("Sequencer signature verification failed"))?;
+        }
+
+        // ── Claim-window enforcement ──────────────────────────────────────
+        let current_slot = self.current_slot.load(Ordering::Relaxed);
+        if contest.claim_deadline_slot > 0 && current_slot > contest.claim_deadline_slot {
+            return Err(Status::failed_precondition("Claim window has expired for this contest"));
+        }
+
+        // Same escrow vault the /escrow/withdraw path pays from.
+        #[allow(deprecated)]
+        let escrow_addr = crate::svm::escrow_vault_address();
+
+        // ── Per-winner: verify proof → guard → transfer ───────────────────
+        let mut results: Vec<PayoutResult> = Vec::with_capacity(req.payouts.len());
+        for leaf in req.payouts {
+            // Decode wallet → raw 32-byte pubkey (must match L2 leaf format).
+            let pubkey_raw_32: [u8; 32] = match bs58::decode(&leaf.wallet).into_vec() {
+                Ok(b) if b.len() == 32 => {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                }
+                _ => {
+                    results.push(PayoutResult {
+                        wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                        error: "wallet must be a base58-encoded 32-byte pubkey".into(),
+                    });
+                    continue;
+                }
+            };
+
+            // Leaf hash: SHA-256(pubkey_raw_32 ++ amount_bb.to_le_bytes(8)).
+            let mut hasher = Sha256::new();
+            hasher.update(pubkey_raw_32);
+            hasher.update(leaf.amount_bb.to_le_bytes());
+            let mut current: [u8; 32] = hasher.finalize().into();
+
+            // Walk the proof — sorted-pair SHA-256 (smaller 32-byte hash first).
+            let mut proof_valid = true;
+            for sibling in &leaf.proof {
+                if sibling.len() != 32 {
+                    proof_valid = false;
+                    break;
+                }
+                let mut sib = [0u8; 32];
+                sib.copy_from_slice(sibling);
+                let mut h = Sha256::new();
+                if current <= sib {
+                    h.update(current);
+                    h.update(sib);
+                } else {
+                    h.update(sib);
+                    h.update(current);
+                }
+                current = h.finalize().into();
+            }
+            if !proof_valid {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: "proof node must be exactly 32 bytes".into(),
+                });
+                continue;
+            }
+            if current != stored_root {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: "Invalid Merkle proof".into(),
+                });
+                continue;
+            }
+
+            // Double-claim guard (shared with /escrow/withdraw).
+            let claim_key = format!("{}:{}", req.contest_id, leaf.wallet);
+            if self.withdrawal_claims.contains_key(&claim_key) {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: "Already claimed".into(),
+                });
+                continue;
+            }
+
+            // amount_bb is in BB lamports (5 decimals, LAMPORTS_PER_BB = 100_000).
+            // Pass directly — no unit conversion needed.
+            let amount_lamports = leaf.amount_bb;
+            if amount_lamports == 0 {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: "payout amount too small (< 1 lamport)".into(),
+                });
+                continue;
+            }
+
+            // Transfer escrow → winner and seal the claim in one atomic ReDB txn.
+            match self.blockchain.atomic_escrow_claim_and_pay(
+                &claim_key, &escrow_addr, &leaf.wallet, amount_lamports, now,
+            ) {
+                Ok(()) => {
+                    self.withdrawal_claims.insert(claim_key.clone(), true);
+
+                    // Update total_claimed (SPL units) on the ContestState.
+                    if let Some(entry) = self.contest_states.get(&req.contest_id) {
+                        let mut snap = entry.clone();
+                        drop(entry);
+                        snap.total_claimed = snap.total_claimed.saturating_add(leaf.amount_bb);
+                        if self.blockchain.store_contest_state(&snap).is_ok() {
+                            self.contest_states.insert(req.contest_id.clone(), snap);
+                        }
+                    }
+
+                    let tx_hash = uuid::Uuid::new_v4().to_string();
+                    info!("💸 payout {} lamports → {} (contest {})",
+                        amount_lamports, leaf.wallet, req.contest_id);
+                    results.push(PayoutResult {
+                        wallet: leaf.wallet, success: true, tx_hash, error: String::new(),
+                    });
+                }
+                Err(e) => {
+                    results.push(PayoutResult {
+                        wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                        error: format!("transfer failed: {}", e),
+                    });
+                }
+            }
+        }
+
+        let all_success = results.iter().all(|r| r.success);
+        Ok(Response::new(DistributePayoutsResponse {
+            all_success,
+            results,
+            error_message: String::new(),
         }))
     }
 }

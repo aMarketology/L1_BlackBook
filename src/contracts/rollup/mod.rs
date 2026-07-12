@@ -73,7 +73,7 @@ struct NftClaimLeaf<'a> {
     /// Always "NFT"
     token: &'a str,
     collection_id: &'a str,
-    token_id: u64,
+    token_id: &'a str,
     /// 32-byte Ed25519 public key of the current owner
     owner: [u8; 32],
     /// SHA-256 hex of the NFT metadata JSON (64 ASCII chars)
@@ -541,8 +541,8 @@ pub struct ExitRequest {
     // ── NFT-specific fields (required when asset_type == "NFT") ───────────
     /// NFT collection identifier (e.g. "BLACKBOOK_GENESIS").
     pub collection_id: Option<String>,
-    /// Token ID within the collection (numeric, stringified in the leaf).
-    pub nft_token_id: Option<u64>,
+    /// Token ID within the collection (arbitrary string, e.g. "genesis-001" or "42").
+    pub nft_token_id: Option<String>,
     /// IPFS / Arweave URI for the NFT metadata JSON.
     pub metadata_uri: Option<String>,
     /// SHA-256 hex of the metadata JSON (content-addressed integrity check).
@@ -600,7 +600,7 @@ pub(crate) fn bb_leaf_hash(rollup_id: &str, address_bytes: [u8; 32], lamports: u
 pub(crate) fn nft_leaf_hash(
     rollup_id: &str,
     collection_id: &str,
-    token_id: u64,
+    token_id: &str,
     owner_bytes: [u8; 32],
     metadata_hash: &str,
 ) -> String {
@@ -744,9 +744,9 @@ pub async fn exit_handler(
                     "error": "collection_id is required for NFT exits."
                 }))),
             };
-            let tok = match req.nft_token_id {
-                Some(v) => v,
-                None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            let tok = match &req.nft_token_id {
+                Some(v) if !v.is_empty() => v.clone(),
+                _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                     "error": "nft_token_id is required for NFT exits."
                 }))),
             };
@@ -757,7 +757,7 @@ pub async fn exit_handler(
                 }))),
             };
             // Borsh leaf: SHA-256( borsh(NftClaimLeaf { rollup_id, "NFT", collection_id, token_id, owner[32], metadata_hash }) )
-            let leaf = nft_leaf_hash(&rollup_id, &col, tok, addr_bytes, &mhash);
+            let leaf = nft_leaf_hash(&rollup_id, &col, &tok, addr_bytes, &mhash);
             // NFT exit_id: keyed by (collection, token) — once exited, never again.
             let exit_id = format!("{}:NFT:{}:{}", rollup_id, col, tok);
             (leaf, exit_id)
@@ -864,7 +864,7 @@ pub async fn exit_handler(
         // ── NFT branch: verify uniqueness → mint on L1 via nft_bridge ──────
         "NFT" => {
             let col = req.collection_id.as_ref().unwrap().clone();
-            let tok = req.nft_token_id.unwrap().to_string();
+            let tok = req.nft_token_id.clone().unwrap();
             let metadata_uri = match &req.metadata_uri {
                 Some(u) if !u.is_empty() => u.clone(),
                 _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({

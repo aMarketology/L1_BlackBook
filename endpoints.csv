@@ -1,0 +1,94 @@
+Section,Method,Path,Auth,Signed Message (exact server-verified format)
+Node Health & Observability,GET,/health,—,Full node status — version / slot / PoH hash / block age / leader / supply
+Node Health & Observability,GET,/live,—,Kubernetes liveness probe — always 200 while process is up
+Node Health & Observability,GET,/ready,—,Kubernetes readiness probe — 200 when synced + healthy
+Node Health & Observability,GET,/metrics,—,Prometheus-format metrics
+Node Health & Observability,GET,/ws,—,WebSocket upgrade — subscribe to live balance/tx events
+Node Health & Observability,GET,/stats,—,Pipeline + Sealevel execution statistics
+Node Health & Observability,GET,/chain/volume,—,24h rolling $BB transfer volume
+Node Health & Observability,GET,/supply/audit,—,"Total BB minted, circulating supply, locked in escrow/rollup vaults"
+Accounts & Balances,GET,/balance/:address,—,$BB balance — returns whole BB float (legacy). Use lamports endpoint for financial logic.
+Accounts & Balances,GET,/usdc/balance/:address,—,wUSDT balance — u64 micro-units (6 decimals)
+Accounts & Balances,GET,/usdc/supply,—,Total wUSDT supply in circulation
+Accounts & Balances,GET,/usdc/accounts/:address,—,SPL token accounts for address
+Accounts & Balances,GET,/wusdt/balance/:address,—,Alias → /usdc/balance/:address
+Accounts & Balances,GET,/wusdt/supply,—,Alias → /usdc/supply
+Accounts & Balances,GET,/wusdt/accounts/:address,—,Alias → /usdc/accounts/:address
+Accounts & Balances,GET,/wusdc/balance/:address,—,Alias → /usdc/balance/:address
+Accounts & Balances,GET,/wusdc/supply,—,Alias → /usdc/supply
+Accounts & Balances,GET,/wusdc/accounts/:address,—,Alias → /usdc/accounts/:address
+Transaction Ledger & Explorer,GET,/ledger,—,Paginated full transaction ledger (query: ?page=&limit=)
+Transaction Ledger & Explorer,GET,/tx/:tx_id,—,Full transaction detail by ID
+Transaction Ledger & Explorer,GET,/address/:address/transactions,—,All transactions for an address
+Transaction Ledger & Explorer,GET,/txs/:address,—,Alias → /address/:address/transactions
+Transfers,POST,/transfer,Ed25519 (custom),"[chain_id_byte] + JSON_payload + ""\n"" + timestamp + ""\n"" + nonce — payload = {to, amount}"
+Transfers,POST,/transfer/simple,Ed25519 (custom),Same handler and same signing scheme as /transfer
+Transfers,POST,/usdc/transfer,Ed25519,"USDC_TRANSFER:{from}:{from}:{to}:{raw_micro_usdt}:{ts}:{nonce} — raw_micro_usdt = floor(amount × 1_000_000)"
+Transfers,POST,/wusdt/transfer,Ed25519,Alias → /usdc/transfer (same handler + same message format)
+Transfers,POST,/wusdc/transfer,Ed25519,Alias → /usdc/transfer (same handler + same message format)
+Faucet,POST,/faucet,Ed25519,"FAUCET:{wallet_address}:{amount}:{timestamp}:{nonce} — rate-limited per wallet"
+PoH & Blocks,GET,/poh/status,—,"Current PoH hash, tick count, slot, epoch"
+PoH & Blocks,GET,/poh/block/latest,—,Most recent finalized block
+PoH & Blocks,GET,/poh/block/:slot,—,Block by slot number
+PoH & Blocks,GET,/poh/transactions/recent,—,Recent transactions across all blocks
+PoH & Blocks,GET,/poh/tx/:tx_id/status,—,Transaction confirmation status via PoH chain
+PoH & Blocks,GET,/blocks,—,Alias → /poh/block/latest
+PoH & Blocks,GET,/blocks/latest,—,Alias → /poh/block/latest
+Consensus & Network,GET,/consensus/tower,—,"Tower BFT vote state, lockout levels, commitment depth"
+Consensus & Network,GET,/turbine/status,—,Turbine shred propagation stats (VIP-whitelisted mesh only)
+Consensus & Network,GET,/validators,—,"Full validator set — stake weights, HTTP ports, current scheduled leader"
+Sealevel (Gulf Stream),POST,/sealevel/submit,Ed25519,Submit tx directly into Gulf Stream → Sealevel parallel execution pipeline
+Swap BB ↔ wUSDT,POST,/swap/bb-to-usdc,Ed25519,"SWAP_BB_USDC:{wallet}:{bb_amount}:{ts}:{nonce} — fixed rate: 10 BB = 1 wUSDT"
+Swap BB ↔ wUSDT,POST,/swap/usdc-to-bb,Ed25519,"SWAP_USDC_BB:{wallet}:{usdc_amount}:{ts}:{nonce}"
+Swap BB ↔ wUSDT,GET,/swap/pool/balances,—,Current BB + wUSDT reserves in the swap pool
+Global Escrow (L2 Settlement),POST,/escrow/deposit,Ed25519,"ESCROW_DEPOSIT:{wallet_address}:{amount_lamports}:{timestamp}:{nonce}"
+Global Escrow (L2 Settlement),POST,/escrow/submit-state-root,L2 Sequencer Ed25519,"Binary packed: market_id_bytes || l2_block_number.to_le_bytes(8) || merkle_root[32] — verified against L2_SEQUENCER_PUBKEY allowlist"
+Global Escrow (L2 Settlement),POST,/escrow/withdraw,Ed25519 + Merkle proof,"ESCROW_WITHDRAW:{market_id}:{wallet_address}:{amount_lamports}:{timestamp}:{nonce}"
+Global Escrow (L2 Settlement),GET,/escrow/status,—,Escrow contract global state overview
+Global Escrow (L2 Settlement),GET,/escrow/market/:market_id,—,Escrow info + settlement status for a market
+Global Escrow (L2 Settlement),GET,/escrow/contest/:contest_id,—,Contest-level escrow + payout breakdown
+Deposit Gateway (Bridge-In),POST,/deposit/request,Ed25519,"DEPOSIT_REQUEST:{wallet_address}:{external_tx_hash}:{amount_micro_stablecoin}:{asset}:{timestamp}:{nonce}"
+Deposit Gateway (Bridge-In),GET,/deposit/status/:tx_hash,—,Check deposit confirmation status by external chain tx hash
+Deposit Gateway (Bridge-In),POST,/deposit/claim,Ed25519,"CLAIM_DEPOSIT:{wallet_address}:{external_tx_hash}:{timestamp}:{nonce}"
+Deposit Gateway (Bridge-In),POST,/deposit/webhook/helius,Helius HMAC,Inbound Solana deposit push notification (server-to-server)
+Deposit Gateway (Bridge-In),POST,/deposit/webhook/alchemy,Alchemy signature,Inbound BSC deposit push notification (server-to-server)
+Withdrawal Gateway (Bridge-Out),POST,/withdraw/request,Ed25519,"WITHDRAW_REQUEST:{wallet_address}:{solana_destination}:{wusdt_amount_micro}:{timestamp}:{nonce}"
+Withdrawal Gateway (Bridge-Out),GET,/withdraw/status/:id,—,Check withdrawal processing status by ID
+Withdrawal Gateway (Bridge-Out),GET,/withdraw/since/:seq,—,All withdrawal records since sequence number — relayer sync endpoint
+Vault Gateway,GET,/vault/kms-pubkey,—,Returns the Ed25519 public key of the configured vault signer (KMS or local)
+Vault Gateway,POST,/vault/burn,Ed25519,"VAULT_BURN:{wallet_address}:{bb_lamports}:{timestamp}:{nonce} — burns BB and mints equal wUSDT micro-units"
+Vault Gateway,POST,/vault/claim-attestation,Ed25519,"CLAIM_ATTESTATION:{wallet_address}:{poh_slot}:{amount_usdt_micro}:{timestamp}:{nonce} — redeems a burn record"
+Oracle,GET,/oracle/nodes,—,List registered oracle nodes with $BB bond stake
+Oracle,GET,/oracle/event/:market_id,—,Finalized oracle result for a market
+Oracle,POST,/oracle/submit-pending-root,Oracle Ed25519,"ORACLE_SUBMIT:{rollup_id}:{market_id}:{outcome}:{merkle_root_hex}:{batch_id}:{timestamp}:{nonce}"
+Oracle,POST,/oracle/dispute,Ed25519,"ORACLE_DISPUTE:{market_id}:{bb_stake_lamports}:{timestamp}:{nonce} — stakes $BB to challenge a pending result"
+Oracle,POST,/oracle/vote,Oracle Ed25519,"ORACLE_VOTE:{market_id}:{vote}:{timestamp}:{nonce}"
+L3 NFT Bridge,GET,/nft/:collection_id/:token_id,—,NFT metadata anchored on L1
+L3 NFT Bridge,GET,/nft/:collection_id/:token_id/owner,—,Current L1 owner of an anchored NFT
+L3 NFT Bridge,POST,/nft/transfer,Ed25519,"NFT_TRANSFER:{from}:{collection_id}:{token_id}:{from}:{to}:{ts}:{nonce} — from appears in both action prefix and body"
+Universal Rollup Hub (L2/L3/L5),POST,/rollup/:rollup_id/lock_bb,Ed25519,"ROLLUP_LOCK_BB:{rollup_id}:{wallet_address}:{bb_lamports}:{symbol_hint}:{timestamp}:{nonce}"
+Universal Rollup Hub (L2/L3/L5),GET,/rollup/:rollup_id/locks/:lock_id,—,Fetch a specific lock record by UUID
+Universal Rollup Hub (L2/L3/L5),POST,/rollup/:rollup_id/locks/:lock_id/consume,Sequencer Ed25519,"CONSUME_LOCK:{rollup_id}:{lock_id}:{timestamp} — no nonce; timestamp freshness enforced"
+Universal Rollup Hub (L2/L3/L5),POST,/rollup/:rollup_id/submit_root,Sequencer Ed25519,"ROLLUP_SUBMIT_ROOT:{rollup_id}:{batch_id}:{merkle_root_hex}:{timestamp} — verified against registered sequencer pubkey"
+Universal Rollup Hub (L2/L3/L5),GET,/rollup/:rollup_id/roots/:batch_id,—,Retrieve anchored Merkle state root by batch ID
+Universal Rollup Hub (L2/L3/L5),POST,/rollup/:rollup_id/exit,Ed25519 + Merkle proof,"ROLLUP_EXIT:{rollup_id}:{asset_type}:{address}:{batch_id}:{timestamp}:{nonce} — asset_type = BB or NFT"
+DA Settlement Layer,GET,/da/:market_id,—,Oracle-finalized state root for a market
+DA Settlement Layer,GET,/da/:rollup_id/pool,—,Dealer vault $BB balance (house bankroll)
+DA Settlement Layer,POST,/da/claim,Ed25519 + Merkle proof,Merkle proof → vault BB release (relayer path)
+Admin (unsafe_admin feature only),POST,/admin/mint,—,Mint $BB to any address — dev/test only
+Admin (unsafe_admin feature only),POST,/admin/burn,—,Burn $BB from any address — dev/test only
+Admin (unsafe_admin feature only),POST,/admin/dealer/settle,—,Batch L2 settlement (dealer)
+Admin (unsafe_admin feature only),GET,/admin/accounts,—,All account balances
+Admin (unsafe_admin feature only),GET,/admin/security/stats,—,Throttle + circuit breaker stats
+Admin (unsafe_admin feature only),POST,/admin/backup,—,Trigger ReDB snapshot backup
+Admin (unsafe_admin feature only),GET,/admin/backup/status,—,Backup job status
+Admin (unsafe_admin feature only),POST,/admin/usdc/mint,—,Mint wUSDT to any address — dev/test only
+Admin (unsafe_admin feature only),POST,/admin/seed_swap_pool,—,Seed BB/wUSDT swap pool reserves
+Admin (unsafe_admin feature only),POST,/admin/swap/set_rate,—,Override BB↔wUSDT swap rate
+Admin (unsafe_admin feature only),POST,/oracle/register,—,Register oracle node (admin-only)
+Admin (unsafe_admin feature only),POST,/admin/deposit/approve,—,Manually approve a pending deposit
+Admin (unsafe_admin feature only),POST,/admin/withdraw/release,—,Manually release a pending withdrawal
+Off-Chain Transport,—,UDP :8003,bincode,"High-throughput tx ingestion — 8 workers. TpuPacket.amount is u64 lamports (NOT BB float)"
+Off-Chain Transport,—,gRPC :50051,protobuf,"Validator relay: GetBalance / SoftLock / SettleBet / BatchSettle / SubscribeBlocks"
+Off-Chain Transport,—,gRPC :50052,protobuf,Dealer settlement stream
+Off-Chain Transport,—,WebSocket :8080/ws,JSON,Live balance subscriptions + block events

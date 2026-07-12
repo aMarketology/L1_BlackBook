@@ -47,6 +47,14 @@ service SettlementService {
 
     // Heartbeat / TPS monitoring.
     rpc SyncBridge(SyncBridgeRequest) returns (SyncBridgeResponse);
+
+    // Dealer-pushed automatic settlement. After SubmitMerkleRoot is confirmed,
+    // the L2 dealer calls this with each winner's wallet + amount + Merkle proof.
+    // L1 verifies the dealer's sequencer signature against the allowlist, checks
+    // each proof against the STORED root, then transfers SPL directly to winners
+    // — no user action required. The dealer cannot alter amounts (bound by the
+    // proof) or redirect funds (wallet is inside the leaf hash).
+    rpc DistributePayouts(DistributePayoutsRequest) returns (DistributePayoutsResponse);
 }
 
 // ── SubscribeBalances ─────────────────────────────────────────────────────────
@@ -194,4 +202,47 @@ message SyncBridgeResponse {
     string node_id       = 1;
     uint64 latest_slot   = 2;
     uint64 uptime_secs   = 3;
+}
+
+// ── DistributePayouts ─────────────────────────────────────────────────────────
+//
+// Dealer-pushed automatic settlement (mirrors /escrow/withdraw, but triggered
+// by the sequencer instead of each winner).
+//
+// Canonical signed message (Ed25519), signed by the L2 sequencer key:
+//   msg = contest_id.as_bytes()          // variable length
+//      ++ merkle_root[32]                // the STORED root from SubmitMerkleRoot
+//      ++ timestamp.to_le_bytes(8)       // unix seconds, little-endian
+// L1 reconstructs this using its own stored root (never the request's) so the
+// dealer cannot sign against a forged root. sequencer_pubkey must be in the
+// L2 sequencer allowlist. timestamp must be within 120s of L1 wall clock.
+//
+// Per-winner leaf (must match the L2 escrow Merkle tree exactly):
+//   leaf = SHA-256( wallet_pubkey_raw_32_bytes ++ amount_bb.to_le_bytes(8) )
+// Proof combine: sorted-pair SHA-256 (smaller 32-byte hash hashed first).
+message PayoutLeaf {
+    string wallet         = 1;   // Base58 recipient wallet address (32-byte pubkey)
+    uint64 amount_bb      = 2;   // Payout in BB lamports (5 decimals, 1 BB = 100_000)
+    repeated bytes proof  = 3;   // Merkle sibling hashes (each exactly 32 bytes)
+}
+
+message DistributePayoutsRequest {
+    string              contest_id       = 1;   // Which settled market to pay out
+    repeated PayoutLeaf payouts          = 2;   // One entry per winner
+    bytes               sequencer_pubkey = 3;   // 32-byte Ed25519 verifying key
+    bytes               sequencer_sig    = 4;   // 64-byte sig over contest_id ++ root ++ ts
+    int64               timestamp        = 5;   // Unix seconds (within 120s of L1 clock)
+}
+
+message PayoutResult {
+    string wallet   = 1;
+    bool   success  = 2;
+    string tx_hash  = 3;   // Tx hash that transferred SPL to this wallet
+    string error    = 4;   // Non-empty if success=false
+}
+
+message DistributePayoutsResponse {
+    bool                  all_success   = 1;   // true only if every payout succeeded
+    repeated PayoutResult results       = 2;
+    string                error_message = 3;   // Top-level error (e.g. signature invalid)
 }
