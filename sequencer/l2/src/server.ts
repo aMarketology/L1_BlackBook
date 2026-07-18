@@ -1,7 +1,7 @@
 import express from 'express';
 import { ed25519 as ed } from '@noble/curves/ed25519';
 import { hexToBytes } from '@noble/hashes/utils';
-import { getBalance, buildMerkleTree, getLatestBatchId, submitOraclePendingRoot } from '@bb/shared';
+import { getBalance, buildMerkleTree, getLatestBatchId, submitOraclePendingRoot, pushPayoutsToL1 } from '@bb/shared';
 import type { SequencerConfig, DatabaseType, BbEntry } from '@bb/shared';
 import { registerLock } from './lockIngest.js';
 import {
@@ -275,6 +275,47 @@ export function createServer(config: SequencerConfig, db: DatabaseType) {
           SET batch_id = ?, merkle_root = ?
           WHERE market_id = ?
         `).run(sealResult.batchId, sealResult.merkleRoot, req.params.id);
+      }
+
+      // ── Push winnings to L1 wallets ────────────────────────────────────
+      // Build Merkle tree from the sealed snapshot and extract per-winner
+      // proofs, then call POST /escrow/push_payouts so BB tokens land in
+      // each winner's native L1 wallet immediately — no manual claim needed.
+      if (sealResult && payouts.length > 0) {
+        try {
+          const { getAllBalances } = await import('./markets.js');
+          const balances = getAllBalances(db);
+          const entries: BbEntry[] = balances.map(b => ({
+            type: 'BB' as const,
+            address: b.address,
+            lamports: b.lamports,
+          }));
+          const { proofs } = buildMerkleTree(config.rollupId ?? 'L2', entries);
+
+          // Map each winner payout to its proof in the tree.
+          // Skip the dealer fee entry ('dealer_reserve' is not a real L1 wallet).
+          const payoutPushes = payouts
+            .filter(p => p.wallet_address !== 'dealer_reserve' && !p.wallet_address.startsWith('dealer'))
+            .map(p => {
+              const idx = entries.findIndex(e => e.address === p.wallet_address);
+              return idx >= 0
+                ? { wallet: p.wallet_address, amountBb: p.payout_lamports, proof: proofs[idx] }
+                : null;
+            })
+            .filter((x): x is { wallet: string; amountBb: bigint; proof: string[] } => x !== null);
+
+          if (payoutPushes.length > 0) {
+            pushPayoutsToL1(config, req.params.id, sealResult.merkleRoot, payoutPushes)
+              .then(() => console.log(`[L2] ✅ Pushed ${payoutPushes.length} payout(s) to L1 for ${req.params.id}`))
+              .catch((err: unknown) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.warn(`[L2] ⚠️  push_payouts failed for ${req.params.id}: ${msg}`);
+              });
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[L2] ⚠️  Could not build payout proofs for ${req.params.id}: ${msg}`);
+        }
       }
 
       // Submit to Oracle dispute window (non-blocking — failure is logged but

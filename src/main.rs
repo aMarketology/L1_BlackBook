@@ -2,7 +2,6 @@ mod contracts;
 mod auth;
 #[path = "watcher/webhook.rs"]
 mod watcher_webhook;
-mod state;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,8 +23,6 @@ use axum::{
 };
 
 use solana_sdk::account::ReadableAccount;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::hash::Hash;
 use tower_http::cors::{CorsLayer, Any, AllowOrigin};
 use axum::http::HeaderValue;
 use tower_http::trace::TraceLayer;
@@ -33,14 +30,62 @@ use axum::extract::DefaultBodyLimit;
 use serde::Deserialize;
 use clap::Parser;
 
-// Re-export state types for convenience
-use state::{
-    NodeMode, NodeConfig, AppState, WsSubscriptions,
-    GulfStreamSubmitRequest, RpcRequest, RpcResponse, RpcParams,
-    RpcAccountResult, RpcContext, RpcAccountValue,
-    VERSION, NETWORK, REDB_DATA_PATH_DEFAULT,
-    POH_SLOT_DURATION_MS, POH_HASHES_PER_TICK, POH_TICKS_PER_SLOT, POH_SLOTS_PER_EPOCH,
-};
+// ============================================================================
+// CLI ARGUMENTS
+// ============================================================================
+
+/// Node operating mode: Writer produces blocks, Reader consumes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NodeMode {
+    /// Single writer node: runs PoH clock, produces blocks, serves relay to readers
+    Writer,
+    /// Reader node: subscribes to writer relay, verifies + stores blocks, serves RPC
+    Reader,
+}
+
+impl std::fmt::Display for NodeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeMode::Writer => write!(f, "writer"),
+            NodeMode::Reader => write!(f, "reader"),
+        }
+    }
+}
+
+/// BlackBook L1 — Consortium / Permissioned Settlement Layer
+#[derive(Parser, Debug)]
+#[command(name = "blackbook-l1", version = VERSION, about = "PoH blockchain node")]
+pub struct NodeConfig {
+    /// Node mode: writer (block producer) or reader (block consumer)
+    #[arg(long, default_value = "writer", value_enum)]
+    pub mode: NodeMode,
+
+    /// Validator identity name (used in leader schedule + logs)
+    #[arg(long, default_value = "genesis_validator")]
+    pub identity: String,
+
+    /// Address of the writer node's gRPC relay (reader mode only)
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    pub writer_addr: String,
+
+    /// Port for the gRPC relay service (writer) or gRPC client target (reader)
+    #[arg(long, default_value_t = 50051)]
+    pub grpc_port: u16,
+
+    /// HTTP port (wallet UI, REST endpoints)
+    #[arg(long, default_value_t = 8080)]
+    pub http_port: u16,
+
+    /// Solana JSON-RPC port
+    #[arg(long, default_value_t = 8899)]
+    pub rpc_port: u16,
+
+    /// Override the ReDB database path (defaults to REDB_PATH env var)
+    /// Useful for running a Reader node alongside a local Writer without
+    /// sharing the same database file.
+    #[arg(long)]
+    pub redb_path: Option<String>,
+}
 
 // ============================================================================
 // MODULES
@@ -79,7 +124,244 @@ use poh_blockchain::{
     TurbineShredder, TurbinePropagator,
 };
 
+
 use runtime::tpu::TpuService;
+
+/// JSON request body for the HTTP `/sealevel/submit` endpoint.
+/// For the binary UDP equivalent, see `runtime::tpu::TpuPacket`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct GulfStreamSubmitRequest {
+    pub from: String,
+    pub to: String,
+    pub amount: f64,
+    pub public_key: String,
+    pub signature: String,
+    pub timestamp: u64,
+    pub nonce: String,
+    pub chain_id: u8,
+    #[serde(default)]
+    pub priority: Option<u64>,
+    #[serde(default)]
+    pub tx_type: Option<String>,
+}
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const VERSION: &str = "5.0.0";
+const NETWORK: &str = "mainnet-beta";
+const REDB_DATA_PATH_DEFAULT: &str = "./blockchain_data";
+
+/// PoH Configuration (400ms slots — matching Solana for max TPS)
+const POH_SLOT_DURATION_MS: u64 = 400;
+const POH_HASHES_PER_TICK: u64 = 12500;
+const POH_TICKS_PER_SLOT: u64 = 64;
+const POH_SLOTS_PER_EPOCH: u64 = 432000; // ~3 days
+
+// No hardcoded test accounts — this is a zero-sum stablecoin.
+// All accounts are created at runtime via wallet creation endpoints.
+
+// ============================================================================
+// SVM LIVE-SYNC HELPER
+// ============================================================================
+
+// ============================================================================
+// APPLICATION STATE
+// ============================================================================
+
+use tokio::sync::mpsc;
+
+#[derive(serde::Deserialize)]
+struct RpcRequest {
+    method: String,
+    params: Option<Vec<serde_json::Value>>,
+    id: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<u64>, // Subscription ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>, // "accountNotification"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<RpcParams>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcParams {
+    subscription: u64,
+    result: RpcAccountResult,
+}
+
+#[derive(serde::Serialize)]
+struct RpcAccountResult {
+    context: RpcContext,
+    value: RpcAccountValue,
+}
+
+#[derive(serde::Serialize)]
+struct RpcContext {
+    slot: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RpcAccountValue {
+    lamports: u64,
+    data: Vec<String>,
+    owner: String,
+    executable: bool,
+    #[serde(rename = "rentEpoch")]
+    rent_epoch: u64,
+}
+
+pub type WsSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
+pub struct WsSubscriptions {
+    pub clients: dashmap::DashMap<std::net::SocketAddr, WsSender>,
+    pub account_subs: dashmap::DashMap<String, dashmap::DashSet<std::net::SocketAddr>>,
+    /// Clients subscribed to PoH slot notifications (`slotSubscribe`).
+    pub slot_subs: dashmap::DashSet<std::net::SocketAddr>,
+}
+
+impl WsSubscriptions {
+    pub fn new() -> Self {
+        Self {
+            clients: dashmap::DashMap::new(),
+            account_subs: dashmap::DashMap::new(),
+            slot_subs: dashmap::DashSet::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    // Core blockchain (ReDB + DashMap cache)
+    pub blockchain: ConcurrentBlockchain,
+
+    // Solana-style consensus
+    pub poh: SharedPoHService,
+    pub current_slot: Arc<AtomicU64>,
+    pub leader_schedule: Arc<RwLock<LeaderSchedule>>,
+    pub pipeline: Arc<TransactionPipeline>,
+    pub parallel_scheduler: Arc<ParallelScheduler>,
+    pub gulf_stream: Arc<GulfStreamService>,
+    pub block_producer: Arc<BlockProducer>,
+    pub finality_tracker: Arc<FinalityTracker>,
+    pub tower_bft: Arc<TowerBFT>,
+
+    // Node identity
+    pub node_mode: NodeMode,
+    pub validator_id: String,
+
+    // Security infrastructure
+    pub throttler: Arc<NetworkThrottler>,
+    pub ws_subscriptions: Arc<WsSubscriptions>,
+    pub block_tx: tokio::sync::broadcast::Sender<FinalizedBlock>,
+    /// Broadcast channel for per-block BB balance update events pushed to L2 subscribers.
+    pub balance_event_tx: tokio::sync::broadcast::Sender<settlement::BalanceUpdateEvent>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
+    pub fee_market: Arc<LocalizedFeeMarket>,
+    pub account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>>,
+    pub used_nonces: Arc<dashmap::DashMap<String, u64>>,
+
+    // Faucet rate-limiter: address → (epoch_at_claim, total_minted_this_epoch)
+    pub faucet_claims: Arc<dashmap::DashMap<String, (u64, u64)>>,
+
+    // ===== Global Escrow Smart Contract =====
+    /// Ed25519 public key of the authorized L2 sequencer (hex)
+    pub l2_sequencer_pubkey: String,
+    /// Allowlist of L2 sequencer hex pubkeys (superset of l2_sequencer_pubkey).
+    /// Loaded from L2_SEQUENCER_ALLOWLIST env var (comma-separated) at startup.
+    /// A state-root submission is accepted iff the signing key is in this set.
+    pub l2_sequencer_allowlist: std::collections::HashSet<String>,
+    /// Per-market merkle roots: market_id → [u8; 32] (raw SHA-256 root)
+    /// L1 stores ONLY the 32-byte math. Metadata lives in L2 PostgreSQL.
+    pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
+    /// Double-withdrawal protection: "{market_id}:{address}" → true
+    pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
+
+    // ===== Universal Rollup Hub Auth =====
+    /// Maps rollup_id ("L2", "L3", "L5") → authorized sequencer pubkey (64-char hex).
+    /// Loaded from {L2,L3,L5}_SEQUENCER_PUBKEY env vars at startup.
+    /// Only the registered key for a given rollup_id may submit roots or consume locks.
+    pub authorized_sequencers: Arc<dashmap::DashMap<String, String>>,
+
+    // ===== Contest Settlement State =====
+    /// Per-contest lifecycle state: contest_id → ContestState
+    /// Hot cache, ReDB-backed via ConcurrentBlockchain.store_contest_state().
+    pub contest_states: Arc<dashmap::DashMap<String, storage::ContestState>>,
+
+    // ===== Deposit Gateway =====
+    /// Custody wallet address users send wUSDT/wUSDT to (from CUSTODY_WALLET_ADDRESS env)
+    pub custody_wallet_address: String,
+    /// All deposit requests: external_tx_hash → DepositRecord (hot cache, ReDB-backed)
+    pub deposit_requests: Arc<dashmap::DashMap<String, storage::DepositRecord>>,
+    /// Background watcher that polls Solana RPC for custody wallet USDC/USDT balances.
+    /// None when CUSTODY_WALLET_ADDRESS is not set.
+    pub custody_watcher: Option<Arc<watcher::CustodyWatcher>>,
+    /// Background watcher that polls BSC (BNB Chain) for BEP-20 USDC/USDT transfers.
+    /// None when BSC_CUSTODY_WALLET is not set.
+    pub bsc_watcher: Option<Arc<watcher::BscWatcher>>,
+    /// Ed25519 public key (hex, 64 chars) of the off-chain Bridge Watcher authority.
+    /// Only this key may drive `POST /bridge/deposit` (Model A onramp).
+    /// Empty string disables the bridge-authority endpoint (returns 503).
+    pub bridge_authority_pubkey: String,
+
+    // ===== Withdrawal Gateway =====
+    /// Dealer address (base58) derived from DEALER_PRIVATE_KEY at startup.
+    /// Empty string when DEALER_PRIVATE_KEY is not set.
+    pub dealer_address: String,
+    /// All withdrawal requests: withdrawal_id (UUID) → WithdrawalRecord (hot cache, ReDB-backed)
+    pub withdrawal_requests: Arc<dashmap::DashMap<String, storage::WithdrawalRecord>>,
+    /// Monotonic sequence counter for withdrawal records.
+    /// Loaded from ReDB at startup; incremented atomically inside every
+    /// `atomic_withdrawal_flush_and_record` call.  The bridge watcher uses
+    /// `GET /withdraw/since/:seq` to resume polling after a crash without
+    /// needing a full table scan.
+    pub withdrawal_seq_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Rolling 24h withdrawal cap enforcement.
+    /// window_start: Unix timestamp (seconds) of when the current window opened.
+    pub withdrawal_window_start: Arc<std::sync::atomic::AtomicU64>,
+    /// Rolling 24h withdrawal cap enforcement.
+    /// window_total: cumulative wUSDT micro-units withdrawn in the current window.
+    pub withdrawal_window_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-24h cap in wUSDT micro-units. Loaded from WITHDRAWAL_DAILY_CAP_WUSDT env var.
+    /// Default: 10_000 wUSDT = 10_000_000_000 micro. 0 means unlimited.
+    pub withdrawal_daily_cap_micro: u64,
+
+    // ===== Layer 5: Rollup Liquidity Bridge =====
+    /// Hot cache of all $BB lock records — lock_id → RollupLockRecord.
+    /// Durable copy is in ReDB (ROLLUP_LIQUIDITY_LOCKS table).
+    /// The L5 sequencer polls GET /rollup/locks/:creator to read new entries.
+    pub rollup_lock_records: Arc<dashmap::DashMap<String, storage::RollupLockRecord>>,
+
+    // ===== Backup State =====
+    pub backup_last_at: Arc<AtomicU64>,
+    pub backup_last_size: Arc<AtomicU64>,
+
+    // ===== Turbine Tick Streaming (Phase 7A — static permissioned registry) =====
+    /// Approved validator / reader nodes for Turbine shred delivery.
+    /// Loaded from config.toml or APPROVED_VALIDATORS env var at startup.
+    pub approved_validators: Arc<runtime::validator_registry::ValidatorRegistry>,
+
+    // ===== Reader Mode: Writer Proxy =====
+    /// When running as a Reader node, this holds the Writer's HTTP base URL
+    /// (e.g. "http://1.2.3.4:8080"). All state-changing POST requests are
+    /// forwarded to the Writer so local and Hetzner state stay identical.
+    /// `None` when running as a Writer node.
+    pub writer_http_url: Option<String>,
+
+    // ===== Vault Claim Signer (KMS / Local Ed25519) =====
+    /// Signs "CLAIM:{poh_slot}:{amount}:{user_pubkey}" attestations verified
+    /// by the Solana Anchor vault program via the Ed25519 sysvar.
+    /// Loaded from AWS_KMS_KEY_ID (KMS) or VAULT_SIGNER_PRIVATE_KEY (local).
+    /// `None` when neither env var is set — vault claim endpoints return 503.
+    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
+}
 
 // ============================================================================
 // HEALTH & STATUS
@@ -106,8 +388,6 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
         now.saturating_sub(b.timestamp)
     });
     let is_healthy = block_age_s.map(|age| age < 10).unwrap_or(current_slot < 5);
-    let current_leader = state.leader_schedule.read().get_leader(current_slot);
-    let is_leader = state.validator_id == current_leader;
 
     Json(serde_json::json!({
         "status": if is_healthy { "healthy" } else { "degraded" },
@@ -135,8 +415,6 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "tower_root": tower_stats.global_root,
             "confirmed_slots": tower_stats.confirmed_slots,
             "validator_count": tower_stats.validator_count,
-            "current_leader": current_leader,
-            "is_leader": is_leader,
         },
         "block_production": {
             "latest_block_age_s": block_age_s,
@@ -148,8 +426,6 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             "pipeline": pipeline_stats.is_running,
         },
         "node_mode": state.node_mode.to_string(),
-        "validators_registered": state.approved_validators.len(),
-        "validator_identity": state.validator_id,
     }))
 }
 
@@ -239,7 +515,6 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     gauge!("pool_wusdt_micro",              "Swap pool wUSDT balance in micro-units",              pool_wusdt_micro);
     gauge!("circuit_breaker_tripped",       "1 if circuit breaker is open (halted), else 0",       cb_tripped);
     gauge!("withdrawal_window_total_micro", "wUSDT withdrawn in current 24h window (micro-units)", withdrawal_window_total);
-    gauge!("skip_slot_total",               "Cumulative slots skipped due to leader timeout (Phase 6)", state.skip_slot_total.load(Ordering::Relaxed));
 
     (
         StatusCode::OK,
@@ -667,6 +942,202 @@ async fn poh_tx_status_handler(
     }))
 }
 
+// ─── POST /escrow/push_payouts ────────────────────────────────────────────────
+//
+// Dealer-pushed payout endpoint: called by the L2 sequencer immediately after
+// market resolution.  The sequencer builds a Merkle tree of winner payouts
+// (leaf = SHA-256(pubkey_raw[32] ++ amount_bb_le8)), signs the root +
+// contest_id, and the L1 verifies each winner's proof against that root before
+// transferring BB from the per-contest escrow vault to each winner's L1 wallet.
+//
+// Signature message (UTF-8):
+//   "PUSH_PAYOUTS:{contest_id}:{merkle_root_hex}:{timestamp}:{nonce}"
+//
+// The merkle_root_hex is included in the signed message so the L1 does NOT
+// need a pre-stored root — the sequencer provides the root directly and the
+// Ed25519 signature proves it's authentic.
+
+#[derive(serde::Deserialize)]
+struct PushPayoutsRequest {
+    contest_id:      String,
+    /// 64-char hex Merkle root — included in the signed message for authenticity
+    merkle_root_hex: String,
+    /// Sequencer Ed25519 public key (64-char hex)
+    public_key:      String,
+    /// Signature over "PUSH_PAYOUTS:{contest_id}:{merkle_root_hex}:{timestamp}:{nonce}"
+    signature:       String,
+    timestamp:       u64,
+    nonce:           String,
+    payouts:         Vec<PushPayoutEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct PushPayoutEntry {
+    /// L1 wallet address (base58)
+    wallet:    String,
+    /// Payout in BB lamports (LAMPORTS_PER_BB = 100_000)
+    amount_bb: u64,
+    /// Merkle proof siblings (hex strings, leaf → root)
+    proof:     Vec<String>,
+}
+
+async fn push_payouts_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PushPayoutsRequest>,
+) -> impl IntoResponse {
+    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+    use sha2::{Sha256, Digest};
+
+    // ── Timestamp freshness ──────────────────────────────────────────────────
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.abs_diff(req.timestamp) > 120 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Timestamp out of ±120s freshness window"
+        }))).into_response();
+    }
+
+    // ── Replay protection ────────────────────────────────────────────────────
+    let replay_key = format!("push_payouts:{}:{}", req.contest_id, req.nonce);
+    match state.used_nonces.entry(replay_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) =>
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used"
+            }))).into_response(),
+        dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
+    }
+
+    // ── Sequencer signature ──────────────────────────────────────────────────
+    let pk_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "public_key must be 32-byte hex"
+        }))).into_response(),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "signature must be 64-byte hex"
+        }))).into_response(),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid public key"
+        }))).into_response(),
+    };
+    let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let msg = format!("PUSH_PAYOUTS:{}:{}:{}:{}", req.contest_id, req.merkle_root_hex, req.timestamp, req.nonce);
+    if verifying_key.verify(msg.as_bytes(), &sig).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "Invalid sequencer signature"
+        }))).into_response();
+    }
+
+    // ── Validate & decode the sequencer-provided Merkle root ─────────────────
+    if req.merkle_root_hex.len() != 64 || !req.merkle_root_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "merkle_root_hex must be 64-char lowercase hex"
+        }))).into_response();
+    }
+
+    // ── Per-contest escrow vault (funded by InitContestReserve) ──────────────
+    let escrow_addr = crate::svm::escrow_vault_address_for(&req.contest_id);
+
+    // ── Per-winner: verify Merkle proof → guard → transfer ───────────────────
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(req.payouts.len());
+    for entry in &req.payouts {
+        // Skip zero-amount entries (dealer fee row, dust)
+        if entry.amount_bb == 0 {
+            continue;
+        }
+
+        // Double-claim guard
+        let claim_key = format!("{}:{}", req.contest_id, entry.wallet);
+        if state.withdrawal_claims.contains_key(&claim_key) {
+            results.push(serde_json::json!({
+                "wallet": entry.wallet, "success": false, "error": "Already claimed"
+            }));
+            continue;
+        }
+
+        // Decode wallet to raw 32-byte pubkey for leaf hash
+        let pubkey_raw: [u8; 32] = match bs58::decode(&entry.wallet).into_vec() {
+            Ok(b) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
+            _ => {
+                results.push(serde_json::json!({
+                    "wallet": entry.wallet, "success": false,
+                    "error": "wallet must be base58 32-byte pubkey"
+                }));
+                continue;
+            }
+        };
+
+        // Leaf: SHA-256(pubkey_raw[32] ++ amount_bb_le8) — matches DistributePayouts gRPC
+        let mut hasher = Sha256::new();
+        hasher.update(pubkey_raw);
+        hasher.update(entry.amount_bb.to_le_bytes());
+        let mut current: [u8; 32] = hasher.finalize().into();
+        let current_hex = hex::encode(current);
+
+        // Walk proof — sorted-pair hex SHA-256 (matches merkle.ts hashPair)
+        let mut current_str = current_hex;
+        let mut proof_ok = true;
+        for sib_hex in &entry.proof {
+            let a = &current_str;
+            let b = sib_hex.trim_start_matches("0x");
+            let combined = if a.as_str() <= b { format!("{}{}", a, b) } else { format!("{}{}", b, a) };
+            let mut h = Sha256::new();
+            h.update(combined.as_bytes());
+            current = h.finalize().into();
+            current_str = hex::encode(current);
+            if b.len() != 64 {
+                proof_ok = false;
+                break;
+            }
+        }
+        if !proof_ok || current_str != req.merkle_root_hex {
+            results.push(serde_json::json!({
+                "wallet": entry.wallet, "success": false,
+                "error": format!("Invalid Merkle proof (computed={}, expected={})",
+                    &current_str[..16], &req.merkle_root_hex[..16])
+            }));
+            continue;
+        }
+
+        // Transfer escrow → winner atomically
+        match state.blockchain.atomic_escrow_claim_and_pay(
+            &claim_key, &escrow_addr, &entry.wallet, entry.amount_bb, now,
+        ) {
+            Ok(()) => {
+                state.withdrawal_claims.insert(claim_key, true);
+                info!("💸 push_payouts: {} lamports → {} (contest {})",
+                    entry.amount_bb, entry.wallet, req.contest_id);
+                results.push(serde_json::json!({
+                    "wallet": entry.wallet, "success": true,
+                    "amount_bb": entry.amount_bb
+                }));
+            }
+            Err(e) => {
+                results.push(serde_json::json!({
+                    "wallet": entry.wallet, "success": false,
+                    "error": format!("transfer failed: {}", e)
+                }));
+            }
+        }
+    }
+
+    let all_success = results.iter().all(|r| r["success"].as_bool().unwrap_or(false));
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": all_success,
+        "contest_id": req.contest_id,
+        "paid": results.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count(),
+        "results": results,
+    }))).into_response()
+}
+
 /// GET /consensus/tower — Tower BFT vote tower state
 async fn tower_bft_handler(
     State(state): State<AppState>,
@@ -722,32 +1193,6 @@ async fn turbine_status_handler(
         "validator_count": validators.len(),
         "propagation_max_hops": max_hops,
         "turbine_fanout": 200,
-    }))
-}
-
-/// GET /validators — Returns the full validator set with pubkeys, addresses,
-/// labels, and stakes. Used for ops visibility and debugging the leader schedule.
-async fn validators_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let current_slot = state.current_slot.load(Ordering::Relaxed);
-    let current_leader = state.leader_schedule.read().get_leader(current_slot);
-    let validators: Vec<serde_json::Value> = state.approved_validators.all().iter().map(|v| {
-        serde_json::json!({
-            "label": v.label,
-            "pubkey": v.pubkey_hex,
-            "addr": v.udp_addr.to_string(),
-            "http_port": v.http_port,
-            "stake_lamports": v.stake_lamports,
-            "stake_bb": v.stake_lamports as f64 / svm::LAMPORTS_PER_BB as f64,
-            "is_current_leader": v.label == current_leader,
-        })
-    }).collect();
-    Json(serde_json::json!({
-        "current_slot": current_slot,
-        "current_leader": current_leader,
-        "total_stake_lamports": state.approved_validators.total_stake(),
-        "validators": validators,
     }))
 }
 
@@ -1304,6 +1749,7 @@ async fn admin_accounts_handler(State(state): State<AppState>) -> impl IntoRespo
     for entry in state.blockchain.svm_accounts.hot_state.iter() {
         let address = bs58::encode(entry.key().to_bytes()).into_string();
         let lamports = {
+            use solana_sdk::account::ReadableAccount;
             entry.value().lamports()
         };
         if lamports > 0 {
@@ -1410,6 +1856,84 @@ struct UsdcTransferRequest {
     timestamp: u64,
     /// Unique nonce string — replay protection
     nonce: String,
+}
+
+#[derive(Deserialize)]
+#[cfg(feature = "unsafe_admin")]
+struct DealerSendWusdcRequest {
+    /// Recipient wallet address (base58) — the buyer's BB wallet
+    to: String,
+    /// Amount of wUSDT to send (human units, e.g. 5.0 = 5 wUSDT)
+    amount: f64,
+}
+
+/// POST /admin/dealer/send_wusdt — Transfer wUSDT from the dealer's ATA to a buyer's ATA.
+///
+/// Used when a user has purchased wUSDT and the dealer owes them the on-chain tokens.
+/// Requires DEALER_PRIVATE_KEY to be set — the dealer address is the sender.
+#[cfg(feature = "unsafe_admin")]
+async fn dealer_send_wusdt_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DealerSendWusdcRequest>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
+
+    if state.dealer_address.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "DEALER_PRIVATE_KEY not configured on this node"
+        })));
+    }
+    if req.amount <= 0.0 || req.to.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "amount must be > 0 and to must not be empty"
+        })));
+    }
+
+    let dealer_pubkey = match bs58::decode(&state.dealer_address).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+        }
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": "Dealer address is invalid"
+        }))),
+    };
+    let to_pubkey = match bs58::decode(&req.to).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
+        }
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid recipient address"
+        }))),
+    };
+
+    let mint       = usdc_mint_bytes();
+    let raw_amount = (req.amount * USDC_UNIT as f64).round() as u64;
+
+    match SplTokenEngine::transfer_tokens(
+        &state.blockchain.svm_accounts, &mint, &dealer_pubkey, &to_pubkey, raw_amount,
+    ) {
+        Ok(result) => {
+            info!("💸 DEALER→BUYER wUSDT: {:.6} to {} (dealer bal: {:.6})",
+                req.amount, req.to,
+                result.from_balance as f64 / USDC_UNIT as f64);
+            let _ = state.blockchain.svm_accounts.flush_block();
+            (StatusCode::OK, Json(serde_json::json!({
+                "success": true,
+                "sent_wusdt": req.amount,
+                "from": state.dealer_address,
+                "to": req.to,
+                "dealer_ata": result.from_ata,
+                "recipient_ata": result.to_ata,
+                "dealer_remaining_wusdt": result.from_balance as f64 / USDC_UNIT as f64,
+                "recipient_wusdt_balance": result.to_balance as f64 / USDC_UNIT as f64,
+            })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("{:?}", e)
+        }))),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1594,9 +2118,57 @@ async fn admin_set_swap_rate_handler(
     })))
 }
 
+/// GET /dealer/balances — Returns the dealer's BB and wUSDT balances.
+///
+/// This is a read-only health/monitoring endpoint. Returns HTTP 503 if the dealer
+/// address is not configured (DEALER_PRIVATE_KEY env var not set).
+async fn dealer_balances_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    use svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT, LAMPORTS_PER_BB};
+
+    if state.dealer_address.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "Dealer not configured — set DEALER_PRIVATE_KEY environment variable"
+        }))).into_response();
+    }
+
+    let addr = &state.dealer_address;
+
+    // BB balance
+    let bb_lamports = state.blockchain.get_balance_lamports(addr);
+    let bb_balance  = bb_lamports as f64 / LAMPORTS_PER_BB as f64;
+
+    // wUSDT balance (via SPL token engine)
+    let wusdt_raw = match bs58::decode(addr).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
+            let pk = solana_sdk::pubkey::Pubkey::new_from_array(arr);
+            SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &usdc_mint_bytes(), &pk)
+        }
+        _ => 0u64,
+    };
+    let wusdt_balance = wusdt_raw as f64 / USDC_UNIT as f64;
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "dealer_address": addr,
+        "bb": {
+            "balance": bb_balance,
+            "lamports": bb_lamports,
+            "unit": "BB"
+        },
+        "wusdt": {
+            "balance": wusdt_balance,
+            "raw": wusdt_raw,
+            "unit": "wUSDT"
+        }
+    }))).into_response()
+}
+
 /// POST /admin/usdc/mint — Mint USDC tokens to a wallet's ATA
 ///
 /// Called when bridge deposits arrive or for initial liquidity seeding.
+/// Only the Dealer (mint authority) should call this in production.
 #[cfg(feature = "unsafe_admin")]
 async fn usdc_mint_handler(
     State(state): State<AppState>,
@@ -1623,7 +2195,7 @@ async fn usdc_mint_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     match SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_amount) {
@@ -1662,7 +2234,7 @@ async fn usdc_balance_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     let raw_balance = SplTokenEngine::get_token_balance(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
@@ -1718,7 +2290,7 @@ async fn usdc_accounts_handler(
             "error": "Invalid base58 wallet address"
         }))),
     };
-    let wallet_pubkey = Pubkey::new_from_array(wallet_bytes);
+    let wallet_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(wallet_bytes);
     let mint = usdc_mint_bytes();
 
     let accounts = SplTokenEngine::get_token_accounts_for_owner(&state.blockchain.svm_accounts, &mint, &wallet_pubkey);
@@ -1775,7 +2347,7 @@ async fn usdc_transfer_handler(
     let from_pubkey = match bs58::decode(&req.from).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            Pubkey::new_from_array(arr)
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid from address"
@@ -1785,7 +2357,7 @@ async fn usdc_transfer_handler(
     let to_pubkey = match bs58::decode(&req.to).into_vec() {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32]; arr.copy_from_slice(&v);
-            Pubkey::new_from_array(arr)
+            solana_sdk::pubkey::Pubkey::new_from_array(arr)
         }
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid to address"
@@ -2198,7 +2770,7 @@ pub fn spawn_account_notification_broadcaster(state: AppState) {
 
             for pubkey in modified_keys {
                 // In Solana, pubkeys are tracked via base58 string.
-                let pubkey_b58 = bs58::encode(pubkey).into_string(); 
+                let pubkey_b58 = solana_sdk::bs58::encode(pubkey).into_string(); 
                 if let Some(subs) = ws_state.ws_subscriptions.account_subs.get(&pubkey_b58) {
                     if subs.is_empty() { continue; }
                     
@@ -2347,17 +2919,6 @@ async fn reader_proxy_middleware(
         return next.run(req).await;
     };
 
-    // In validator mode the writer_http_url is always set, but when this node
-    // IS the current leader it must handle writes itself — not proxy to itself.
-    // Without this check a single-validator setup creates a self-loop → 502.
-    {
-        let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
-        let current_leader = state.leader_schedule.read().get_leader(current_slot);
-        if state.validator_id == current_leader {
-            return next.run(req).await;
-        }
-    }
-
     let method = req.method().clone();
     // Only proxy state-changing methods
     if !matches!(
@@ -2475,6 +3036,7 @@ fn build_router(state: AppState) -> Router {
         .route("/chain/volume", get(chain_volume_handler))
         .route("/supply/audit", get(supply_audit_handler))
         .route("/balance/:address", get(balance_handler))
+        .route("/dealer/balances", get(dealer_balances_handler))
         .route("/tx/:tx_id", get(transaction_details_handler))
         .route("/address/:address/transactions", get(address_transactions_handler))
         .route("/ledger", get(ledger_handler))
@@ -2491,6 +3053,8 @@ fn build_router(state: AppState) -> Router {
         .route("/poh/block/:slot", get(poh_block_by_slot_handler))
         .route("/poh/transactions/recent", get(poh_recent_transactions_handler))
         .route("/poh/tx/:tx_id/status", get(poh_tx_status_handler))
+        // Dealer-pushed market payouts (L2 sequencer calls after resolution)
+        .route("/escrow/push_payouts", post(push_payouts_handler))
         // Block & Tx explorer aliases
         .route("/blocks", get(poh_latest_block_handler))
         .route("/blocks/latest", get(poh_latest_block_handler))
@@ -2499,7 +3063,6 @@ fn build_router(state: AppState) -> Router {
         .route("/consensus/tower", get(tower_bft_handler))
         // Turbine
         .route("/turbine/status", get(turbine_status_handler))
-        .route("/validators", get(validators_handler))
         // /turbine/register and /turbine/heartbeat removed (Phase 7A hard cutover)
         // Sealevel
         .route("/sealevel/submit", post(gulf_stream_submit_handler))
@@ -2583,6 +3146,7 @@ fn build_router(state: AppState) -> Router {
             .route("/admin/backup/status", get(backup_status_handler))
             // Admin USDC
             .route("/admin/usdc/mint", post(usdc_mint_handler))
+            .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
             .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
             .route("/admin/swap/set_rate", post(admin_set_swap_rate_handler))
             // Oracle (admin-only registration)
@@ -2671,7 +3235,6 @@ async fn main() {
     let mode_label = match config.mode {
         NodeMode::Writer => "WRITER (Block Producer)",
         NodeMode::Reader => "READER (Block Consumer)",
-        NodeMode::Validator => "VALIDATOR (Rotating Leader)",
     };
 
     info!("╔══════════════════════════════════════════════════════╗");
@@ -2707,9 +3270,7 @@ async fn main() {
     };
     let poh_service: SharedPoHService = create_poh_service_with_slot(poh_config, current_slot.clone());
     // Bounded tick broadcast channel — drops shreds when TurbineTickService stalls (never OOM).
-    let node_is_producer = config.mode == NodeMode::Writer || config.mode == NodeMode::Validator;
-    let _node_is_consumer = config.mode == NodeMode::Reader || config.mode == NodeMode::Validator;
-    let (tick_tx_for_clock, tick_rx_for_service) = if node_is_producer {
+    let (tick_tx_for_clock, tick_rx_for_service) = if config.mode == NodeMode::Writer {
         let (tx, rx) = tokio::sync::mpsc::channel::<runtime::TickShred>(runtime::turbine::TICK_CHANNEL_CAPACITY);
         (Some(tx), Some(rx))
     } else {
@@ -2843,6 +3404,26 @@ async fn main() {
         blockchain.load_withdrawal_seq_counter(),
     ));
 
+    // ── Dealer address: derive from DEALER_PRIVATE_KEY ───────────────────
+    let dealer_address: String = match std::env::var("DEALER_PRIVATE_KEY") {
+        Ok(hex_key) if hex_key.len() == 64 => {
+            match hex::decode(&hex_key) {
+                Ok(bytes) => match bytes.as_slice().try_into() as Result<[u8; 32], _> {
+                    Ok(arr) => {
+                        use ed25519_dalek::SigningKey;
+                        let sk = SigningKey::from_bytes(&arr);
+                        let addr = bs58::encode(sk.verifying_key().to_bytes()).into_string();
+                        info!("💼 Dealer address: {}", addr);
+                        addr
+                    }
+                    Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY wrong length"); String::new() }
+                },
+                Err(_) => { warn!("⚠️  DEALER_PRIVATE_KEY invalid hex"); String::new() }
+            }
+        }
+        _ => { info!("ℹ️  DEALER_PRIVATE_KEY not set — dealer swap/withdrawal disabled"); String::new() }
+    };
+
     // Recover escrow state from ReDB (market roots + claims)
     let market_roots: Arc<dashmap::DashMap<String, [u8; 32]>> = Arc::new(dashmap::DashMap::new());
     let withdrawal_claims: Arc<dashmap::DashMap<String, bool>> = Arc::new(dashmap::DashMap::new());
@@ -2901,59 +3482,16 @@ async fn main() {
         info!("🕐 Slot counter → slot {}", recovered_slot);
     }
 
-    // ── Permissioned Turbine registry (Phase 7A) ──────────────────────────
-    let approved_validators = Arc::new(
-        runtime::validator_registry::ValidatorRegistry::load(
-            None,
-            std::env::var("APPROVED_VALIDATORS").ok().as_deref(),
-        )
-        .unwrap_or_else(|e| {
-            error!("❌ ValidatorRegistry load error: {} — continuing with empty registry", e);
-            runtime::validator_registry::ValidatorRegistry::empty()
-        }),
-    );
-
     // 4. Consensus Infrastructure
-    //
-    // In Validator mode: populate both LeaderSchedule AND TowerBFT from the
-    // ValidatorRegistry so every node computes the identical deterministic
-    // schedule from the same config.toml. The --identity must match a label
-    // in the registry.
-    //
-    // In legacy Writer/Reader mode: use --identity as sole validator with
-    // 1B lamports default stake (backward compat).
     let validator_id = config.identity.clone();
     let leader_schedule = Arc::new(RwLock::new(LeaderSchedule::new()));
-    let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
     {
         let mut schedule = leader_schedule.write();
-        // In Validator mode, populate multi-validator schedule from config.toml.
-        // In Writer/Reader mode, use single-validator fallback (always produce).
-        let use_multi_validator = config.mode == NodeMode::Validator && !approved_validators.is_empty();
-        if use_multi_validator {
-            // Multi-validator: populate from registry (config.toml or env var).
-            let mut total_stake = 0u64;
-            for v in approved_validators.all() {
-                schedule.set_stake(&v.label, v.stake_lamports);
-                tower_bft.register_validator(&v.label, v.stake_lamports);
-                total_stake += v.stake_lamports;
-            }
-            info!(
-                "📋 Leader schedule populated from {} validator(s) — total stake: {} lamports ({:.2} BB)",
-                approved_validators.len(),
-                total_stake,
-                total_stake as f64 / svm::LAMPORTS_PER_BB as f64
-            );
-        } else {
-            // Dev/legacy mode: single-validator fallback.
-            schedule.set_stake(&validator_id, 1_000_000_000u64);
-            tower_bft.register_validator(&validator_id, 1_000_000_000u64);
-            info!("📋 Leader schedule: single-validator legacy mode (id={})", &validator_id);
-        }
+        // 10,000 BB in lamports — genesis validator's starting stake weight.
+        schedule.set_stake(&validator_id, 1_000_000_000u64);
         let epoch = recovered_slot / POH_SLOTS_PER_EPOCH;
         schedule.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
     }
-    info!("🗼 Tower BFT initialized with {} validator(s)", tower_bft.get_stats().validator_count);
 
     let (pipeline, commit_rx) = TransactionPipeline::new();
     pipeline.start(current_slot.clone());
@@ -2987,6 +3525,11 @@ async fn main() {
 
     let finality_tracker = Arc::new(FinalityTracker::new(current_slot.clone()));
 
+    // Tower BFT — single-validator mode with genesis stake (1,000,000,000 lamports = 10,000 BB)
+    let tower_bft = TowerBFT::new(validator_id.clone(), current_slot.clone());
+    tower_bft.register_validator(&validator_id, 1_000_000_000u64);
+    info!("🗼 Tower BFT initialized (single-validator mode, id={})", &validator_id);
+
     // 4a.1 Pipeline commit drain — record finality for committed pipeline txs
     {
         let fin = finality_tracker.clone();
@@ -2999,6 +3542,18 @@ async fn main() {
             }
         });
     }
+
+    // ── Permissioned Turbine registry (Phase 7A) ──────────────────────────
+    let approved_validators = Arc::new(
+        runtime::validator_registry::ValidatorRegistry::load(
+            None,
+            std::env::var("APPROVED_VALIDATORS").ok().as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            error!("❌ ValidatorRegistry load error: {} — continuing with empty registry", e);
+            runtime::validator_registry::ValidatorRegistry::empty()
+        }),
+    );
 
     // ── Validator identity keypair (Phase 7C) ─────────────────────────────
     // Used to sign outgoing Turbine shreds. Absent = ephemeral key (dev only).
@@ -3036,16 +3591,9 @@ async fn main() {
         }
     );
 
-    // 4b. Block Production Loop + Relay (WRITER / VALIDATOR MODE)
+    // 4b. Block Production Loop + Relay (WRITER MODE ONLY)
     // In Reader mode, block production is disabled — blocks come from the Writer via gRPC.
-    // In Validator mode, the block production runs but only produces when the
-    // schedule says this node IS the leader for the current slot.
-
-    // ── Skip-slot counter (Phase 6) — created here so both the block production
-    // loop and AppState can reference the same Arc.
-    let skip_slot_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-
-    let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if node_is_producer {
+    let relay_sender: Option<tokio::sync::broadcast::Sender<FinalizedBlock>> = if config.mode == NodeMode::Writer {
         // Create relay service for streaming blocks to reader nodes
         let (relay_service, block_sender) = relay::create_relay(
             block_producer.clone(),
@@ -3107,7 +3655,6 @@ async fn main() {
 
         let validator_id_for_loop = validator_id.clone();
         let relay_tx = block_sender.clone();
-        let is_writer_mode = config.mode == NodeMode::Writer;
 
         // ── Turbine Tick Streaming service (Writer mode only) ──────────────────
         if let Some(tick_rx) = tick_rx_for_service {
@@ -3126,74 +3673,20 @@ async fn main() {
             let tower = tower_bft.clone();
             let ls = leader_schedule.clone();
             let vid = validator_id_for_loop;
-            let slot_arc = current_slot.clone();
             let balance_event_tx_loop = balance_event_tx.clone();
             let balance_event_blockchain = blockchain.clone();
-            let skip_slot = skip_slot_total.clone();
             tokio::spawn(async move {
-                info!("🏭 Block production loop started ({}ms slots, {} slot tenure)",
-                    POH_SLOT_DURATION_MS, runtime::LEADER_TENURE_SLOTS);
+                info!("🏭 Block production loop started (400ms slots)");
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(POH_SLOT_DURATION_MS));
                 let mut last_epoch: u64 = 0;
-                let mut was_leader: bool = false;
-                let mut last_leader: String = String::new();
                 loop {
                     interval.tick().await;
-                    let slot = slot_arc.load(Ordering::Relaxed);
-
-                    // In Writer mode: always produce blocks (single-writer legacy).
-                    // In Validator mode: only produce when scheduled as leader.
-                    let is_leader = is_writer_mode || bp.is_current_leader();
-                    if !is_leader {
-                        let current_leader = ls.read().get_leader(slot);
-                        if current_leader != last_leader {
-                            info!("🔄 Slot {}: leader is now '{}' (we are '{}')",
-                                slot, current_leader, vid);
-                            last_leader = current_leader.clone();
-                        }
-
-                        // ── Skip-slot: detect silent leader ────────────────
-                        // If the latest block is older than one full tenure
-                        // (LEADER_TENURE_SLOTS * POH_SLOT_DURATION_MS + 2s grace),
-                        // the scheduled leader is unresponsive. Fast-forward the
-                        // shared slot counter to the end of their tenure so the
-                        // PoH clock naturally reaches the next validator's slot.
-                        let max_block_age_s = (runtime::LEADER_TENURE_SLOTS * POH_SLOT_DURATION_MS / 1000) + 2;
-                        let latest_block_age_s = bp.get_latest_block().map(|b| {
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            now.saturating_sub(b.timestamp)
-                        });
-                        if let Some(age_s) = latest_block_age_s {
-                            if age_s > max_block_age_s {
-                                if let Some(skipped) = tower.skip_past_tenure(slot) {
-                                    warn!(
-                                        "⏭  SKIP-SLOT: leader '{}' silent for {}s (max {}s) — \
-                                         fast-forwarded {} slots to tenure boundary",
-                                        current_leader, age_s, max_block_age_s, skipped
-                                    );
-                                    // Accumulate for observability
-                                    skip_slot.fetch_add(skipped, Ordering::Relaxed);
-                                }
-                            }
-                        }
-
-                        was_leader = false;
-                        continue;
-                    }
-
-                    // ── Leadership transition ─────────────────────────────
-                    if !was_leader {
-                        info!("👑 Slot {}: WE are now the leader — producing blocks", slot);
-                        was_leader = true;
-                    }
-
                     match bp.produce_block() {
                         Ok(block) => {
+                            // Wire finality tracker — advance confirmations for all tracked txs
                             ft.update_confirmations(block.slot);
 
+                            // Tower BFT self-vote — even single-validator builds the vote tower
                             match tower.vote(&vid, block.slot, &block.hash) {
                                 Ok(supermajority) => {
                                     if supermajority {
@@ -3207,16 +3700,34 @@ async fn main() {
                             let epoch = block.slot / POH_SLOTS_PER_EPOCH;
                             if epoch > last_epoch {
                                 last_epoch = epoch;
-                                ls.write().generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
-                                info!("📅 Epoch {}: leader schedule rotated", epoch);
+                                let mut sched = ls.write();
+                                sched.generate_schedule(epoch, POH_SLOTS_PER_EPOCH);
+                                info!("📅 Epoch {}: leader schedule rotated for {} slots",
+                                    epoch, POH_SLOTS_PER_EPOCH);
                             }
 
                             if block.tx_count > 0 {
-                                info!("📦 Block {}: {} txs, hash: {}",
+                                info!("📦 Block {} produced: {} txs, hash: {}",
                                     block.slot, block.tx_count, &block.hash[..16]);
                             }
 
-                            // Emit balance updates for L2 subscribers
+                            // Turbine shredding — break block into propagatable shreds
+                            let shredder = TurbineShredder::new(block.slot, vid.clone());
+                            let shreds = shredder.shred_block(&block);
+                            let data_shreds = shreds.iter().filter(|s| !s.is_coding).count();
+                            let fec_shreds = shreds.len() - data_shreds;
+                            if block.tx_count > 0 {
+                                info!("🌊 Turbine: Block {} → {} data + {} FEC shreds",
+                                    block.slot, data_shreds, fec_shreds);
+                            }
+
+                            // Turbine propagation tree (single-node for now)
+                            let validators = vec![vid.clone()];
+                            let _tree = TurbinePropagator::calculate_tree(&validators, &vid);
+
+                            // Emit per-block BB balance updates for L2's SubscribeBalances.
+                            // One event per unique address touched; idempotency key: (address, slot).
+                            // We iterate before relay_tx.send because send consumes `block`.
                             if block.tx_count > 0 {
                                 use crate::protocol::blockchain::TxData;
                                 use std::collections::HashSet;
@@ -3239,16 +3750,21 @@ async fn main() {
                                         TxData::EscrowStateRoot { .. } => {}
                                     }
                                 }
+                                let slot = block.slot;
+                                let timestamp = block.timestamp;
+                                let block_hash = block.hash.clone();
                                 for addr in touched {
-                                    let new_balance = balance_event_blockchain.get_balance_lamports(&addr);
+                                    let new_balance =
+                                        balance_event_blockchain.get_balance_lamports(&addr);
+                                    // delta_lamports = 0: L2 computes from cached vs new value.
                                     let _ = balance_event_tx_loop.send(
                                         crate::settlement::BalanceUpdateEvent {
                                             address: addr,
                                             new_balance_lamports: new_balance,
                                             delta_lamports: 0,
-                                            slot: block.slot,
-                                            timestamp: block.timestamp,
-                                            block_hash: block.hash.clone(),
+                                            slot,
+                                            timestamp,
+                                            block_hash: block_hash.clone(),
                                         },
                                     );
                                 }
@@ -3258,8 +3774,9 @@ async fn main() {
                             let _ = relay_tx.send(block);
                         }
                         Err(e) => {
+                            // "Not leader" and "Already produced" are normal — don't log as errors
                             let msg = e.to_string();
-                            if !msg.contains("already produced") {
+                            if !msg.contains("not leader") && !msg.contains("already produced") {
                                 warn!("⚠️  Block production: {}", msg);
                             }
                         }
@@ -3286,8 +3803,8 @@ async fn main() {
     let account_metadata: Arc<dashmap::DashMap<String, AccountMetadata>> = Arc::new(dashmap::DashMap::new());
     info!("🛡️  Security initialized");
 
-    // 6. Sealevel Execution Loop (PRODUCER MODES — readers don't execute txs)
-    if node_is_producer {
+    // 6. Sealevel Execution Loop (WRITER MODE ONLY — readers don't execute txs)
+    if config.mode == NodeMode::Writer {
         let sealevel_bc = blockchain.clone();
         let sealevel_sched = parallel_scheduler.clone();
         let sealevel_gs = gulf_stream.clone();
@@ -3372,26 +3889,10 @@ async fn main() {
         });
     }
 
-    // 6b. Reader Node Sync (CONSUMER MODES — Reader + Validator)
-    // In Validator mode: sync from the current leader when not producing.
-    // Falls back to static --writer-addr for legacy Reader mode.
-    if config.mode == NodeMode::Reader || config.mode == NodeMode::Validator {
-        let sync_addr = if config.mode == NodeMode::Validator && !approved_validators.is_empty() {
-            // In Validator mode, find the current leader's gRPC address from the registry.
-            // If the current node IS the leader, this won't be used (block production runs instead).
-            // During startup a Validator always syncs from the current schedule leader first.
-            let current_leader_label = leader_schedule.read().get_leader(recovered_slot);
-            approved_validators.get_by_label(&current_leader_label)
-                .map(|v| {
-                    let ip = v.ip;
-                    format!("http://{}:{}", ip, config.grpc_port)
-                })
-                .unwrap_or_else(|| config.writer_addr.clone())
-        } else {
-            config.writer_addr.clone()
-        };
+    // 6b. Reader Node Sync (READER MODE ONLY)
+    if config.mode == NodeMode::Reader {
         let reader_node = Arc::new(reader::ReaderNode::new(
-            sync_addr,
+            config.writer_addr.clone(),
             blockchain.clone(),
             current_slot.clone(),
             validator_id.clone(),
@@ -3400,9 +3901,7 @@ async fn main() {
         tokio::spawn(async move {
             reader_node.run().await;
         });
-        info!("📖 Reader sync task started → {} (mode: {})",
-            if config.mode == NodeMode::Validator { "dynamic leader" } else { &config.writer_addr },
-            config.mode);
+        info!("📖 Reader sync task started → {}", config.writer_addr);
 
         // ── Turbine Tick Receiver — verify PoH chain in real-time from Writer ───
         let genesis_hash = {
@@ -3514,6 +4013,7 @@ async fn main() {
         custody_watcher: custody_watcher.clone(),
         bsc_watcher: bsc_watcher_arc.clone(),
         bridge_authority_pubkey: std::env::var("BRIDGE_AUTHORITY_PUBKEY").unwrap_or_default(),
+        dealer_address,
         withdrawal_requests,
         withdrawal_seq_counter,
         withdrawal_window_start: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -3530,36 +4030,20 @@ async fn main() {
         rollup_lock_records: Arc::new(dashmap::DashMap::new()),
         backup_last_at: Arc::new(AtomicU64::new(0)),
         backup_last_size: Arc::new(AtomicU64::new(0)),
-        // Cumulative count of slots skipped due to leader timeout (Phase 6 skip-slot).
-        skip_slot_total: skip_slot_total.clone(),
         approved_validators: approved_validators.clone(),
         vault_signer: layer1::kms::VaultSigner::from_env().map(Arc::new),
-        writer_http_url: if config.mode == NodeMode::Reader || config.mode == NodeMode::Validator {
-            // Derive the Writer's HTTP URL from the current leader in the schedule.
+        writer_http_url: if config.mode == NodeMode::Reader {
+            // Derive the Writer's HTTP URL from its gRPC address.
+            // gRPC default port 50051 → HTTP port 8080.
             // Override via WRITER_HTTP_URL env var if ports differ.
             let url = std::env::var("WRITER_HTTP_URL")
                 .unwrap_or_else(|_| {
-                    // In Validator mode, resolve from the leader schedule + registry.
-                    if config.mode == NodeMode::Validator && !approved_validators.is_empty() {
-                        let current_leader = leader_schedule.read().get_leader(
-                            current_slot.load(Ordering::Relaxed)
-                        );
-                        approved_validators.get_by_label(&current_leader)
-                            .map(|v| format!("http://{}:{}", v.ip, v.http_port))
-                            .unwrap_or_else(|| {
-                                let addr = config.writer_addr
-                                    .replace("http://", "")
-                                    .replace(":50051", ":8080");
-                                format!("http://{addr}")
-                            })
-                    } else {
-                        let addr = config.writer_addr
-                            .replace("http://", "")
-                            .replace(":50051", ":8080");
-                        format!("http://{addr}")
-                    }
+                    let addr = config.writer_addr
+                        .replace("http://", "")
+                        .replace(":50051", ":8080");
+                    format!("http://{addr}")
                 });
-            info!("📡 {}: proxying writes to {}", config.mode, url);
+            info!("📡 Reader mode: proxying writes to {}", url);
             Some(url)
         } else {
             None
@@ -3738,7 +4222,7 @@ async fn main() {
             Ok(bytes) if bytes.len() == 32 => {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&bytes);
-                let mint_authority = Pubkey::new_from_array(key);
+                let mint_authority = solana_sdk::pubkey::Pubkey::new_from_array(key);
                 match SplTokenEngine::bootstrap_usdc_mint(&rpc_svm_accounts, &mint_authority) {
                     Ok(mint_addr) => info!("💵 USDC Mint: {} (authority: {})", mint_addr, mint_authority_addr),
                     Err(e) => error!("❌ USDC mint bootstrap failed: {:?}", e),
@@ -3874,6 +4358,7 @@ async fn main() {
         use std::sync::Mutex;
         use svm::BlackBookSVM;
         use solana_rpc::{BlackBookRpcImpl, start_rpc_server};
+        use solana_sdk::hash::Hash;
         use sha2::{Sha256, Digest as _};
 
         // Compute the same genesis hash used by BlockProducer

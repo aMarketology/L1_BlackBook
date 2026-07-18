@@ -157,3 +157,49 @@ export async function submitOraclePendingRoot(
     nonce,
   });
 }
+
+/**
+ * Push winner payouts to L1 wallets after market resolution.
+ *
+ * Calls `POST /escrow/push_payouts` on the L1 node, which verifies each
+ * winner's Merkle proof and transfers BB from the per-contest escrow vault
+ * to each winner's L1 wallet atomically.
+ *
+ * Canonical signed message (UTF-8):
+ *   `"PUSH_PAYOUTS:{contest_id}:{merkle_root_hex}:{timestamp}:{nonce}"`
+ *
+ * The root is included in the signed message so the L1 does NOT need
+ * a pre-stored root — the sequencer provides it and the Ed25519 signature
+ * proves authenticity.
+ *
+ * @param contestId      L2 market ID.
+ * @param merkleRootHex  64-char hex Merkle root of the winner payout tree.
+ * @param payouts        Array of { wallet (base58), amountBb (lamports), proof (hex strings) }.
+ */
+export async function pushPayoutsToL1(
+  config: SequencerConfig,
+  contestId: string,
+  merkleRootHex: string,
+  payouts: Array<{ wallet: string; amountBb: bigint; proof: string[] }>,
+): Promise<void> {
+  if (payouts.length === 0) return;
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = `${timestamp}`;
+  const message = `PUSH_PAYOUTS:${contestId}:${merkleRootHex}:${timestamp}:${nonce}`;
+  const signature = signMessage(message, config.keypair.privateKeyHex);
+
+  await httpPost(`${config.l1HttpUrl}/escrow/push_payouts`, {
+    contest_id:      contestId,
+    merkle_root_hex: merkleRootHex,
+    public_key:      config.keypair.publicKeyHex,
+    signature,
+    timestamp,
+    nonce,
+    payouts: payouts.map(p => ({
+      wallet:    p.wallet,
+      amount_bb: Number(p.amountBb),
+      proof:     p.proof,
+    })),
+  });
+}

@@ -117,4 +117,42 @@ export async function submitOraclePendingRoot(config, marketId, outcome, merkleR
         nonce,
     });
 }
+/**
+ * Push winner payouts to L1 wallets after market resolution.
+ *
+ * Calls `POST /escrow/push_payouts` on the L1 node, which verifies each
+ * winner's Merkle proof against the already-anchored rollup state root and
+ * transfers BB lamports from the shared escrow vault into each winner's
+ * native L1 wallet atomically.
+ *
+ * Must be called AFTER `submitRoot()` so the stored root exists on L1.
+ *
+ * Canonical signed message (UTF-8):
+ *   `"PUSH_PAYOUTS:{contest_id}:{batch_id}:{timestamp}:{nonce}"`
+ *
+ * @param contestId   L2 market ID.
+ * @param batchId     Rollup batch_id returned by sealAndSubmit.
+ * @param payouts     Array of { wallet (base58), amountBb (lamports), proof (hex strings) }.
+ */
+export async function pushPayoutsToL1(config, contestId, batchId, payouts) {
+    if (payouts.length === 0)
+        return;
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = `${batchId}-${timestamp}`;
+    const message = `PUSH_PAYOUTS:${contestId}:${batchId}:${timestamp}:${nonce}`;
+    const signature = signMessage(message, config.keypair.privateKeyHex);
+    await httpPost(`${config.l1HttpUrl}/escrow/push_payouts`, {
+        contest_id: contestId,
+        batch_id: batchId,
+        public_key: config.keypair.publicKeyHex,
+        signature,
+        timestamp,
+        nonce,
+        payouts: payouts.map(p => ({
+            wallet: p.wallet,
+            amount_bb: Number(p.amountBb),
+            proof: p.proof,
+        })),
+    });
+}
 //# sourceMappingURL=l1Client.js.map

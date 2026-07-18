@@ -52,4 +52,26 @@ export declare function submitRoot(config: SequencerConfig, batchId: number, mer
  * @param batchId        Rollup Hub batch_id from the sealAndSubmit result.
  */
 export declare function submitOraclePendingRoot(config: SequencerConfig, marketId: string, outcome: 'YES' | 'NO' | 'REFUND', merkleRootHex: string, batchId: number): Promise<void>;
+/**
+ * Push winner payouts to L1 wallets after market resolution.
+ *
+ * Calls `POST /escrow/push_payouts` on the L1 node, which verifies each
+ * winner's Merkle proof against the already-anchored rollup state root and
+ * transfers BB lamports from the shared escrow vault into each winner's
+ * native L1 wallet atomically.
+ *
+ * Must be called AFTER `submitRoot()` so the stored root exists on L1.
+ *
+ * Canonical signed message (UTF-8):
+ *   `"PUSH_PAYOUTS:{contest_id}:{batch_id}:{timestamp}:{nonce}"`
+ *
+ * @param contestId   L2 market ID.
+ * @param batchId     Rollup batch_id returned by sealAndSubmit.
+ * @param payouts     Array of { wallet (base58), amountBb (lamports), proof (hex strings) }.
+ */
+export declare function pushPayoutsToL1(config: SequencerConfig, contestId: string, batchId: number, payouts: Array<{
+    wallet: string;
+    amountBb: bigint;
+    proof: string[];
+}>): Promise<void>;
 //# sourceMappingURL=l1Client.d.ts.map
