@@ -818,8 +818,17 @@ impl SettlementService for BlackBookSettlementService {
         }
 
         // Same escrow vault the /escrow/withdraw path pays from.
-        #[allow(deprecated)]
-        let escrow_addr = crate::svm::escrow_vault_address();
+        // Per-contest PDA: funds were locked via InitContestReserve into
+        // escrow_vault_address_for(contest_id) — the deprecated global vault
+        // is empty for this contest and would cause "Insufficient escrow".
+        let escrow_addr = crate::svm::escrow_vault_address_for(&req.contest_id);
+
+        // ── Fallback vault: L2 rollup vault ───────────────────────────────
+        // If the per-contest escrow vault has insufficient balance (e.g.
+        // InitContestReserve was never called or locked too little), fall
+        // back to the L2 rollup vault PDA. This is the same vault used by
+        // the Universal Rollup Hub's lock_bb / exit flow.
+        let l2_rollup_vault = crate::svm::pda::rollup_vault_address("L2");
 
         // ── Per-winner: verify proof → guard → transfer ───────────────────
         let mut results: Vec<PayoutResult> = Vec::with_capacity(req.payouts.len());
@@ -902,35 +911,48 @@ impl SettlementService for BlackBookSettlementService {
             }
 
             // Transfer escrow → winner and seal the claim in one atomic ReDB txn.
-            match self.blockchain.atomic_escrow_claim_and_pay(
-                &claim_key, &escrow_addr, &leaf.wallet, amount_lamports, now,
-            ) {
-                Ok(()) => {
-                    self.withdrawal_claims.insert(claim_key.clone(), true);
+            // Try per-contest vault first; fall back to L2 rollup vault if
+            // the per-contest vault has insufficient balance.
+            let wallet = leaf.wallet.clone();
+            let mut paid = false;
+            let mut last_err = String::new();
+            for vault_addr in &[&escrow_addr, &l2_rollup_vault] {
+                match self.blockchain.atomic_escrow_claim_and_pay(
+                    &claim_key, vault_addr, &wallet, amount_lamports, now,
+                ) {
+                    Ok(()) => {
+                        self.withdrawal_claims.insert(claim_key.clone(), true);
 
-                    // Update total_claimed (SPL units) on the ContestState.
-                    if let Some(entry) = self.contest_states.get(&req.contest_id) {
-                        let mut snap = entry.clone();
-                        drop(entry);
-                        snap.total_claimed = snap.total_claimed.saturating_add(leaf.amount_bb);
-                        if self.blockchain.store_contest_state(&snap).is_ok() {
-                            self.contest_states.insert(req.contest_id.clone(), snap);
+                        // Update total_claimed (SPL units) on the ContestState.
+                        if let Some(entry) = self.contest_states.get(&req.contest_id) {
+                            let mut snap = entry.clone();
+                            drop(entry);
+                            snap.total_claimed = snap.total_claimed.saturating_add(leaf.amount_bb);
+                            if self.blockchain.store_contest_state(&snap).is_ok() {
+                                self.contest_states.insert(req.contest_id.clone(), snap);
+                            }
                         }
-                    }
 
-                    let tx_hash = uuid::Uuid::new_v4().to_string();
-                    info!("💸 payout {} lamports → {} (contest {})",
-                        amount_lamports, leaf.wallet, req.contest_id);
-                    results.push(PayoutResult {
-                        wallet: leaf.wallet, success: true, tx_hash, error: String::new(),
-                    });
+                        let tx_hash = uuid::Uuid::new_v4().to_string();
+                        let vault_label = if **vault_addr == escrow_addr { "per-contest" } else { "L2 rollup" };
+                        info!("💸 payout {} lamports → {} (contest {} via {} vault)",
+                            amount_lamports, wallet, req.contest_id, vault_label);
+                        results.push(PayoutResult {
+                            wallet, success: true, tx_hash, error: String::new(),
+                        });
+                        paid = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                    }
                 }
-                Err(e) => {
-                    results.push(PayoutResult {
-                        wallet: leaf.wallet, success: false, tx_hash: String::new(),
-                        error: format!("transfer failed: {}", e),
-                    });
-                }
+            }
+            if !paid {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: format!("transfer failed (per-contest + L2 rollup vault): {}", last_err),
+                });
             }
         }
 
