@@ -1,0 +1,7 @@
+﻿cargo :     Finished `dev` profile [optimized] target(s) in 0.68s
+At line:1 char:1
++ cargo build --features unsafe_admin 2>&1 | Out-File -FilePath build_o ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `d...get(s) in 0.68s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
