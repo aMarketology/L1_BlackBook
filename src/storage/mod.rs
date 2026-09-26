@@ -2041,10 +2041,16 @@ impl ConcurrentBlockchain {
         let user_bytes = borsh::to_vec(&StoredAccount::from(&user_account))
             .map_err(|e| format!("Serialization error: {}", e))?;
 
-        // Single atomic ReDB write: claim seal + both SVM account states
+        // Single atomic ReDB write: claim seal + both SVM account states.
+        // The replay guard is enforced INSIDE this transaction: if the claim key
+        // already exists, we reject before any balance mutation, so the same
+        // Merkle proof can never drain the vault twice — even across restarts.
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut claims = write_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
+            if claims.get(claim_key).map_err(|e| e.to_string())?.is_some() {
+                return Err(format!("Already claimed: {claim_key}"));
+            }
             claims.insert(claim_key, timestamp).map_err(|e| e.to_string())?;
 
             let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
