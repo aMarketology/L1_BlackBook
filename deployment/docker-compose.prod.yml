@@ -8,7 +8,7 @@
 #   docker compose -f deployment/docker-compose.prod.yml down
 #
 # Requires: /opt/blackbook/.env (copy from .env.template and fill in values)
-#   Set BLACKBOOK_MODE=validator and BLACKBOOK_IDENTITY=cherry-writer in .env
+#   Set BLACKBOOK_MODE=writer and BLACKBOOK_IDENTITY=latitude-writer in .env
 # ============================================================================
 
 services:
@@ -29,11 +29,12 @@ services:
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
       - REDB_PATH=${REDB_PATH:-/data/blockchain_data/blockchain.redb}
 
-    # Run in validator mode by default (override via BLACKBOOK_MODE in .env)
+    # Run as the supported single block producer by default.
+    # `validator` is reserved for the future rotating-validator implementation.
     command: >
       /app/layer1
-      --mode ${BLACKBOOK_MODE:-validator}
-      --identity ${BLACKBOOK_IDENTITY:-cherry-writer}
+      --mode ${BLACKBOOK_MODE:-writer}
+      --identity ${BLACKBOOK_IDENTITY:-latitude-writer}
       --http-port ${BLACKBOOK_HTTP_PORT:-8080}
       --grpc-port ${BLACKBOOK_GRPC_PORT:-50051}
 
