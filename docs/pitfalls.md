@@ -6,24 +6,22 @@ developer or operator.
 
 ---
 
-## 1. NFT `token_id` type mismatch (BUG — exit proofs can fail)
+## 1. NFT `token_id` type mismatch — ✅ FIXED (2026-09-29)
 
-**Severity: high.** The Rust and TypeScript disagree on the NFT leaf's
-`token_id` type:
+**Severity: high (was a real bug).** The Rust and TypeScript disagreed on the
+NFT leaf's `token_id` type:
 
 - Rust `NftClaimLeaf.token_id` is `&str` (Borsh encodes as `u32_LE(len) || utf8`).
-- TypeScript `merkle.ts` `serializeNftLeaf` writes `tokenId` as **`u64`**
+- TypeScript `merkle.ts` `serializeNftLeaf` wrote `tokenId` as **`u64`**
   (8 bytes LE, via `borshWriteU64`).
 
-These produce different leaf bytes, so an NFT exit proof built by the current
-TypeScript sequencer will **fail L1 `verify_merkle_proof`** for NFT exits.
-BB exits are unaffected (no `token_id` field).
+These produced different leaf bytes, so an NFT exit proof built by the
+TypeScript sequencer **failed L1 `verify_merkle_proof`** for NFT exits.
 
-**Action:** align one side. Either change the TS `serializeNftLeaf` to
-`borshWriteString(buf, tokenId)` (matching Rust `&str`), or change Rust
-`token_id` to `u64` and update `NftClaimLeaf` + `nft_leaf_hash` callers. Confirm
-against `sequencer/l3/src/batchSealer.ts` (which passes `tokenId: string`) and
-the Rust `exit_handler` (`req.nft_token_id`).
+**Resolution:** `sequencer/shared/src/merkle.ts` `serializeNftLeaf` now writes
+`token_id` via `borshWriteString(buf, tokenId)` (matching Rust `&str`). The
+`NftEntry.tokenId` field was already `string` end-to-end; only the leaf
+serializer diverged. BB leaves are unaffected.
 
 ---
 

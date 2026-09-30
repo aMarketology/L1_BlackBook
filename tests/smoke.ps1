@@ -99,20 +99,24 @@ try {
     }
 }
 
-# Test B: with dealer_sig - 200 on unsafe_admin build, 404 on prod build
-Write-Host -NoNewline "  POST /admin/mint with dealer_sig ... "
+# Test B: with an INVALID (dummy) dealer_sig - now rejected. 404 on prod build.
+#   (A real Ed25519 signature from DEALER_PRIVATE_KEY is required for 200.)
+Write-Host -NoNewline "  POST /admin/mint with dummy dealer_sig ... "
 $adminAvailable = $false
 try {
     $response = Invoke-WebRequest -Uri "$BaseUrl/admin/mint" -Method POST `
         -ContentType "application/json" `
-        -Body (@{ to = $AliceAddr; amount = 1.0; dealer_signature = "smoke_test_sig" } | ConvertTo-Json) `
+        -Body (@{ to = $AliceAddr; amount = 1.0; dealer_signature = "smoke_test_sig"; timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); nonce = "smoke-nonce" } | ConvertTo-Json) `
         -ErrorAction Stop
-    $script:adminAvailable = $true
-    Write-Host "PASS (200 - minted, unsafe_admin ON)" -ForegroundColor Green
-    $pass++
+    # 200 means a dummy signature was accepted — auth is broken.
+    Write-Host "FAIL (dummy dealer_sig accepted - auth broken!)" -ForegroundColor Red
+    $fail++
 } catch {
     $code = $_.Exception.Response.StatusCode.value__
-    if ($code -eq 404) {
+    if ($code -eq 401) {
+        Write-Host "PASS (401 - dummy sig rejected, dealer auth live)" -ForegroundColor Green
+        $pass++
+    } elseif ($code -eq 404) {
         Write-Host "PASS (404 - unsafe_admin safely OFF on this node)" -ForegroundColor Green
         $pass++
     } else {

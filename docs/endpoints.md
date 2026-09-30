@@ -173,6 +173,15 @@ See [Rollup Hub Integration](rollup-hub.md) for the full lifecycle.
 > These are **dev/test only** and do not exist in a release build without the
 > `unsafe_admin` feature flag.
 
+`/admin/mint` and `/admin/burn` additionally require a valid dealer Ed25519
+signature (derived from `DEALER_PRIVATE_KEY`). The signed message is:
+
+- Mint: `ADMIN_MINT:{to}:{lamports}:{timestamp}:{nonce}`
+- Burn: `ADMIN_BURN:{from}:{lamports}:{timestamp}:{nonce}`
+
+where `{lamports}` is the integer micro-unit amount (`amount * 100_000`). The
+request body must include `dealer_signature`, `timestamp`, and `nonce`.
+
 ## Off-chain transport
 
 | Transport | Address | Protocol | Notes |

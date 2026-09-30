@@ -218,13 +218,24 @@ async function l1Balance(address) {
 
 /**
  * Admin-mint BB to an address (requires unsafe_admin feature on L1).
- * Falls back to faucet if USE_ADMIN_MINT=false.
+ * Signs the canonical ADMIN_MINT message with the dealer key (must match
+ * DEALER_PRIVATE_KEY on L1). Falls back to faucet if USE_ADMIN_MINT=false.
  */
 async function fundAgent(wallet, bbAmount) {
   if (USE_ADMIN_MINT) {
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = crypto.randomUUID();
+    const lamports = Math.round(bbAmount * LAMPORTS);
+    const msg = `ADMIN_MINT:${wallet.address}:${lamports}:${ts}:${nonce}`;
+    const dealerSeed = process.env.DEALER_PRIVATE_KEY
+      || '88c428ea60ec00ef8e2aa7af19384a7732efa0a43cd325ef976036197836c7f9';
+    const dealer_signature = await sign(msg, dealerSeed);
     const r = await request(`${L1_URL}/admin/mint`, 'POST', {
-      address: wallet.address,
-      amount:  bbAmount,
+      to: wallet.address,
+      amount: bbAmount,
+      dealer_signature,
+      timestamp: ts,
+      nonce,
     });
     if (r.status !== 200) {
       throw new Error(`Admin mint failed for ${wallet.address}: ${JSON.stringify(r.body)}`);

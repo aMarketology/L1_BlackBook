@@ -60,19 +60,39 @@ try {
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 5.2a — Admin Mint
 # ─────────────────────────────────────────────────────────────────────────────
-Section "TEST 5.2a — Admin Mint (requires --features unsafe_admin)"
+Section "TEST 5.2a — Admin Mint (requires --features unsafe_admin + dealer sig)"
 
 # Use a fixed test wallet (base58 32-byte Solana-style pubkey)
 $testWallet = "GsbwXfJraMomNxBcpR3DBdFEWmZGRmMVFZKfDe3Xwxvb"
 
-$mintBody = @{
-    to     = $testWallet
-    amount = 100.0
-} | ConvertTo-Json
+# Sign the canonical ADMIN_MINT message with the dealer key (DEALER_PRIVATE_KEY
+# from .env) using Node + @noble/curves. The signed message binds the integer
+# lamport amount so it cannot be replayed against a different recipient/amount.
+$mintJs = @"
+const { ed25519: ed } = require('@noble/curves/ed25519.js');
+const { bytesToHex, hexToBytes } = require('@noble/hashes/utils.js');
+const to = process.argv[1];
+const amount = parseFloat(process.argv[2]);
+const lamports = Math.round(amount * 100_000);
+const ts = Math.floor(Date.now() / 1000);
+const nonce = require('crypto').randomUUID();
+const msg = 'ADMIN_MINT:' + to + ':' + lamports + ':' + ts + ':' + nonce;
+const priv = hexToBytes('88c428ea60ec00ef8e2aa7af19384a7732efa0a43cd325ef976036197836c7f9');
+const sig = bytesToHex(ed.sign(new TextEncoder().encode(msg), priv));
+console.log(JSON.stringify({ ts, nonce, sig }));
+"@
+$sigParts = node -e $mintJs -- $testWallet 100.0 | ConvertFrom-Json
 
 try {
+    $body = @{
+        to = $testWallet
+        amount = 100.0
+        dealer_signature = $sigParts.sig
+        timestamp = $sigParts.ts
+        nonce = $sigParts.nonce
+    } | ConvertTo-Json
     $r = Invoke-RestMethod "$base/admin/mint" -Method POST `
-        -ContentType "application/json" -Body $mintBody
+        -ContentType "application/json" -Body $body
     Write-Host "  Response: $($r | ConvertTo-Json -Compress)"
 
     if ($r.success -eq $true) {
@@ -84,6 +104,8 @@ try {
     $status = $_.Exception.Response.StatusCode.value__
     if ($status -eq 404) {
         Fail "admin/mint returned 404 — did you start L1 with --features unsafe_admin?"
+    } elseif ($status -eq 401) {
+        Fail "admin/mint returned 401 — dealer signature invalid. Ensure DEALER_PRIVATE_KEY on L1 matches the test key."
     } else {
         Fail "admin/mint failed ($status): $_"
     }
