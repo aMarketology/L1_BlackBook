@@ -1107,25 +1107,41 @@ async fn push_payouts_handler(
             continue;
         }
 
-        // Transfer escrow → winner atomically
-        match state.blockchain.atomic_escrow_claim_and_pay(
-            &claim_key, &escrow_addr, &entry.wallet, entry.amount_bb, now,
-        ) {
-            Ok(()) => {
-                state.withdrawal_claims.insert(claim_key, true);
-                info!("💸 push_payouts: {} lamports → {} (contest {})",
-                    entry.amount_bb, entry.wallet, req.contest_id);
-                results.push(serde_json::json!({
-                    "wallet": entry.wallet, "success": true,
-                    "amount_bb": entry.amount_bb
-                }));
+        // Transfer escrow → winner atomically.
+        // Try the per-contest vault first; fall back to the L2 rollup vault
+        // if the per-contest vault has insufficient balance (e.g.
+        // InitContestReserve was never called or locked too little). This
+        // mirrors the gRPC DistributePayouts fallback so both settlement
+        // paths source funds identically.
+        let l2_rollup_vault = crate::svm::pda::rollup_vault_address("L2");
+        let mut paid = false;
+        let mut last_err = String::new();
+        for vault_addr in &[&escrow_addr, &l2_rollup_vault] {
+            match state.blockchain.atomic_escrow_claim_and_pay(
+                &claim_key, vault_addr, &entry.wallet, entry.amount_bb, now,
+            ) {
+                Ok(()) => {
+                    state.withdrawal_claims.insert(claim_key.clone(), true);
+                    let vault_label = if *vault_addr == &escrow_addr { "per-contest" } else { "L2 rollup" };
+                    info!("💸 push_payouts: {} lamports → {} (contest {} via {} vault)",
+                        entry.amount_bb, entry.wallet, req.contest_id, vault_label);
+                    results.push(serde_json::json!({
+                        "wallet": entry.wallet, "success": true,
+                        "amount_bb": entry.amount_bb
+                    }));
+                    paid = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                }
             }
-            Err(e) => {
-                results.push(serde_json::json!({
-                    "wallet": entry.wallet, "success": false,
-                    "error": format!("transfer failed: {}", e)
-                }));
-            }
+        }
+        if !paid {
+            results.push(serde_json::json!({
+                "wallet": entry.wallet, "success": false,
+                "error": format!("transfer failed (per-contest + L2 rollup vault): {}", last_err)
+            }));
         }
     }
 
@@ -3117,8 +3133,10 @@ async fn reader_proxy_middleware(
 
 fn build_router(state: AppState) -> Router {
 
-    // CORS: allow a hardcoded set of production + dev origins.
-    // Add extra origins at runtime via CORS_EXTRA_ORIGINS (comma-separated).
+    // CORS: allow a hardcoded set of production + dev origins, plus any
+    // Vercel preview/production domain (*.vercel.app) and any *.blackbook.id
+    // subdomain via suffix matching. Add extra origins at runtime via
+    // CORS_EXTRA_ORIGINS (comma-separated).
     // Example: CORS_EXTRA_ORIGINS=https://staging.blackbook.id,http://localhost:3000
     let mut allowed: Vec<HeaderValue> = vec![
         // Production
@@ -3140,10 +3158,18 @@ fn build_router(state: AppState) -> Router {
             }
         }
     }
-    info!("🔒 CORS: {} origin(s) allowed", allowed.len());
+    info!("🔒 CORS: {} explicit origin(s) allowed (+ *.vercel.app, *.blackbook.id)", allowed.len());
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _req| {
-            allowed.contains(origin)
+            // Exact match against the explicit allowlist.
+            if allowed.contains(origin) {
+                return true;
+            }
+            // Suffix match for Vercel (dynamic preview + production) and any
+            // blackbook.id subdomain. `origin` is a HeaderValue; compare its
+            // ASCII bytes so we don't allocate a String per request.
+            let bytes = origin.as_bytes();
+            bytes.ends_with(b".vercel.app") || bytes.ends_with(b".blackbook.id")
         }))
         .allow_methods(Any)
         .allow_headers(Any);
