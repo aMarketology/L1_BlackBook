@@ -22,7 +22,7 @@ const bs58 = _require('bs58');
 //
 // ClaimLeaf (NFT):
 //   borsh( rollup_id: String, token: "NFT", collection_id: String,
-//          token_id: u64, owner: [u8;32], metadata_hash: String )
+//          token_id: String, owner: [u8;32], metadata_hash: String )
 //
 // SHA-256 of the Borsh bytes = the canonical leaf digest used in the tree.
 // Matches the Rust `ClaimLeaf` BorshSerialize derive in contracts/rollup/mod.rs
@@ -72,7 +72,7 @@ function serializeBbLeaf(rollupId, address, lamports) {
  *   rollup_id     : String  → u32_LE(len) + utf8
  *   token         : String  → u32_LE(3) + "NFT"
  *   collection_id : String  → u32_LE(len) + utf8
- *   token_id      : u64     → 8 bytes LE
+ *   token_id      : String  → u32_LE(len) + utf8  (NOT u64 — matches Rust &str)
  *   owner         : [u8;32] → 32 raw bytes (bs58-decoded pubkey)
  *   metadata_hash : String  → u32_LE(64) + hex chars (64 ASCII bytes)
  */
@@ -81,7 +81,7 @@ function serializeNftLeaf(rollupId, collectionId, tokenId, owner, metadataHash) 
     borshWriteString(buf, rollupId);
     borshWriteString(buf, 'NFT');
     borshWriteString(buf, collectionId);
-    borshWriteU64(buf, tokenId);
+    borshWriteString(buf, tokenId);
     const ownerBytes = bs58.decode(owner);
     if (ownerBytes.length !== 32)
         throw new Error(`NFT leaf: owner must decode to 32 bytes, got ${ownerBytes.length}`);
@@ -95,7 +95,7 @@ export function buildLeafBytes(rollupId, entry) {
     if (entry.type === 'BB') {
         return serializeBbLeaf(rollupId, entry.address, entry.lamports);
     }
-    return serializeNftLeaf(rollupId, entry.collectionId, BigInt(entry.tokenId), entry.owner, entry.metadataHash);
+    return serializeNftLeaf(rollupId, entry.collectionId, entry.tokenId, entry.owner, entry.metadataHash);
 }
 /**
  * @deprecated Use `buildLeafBytes` + `hashLeafBytes` instead.

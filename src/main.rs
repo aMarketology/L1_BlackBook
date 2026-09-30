@@ -1349,10 +1349,107 @@ async fn gulf_stream_submit_handler(
 struct MintRequest {
     to: String,
     amount: f64,
-    /// Optional: dealer signature for production auth
+    /// Dealer Ed25519 signature (hex, 64 bytes) over the canonical message.
     dealer_signature: Option<String>,
+    /// Unix timestamp (seconds) — rejected outside ±120s.
+    timestamp: u64,
+    /// Unique nonce string — replay protection.
+    nonce: String,
     /// Optional: receipt ID from L2 for audit trail
     l2_receipt_id: Option<String>,
+}
+
+/// Verify an admin (dealer) Ed25519 signature over a canonical action message.
+///
+/// Signed message: `"{action}:{body}:{timestamp}:{nonce}"` where `body` carries
+/// the integer lamport amount so floating-point ambiguity cannot be exploited.
+/// The signing key MUST be the dealer (derived from `DEALER_PRIVATE_KEY`); the
+/// verifying key is decoded from `state.dealer_address` (its base58 pubkey).
+#[cfg(feature = "unsafe_admin")]
+fn verify_dealer_auth(
+    state: &AppState,
+    action: &str,
+    body: &str,
+    signature_hex: &str,
+    timestamp: u64,
+    nonce: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let err = |code: StatusCode, msg: &str| -> (StatusCode, Json<serde_json::Value>) {
+        (code, Json(serde_json::json!({ "error": msg })))
+    };
+
+    // Dealer must be configured (DEALER_PRIVATE_KEY set).
+    if state.dealer_address.is_empty() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DEALER_PRIVATE_KEY not configured on this node",
+        ));
+    }
+
+    // Derive the dealer verifying key from its base58 address.
+    let dealer_pk_bytes = bs58::decode(&state.dealer_address)
+        .into_vec()
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Dealer address is invalid base58"))?;
+    if dealer_pk_bytes.len() != 32 {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Dealer address is not 32 bytes",
+        ));
+    }
+    let dealer_pk_arr: &[u8; 32] = dealer_pk_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Dealer address invalid"))?;
+    let verifying_key = VerifyingKey::from_bytes(dealer_pk_arr)
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Dealer public key invalid"))?;
+
+    // Reconstruct the signed message.
+    let message = format!("{action}:{body}:{timestamp}:{nonce}");
+
+    // Decode the signature.
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid dealer_signature hex"))?;
+    if sig_bytes.len() != 64 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "dealer_signature must be 64 bytes",
+        ));
+    }
+    let sig_arr: &[u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid signature length"))?;
+    let signature = Signature::from_bytes(sig_arr);
+
+    if verifying_key.verify(message.as_bytes(), &signature).is_err() {
+        return Err(err(StatusCode::UNAUTHORIZED, "Invalid dealer signature"));
+    }
+
+    // Timestamp freshness (±120s window, slightly looser than user txs).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.abs_diff(timestamp) > 120 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Request timestamp outside ±120s window",
+        ));
+    }
+
+    // Replay protection via atomic nonce insert.
+    let nonce_key = format!("{action}:{body}:{nonce}");
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            Err(err(StatusCode::CONFLICT, "Nonce already used — possible replay"))
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+            Ok(())
+        }
+    }
 }
 
 /// POST /admin/mint — Mint $BB tokens (Dealer only in production)
@@ -1364,14 +1461,6 @@ async fn admin_mint_handler(
     State(state): State<AppState>,
     Json(req): Json<MintRequest>,
 ) -> impl IntoResponse {
-    // Validate dealer signature (security gate for production)
-    if req.dealer_signature.is_none() {
-        warn!("\u{26a0}\u{fe0f} Mint request without dealer_signature from to={}", req.to);
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing dealer signature for admin mint"
-        })));
-    }
-
     if req.amount <= 0.0 || req.to.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid mint parameters"
@@ -1385,6 +1474,26 @@ async fn admin_mint_handler(
 
     // ═══ SINGLE f64 → u64 conversion at the HTTP boundary ═══
     let mint_lamports = (req.amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+
+    // ── Dealer authorization: rigorous Ed25519 signature verification ─────
+    let signature = match req.dealer_signature {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            warn!("⚠️  Mint request without dealer_signature to={}", req.to);
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": "Missing dealer signature for admin mint"
+            })));
+        }
+    };
+    // Signed message binds the integer lamport amount + target so the signature
+    // cannot be replayed against a different recipient or amount.
+    let body = format!("{}:{}", req.to, mint_lamports);
+    if let Err((code, body_json)) =
+        verify_dealer_auth(&state, "ADMIN_MINT", &body, &signature, req.timestamp, &req.nonce)
+    {
+        return (code, body_json);
+    }
+
     match state.blockchain.mint_lamports(&req.to, mint_lamports) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.to);
@@ -1431,7 +1540,12 @@ async fn admin_mint_handler(
 struct BurnRequest {
     from: String,
     amount: f64,
+    /// Dealer Ed25519 signature (hex, 64 bytes) over the canonical message.
     dealer_signature: Option<String>,
+    /// Unix timestamp (seconds) — rejected outside ±120s.
+    timestamp: u64,
+    /// Unique nonce string — replay protection.
+    nonce: String,
     l2_receipt_id: Option<String>,
 }
 
@@ -1441,14 +1555,6 @@ async fn admin_burn_handler(
     State(state): State<AppState>,
     Json(req): Json<BurnRequest>,
 ) -> impl IntoResponse {
-    // Validate dealer signature (security gate for production)
-    if req.dealer_signature.is_none() {
-        warn!("\u{26a0}\u{fe0f} Burn request without dealer_signature from={}", req.from);
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "Missing dealer signature for admin burn"
-        })));
-    }
-
     if req.amount <= 0.0 || req.from.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid burn parameters" })));
     }
@@ -1467,6 +1573,24 @@ async fn admin_burn_handler(
 
     // ═══ SINGLE f64 → u64 conversion at the HTTP boundary ═══
     let burn_lamports = (req.amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64;
+
+    // ── Dealer authorization: rigorous Ed25519 signature verification ─────
+    let signature = match req.dealer_signature {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            warn!("⚠️  Burn request without dealer_signature from={}", req.from);
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                "error": "Missing dealer signature for admin burn"
+            })));
+        }
+    };
+    let body = format!("{}:{}", req.from, burn_lamports);
+    if let Err((code, body_json)) =
+        verify_dealer_auth(&state, "ADMIN_BURN", &body, &signature, req.timestamp, &req.nonce)
+    {
+        return (code, body_json);
+    }
+
     match state.blockchain.burn_lamports(&req.from, burn_lamports) {
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.from);

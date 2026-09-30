@@ -547,21 +547,52 @@ export class DealerSDK {
    *   - Airdropping promotional BB to users
    *   - Correcting ledger discrepancies
    *
+   * Requires the dealer's Ed25519 signature. Signs the canonical message:
+   *   `"ADMIN_MINT:{to}:{lamports}:{timestamp}:{nonce}"`
+   * where {lamports} is the integer micro-unit amount (amount * 100_000).
+   *
    * @param to      Recipient base58 address
    * @param amount  BB amount (human-readable, e.g. 100.5)
    */
   async mint(to: string, amount: number): Promise<MintResponse> {
-    return this.post("/admin/mint", { to, amount });
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const lamports = Math.round(amount * 100_000); // 1 BB = 100_000 lamports
+    const message = `ADMIN_MINT:${to}:${lamports}:${timestamp}:${nonce}`;
+    const dealer_signature = await this.signMessage(message);
+
+    return this.post("/admin/mint", {
+      to,
+      amount,
+      dealer_signature,
+      timestamp,
+      nonce,
+    });
   }
 
   /**
    * Burn BB tokens from any address.
    *
+   * Requires the dealer's Ed25519 signature. Signs the canonical message:
+   *   `"ADMIN_BURN:{from}:{lamports}:{timestamp}:{nonce}"`
+   *
    * @param from    Address to debit
    * @param amount  BB amount to destroy
    */
   async burn(from: string, amount: number): Promise<BurnResponse> {
-    return this.post("/admin/burn", { from, amount });
+    const timestamp = nowSecs();
+    const nonce = randomNonce();
+    const lamports = Math.round(amount * 100_000);
+    const message = `ADMIN_BURN:${from}:${lamports}:${timestamp}:${nonce}`;
+    const dealer_signature = await this.signMessage(message);
+
+    return this.post("/admin/burn", {
+      from,
+      amount,
+      dealer_signature,
+      timestamp,
+      nonce,
+    });
   }
 
   /**

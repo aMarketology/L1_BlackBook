@@ -1,0 +1,44 @@
+# ============================================================================
+# BlackBook L1 — Self-Hosted Auto-Deploy (Windows PC as first mainnet node)
+# ============================================================================
+# Runs on a GitHub self-hosted runner installed on the Windows machine that
+# hosts the L1 node. On every push to master/main, this workflow:
+#   1. Pulls the latest code IN-PLACE (into the real repo directory, not the
+#      runner's isolated _work/ folder).
+#   2. Rebuilds the release binary in-place (target\release\layer1.exe).
+#   3. Restarts the NSSM Windows service "BlackBookL1".
+#
+# Why in-place (not actions/checkout): actions/checkout forces the code into
+# the runner's isolated _work/ directory, which would build a binary the NSSM
+# service never runs. By setting working-directory to the real repo path and
+# doing a manual `git pull`, `cargo build` replaces the exact binary NSSM is
+# watching.
+# ============================================================================
+
+name: L1 Node Auto-Deploy
+
+on:
+  push:
+    branches: [ "master", "main" ]
+
+jobs:
+  build-and-deploy:
+    # Custom label given to the local Windows PC runner.
+    runs-on: self-hosted
+
+    # Run directly inside the ACTUAL repo on disk, not the runner's _work/.
+    defaults:
+      run:
+        working-directory: C:\Users\maxd1\Documents\GitHub\blackbook-wallet\L1_BlackBook
+
+    steps:
+      - name: Git Pull Latest (In-Place)
+        run: |
+          git reset --hard
+          git pull origin main || git pull origin master
+
+      - name: Build Release Binary
+        run: cargo build --release
+
+      - name: Restart L1 Service
+        run: nssm restart BlackBookL1

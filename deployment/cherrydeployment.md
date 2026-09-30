@@ -1,9 +1,10 @@
-# BlackBook L1 — Cherry Servers Production Deployment Guide
+# BlackBook L1 — Production Deployment Guide
 
 **Version:** 5.0.2-mainnet-beta  
-**Date:** 2026-06-25  
-**Target:** Bare Metal (Hetzner/Cherry) — Ubuntu 24.04  
-**Status:** 85% Ready (3 blockers to resolve)
+**Date:** 2026-09-29  
+**Future Target:** OVH Cloud (Bare Metal / VPS) — Ubuntu 24.04  
+**Current Mode:** Local development — L1 runs constantly on dev machine; L2 prediction market runs on top  
+**Status:** Local dev active; production deployment deferred
 
 ---
 
@@ -12,12 +13,13 @@
 1. [Architecture Overview](#architecture-overview)
 2. [Key Design Decisions](#key-design-decisions)
 3. [Contracts Deployed on L1](#contracts-deployed-on-l1)
-4. [Critical Gaps for Production](#critical-gaps-for-production)
-5. [What's Solid (No Changes Needed)](#whats-solid-no-changes-needed)
-6. [Deployment Readiness Assessment](#deployment-readiness-assessment)
-7. [Pre-Deployment Checklist](#pre-deployment-checklist)
-8. [Post-Deploy Verification](#post-deploy-verification)
-9. [Troubleshooting](#troubleshooting)
+4. [Local Development (Current)](#local-development-current)
+5. [Critical Gaps for Production](#critical-gaps-for-production)
+6. [What's Solid (No Changes Needed)](#whats-solid-no-changes-needed)
+7. [Deployment Readiness Assessment](#deployment-readiness-assessment)
+8. [Pre-Deployment Checklist](#pre-deployment-checklist)
+9. [Post-Deploy Verification](#post-deploy-verification)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -78,16 +80,152 @@ Leaders rotate in contiguous 4-slot tenures (`LEADER_TENURE_SLOTS = 4`, 1.6s eac
 
 ---
 
-## ⚠️ Critical Gaps for Production
+## 💻 Local Development (Current)
 
-| # | Gap | Severity | Fix |
+**The L1 runs constantly on the dev machine. The L2 prediction market sequencer runs on top of it.**
+
+### L1 — Start the Node
+
+```powershell
+# Windows (PowerShell) — writer mode with unsafe_admin for dev
+.\dev.ps1 writer
+
+# Or manually:
+$env:REDB_PATH = "blockchain_data/dev.redb"
+$env:RUST_LOG = "info,layer1=info,tower_http=warn"
+$env:RUST_BACKTRACE = "1"
+cargo build --features unsafe_admin
+.\target\debug\layer1.exe --mode writer
+```
+
+The L1 starts on:
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| `:8080` | HTTP | REST API (wallet, escrow, swap, rollup) |
+| `:8899` | HTTP | Solana JSON-RPC (Phantom, OneKey) |
+| `:8003` | UDP | TPU binary transaction ingestion |
+| `:8004` | UDP | Turbine tick shred broadcast |
+| `:50051` | gRPC | Validator relay (writer → reader) |
+| `:50052` | gRPC | Settlement (L2 → L1) |
+
+### L1 — What's Already Configured
+
+Your `.env` already has all the critical secrets:
+- ✅ `SERVER_MASTER_KEY` — set
+- ✅ `L2_SEQUENCER_PUBKEY` — `ca9225e3...` (matches L2 sequencer key)
+- ✅ `DEALER_PRIVATE_KEY` — set (same key as L2 sequencer — shared Oracle identity)
+- ✅ `L3_SEQUENCER_PUBKEY` — set
+- ✅ `GENESIS_SEEDS` — dealer wallet seeded with 1M BB
+- ⚠️ `USDC_MINT_AUTHORITY` — empty (wUSDT minting disabled until wallet created)
+
+### L2 Prediction Market Sequencer — Start
+
+```powershell
+cd sequencer
+
+# Install deps (first time only)
+npm install
+
+# Build shared library first
+npm run build --workspace=shared
+
+# Start L2 sequencer in dev mode
+npm run dev:l2
+```
+
+The L2 sequencer:
+- Listens on `:7072`
+- Connects to L1 via WebSocket (`ws://localhost:8080/ws`) for PoH slot ticks
+- Seals Merkle batches every 25 slots (~10 seconds)
+- Submits state roots to L1 via `POST /rollup/L2/submit_root`
+- Manages prediction markets: create, bet (YES/NO), lock, resolve
+- Tracks off-chain balances in SQLite (`sequencer/l2/data/l2.sqlite`)
+
+### L2 — Required `.env`
+
+The L2 sequencer needs `sequencer/l2/.env` (or reads from `sequencer/.env.l2`):
+
+```env
+L2_SEQUENCER_PRIVKEY=88c428ea60ec00ef8e2aa7af19384a7732efa0a43cd325ef976036197836c7f9
+L2_SEQUENCER_PUBKEY=ca9225e31a668c0540062c1be1f36a70593ef6f3dac10dcc771e65f96f13b9dc
+L1_HTTP_URL=http://localhost:8080
+L1_WS_URL=ws://localhost:8080/ws
+DB_PATH=./data/l2.sqlite
+PORT=7072
+SLOTS_PER_BATCH=25
+```
+
+### L1 + L2 — Full Local Stack Verification
+
+```powershell
+# 1. L1 health
+curl http://localhost:8080/health
+
+# 2. L1 balance (dealer wallet)
+curl http://localhost:8080/balance/EdkcKbgiYRVWMGXKbehfDrAuWUcgd7A6UoJzVg7CYQCT
+
+# 3. L2 sequencer health
+curl http://localhost:7072/health
+
+# 4. Create a prediction market on L2
+curl -X POST http://localhost:7072/markets \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Will BTC hit $100k by December?"}'
+
+# 5. Place a bet
+curl -X POST http://localhost:7072/markets/<market_id>/bet \
+  -H "Content-Type: application/json" \
+  -d '{"wallet_address": "EdkcKbgiYRVWMGXKbehfDrAuWUcgd7A6UoJzVg7CYQCT", "side": "YES", "amount_lamports": 10000000}'
+
+# 6. Lock market, resolve, and seal
+curl -X POST http://localhost:7072/markets/<market_id>/lock
+curl -X POST http://localhost:7072/markets/<market_id>/resolve \
+  -H "Content-Type: application/json" \
+  -d '{"outcome": "YES"}'
+```
+
+### Blockers to Spinning Up Locally
+
+| # | Blocker | Status | Fix |
 |---|---|---|---|
-| **1** | `DEALER_PRIVATE_KEY` missing from L1 `.env` | 🔴 **BLOCKER** | All dealer endpoints return 503. Add the key from L2 (`e5284bcb...`) |
-| **2** | Vault runs in dev mode (`server -dev`) | 🔴 **BLOCKER** | No HA, no auto-unseal, unsealed on restart. Need production config |
-| **3** | `L2_ORACLE_ADDRESS` not set in `seed_hetzner.sh` | 🟡 High | Oracle wallet won't be pre-funded (10k BB). Set to `WavLzgRxCPmPuiCCW1FA6aFRB6PwTRnNAoBmPWx2qwP` |
-| **4** | gRPC port 50051 requires `READER_NODE_IP` | 🟡 High | Reader nodes can't connect until UFW rule added |
-| **5** | `USDC_MINT_AUTHORITY` empty | 🟡 High | wUSDT minting disabled until mint authority wallet created |
-| **6** | `CUSTODY_WALLET_ADDRESS` empty | 🟡 Medium | Deposit gateway (Solana/BSC watchers) disabled |
+| **1** | L1 builds and runs | ✅ Working | `.\dev.ps1 writer` |
+| **2** | `.env` secrets configured | ✅ Working | All keys present |
+| **3** | L2 sequencer `.env` points to localhost | ✅ Working | `sequencer/l2/.env` already has `L1_HTTP_URL=http://localhost:8080` |
+| **4** | `sequencer/shared` needs build | ⚠️ First run | `npm run build --workspace=shared` |
+| **5** | L2 SQLite DB directory | ⚠️ First run | `mkdir sequencer\l2\data` if missing |
+| **6** | `USDC_MINT_AUTHORITY` empty | 🟡 Optional | Only needed for wUSDT minting; prediction market uses $BB |
+
+### Quick-Start Checklist (Local)
+
+```powershell
+# Terminal 1 — L1
+.\dev.ps1 writer
+
+# Terminal 2 — L2 Sequencer
+cd sequencer
+npm install
+npm run build --workspace=shared
+# Ensure sequencer/l2/.env has L1_HTTP_URL=http://localhost:8080
+npm run dev:l2
+
+# Terminal 3 — Smoke test
+curl http://localhost:8080/health
+curl http://localhost:7072/health
+```
+
+---
+
+## ⚠️ Critical Gaps for Production (OVH Cloud)
+
+| # | Gap | Severity | Status (Local) | Fix for OVH |
+|---|---|---|---|---|
+| **1** | `DEALER_PRIVATE_KEY` in `.env` | 🔴 **BLOCKER** | ✅ Set locally | Already in `.env` — just SCP to OVH |
+| **2** | Vault runs in dev mode (`server -dev`) | 🔴 **BLOCKER** | N/A (no Vault locally) | Need production config with auto-unseal |
+| **3** | `L2_ORACLE_ADDRESS` not set in seed script | 🟡 High | ✅ Dealer wallet seeded via `GENESIS_SEEDS` | Set in `seed_hetzner.sh` |
+| **4** | gRPC port 50051 requires `READER_NODE_IP` | 🟡 High | N/A (single node) | Configure UFW on OVH |
+| **5** | `USDC_MINT_AUTHORITY` empty | 🟡 High | ⚠️ Empty locally | Create mint authority wallet, set address |
+| **6** | `CUSTODY_WALLET_ADDRESS` empty | 🟡 Medium | N/A (no cross-chain) | Set Solana custody wallet for deposit gateway |
+| **7** | L2 sequencer `.env` points to production IP | 🟡 Medium | ✅ Already `localhost:8080` |
 
 ---
 
@@ -106,87 +244,60 @@ Leaders rotate in contiguous 4-slot tenures (`LEADER_TENURE_SLOTS = 4`, 1.6s eac
 
 ## 🎯 Deployment Readiness Assessment
 
-**Overall Status: 85% Ready**
+**Overall Status: Local dev active — OVH production deployment deferred**
 
-### Blockers (Must Fix Before Deploy)
+### Local Dev (Current) — ✅ Working
 
-1. **Add `DEALER_PRIVATE_KEY` to L1 `.env`**
-   - Without this, all dealer endpoints return 503
-   - Required for: `/admin/dealer/settle`, `/admin/dealer/send_wusdt`, `/dealer/balances`, swap pool operations, withdrawal gateway
+The L1 runs on this machine in writer mode. The L2 prediction market sequencer runs alongside it. All critical secrets are configured in `.env`. The main blocker for the full L1+L2 local stack is ensuring the L2 sequencer's `.env` points to `localhost:8080` instead of the production IP.
 
-2. **Switch Vault to Production Mode**
-   - Current: `command: server -dev` (dev mode, unsealed on restart)
-   - Required: HA cluster with Consul/PostgreSQL backend + AWS KMS auto-unseal
+### Blockers for OVH Production Deploy (When Ready)
 
-3. **Set `L2_ORACLE_ADDRESS` in Genesis Seeder**
-   - Oracle wallet won't be pre-funded with 10,000 BB
-   - Set to: `WavLzgRxCPmPuiCCW1FA6aFRB6PwTRnNAoBmPWx2qwP`
-
-### High Priority (Fix Before Traffic)
-
-4. **Configure `READER_NODE_IP` for gRPC Access**
-   - Reader nodes can't connect until UFW rule added
-   - Set env var and re-run `setup-hetzner.sh`
-
-5. **Create Mint Authority Wallet**
-   - Set `USDC_MINT_AUTHORITY` to base58 address after first mint authority wallet created
-   - Required for wUSDT minting
-
-6. **Set `CUSTODY_WALLET_ADDRESS`**
-   - Deposit gateway (Solana/BSC watchers) disabled
-   - Set to Solana custody wallet address
+1. **Provision OVH Cloud instance** — bare metal or VPS, Ubuntu 24.04
+2. **SCP `.env` to OVH** — all secrets are already populated locally
+3. **Run bootstrap** — adapt `setup-cherry.sh` for OVH (same Ubuntu 24.04 base)
+4. **Switch Vault to Production Mode** — HA cluster with auto-unseal
+5. **Set `USDC_MINT_AUTHORITY`** — create mint authority wallet, set address
+6. **Set `CUSTODY_WALLET_ADDRESS`** — for cross-chain deposit gateway
+7. **Configure DNS** — point `layer1.blackbook.id` and `layer2.blackbook.id` to OVH IP
+8. **Provision TLS certs** — Let's Encrypt via Certbot + Nginx
 
 ---
 
-## 📝 Pre-Deployment Checklist
+## 📝 Pre-Deployment Checklist (OVH Cloud)
 
 ### On LOCAL Machine
 
 ```bash
-# 1. Copy template and fill in required values
-cp .env.template .env
+# 1. .env is already populated — verify all values
+cat .env | grep -E "SERVER_MASTER_KEY|L2_SEQUENCER|DEALER_PRIVATE_KEY|GENESIS_SEEDS"
 
-# Fill in ALL required values:
-#   SERVER_MASTER_KEY=<32-byte hex from openssl rand -hex 32>
-#   L2_SEQUENCER_PUBKEY=fb78242e99e8bd8ef06fc06ce0e50cb00a94217017423c957c2b136eb6d9bbeb
-#   DEALER_PRIVATE_KEY=e5284bcb4d8fb72a8969d48a888512b1f42fe5c57d1ae5119a09785ba13654ae
-#   L3_SEQUENCER_PUBKEY=26538a990367ac1ab7499ae4647ecc62daef041305d187d0debbfb06f17a6af0
-#   USDC_MINT_AUTHORITY=<base58 after first mint authority wallet created>
-#   CUSTODY_WALLET_ADDRESS=<Solana custody wallet for deposits>
-#   BRIDGE_AUTHORITY_PUBKEY=<if using cross-chain bridge>
+# 2. Copy .env to OVH server BEFORE running bootstrap
+scp .env root@<OVH_IP>:/opt/blackbook-env.tmp
 
-# 2. Set L2 oracle address for genesis seeding
-export L2_ORACLE_ADDRESS=WavLzgRxCPmPuiCCW1FA6aFRB6PwTRnNAoBmPWx2qwP
-
-# 3. Copy .env to server BEFORE running bootstrap
-scp .env root@<HETZNER_IP>:/opt/blackbook-env.tmp
-
-# 4. Verify Docker build locally (optional but recommended)
+# 3. Verify Docker build locally (optional but recommended)
 docker compose -f deployment/docker-compose.prod.yml build
 ```
 
-### On Server (Hetzner/Cherry)
+### On Server (OVH Cloud)
 
 ```bash
 # 1. SSH into server
-ssh root@<HETZNER_IP>
+ssh root@<OVH_IP>
 
-# 2. Run bootstrap script (will clone, move .env, build, launch)
-bash deployment/setup-hetzner.sh
+# 2. Run bootstrap script (adapt setup-cherry.sh for OVH — same Ubuntu 24.04 base)
+bash deployment/setup-cherry.sh
 
 # 3. Wait for node to be healthy (~60s)
 docker logs -f blackbook-l1
 
 # 4. Seed genesis balances
-export HETZNER_HOST=<HETZNER_IP>
+export HETZNER_HOST=<OVH_IP>
 bash deployment/seed_hetzner.sh
 
 # 5. Verify all endpoints
 curl https://layer1.blackbook.id/health
-curl https://layer1.blackbook.id/balance/EJYsHB4zZ5J5fmtk61Ge9BYDuA1QMtC8j9Dm7q8jWbmo
-curl https://layer1.blackbook.id/balance/FHLDZvGVq8doU4sKAfQ6nCMr8azkEpucCwk1L1jNJAmy
-curl https://layer1.blackbook.id/balance/WavLzgRxCPmPuiCCW1FA6aFRB6PwTRnNAoBmPWx2qwP
-curl https://layer1.blackbook.id/dealer/balances   # Should NOT return 503 now
+curl https://layer1.blackbook.id/balance/EdkcKbgiYRVWMGXKbehfDrAuWUcgd7A6UoJzVg7CYQCT
+curl https://layer1.blackbook.id/dealer/balances
 ```
 
 ---

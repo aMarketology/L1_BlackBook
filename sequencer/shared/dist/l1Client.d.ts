@@ -56,20 +56,21 @@ export declare function submitOraclePendingRoot(config: SequencerConfig, marketI
  * Push winner payouts to L1 wallets after market resolution.
  *
  * Calls `POST /escrow/push_payouts` on the L1 node, which verifies each
- * winner's Merkle proof against the already-anchored rollup state root and
- * transfers BB lamports from the shared escrow vault into each winner's
- * native L1 wallet atomically.
- *
- * Must be called AFTER `submitRoot()` so the stored root exists on L1.
+ * winner's Merkle proof and transfers BB from the per-contest escrow vault
+ * to each winner's L1 wallet atomically.
  *
  * Canonical signed message (UTF-8):
- *   `"PUSH_PAYOUTS:{contest_id}:{batch_id}:{timestamp}:{nonce}"`
+ *   `"PUSH_PAYOUTS:{contest_id}:{merkle_root_hex}:{timestamp}:{nonce}"`
  *
- * @param contestId   L2 market ID.
- * @param batchId     Rollup batch_id returned by sealAndSubmit.
- * @param payouts     Array of { wallet (base58), amountBb (lamports), proof (hex strings) }.
+ * The root is included in the signed message so the L1 does NOT need
+ * a pre-stored root — the sequencer provides it and the Ed25519 signature
+ * proves authenticity.
+ *
+ * @param contestId      L2 market ID.
+ * @param merkleRootHex  64-char hex Merkle root of the winner payout tree.
+ * @param payouts        Array of { wallet (base58), amountBb (lamports), proof (hex strings) }.
  */
-export declare function pushPayoutsToL1(config: SequencerConfig, contestId: string, batchId: number, payouts: Array<{
+export declare function pushPayoutsToL1(config: SequencerConfig, contestId: string, merkleRootHex: string, payouts: Array<{
     wallet: string;
     amountBb: bigint;
     proof: string[];

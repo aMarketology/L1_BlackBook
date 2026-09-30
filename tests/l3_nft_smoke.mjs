@@ -71,8 +71,18 @@ function assert(cond, msg) {
 
 // ── Step helpers ──────────────────────────────────────────────────────────────
 
+// ── Dealer (admin) — signs /admin/mint. Must match DEALER_PRIVATE_KEY on L1 ──
+const DEALER_SECRET = '88c428ea60ec00ef8e2aa7af19384a7732efa0a43cd325ef976036197836c7f9';
+const DEALER_PRIV   = hexToBytes(DEALER_SECRET); // 32-byte seed
+
 async function adminMint(addr, bb) {
-  return post(`${L1}/admin/mint`, { to: addr, amount: bb, dealer_signature: 'dev' });
+  const t = ts(); const n = nonce();
+  const lamports = Math.round(bb * LAMPORTS_PER_BB);
+  const msg = `ADMIN_MINT:${addr}:${lamports}:${t}:${n}`;
+  const dealer_signature = sign(msg, DEALER_PRIV);
+  return post(`${L1}/admin/mint`, {
+    to: addr, amount: bb, dealer_signature, timestamp: t, nonce: n,
+  });
 }
 
 async function lockBb(priv, pubHex, addr, lamports) {
