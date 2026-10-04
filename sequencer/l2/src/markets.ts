@@ -10,13 +10,39 @@ import type { DatabaseType } from '@bb/shared';
  * Defaults to 100 bps (1%).
  */
 const DEALER_FEE_BPS = Number(process.env.DEALER_FEE_BPS ?? '100');
+
 /**
  * L1 wallet address of the market maker / prize pool operator.
  * Receives the house fee from every resolved market.
- * The dealer's L2 balance accumulates and is included in the Merkle tree —
- * they exit to L1 via the same Rollup Hub proof mechanism as users.
+ *
+ * MUST be a real base58 L1 wallet (32-byte Ed25519 pubkey). The dealer's L2
+ * balance accumulates and is included in the Merkle tree — they exit to L1 via
+ * the same Rollup Hub proof mechanism as users. A non-base58 placeholder like
+ * 'dealer_reserve' would create a phantom balance that can never exit, which is
+ * itself a form of unbacked credit.
  */
-const DEALER_ADDRESS = process.env.DEALER_ADDRESS ?? 'dealer_reserve';
+const DEALER_ADDRESS = process.env.DEALER_ADDRESS ?? '';
+
+/** Validate that DEALER_ADDRESS is a base58-encoded 32-byte pubkey. */
+function isBase58Pubkey(s: string): boolean {
+  if (!s || s.length < 32 || s.length > 44) return false;
+  try {
+    // Lazy-require bs58 to avoid a hard import at module load.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const bs58 = require('bs58');
+    const bytes = bs58.decode(s);
+    return bytes.length === 32;
+  } catch {
+    return false;
+  }
+}
+
+if (!isBase58Pubkey(DEALER_ADDRESS)) {
+  throw new Error(
+    `DEALER_ADDRESS must be a base58-encoded 32-byte L1 wallet address. ` +
+    `Got: ${JSON.stringify(DEALER_ADDRESS)}. Set DEALER_ADDRESS=<base58> in the L2 env.`,
+  );
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
