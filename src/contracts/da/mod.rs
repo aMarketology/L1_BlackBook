@@ -22,7 +22,8 @@
 //   POST /da/claim
 //     Relayer path: user submits their Merkle proof + Ed25519 wallet sig.
 //     L1 verifies proof against ESCROW_MARKET_ROOTS[market_id], checks the
-//     double-claim guard, then releases from the per-rollup vault PDA → user.
+//     double-claim guard, then releases from that market's escrow PDA → user.
+//     The rollup vault is never debited. An empty escrow fails closed.
 //
 // ── Merkle leaf format (must match L2 sequencer EXACTLY) ─────────────────────
 //
@@ -47,6 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::AppState;
+use crate::svm::escrow_vault_address_for;
 use crate::svm::pda::rollup_vault_address;
 // Re-use the Borsh leaf hash helpers from the rollup module so the DA claim
 // path is guaranteed to produce the identical leaf as the rollup exit path.
@@ -229,7 +231,8 @@ pub async fn get_da_pool_handler(
 //   6. Double-claim guard: ESCROW_CLAIMS["{market_id}:{address}"] not set
 //   7. Vault has sufficient balance
 //
-// On success: rollup vault PDA → user wallet, seal claim in ESCROW_CLAIMS.
+// On success: market escrow PDA → user wallet, seal claim in ESCROW_CLAIMS.
+// The rollup vault is not a fallback. An empty escrow fails closed.
 
 #[derive(serde::Deserialize)]
 pub struct DaClaimRequest {
@@ -428,25 +431,30 @@ pub async fn da_claim_handler(
         );
     }
 
-    // ── Vault solvency check ──────────────────────────────────────────────────
-    let vault_address = rollup_vault_address(&req.rollup_id);
-    let vault_balance = state.blockchain.get_balance_lamports(&vault_address);
-    if vault_balance < req.balance_lamports {
+    // ── Market escrow only. Never the rollup vault. ─────────────────────────
+    // Prefer the vault recorded when the market was funded. If none was
+    // stored, use the per-market escrow PDA. An empty vault fails closed.
+    let escrow_addr = match state.blockchain.load_contest_state(&req.market_id) {
+        Ok(Some(contest)) if !contest.vault_pda.is_empty() => contest.vault_pda,
+        _ => escrow_vault_address_for(&req.market_id),
+    };
+    let escrow_balance = state.blockchain.get_balance_lamports(&escrow_addr);
+    if escrow_balance < req.balance_lamports {
         return (
             StatusCode::PAYMENT_REQUIRED,
             Json(serde_json::json!({
-                "error": "Rollup vault has insufficient balance to cover this claim",
-                "vault_balance_lamports": vault_balance,
+                "error": "Market escrow has insufficient balance to cover this claim",
+                "escrow_balance_lamports": escrow_balance,
                 "claim_lamports": req.balance_lamports,
-                "vault_address": vault_address,
+                "escrow_address": escrow_addr,
             })),
         );
     }
 
-    // ── Atomic: debit vault → credit user + seal claim in ESCROW_CLAIMS ──────
+    // ── Atomic: debit escrow → credit user + seal claim in ESCROW_CLAIMS ─────
     if let Err(e) = state.blockchain.atomic_escrow_claim_and_pay(
         &claim_key,
-        &vault_address,
+        &escrow_addr,
         &req.wallet_address,
         req.balance_lamports,
         now,
@@ -465,8 +473,8 @@ pub async fn da_claim_handler(
     let new_balance_bb = new_balance as f64 / 100_000.0;
 
     info!(
-        "💸 DA CLAIM: {} lamports from {} vault → {} (market: {}, merkle root: {})",
-        req.balance_lamports, req.rollup_id, req.wallet_address, req.market_id, &expected_root_hex[..16]
+        "💸 DA CLAIM: {} lamports from market escrow {} → {} (market: {}, merkle root: {})",
+        req.balance_lamports, escrow_addr, req.wallet_address, req.market_id, &expected_root_hex[..16]
     );
 
     (
@@ -479,6 +487,7 @@ pub async fn da_claim_handler(
             "released_lamports": req.balance_lamports,
             "released_bb": req.balance_lamports as f64 / 100_000.0,
             "new_balance_bb": new_balance_bb,
+            "escrow_address": escrow_addr,
             "state_root": expected_root_hex,
         })),
     )

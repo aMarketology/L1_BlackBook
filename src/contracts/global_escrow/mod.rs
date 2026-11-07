@@ -341,15 +341,19 @@ pub async fn escrow_submit_state_root_handler(
 
     // ── MONOTONICITY CHECK ─────────────────────────────────────────────────
     // Prevent replay of older state roots by ensuring strictly increasing l2_block_number
-    if let Ok(Some(existing_state)) = state.blockchain.load_contest_state(&req.market_id) {
-        if req.l2_block_number <= existing_state.last_l2_block {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "L2 block number must be strictly greater than previous submission",
-                "provided_block": req.l2_block_number,
-                "last_seen_block": existing_state.last_l2_block,
-            })));
+    let (stored_parent, stored_vault) = match state.blockchain.load_contest_state(&req.market_id) {
+        Ok(Some(existing_state)) => {
+            if req.l2_block_number <= existing_state.last_l2_block {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({
+                    "error": "L2 block number must be strictly greater than previous submission",
+                    "provided_block": req.l2_block_number,
+                    "last_seen_block": existing_state.last_l2_block,
+                })));
+            }
+            (existing_state.parent_contest_id, existing_state.vault_pda)
         }
-    }
+        _ => (String::new(), String::new()),
+    };
 
     // ── STORE MARKET ROOT (32 bytes only — L1 is a vault, not a filing cabinet) ──
     let root_bytes: [u8; 32] = match hex::decode(&req.merkle_root) {
@@ -382,8 +386,13 @@ pub async fn escrow_submit_state_root_handler(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        vault_pda: crate::svm::escrow_vault_address_for(&req.market_id),
+        vault_pda: if stored_vault.is_empty() {
+            crate::svm::escrow_vault_address_for(&req.market_id)
+        } else {
+            stored_vault
+        },
         house_rake_swept_tx: None,
+        parent_contest_id: stored_parent,
     };
 
     // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────────
@@ -642,8 +651,11 @@ pub async fn escrow_withdraw_handler(
         }
     }
 
-    // ── EXECUTE: debit escrow PDA → credit user (u64 lamports — no f64) ─────
-    let escrow_addr = escrow_vault_address();
+    // ── EXECUTE: debit this market's escrow, never the global vault ────────
+    let escrow_addr = match state.blockchain.load_contest_state(&req.market_id) {
+        Ok(Some(contest)) if !contest.vault_pda.is_empty() => contest.vault_pda,
+        _ => crate::svm::escrow_vault_address_for(&req.market_id),
+    };
     let escrow_balance_lamports = state.blockchain.get_balance_lamports(&escrow_addr);
     if escrow_balance_lamports < req.amount {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({

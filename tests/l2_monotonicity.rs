@@ -37,6 +37,7 @@ fn make_contest(contest_id: &str, last_l2_block: u64) -> ContestState {
         created_at: 1_700_000_000,
         vault_pda: String::new(),
         house_rake_swept_tx: None,
+        parent_contest_id: String::new(),
     }
 }
 

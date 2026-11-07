@@ -1107,41 +1107,26 @@ async fn push_payouts_handler(
             continue;
         }
 
-        // Transfer escrow → winner atomically.
-        // Try the per-contest vault first; fall back to the L2 rollup vault
-        // if the per-contest vault has insufficient balance (e.g.
-        // InitContestReserve was never called or locked too little). This
-        // mirrors the gRPC DistributePayouts fallback so both settlement
-        // paths source funds identically.
-        let l2_rollup_vault = crate::svm::pda::rollup_vault_address("L2");
-        let mut paid = false;
-        let mut last_err = String::new();
-        for vault_addr in &[&escrow_addr, &l2_rollup_vault] {
-            match state.blockchain.atomic_escrow_claim_and_pay(
-                &claim_key, vault_addr, &entry.wallet, entry.amount_bb, now,
-            ) {
-                Ok(()) => {
-                    state.withdrawal_claims.insert(claim_key.clone(), true);
-                    let vault_label = if *vault_addr == &escrow_addr { "per-contest" } else { "L2 rollup" };
-                    info!("💸 push_payouts: {} lamports → {} (contest {} via {} vault)",
-                        entry.amount_bb, entry.wallet, req.contest_id, vault_label);
-                    results.push(serde_json::json!({
-                        "wallet": entry.wallet, "success": true,
-                        "amount_bb": entry.amount_bb
-                    }));
-                    paid = true;
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                }
+        // Transfer escrow → winner atomically. Pay only from escrow_addr.
+        // On failure, return the error. Do not try the rollup vault.
+        match state.blockchain.atomic_escrow_claim_and_pay(
+            &claim_key, &escrow_addr, &entry.wallet, entry.amount_bb, now,
+        ) {
+            Ok(()) => {
+                state.withdrawal_claims.insert(claim_key.clone(), true);
+                info!("💸 push_payouts: {} lamports → {} (contest {} via escrow vault)",
+                    entry.amount_bb, entry.wallet, req.contest_id);
+                results.push(serde_json::json!({
+                    "wallet": entry.wallet, "success": true,
+                    "amount_bb": entry.amount_bb
+                }));
             }
-        }
-        if !paid {
-            results.push(serde_json::json!({
-                "wallet": entry.wallet, "success": false,
-                "error": format!("transfer failed (per-contest + L2 rollup vault): {}", last_err)
-            }));
+            Err(e) => {
+                results.push(serde_json::json!({
+                    "wallet": entry.wallet, "success": false,
+                    "error": format!("transfer failed: {}", e)
+                }));
+            }
         }
     }
 
@@ -1469,6 +1454,7 @@ fn verify_dealer_auth(
 }
 
 /// POST /admin/mint — Mint $BB tokens (Dealer only in production)
+#[allow(dead_code)]
 ///
 /// The Dealer collects losing bets from L2 via receipts, then mints
 /// those tokens to the Dealer wallet for payout to winners.
@@ -1566,6 +1552,7 @@ struct BurnRequest {
 }
 
 /// POST /admin/burn — Burn $BB tokens (Dealer only)
+#[allow(dead_code)]
 #[cfg(feature = "unsafe_admin")]
 async fn admin_burn_handler(
     State(state): State<AppState>,
@@ -1709,29 +1696,21 @@ async fn faucet_handler(
         })));
     }
 
-    // ── EPOCH RATE LIMITING (atomic via entry() — prevents concurrent-request bypass) ──
+    // ── EPOCH RATE LIMITING ────────────────────────────────────────────────
+    // Hot cache is a fast reject. The durable seal is inside atomic_faucet_mint,
+    // so a restart cannot reset the once-per-epoch cap.
     let current_slot = state.current_slot.load(std::sync::atomic::Ordering::Relaxed);
     let current_epoch = current_slot / POH_SLOTS_PER_EPOCH;
-    // Use entry() to atomically check-and-reserve the claim slot.
-    // This prevents two simultaneous requests from both passing the `get()` check
-    // before either writes the `insert()` — the classic TOCTOU race.
-    match state.faucet_claims.entry(req.wallet_address.clone()) {
-        dashmap::mapref::entry::Entry::Occupied(occ) => {
-            let (claimed_epoch, _) = *occ.get();
-            if claimed_epoch >= current_epoch {
-                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-                    "error": "Faucet: already claimed this epoch",
-                    "wallet": req.wallet_address,
-                    "epoch": current_epoch,
-                    "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
-                })));
-            }
-            // Stale entry from a previous epoch — allow, will be overwritten at success path.
-        }
-        dashmap::mapref::entry::Entry::Vacant(_) => {
-            // No prior claim — proceed. Entry is NOT inserted yet;
-            // we only write it after the mint succeeds (below).
-        }
+    let already = state.faucet_claims.get(&req.wallet_address)
+        .map(|e| e.value().0)
+        .or_else(|| state.blockchain.load_faucet_claim_epoch(&req.wallet_address));
+    if already.is_some_and(|claimed| claimed >= current_epoch) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "error": "Faucet: already claimed this epoch",
+            "wallet": req.wallet_address,
+            "epoch": current_epoch,
+            "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
+        })));
     }
 
     // ── REPLAY PROTECTION ──────────────────────────────────────────────────
@@ -1763,8 +1742,24 @@ async fn faucet_handler(
     }
 
     // ── MINT TOKENS ────────────────────────────────────────────────────────
-    let lamports = (amount * crate::svm::LAMPORTS_PER_BB as f64) as u64;
-    match state.blockchain.credit_svm_lamports(&req.wallet_address, lamports) {
+    // Cap is integer lamports, not the signed float. 0.1 BB = 10_000 lamports.
+    const MAX_FAUCET_LAMPORTS: u64 = crate::svm::LAMPORTS_PER_BB / 10;
+    let lamports = ((amount * crate::svm::LAMPORTS_PER_BB as f64).round() as u64)
+        .min(MAX_FAUCET_LAMPORTS);
+    if lamports == 0 || lamports > MAX_FAUCET_LAMPORTS {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Amount must be between 1 lamport and 0.1 BB"
+        })));
+    }
+    match state.blockchain.atomic_faucet_mint(&req.wallet_address, lamports, current_epoch) {
+        Err(e) if e == "already_claimed" => {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                "error": "Faucet: already claimed this epoch",
+                "wallet": req.wallet_address,
+                "epoch": current_epoch,
+                "retry_after_slot": (current_epoch + 1) * POH_SLOTS_PER_EPOCH
+            })));
+        }
         Ok(_) => {
             let new_bal = state.blockchain.get_balance(&req.wallet_address);
             info!("🚰 FAUCET: {} BB → {} (Ed25519 verified)", amount, req.wallet_address);
@@ -1830,6 +1825,7 @@ struct PayoutEntry {
 }
 
 #[cfg(feature = "unsafe_admin")]
+#[allow(dead_code)]
 async fn dealer_settle_handler(
     State(state): State<AppState>,
     Json(req): Json<DealerSettlementRequest>,
@@ -2151,6 +2147,7 @@ struct SeedSwapPoolRequest {
 }
 
 #[cfg(feature = "unsafe_admin")]
+#[allow(dead_code)]
 async fn admin_seed_swap_pool_handler(
     State(state): State<AppState>,
     Json(req): Json<SeedSwapPoolRequest>,
@@ -3271,6 +3268,7 @@ fn build_router(state: AppState) -> Router {
         // L5 rollup bridge endpoints (lock $BB, query lock, consume lock, submit state root, exit)
         .route("/rollup/:rollup_id/lock_bb", post(contracts::rollup::lock_bb_handler))
         .route("/rollup/:rollup_id/locks/:lock_id", get(contracts::rollup::get_lock_by_id_handler))
+        .route("/rollup/:rollup_id/locks/creator/:creator_address", get(contracts::rollup::get_locks_by_creator_handler))
         .route("/rollup/:rollup_id/locks/:lock_id/consume", post(contracts::rollup::consume_lock_handler))
         .route("/rollup/:rollup_id/roots/:batch_id", get(contracts::rollup::get_root_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
@@ -3287,9 +3285,11 @@ fn build_router(state: AppState) -> Router {
     {
         router = router
             // Admin (Dealer)
-            .route("/admin/mint", post(admin_mint_handler))
-            .route("/admin/burn", post(admin_burn_handler))
-            .route("/admin/dealer/settle", post(dealer_settle_handler))
+            // Supply-changing routes stay unregistered. The handlers remain
+            // behind unsafe_admin so they still compile, but they are not reachable.
+            // .route("/admin/mint", post(admin_mint_handler))
+            // .route("/admin/burn", post(admin_burn_handler))
+            // .route("/admin/dealer/settle", post(dealer_settle_handler))
             .route("/admin/accounts", get(admin_accounts_handler))
             .route("/admin/security/stats", get(security_stats_handler))
             .route("/admin/backup", post(backup_database_handler))
@@ -3297,7 +3297,7 @@ fn build_router(state: AppState) -> Router {
             // Admin USDC
             .route("/admin/usdc/mint", post(usdc_mint_handler))
             .route("/admin/dealer/send_wusdt", post(dealer_send_wusdt_handler))
-            .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
+            // .route("/admin/seed_swap_pool", post(admin_seed_swap_pool_handler))
             .route("/admin/swap/set_rate", post(admin_set_swap_rate_handler))
             // Oracle (admin-only registration)
             .route("/oracle/register", post(contracts::oracle::register_oracle_handler))
@@ -4486,7 +4486,7 @@ async fn main() {
     info!("   GET  /usdc/supply               Total wUSDT supply");
     info!("");
     info!("🔐 ADMIN (unsafe_admin feature):");
-    info!("   POST /admin/mint  /admin/burn  /admin/dealer/settle");
+    info!("   POST /admin/mint /admin/burn /admin/dealer/settle /admin/seed_swap_pool are unregistered");
     info!("");
     info!("🌐 gRPC: 0.0.0.0:{}", config.grpc_port);
     info!("");

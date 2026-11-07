@@ -292,11 +292,18 @@ impl CustodyWatcher {
         let signing_key = SigningKey::from_bytes(&sk_bytes);
         let dealer_addr = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
 
-        // Only run full sync if dealer has no BB yet (fresh chain)
+        // Only run full sync if dealer has no BB yet (fresh chain).
+        // A funded dealer must never be reminted from the custody balance:
+        // spending the first mint would make the next restart look "fresh".
         if self.blockchain.get_balance(&dealer_addr) > 0.0 {
-            info!("👀 Startup sync: dealer {} already funded — checking wUSDT invariant", &dealer_addr[..8]);
-            // Invariant reconciliation: if BB exists but wUSDT supply is 0, mint the missing wUSDT
-            self.reconcile_wusdt_invariant(&dealer_addr, &signing_key.verifying_key().to_bytes()).await;
+            info!("👀 Startup sync: dealer {} already funded — no remint", &dealer_addr[..8]);
+            return;
+        }
+        // One-shot even if the dealer later spends the mint to zero.
+        // Reserve before any credit so a second boot cannot pass the check.
+        let sync_key = format!("STARTUP_SYNC:{}", self.custody_address);
+        if let Err(_) = self.blockchain.reserve_bridge_tx(&sync_key) {
+            info!("👀 Startup sync: {} already synced — no remint", &self.custody_address);
             return;
         }
 
@@ -321,8 +328,8 @@ impl CustodyWatcher {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs();
 
-        // Create a synthetic deposit record so the full lifecycle is tracked
-        let tx_key = format!("STARTUP_SYNC:{}:{}", self.custody_address, now);
+        // Stable key: a restart must not mint this custody balance again.
+        let tx_key = sync_key.clone();
         let record = DepositRecord {
             wallet_address: dealer_addr.clone(),
             external_tx_hash: tx_key.clone(),
@@ -337,10 +344,14 @@ impl CustodyWatcher {
         let _ = self.blockchain.store_deposit_request(&record);
         self.deposit_requests.insert(tx_key.clone(), record);
 
-        // Mint BB
+        // Mint BB. Release the one-shot reservation if the credit fails.
         match self.blockchain.credit_lamports(&dealer_addr, bb_lamports_val) {
             Ok(_) => info!("🪙  Startup sync: {:.5} BB → dealer {}", bb_to_mint, &dealer_addr[..8]),
-            Err(e) => { error!("❌ Startup sync BB mint failed: {}", e); return; }
+            Err(e) => {
+                self.blockchain.cancel_bridge_tx(&sync_key);
+                error!("❌ Startup sync BB mint failed: {}", e);
+                return;
+            }
         }
 
         // Mint wUSDT (if USDC balance > 0)

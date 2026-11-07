@@ -285,6 +285,9 @@ impl SettlementService for BlackBookSettlementService {
         if req.bb_reserve == 0 {
             return Err(Status::invalid_argument("bb_reserve must be > 0"));
         }
+        if req.parent_contest_id == req.contest_id {
+            return Err(Status::invalid_argument("parent_contest_id must differ from contest_id"));
+        }
 
         // Check contest is not already Open or Settled
         if let Some(existing) = self.contest_states.get(&req.contest_id) {
@@ -307,25 +310,68 @@ impl SettlementService for BlackBookSettlementService {
             }
         }
 
-        // Debit dealer → per-contest escrow vault PDA (not global vault)
+        // A hub side-bet does not open or debit its own vault. Its prize is an
+        // allocation of the parent escrow, recorded here and enforced at payout.
+        // The parent must already be Open with at least this allocation still
+        // unclaimed. A later payout may only use the parent stored on this record.
+        let (escrow_addr, debit_dealer) = if req.parent_contest_id.is_empty() {
+            (escrow_vault_address_for(&req.contest_id), true)
+        } else {
+            let parent = self.contest_states.get(&req.parent_contest_id).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "parent contest {} is not open on L1",
+                    req.parent_contest_id
+                ))
+            })?;
+            if parent.status != ContestStatus::Open {
+                return Err(Status::failed_precondition(
+                    "parent contest is not Open — child reserve refused",
+                ));
+            }
+            let already_allocated = self
+                .contest_states
+                .iter()
+                .filter(|e| e.parent_contest_id == req.parent_contest_id)
+                .map(|e| e.total_deposited)
+                .fold(0u64, |acc, n| acc.saturating_add(n));
+            let parent_remaining = parent
+                .total_deposited
+                .saturating_sub(parent.total_claimed)
+                .saturating_sub(already_allocated);
+            if req.bb_reserve > parent_remaining {
+                return Err(Status::failed_precondition(format!(
+                    "child allocation {} exceeds parent {} unallocated escrow {}",
+                    req.bb_reserve, req.parent_contest_id, parent_remaining
+                )));
+            }
+            let parent_vault = if parent.vault_pda.is_empty() {
+                escrow_vault_address_for(&req.parent_contest_id)
+            } else {
+                parent.vault_pda.clone()
+            };
+            (parent_vault, false)
+        };
+
+        // Debit dealer → per-contest escrow vault PDA (not global vault).
+        // Child markets skip this: the parent vault already holds the BB.
         // Use debit_svm_lamports to avoid u64 → f64 → u64 precision loss.
-        let escrow_addr = escrow_vault_address_for(&req.contest_id);
-        if let Err(e) = self.blockchain.debit_svm_lamports(&req.dealer_address, req.bb_reserve) {
-            return Ok(Response::new(InitContestReserveResponse {
-                confirmed: false,
-                l1_tx_hash: String::new(),
-                error_message: format!("Dealer debit failed: {} (balance check passed?)", e),
-            }));
-        }
-        let escrow_addr_credit = escrow_addr.clone();
-        if let Err(e) = self.blockchain.credit_svm_lamports(&escrow_addr_credit, req.bb_reserve) {
-            // Rollback
-            let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
-            return Ok(Response::new(InitContestReserveResponse {
-                confirmed: false,
-                l1_tx_hash: String::new(),
-                error_message: format!("Escrow credit failed: {}", e),
-            }));
+        if debit_dealer {
+            if let Err(e) = self.blockchain.debit_svm_lamports(&req.dealer_address, req.bb_reserve) {
+                return Ok(Response::new(InitContestReserveResponse {
+                    confirmed: false,
+                    l1_tx_hash: String::new(),
+                    error_message: format!("Dealer debit failed: {} (balance check passed?)", e),
+                }));
+            }
+            if let Err(e) = self.blockchain.credit_svm_lamports(&escrow_addr, req.bb_reserve) {
+                // Rollback
+                let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
+                return Ok(Response::new(InitContestReserveResponse {
+                    confirmed: false,
+                    l1_tx_hash: String::new(),
+                    error_message: format!("Escrow credit failed: {}", e),
+                }));
+            }
         }
 
         let l1_tx_hash = uuid::Uuid::new_v4().to_string();
@@ -350,13 +396,17 @@ impl SettlementService for BlackBookSettlementService {
             created_at: now,
             vault_pda: escrow_addr.clone(),
             house_rake_swept_tx: None,
+            parent_contest_id: req.parent_contest_id.clone(),
         };
 
         // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────────
         if let Err(e) = self.blockchain.store_contest_state(&contest) {
-            // Rollback the token transfer
-            let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
-            let _ = self.blockchain.debit_svm_lamports(&escrow_addr, req.bb_reserve);
+            // Rollback only a transfer this call actually made. A child market
+            // never debited the dealer or credited a vault.
+            if debit_dealer {
+                let _ = self.blockchain.credit_svm_lamports(&req.dealer_address, req.bb_reserve);
+                let _ = self.blockchain.debit_svm_lamports(&escrow_addr, req.bb_reserve);
+            }
             return Ok(Response::new(InitContestReserveResponse {
                 confirmed: false,
                 l1_tx_hash: String::new(),
@@ -451,14 +501,18 @@ impl SettlementService for BlackBookSettlementService {
         // ── MONOTONICITY CHECK ────────────────────────────────────────────
         // Ensure incoming l2_block_number > stored last_l2_block to prevent
         // a buggy or malicious L2 sequencer from regressing chain state.
-        if let Ok(Some(existing)) = self.blockchain.load_contest_state(&req.contest_id) {
-            if req.l2_block_number <= existing.last_l2_block {
-                return Err(Status::failed_precondition(format!(
-                    "L2 block number must be strictly greater than previous submission: got {} <= stored {}",
-                    req.l2_block_number, existing.last_l2_block
-                )));
+        let (stored_parent, stored_vault) = match self.blockchain.load_contest_state(&req.contest_id) {
+            Ok(Some(existing)) => {
+                if req.l2_block_number <= existing.last_l2_block {
+                    return Err(Status::failed_precondition(format!(
+                        "L2 block number must be strictly greater than previous submission: got {} <= stored {}",
+                        req.l2_block_number, existing.last_l2_block
+                    )));
+                }
+                (existing.parent_contest_id, existing.vault_pda)
             }
-        }
+            _ => (String::new(), String::new()),
+        };
 
         const CLAIM_WINDOW_SLOTS: u64 = 6_480_000;
         let current_slot = self.current_slot.load(Ordering::Relaxed);
@@ -480,8 +534,13 @@ impl SettlementService for BlackBookSettlementService {
             l1_tx_hash: l1_tx_hash.clone(),
             last_l2_block: req.l2_block_number,
             created_at: now,
-            vault_pda: crate::svm::escrow_vault_address_for(&req.contest_id),
+            vault_pda: if stored_vault.is_empty() {
+                crate::svm::escrow_vault_address_for(&req.contest_id)
+            } else {
+                stored_vault
+            },
             house_rake_swept_tx: None,
+            parent_contest_id: stored_parent,
         };
 
         // ── PERSISTENCE GUARANTEE (ReDB FIRST) ──────────────────────────
@@ -817,22 +876,70 @@ impl SettlementService for BlackBookSettlementService {
             return Err(Status::failed_precondition("Claim window has expired for this contest"));
         }
 
-        // Same escrow vault the /escrow/withdraw path pays from.
-        // Per-contest PDA: funds were locked via InitContestReserve into
-        // escrow_vault_address_for(contest_id) — the deprecated global vault
-        // is empty for this contest and would cause "Insufficient escrow".
-        let escrow_addr = crate::svm::escrow_vault_address_for(&req.contest_id);
-
-        // ── Fallback vault: L2 rollup vault ───────────────────────────────
-        // If the per-contest escrow vault has insufficient balance (e.g.
-        // InitContestReserve was never called or locked too little), fall
-        // back to the L2 rollup vault PDA. This is the same vault used by
-        // the Universal Rollup Hub's lock_bb / exit flow.
-        let l2_rollup_vault = crate::svm::pda::rollup_vault_address("L2");
+        // A child market pays from the parent vault recorded at funding time.
+        // The request hint is checked against that record and never used as a
+        // vault pointer on its own. The debit is capped at the child's
+        // allocation so one side-bet cannot drain the hub.
+        let (escrow_addr, payout_cap) = if contest.parent_contest_id.is_empty() {
+            if !req.parent_contest_id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "parent_contest_id was not recorded for this contest",
+                ));
+            }
+            let own_vault = if contest.vault_pda.is_empty() {
+                crate::svm::escrow_vault_address_for(&req.contest_id)
+            } else {
+                contest.vault_pda.clone()
+            };
+            (own_vault, u64::MAX)
+        } else {
+            if !req.parent_contest_id.is_empty()
+                && req.parent_contest_id != contest.parent_contest_id
+            {
+                return Err(Status::invalid_argument(format!(
+                    "parent_contest_id {} does not match stored parent {}",
+                    req.parent_contest_id, contest.parent_contest_id
+                )));
+            }
+            let parent = match self.contest_states.get(&contest.parent_contest_id) {
+                Some(p) => p.clone(),
+                None => match self.blockchain.load_contest_state(&contest.parent_contest_id) {
+                    Ok(Some(p)) => p,
+                    _ => return Err(Status::failed_precondition(
+                        "stored parent contest is not open on L1",
+                    )),
+                },
+            };
+            let parent_vault = if parent.vault_pda.is_empty() {
+                crate::svm::escrow_vault_address_for(&contest.parent_contest_id)
+            } else {
+                parent.vault_pda.clone()
+            };
+            let cap = contest.total_deposited.saturating_sub(contest.total_claimed);
+            (parent_vault, cap)
+        };
+        let requested: u64 = req.payouts.iter().fold(0u64, |acc, leaf| acc.saturating_add(leaf.amount_bb));
+        if requested > payout_cap {
+            return Err(Status::failed_precondition(format!(
+                "payout {} exceeds child allocation remaining {}",
+                requested, payout_cap
+            )));
+        }
 
         // ── Per-winner: verify proof → guard → transfer ───────────────────
         let mut results: Vec<PayoutResult> = Vec::with_capacity(req.payouts.len());
         for leaf in req.payouts {
+            // The one-winner pad is a zero-amount all-zero leaf. It exists only
+            // to give the real winner a sibling. Never pay it, and never pay a
+            // zero amount even if a caller includes it.
+            if leaf.amount_bb == 0 || leaf.wallet == "11111111111111111111111111111111" {
+                results.push(PayoutResult {
+                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                    error: "zero-amount padding leaf is not payable".into(),
+                });
+                continue;
+            }
+
             // Decode wallet → raw 32-byte pubkey (must match L2 leaf format).
             let pubkey_raw_32: [u8; 32] = match bs58::decode(&leaf.wallet).into_vec() {
                 Ok(b) if b.len() == 32 => {
@@ -911,48 +1018,38 @@ impl SettlementService for BlackBookSettlementService {
             }
 
             // Transfer escrow → winner and seal the claim in one atomic ReDB txn.
-            // Try per-contest vault first; fall back to L2 rollup vault if
-            // the per-contest vault has insufficient balance.
+            // escrow_addr is already the child vault, or the stored parent vault.
+            // A failed debit is a failed leaf — do not try another vault.
             let wallet = leaf.wallet.clone();
-            let mut paid = false;
-            let mut last_err = String::new();
-            for vault_addr in &[&escrow_addr, &l2_rollup_vault] {
-                match self.blockchain.atomic_escrow_claim_and_pay(
-                    &claim_key, vault_addr, &wallet, amount_lamports, now,
-                ) {
-                    Ok(()) => {
-                        self.withdrawal_claims.insert(claim_key.clone(), true);
+            match self.blockchain.atomic_escrow_claim_and_pay(
+                &claim_key, &escrow_addr, &wallet, amount_lamports, now,
+            ) {
+                Ok(()) => {
+                    self.withdrawal_claims.insert(claim_key.clone(), true);
 
-                        // Update total_claimed (SPL units) on the ContestState.
-                        if let Some(entry) = self.contest_states.get(&req.contest_id) {
-                            let mut snap = entry.clone();
-                            drop(entry);
-                            snap.total_claimed = snap.total_claimed.saturating_add(leaf.amount_bb);
-                            if self.blockchain.store_contest_state(&snap).is_ok() {
-                                self.contest_states.insert(req.contest_id.clone(), snap);
-                            }
+                    // Update total_claimed (SPL units) on the ContestState.
+                    if let Some(entry) = self.contest_states.get(&req.contest_id) {
+                        let mut snap = entry.clone();
+                        drop(entry);
+                        snap.total_claimed = snap.total_claimed.saturating_add(leaf.amount_bb);
+                        if self.blockchain.store_contest_state(&snap).is_ok() {
+                            self.contest_states.insert(req.contest_id.clone(), snap);
                         }
+                    }
 
-                        let tx_hash = uuid::Uuid::new_v4().to_string();
-                        let vault_label = if **vault_addr == escrow_addr { "per-contest" } else { "L2 rollup" };
-                        info!("💸 payout {} lamports → {} (contest {} via {} vault)",
-                            amount_lamports, wallet, req.contest_id, vault_label);
-                        results.push(PayoutResult {
-                            wallet, success: true, tx_hash, error: String::new(),
-                        });
-                        paid = true;
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = e;
-                    }
+                    let tx_hash = uuid::Uuid::new_v4().to_string();
+                    info!("💸 payout {} lamports → {} (contest {} via escrow vault)",
+                        amount_lamports, wallet, req.contest_id);
+                    results.push(PayoutResult {
+                        wallet, success: true, tx_hash, error: String::new(),
+                    });
                 }
-            }
-            if !paid {
-                results.push(PayoutResult {
-                    wallet: leaf.wallet, success: false, tx_hash: String::new(),
-                    error: format!("transfer failed (per-contest + L2 rollup vault): {}", last_err),
-                });
+                Err(e) => {
+                    results.push(PayoutResult {
+                        wallet: leaf.wallet, success: false, tx_hash: String::new(),
+                        error: format!("transfer failed: {}", e),
+                    });
+                }
             }
         }
 

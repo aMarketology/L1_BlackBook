@@ -1,3 +1,7 @@
+postgresql://postgres.umilbuydwxydenheqbpx:Dollabills420%21word@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+
+blanket verify scout degree open leave joke alarm wear rookie dial ugly dial subject devote prison rapid slim man thumb junior pen steel circle
+
 # ============================================================================
 # BlackBook L1 — Elevation-Required Setup (run in an ADMIN PowerShell)
 # ============================================================================
@@ -24,7 +28,13 @@ if (-not $nssm) {
     $nssm = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter nssm.exe -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1 -ExpandProperty FullName
 }
-if (-not $nssm) { throw "nssm.exe not found. Install via: winget install NSSM.NSSM" }
+blanket verify scout degree open leave joke alarm wear rookie dial ugly dial subject devote prison rapid slim man thumb junior pen steel circleif (-not $nssm) { throw "nssm.exe not found. Install via: winget install NSSM.NSSM" }
+
+
+
+
+---
+
 
 $exe = Join-Path $Repo "target\release\layer1.exe"
 if (-not (Test-Path $exe)) { throw "Release binary not found at $exe - run: cargo build --release" }

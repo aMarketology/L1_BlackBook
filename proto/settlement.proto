@@ -103,9 +103,13 @@ message GetBalanceResponse {
 // ── InitContestReserve ────────────────────────────────────────────────────────
 
 message InitContestReserveRequest {
-    string contest_id     = 1;
-    string dealer_address = 2; // base58 — dealer's BB wallet
-    uint64 bb_reserve     = 3; // SPL units to lock from dealer → escrow
+    string contest_id         = 1;
+    string dealer_address     = 2; // base58 — dealer's BB wallet
+    uint64 bb_reserve         = 3; // SPL units to lock from dealer → escrow
+    // Hub side-bet only. When set, L1 records this child against the parent's
+    // already-funded escrow and does not open or debit a second vault.
+    // Empty for a normal contest. Must match the parent stored at payout time.
+    string parent_contest_id  = 4;
 }
 
 message InitContestReserveResponse {
@@ -227,11 +231,16 @@ message PayoutLeaf {
 }
 
 message DistributePayoutsRequest {
-    string              contest_id       = 1;   // Which settled market to pay out
-    repeated PayoutLeaf payouts          = 2;   // One entry per winner
-    bytes               sequencer_pubkey = 3;   // 32-byte Ed25519 verifying key
-    bytes               sequencer_sig    = 4;   // 64-byte sig over contest_id ++ root ++ ts
-    int64               timestamp        = 5;   // Unix seconds (within 120s of L1 clock)
+    string              contest_id        = 1;   // Which settled market to pay out
+    repeated PayoutLeaf payouts           = 2;   // One entry per winner
+    bytes               sequencer_pubkey  = 3;   // 32-byte Ed25519 verifying key
+    bytes               sequencer_sig     = 4;   // 64-byte sig over contest_id ++ root ++ ts
+    int64               timestamp         = 5;   // Unix seconds (within 120s of L1 clock)
+    // Optional hint only. L1 pays from a parent vault solely when this equals
+    // the parent_contest_id stored on the child ContestState at funding time.
+    // A mismatched or unknown parent is rejected; it is never trusted as a
+    // vault pointer by itself.
+    string              parent_contest_id = 6;
 }
 
 message PayoutResult {

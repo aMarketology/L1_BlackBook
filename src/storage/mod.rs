@@ -78,6 +78,10 @@ pub const ESCROW_MARKET_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::n
 /// Prevents double-withdrawal per market — durable across restarts
 pub const ESCROW_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("escrow_claims");
 
+/// Faucet epoch claims: wallet address → epoch last paid.
+/// Durable so a restart cannot reset the once-per-epoch cap.
+const FAUCET_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("faucet_claims");
+
 /// Slot metadata: Slot (u64) -> SlotMeta JSON (bytes)
 pub const SLOT_META: TableDefinition<u64, &[u8]> = TableDefinition::new("slot_meta");
 
@@ -789,6 +793,7 @@ impl ConcurrentBlockchain {
             // Escrow tables
             let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
             let _ = write_txn.open_table(ESCROW_CLAIMS)?;
+            let _ = write_txn.open_table(FAUCET_CLAIMS)?;
             let _ = write_txn.open_table(SLOT_META)?;
             let _ = write_txn.open_table(MERKLE_NODES)?;
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
@@ -1724,16 +1729,79 @@ impl ConcurrentBlockchain {
         serde_json::from_slice::<RollupLockRecord>(value.value()).ok()
     }
 
-    /// Mark a lock as consumed in ReDB (idempotent — safe to call twice).
+    /// Mark a lock as consumed in ReDB.
+    ///
+    /// A second consume is a hard error (`already_consumed`). Callers must not
+    /// treat that as success — a replayed lock must not credit the rollup again.
     /// Called by `POST /rollup/locks/:lock_id/consume`.
     pub fn consume_rollup_lock(&self, lock_id: &str) -> Result<(), String> {
-        let mut record = self.load_rollup_lock_by_id(lock_id)
-            .ok_or_else(|| format!("Lock {} not found", lock_id))?;
-        if record.consumed {
-            return Ok(()); // already consumed, idempotent
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).map_err(|e| e.to_string())?;
+            let record_opt: Option<RollupLockRecord> = {
+                let raw = table.get(lock_id).map_err(|e| e.to_string())?;
+                match raw {
+                    Some(v) => Some(serde_json::from_slice::<RollupLockRecord>(v.value()).map_err(|e| e.to_string())?),
+                    None => None,
+                }
+            };
+            let mut record = record_opt.ok_or_else(|| format!("Lock {} not found", lock_id))?;
+            if record.consumed {
+                return Err("already_consumed".to_string());
+            }
+            record.consumed = true;
+            let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+            table.insert(lock_id, bytes.as_slice()).map_err(|e| e.to_string())?;
         }
-        record.consumed = true;
-        self.store_rollup_lock(&record)
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Epoch last paid by the faucet for this wallet. `None` if never claimed.
+    pub fn load_faucet_claim_epoch(&self, wallet: &str) -> Option<u64> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(FAUCET_CLAIMS).ok()?;
+        table.get(wallet).ok()?.map(|v| v.value())
+    }
+
+    /// Mint faucet lamports and seal the epoch claim in one ReDB write.
+    ///
+    /// Rejects with `already_claimed` if this wallet already has a claim for
+    /// `epoch` or a later epoch. The cap therefore survives a restart.
+    pub fn atomic_faucet_mint(
+        &self,
+        wallet: &str,
+        lamports: u64,
+        epoch: u64,
+    ) -> Result<(), String> {
+        if lamports == 0 {
+            return Err("Amount must be > 0 lamports".to_string());
+        }
+        let pk = Self::addr_to_pubkey(wallet);
+        let current = self.svm_accounts.get_lamports(&pk);
+        let new_lamports = current.checked_add(lamports)
+            .ok_or_else(|| "Balance overflow".to_string())?;
+        let account = AccountSharedData::new(new_lamports, 0, &solana_sdk::system_program::id());
+        let account_bytes = borsh::to_vec(&StoredAccount::from(&account))
+            .map_err(|e| format!("Serialization error: {}", e))?;
+
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut claims = write_txn.open_table(FAUCET_CLAIMS).map_err(|e| e.to_string())?;
+            let prior = claims.get(wallet).map_err(|e| e.to_string())?.map(|v| v.value());
+            if prior.is_some_and(|claimed| claimed >= epoch) {
+                return Err("already_claimed".to_string());
+            }
+            claims.insert(wallet, epoch).map_err(|e| e.to_string())?;
+
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(pk.to_bytes().as_slice(), account_bytes.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        self.svm_accounts.hot_state.insert(pk, account);
+        self.mirror_balance_to_cache(wallet, new_lamports);
+        self.total_supply.fetch_add(lamports, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Load all rollup lock records for a given creator address (called at startup or by L5 poller).
@@ -2771,6 +2839,12 @@ pub struct ContestState {
     /// `None` until the rake transfer is committed; idempotent — set exactly once.
     #[serde(default)]
     pub house_rake_swept_tx: Option<String>,
+    /// Hub side-bet only. When set, this child's prize is paid from the parent
+    /// contest's escrow, capped at `total_deposited` (the child's allocation).
+    /// Empty for a normal contest. `#[serde(default)]` keeps contests stored
+    /// before this field readable.
+    #[serde(default)]
+    pub parent_contest_id: String,
 }
 
 // ============================================================================

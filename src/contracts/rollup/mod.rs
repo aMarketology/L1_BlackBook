@@ -20,6 +20,9 @@
 // GET  /rollup/:rollup_id/locks/:lock_id
 //   L5/L2/L3 sequencer reads a specific lock record before crediting rollup funds.
 //
+// GET  /rollup/:rollup_id/locks/creator/:creator_address
+//   Wallet UI lists unconsumed locks for the signed-in address. Read-only.
+//
 // POST /rollup/:rollup_id/locks/:lock_id/consume
 //   Sequencer marks a lock as spent (idempotent, prevents double-credit).
 // ============================================================================
@@ -275,6 +278,36 @@ pub async fn get_lock_by_id_handler(
     }
 }
 
+/// GET /rollup/:rollup_id/locks/creator/:creator_address
+/// Unconsumed locks for one wallet. Read-only. Does not move funds.
+pub async fn get_locks_by_creator_handler(
+    State(state): State<AppState>,
+    Path((rollup_id, creator_address)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if rollup_id.is_empty() || rollup_id.len() > 8 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid rollup_id"
+        }))).into_response();
+    }
+    if creator_address.is_empty() || creator_address.len() > 64 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Invalid creator address"
+        }))).into_response();
+    }
+    match state.blockchain.load_rollup_locks_by_creator(&creator_address) {
+        Ok(locks) => {
+            let pending: Vec<RollupLockRecord> = locks
+                .into_iter()
+                .filter(|lock| lock.rollup_id == rollup_id && !lock.consumed)
+                .collect();
+            (StatusCode::OK, Json(pending)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to load locks: {e}")
+        }))).into_response(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GET /rollup/:rollup_id/roots/:batch_id
 //  Read a stored Merkle state root for debugging / smoke tests.
@@ -375,8 +408,14 @@ pub async fn consume_lock_handler(
         })));
     }
 
-    // ── Mark consumed (idempotent) ─────────────────────────────────────────
+    // ── Mark consumed. A second consume is a hard error, not a no-op. ─────
     if let Err(e) = state.blockchain.consume_rollup_lock(&lock_id) {
+        if e == "already_consumed" {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Lock already consumed",
+                "lock_id": lock_id
+            })));
+        }
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e })));
     }
 
