@@ -94,39 +94,25 @@ pub async fn deposit_request_handler(
         })));
     }
 
-    // ── REPLAY PROTECTION (nonce) ─────────────────────────────────────────
-    let nonce_key = format!("deposit_request:{}:{}", req.wallet_address, req.nonce);
+    // ── TIMESTAMP FRESHNESS (±60s) ────────────────────────────────────────
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now.saturating_sub(req.timestamp) > 60 {
+    if now.abs_diff(req.timestamp) > 60 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Request too old (>60s)"
+            "error": "Request timestamp outside ±60s window"
         })));
-    }
-    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
-    match state.used_nonces.entry(nonce_key) {
-        dashmap::mapref::entry::Entry::Occupied(_) => {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "Nonce already used — possible replay attack"
-            })));
-        }
-        dashmap::mapref::entry::Entry::Vacant(v) => {
-            v.insert(now);
-        }
     }
 
     // ── ALREADY PROCESSED? (durable ReDB check) ────────────────────────────
-    // Note: the "pending" duplicate check is enforced atomically below via
-    // entry() — no separate contains_key needed here.
     if state.blockchain.is_bridge_tx_processed(&req.external_tx_hash) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": "This external_tx_hash has already been minted. Possible double-submission."
         })));
     }
 
-    // ── Ed25519 SIGNATURE VERIFICATION ───────────────────────────────────
+    // ── Ed25519 SIGNATURE VERIFICATION (before consuming nonce) ───────────
     let message = format!(
         "DEPOSIT_REQUEST:{}:{}:{}:{}:{}:{}",
         req.wallet_address, req.external_tx_hash,
@@ -158,13 +144,25 @@ pub async fn deposit_request_handler(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "Signature verification failed" })));
     }
 
-    // Confirm the public key matches the claimed wallet address
     let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
     if derived_address != req.wallet_address {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
             "error": "public_key does not match wallet_address",
             "derived": derived_address,
         })));
+    }
+
+    // ── REPLAY PROTECTION (nonce) ─────────────────────────────────────────
+    let nonce_key = format!("deposit_request:{}:{}", req.wallet_address, req.nonce);
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used — possible replay attack"
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
     }
 
     // ── CREATE RECORD ─────────────────────────────────────────────────────
@@ -351,27 +349,7 @@ pub async fn deposit_approve_handler(
         })));
     }
 
-    // ── MINT BB (Bug #2: reserve-before-mint, no TOCTOU race) ──────────────
-    let mint_tx_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = state.blockchain.reserve_bridge_tx(&req.external_tx_hash) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": format!("Double-mint blocked: {}", e)
-        })));
-    }
-    match state.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
-        Ok(_) => {
-            if let Err(e) = state.blockchain.commit_bridge_tx(&req.external_tx_hash, &mint_tx_id) {
-                tracing::warn!("⚠️  Failed to persist bridge tx committed flag: {}", e);
-            }
-        }
-        Err(e) => {
-            state.blockchain.cancel_bridge_tx(&req.external_tx_hash);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
-        }
-    }
-    let new_balance = state.blockchain.get_balance(&record.wallet_address);
-
-    // ── UPDATE RECORD ─────────────────────────────────────────────────────
+    // ── SINGLE-TXN ATOMIC MINT + DEPOSIT APPROVAL + PROCESSED SEAL ────────
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -380,13 +358,29 @@ pub async fn deposit_approve_handler(
     updated.status = "approved".to_string();
     updated.approved_at = Some(now);
 
-    if let Err(e) = state.blockchain.store_deposit_request(&updated) {
-        tracing::error!("Failed to persist deposit approval to ReDB: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": "Failed to persist deposit approval — transaction aborted"
-        })));
-    }
-    state.deposit_requests.insert(req.external_tx_hash.clone(), updated.clone());
+    let mint_tx_id = uuid::Uuid::new_v4().to_string();
+    let new_balance_lamports = match state.blockchain.atomic_mint_bridge_deposit(
+        &req.external_tx_hash,
+        &record.wallet_address,
+        record.bb_lamports,
+        &mint_tx_id,
+        Some(&updated),
+        false,
+    ) {
+        Ok(bal) => bal,
+        Err(e) if e.contains("already") => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": format!("Double-mint blocked: {}", e)
+            })));
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Atomic deposit approval failed: {}", e)
+            })));
+        }
+    };
+    state.deposit_requests.insert(req.external_tx_hash.clone(), updated);
+    let new_balance = new_balance_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64;
 
     // ── RECORD IN POH BLOCK ───────────────────────────────────────────────
     {
@@ -482,25 +476,16 @@ pub async fn deposit_claim_handler(
         })));
     }
 
-    // ── Timestamp freshness ───────────────────────────────────────────────
+    // ── Timestamp freshness (±60s) ────────────────────────────────────────
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now.saturating_sub(req.timestamp) > 60 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Request too old (>60s)" })));
+    if now.abs_diff(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Request timestamp outside ±60s window" })));
     }
 
-    // ── Nonce / replay protection ─────────────────────────────────────────
-    let nonce_key = format!("deposit_claim:{}:{}", req.wallet_address, req.nonce);
-    match state.used_nonces.entry(nonce_key) {
-        dashmap::mapref::entry::Entry::Occupied(_) => {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "Nonce already used" })));
-        }
-        dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
-    }
-
-    // ── Ed25519 signature verification ─────────────────────────────────────
+    // ── Ed25519 signature verification (before consuming nonce) ───────────
     let message = format!(
         "CLAIM_DEPOSIT:{}:{}:{}:{}",
         req.wallet_address, req.external_tx_hash, req.timestamp, req.nonce
@@ -536,6 +521,15 @@ pub async fn deposit_claim_handler(
         })));
     }
 
+    // ── Nonce / replay protection ─────────────────────────────────────────
+    let nonce_key = format!("deposit_claim:{}:{}", req.wallet_address, req.nonce);
+    match state.used_nonces.entry(nonce_key) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "Nonce already used" })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => { v.insert(now); }
+    }
+
     // ── Look up the unattributed deposit ──────────────────────────────────
     let record = match state.blockchain.get_unattributed_deposit(&req.external_tx_hash) {
         Ok(Some(r)) => r,
@@ -552,31 +546,28 @@ pub async fn deposit_claim_handler(
         })));
     }
 
-    // ── Reserve → credit → commit (Bug #2 atomic pattern) ────────────────
+    // ── Single-txn atomic claim + BB credit + processed seal ──────────────
     let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(record.amount_micro_stablecoin);
     let mint_tx_id = uuid::Uuid::new_v4().to_string();
 
-    if let Err(e) = state.blockchain.reserve_bridge_tx(&req.external_tx_hash) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": format!("Double-mint blocked: {}", e) })));
-    }
-    match state.blockchain.credit_lamports(&req.wallet_address, bb_lamports) {
-        Ok(_) => {
-            if let Err(e) = state.blockchain.commit_bridge_tx(&req.external_tx_hash, &mint_tx_id) {
-                tracing::warn!("⚠️  claim commit_bridge_tx: {}", e);
-            }
+    let new_balance_lamports = match state.blockchain.atomic_mint_bridge_deposit(
+        &req.external_tx_hash,
+        &req.wallet_address,
+        bb_lamports,
+        &mint_tx_id,
+        None,
+        true,
+    ) {
+        Ok(bal) => bal,
+        Err(e) if e.contains("already") => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": format!("Double-mint blocked: {}", e) })));
         }
         Err(e) => {
-            state.blockchain.cancel_bridge_tx(&req.external_tx_hash);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("BB mint failed: {}", e) })));
         }
-    }
+    };
 
-    // ── Mark claimed in ReDB ──────────────────────────────────────────────
-    if let Err(e) = state.blockchain.mark_unattributed_claimed(&req.external_tx_hash, &req.wallet_address) {
-        tracing::warn!("⚠️  Failed to mark unattributed deposit claimed: {}", e);
-    }
-
-    let new_balance = state.blockchain.get_balance(&req.wallet_address);
+    let new_balance = new_balance_lamports as f64 / crate::svm::LAMPORTS_PER_BB as f64;
 
     tracing::info!("✅ CLAIM: {:.6} {} → {:.5} BB → {} (tx: {})",
         record.amount_micro_stablecoin as f64 / crate::svm::USDC_UNIT as f64,

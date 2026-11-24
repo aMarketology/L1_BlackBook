@@ -129,6 +129,11 @@ pub async fn lock_bb_handler(
             "error": "wallet_address and bb_lamports are required and must be non-zero"
         })));
     }
+    if !crate::is_valid_bb_address(&req.wallet_address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "wallet_address must be a valid 32-byte base58 Ed25519 address"
+        })));
+    }
 
     if let Some(ref sym) = req.token_symbol_hint {
         // Only uppercase alphanumeric + underscore, 1–12 chars
@@ -139,7 +144,21 @@ pub async fn lock_bb_handler(
         }
     }
 
-    // ── Ed25519 SIGNATURE VERIFICATION ─────────────────────────────────────
+    // ── TIMESTAMP FRESHNESS (±60s) ─────────────────────────────────────────
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if now.abs_diff(req.timestamp) > 60 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "Timestamp out of ±60s freshness window",
+            "server_time": now,
+            "request_time": req.timestamp
+        })));
+    }
+
+    // ── Ed25519 SIGNATURE VERIFICATION + PUBKEY → WALLET BINDING ───────────
     let symbol_hint_str = req.token_symbol_hint.as_deref().unwrap_or("");
     let message = format!(
         "ROLLUP_LOCK_BB:{}:{}:{}:{}:{}:{}",
@@ -167,6 +186,22 @@ pub async fn lock_bb_handler(
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Bad public key" }))),
     };
+
+    // CRITICAL P0 GUARD: signing public_key MUST own wallet_address
+    let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived_address != req.wallet_address {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "public_key does not match wallet_address",
+            "derived": derived_address,
+        })));
+    }
+    let signer_pk = solana_sdk::pubkey::Pubkey::new_from_array(*pubkey_arr);
+    if crate::svm::pda::is_reserved_pda(&signer_pk) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "Reserved protocol PDA cannot lock funds"
+        })));
+    }
+
     let sig_arr: &[u8; 64] = match sig_bytes.as_slice().try_into() {
         Ok(a) => a,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid signature length" }))),
@@ -179,20 +214,7 @@ pub async fn lock_bb_handler(
         })));
     }
 
-    // ── REPLAY PROTECTION ──────────────────────────────────────────────────
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if now.saturating_sub(req.timestamp) > 60 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": "Request too old (>60s)",
-            "server_time": now,
-            "request_time": req.timestamp
-        })));
-    }
-
+    // ── ATOMIC REPLAY PROTECTION ───────────────────────────────────────────
     let nonce_key = format!("rollup_lock:{}:{}", req.wallet_address, req.nonce);
     match state.used_nonces.entry(nonce_key) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -233,8 +255,45 @@ pub async fn lock_bb_handler(
         })));
     }
 
-    // Hot-cache so the L5 sequencer poller can read without hitting ReDB
+    // Hot-cache so the rollup sequencer poller can read without hitting ReDB
     state.rollup_lock_records.insert(lock_id.clone(), record);
+
+    // Anchor the 1:1 $BB lock onto the L1 PoH clock + transparent ledger
+    // (TransferBb from user → rollup vault keeps Reader nodes and SubscribeBalances in sync)
+    {
+        use crate::protocol::{Transaction as ProtoTx, TxData};
+        let proto_tx = ProtoTx {
+            hash: lock_id.clone(),
+            from: req.wallet_address.clone(),
+            timestamp: now,
+            data: TxData::TransferBb {
+                to: vault_addr.clone(),
+                amount: req.bb_lamports,
+            },
+            signature: req.signature.clone(),
+            signer_pubkey: req.public_key.clone(),
+        };
+        state.poh.write().queue_transaction(lock_id.clone());
+        state.block_producer.record_executed_transaction(proto_tx);
+
+        let user_after = state.blockchain.get_balance_lamports(&req.wallet_address);
+        let vault_after = state.blockchain.get_balance_lamports(&vault_addr);
+        let tx_record = crate::storage::TransactionRecord::with_id(
+            lock_id.clone(),
+            crate::storage::TxType::Lock,
+            &req.wallet_address,
+            &vault_addr,
+            req.bb_lamports,
+            0,
+            user_after.saturating_add(req.bb_lamports),
+            user_after,
+            vault_after,
+            crate::storage::AuthType::Ed25519,
+        );
+        if let Err(e) = state.blockchain.log_transaction(tx_record) {
+            tracing::warn!("Failed to log rollup lock receipt: {}", e);
+        }
+    }
 
     info!(
         "🔒 ROLLUP LOCK: {} lamports ({:.5} BB) from {} → vault {} (lock_id: {})",
@@ -251,7 +310,8 @@ pub async fn lock_bb_handler(
         "vault_address": vault_addr,
         "creator_address": req.wallet_address,
         "delta_lamports": req.bb_lamports,
-        "token_symbol_hint": req.token_symbol_hint
+        "token_symbol_hint": req.token_symbol_hint,
+        "poh_slot": state.current_slot.load(std::sync::atomic::Ordering::Relaxed)
     })))
 }
 
@@ -315,6 +375,22 @@ pub async fn get_locks_by_creator_handler(
 
 /// GET /rollup/:rollup_id/roots/:batch_id — return the 64-char hex Merkle root
 /// that was anchored on-chain for the given batch, or 404 if not found.
+/// GET /rollup/:rollup_id/exited/:address — lamports already released to this wallet.
+/// Read-only. Does not change the watermark.
+pub async fn get_exit_watermark_handler(
+    State(state): State<AppState>,
+    Path((rollup_id, address)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let exit_id_input = format!("{}:BB:{}", rollup_id, address.to_lowercase());
+    let exit_id = sha256_hex(&exit_id_input);
+    let withdrawn = state.blockchain.get_cumulative_exit(&exit_id);
+    (StatusCode::OK, Json(serde_json::json!({
+        "rollup_id": rollup_id,
+        "address": address,
+        "already_withdrawn_lamports": withdrawn,
+    })))
+}
+
 pub async fn get_root_handler(
     State(state): State<AppState>,
     Path((rollup_id, batch_id)): Path<(String, u64)>,
@@ -538,6 +614,25 @@ pub async fn submit_root_handler(
         })));
     }
 
+    // Anchor the rollup Merkle state root on the L1 PoH clock
+    {
+        use crate::protocol::{Transaction as ProtoTx, TxData};
+        let tx_hash = format!("rollup_root_{}_{}", rollup_id, req.batch_id);
+        let proto_tx = ProtoTx {
+            hash: tx_hash.clone(),
+            from: req.sequencer_public_key.clone(),
+            timestamp: now,
+            data: TxData::EscrowStateRoot {
+                market_id: format!("{}:batch:{}", rollup_id, req.batch_id),
+                merkle_root: req.merkle_root_hex.clone(),
+            },
+            signature: req.signature.clone(),
+            signer_pubkey: req.sequencer_public_key.clone(),
+        };
+        state.poh.write().queue_transaction(tx_hash);
+        state.block_producer.record_executed_transaction(proto_tx);
+    }
+
     info!(
         "🌳 ROLLUP ROOT: rollup={} batch_id={} root={}",
         rollup_id, req.batch_id, req.merkle_root_hex
@@ -548,6 +643,7 @@ pub async fn submit_root_handler(
         "rollup_id": rollup_id,
         "batch_id": req.batch_id,
         "merkle_root_hex": req.merkle_root_hex,
+        "poh_slot": state.current_slot.load(std::sync::atomic::Ordering::Relaxed),
         "message": format!("{} state root anchored on L1.", rollup_id)
     })))
 }
@@ -698,15 +794,7 @@ pub async fn exit_handler(
         })));
     }
 
-    // ── Replay protection ──────────────────────────────────────────────────
-    let replay_key = format!("exit_nonce:{}", req.nonce);
-    if state.used_nonces.contains_key(&replay_key) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": "Nonce already used."
-        })));
-    }
-
-    // ── Ed25519 signature verification ─────────────────────────────────────
+    // ── Ed25519 signature verification + pubkey → address binding ─────────
     let pk_bytes = match hex::decode(&req.public_key) {
         Ok(b) if b.len() == 32 => b,
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -719,13 +807,41 @@ pub async fn exit_handler(
             "error": "signature must be 64-byte hex."
         }))),
     };
-    let verifying_key = match VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap()) {
+    let pk_arr: &[u8; 32] = match pk_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "public_key must be 32 bytes."
+        }))),
+    };
+    let verifying_key = match VerifyingKey::from_bytes(pk_arr) {
         Ok(k) => k,
         Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": "Invalid public key."
         }))),
     };
-    let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+    // CRITICAL P0 GUARD: signing public_key MUST own req.address
+    let derived_address = bs58::encode(verifying_key.to_bytes()).into_string();
+    if derived_address != req.address {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": "public_key does not match address",
+            "derived": derived_address,
+        })));
+    }
+    let signer_pk = solana_sdk::pubkey::Pubkey::new_from_array(*pk_arr);
+    if crate::svm::pda::is_reserved_pda(&signer_pk) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "Reserved protocol PDA cannot exit"
+        })));
+    }
+
+    let sig_arr: &[u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "signature must be 64 bytes."
+        }))),
+    };
+    let sig = Signature::from_bytes(sig_arr);
     // Canonical signed message — asset_type and rollup_id are both bound into the sig
     let signed_msg = format!(
         "ROLLUP_EXIT:{}:{}:{}:{}:{}:{}",
@@ -735,6 +851,19 @@ pub async fn exit_handler(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
             "error": "Invalid signature."
         })));
+    }
+
+    // ── Atomic replay protection (entry() eliminates TOCTOU race) ──────────
+    let replay_key = format!("rollup_exit:{}:{}", req.address, req.nonce);
+    match state.used_nonces.entry(replay_key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "Nonce already used."
+            })));
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(now);
+        }
     }
 
     // ── Validate proof shape ───────────────────────────────────────────────
@@ -875,8 +1004,43 @@ pub async fn exit_handler(
                 return (code, Json(serde_json::json!({ "error": msg })));
             }
 
-            state.used_nonces.insert(replay_key, now);
             let bal_after = state.blockchain.get_balance_lamports(&req.address);
+            let vault_after = state.blockchain.get_balance_lamports(&vault_addr);
+            let exit_tx_id = uuid::Uuid::new_v4().to_string();
+
+            // Anchor the 1:1 $BB exit payout onto the L1 PoH clock + transparent ledger
+            {
+                use crate::protocol::{Transaction as ProtoTx, TxData};
+                let proto_tx = ProtoTx {
+                    hash: exit_tx_id.clone(),
+                    from: vault_addr.clone(),
+                    timestamp: now,
+                    data: TxData::TransferBb {
+                        to: req.address.clone(),
+                        amount: withdrawable,
+                    },
+                    signature: req.signature.clone(),
+                    signer_pubkey: req.public_key.clone(),
+                };
+                state.poh.write().queue_transaction(exit_tx_id.clone());
+                state.block_producer.record_executed_transaction(proto_tx);
+
+                let tx_record = crate::storage::TransactionRecord::with_id(
+                    exit_tx_id.clone(),
+                    crate::storage::TxType::Unlock,
+                    &vault_addr,
+                    &req.address,
+                    withdrawable,
+                    0,
+                    vault_after.saturating_add(withdrawable),
+                    vault_after,
+                    bal_after,
+                    crate::storage::AuthType::Ed25519,
+                );
+                if let Err(e) = state.blockchain.log_transaction(tx_record) {
+                    tracing::warn!("Failed to log rollup exit receipt: {}", e);
+                }
+            }
 
             info!(
                 "🚀 BB EXIT: {} lamports → {} (rollup={} batch={} proven={} cumulative={} proof_depth={})",
@@ -887,6 +1051,8 @@ pub async fn exit_handler(
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
                 "asset_type": "BB",
+                "tx_id": exit_tx_id,
+                "poh_slot": state.current_slot.load(std::sync::atomic::Ordering::Relaxed),
                 "released_lamports": withdrawable,
                 "released_bb": withdrawable as f64 / crate::svm::LAMPORTS_PER_BB as f64,
                 "proven_balance_lamports": proven,
@@ -959,8 +1125,6 @@ pub async fn exit_handler(
                     "error": format!("Failed to persist NFT exit record: {}", e)
                 })));
             }
-
-            state.used_nonces.insert(replay_key, now);
 
             info!(
                 "🖼️  NFT EXIT: {}:{} → {} (rollup={} batch={})",

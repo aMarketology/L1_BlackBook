@@ -98,13 +98,13 @@ pub fn verify_signed_action(
         return Err(err(StatusCode::UNAUTHORIZED, "Signature verification failed"));
     }
 
-    // ── 4. Timestamp freshness ─────────────────────────────────────────────
+    // ── 4. Timestamp freshness (±60s window) ───────────────────────────────
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if now.saturating_sub(timestamp) > MAX_TIMESTAMP_AGE_SECS {
-        return Err(err(StatusCode::BAD_REQUEST, "Request expired (>60s old)"));
+    if now.abs_diff(timestamp) > MAX_TIMESTAMP_AGE_SECS {
+        return Err(err(StatusCode::BAD_REQUEST, "Request timestamp outside ±60s window"));
     }
 
     // ── 5. Replay protection (atomic nonce insert) ─────────────────────────

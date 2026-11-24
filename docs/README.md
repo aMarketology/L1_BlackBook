@@ -76,3 +76,19 @@ Fixed baseline rate: **10 BB = 1 wUSDT**.
 4. Every state-changing POST is Ed25519-signed. Replay is blocked by nonce +
    60-second timestamp freshness.
 5. ReDB writes precede DashMap hot-state updates (durability first).
+
+---
+
+## Ecosystem Consumer Alignment (2026-11-22)
+
+`blvkprism` (Next.js frontend) and `L2_BlackBook` (Rust/Axum market & fantasy engine) now organize reality TV and sports around two product modes:
+
+1. **Mode 1 — Global Last-One-Standing Pools** (`global_survivor`, `global_amazing_race`, `global_mls`): Users pick who lasts the longest; an eliminated pick knocks out the entry and survivors split the pot. Anchored to L1 escrow parent contests:
+   - Survivor 51: `SURVIVOR-S51-MAIN-V2`
+   - Amazing Race 39: `TAR-S39-MAIN-V2`
+   - MLS 2026: `MLS-2026-MAIN-V2`
+2. **Mode 2 — Custom Fantasy Leagues**: Commissioner-hosted BB/FC leagues (defaulting to strict `0 / 1 / 2` scoring + Perplexity Sonar / ClearSports oracles in `blvkprism`) with optional user-signed L1 escrow vaults (`ESCROW_DEPOSIT`).
+
+### Pure Custody Boundary (Unchanged)
+- L1 stores **zero game logic, rosters, or fantasy scoring rules** — those remain strictly in `blvkprism` / `L2_BlackBook`.
+- All BB flows remain **Lock-Only Custody** (`ROLLUP_LOCK_BB` / `ESCROW_DEPOSIT` in; Merkle `SubmitMerkleRoot` + `ROLLUP_EXIT` / `ESCROW_WITHDRAW` out). Never mint or seed unapproved balances.

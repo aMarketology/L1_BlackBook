@@ -69,15 +69,6 @@ const TRANSACTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("transac
 /// This is CRITICAL for replay protection - prevents double-minting from same USDC lock
 const PROCESSED_BRIDGE_TXS: TableDefinition<&str, &str> = TableDefinition::new("processed_bridge_txs");
 
-/// Escrow market roots: MarketID (String) → MerkleRoot (32 bytes, SHA-256)
-/// Stores ONLY the raw 32-byte merkle root per market. No metadata.
-/// L1 is a vault — it stores the math, not the floor plan.
-pub const ESCROW_MARKET_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_market_roots");
-
-/// Escrow withdrawal claims: "{market_id}:{address}" (String) → ClaimTimestamp (u64)
-/// Prevents double-withdrawal per market — durable across restarts
-pub const ESCROW_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("escrow_claims");
-
 /// Faucet epoch claims: wallet address → epoch last paid.
 /// Durable so a restart cannot reset the once-per-epoch cap.
 const FAUCET_CLAIMS: TableDefinition<&str, u64> = TableDefinition::new("faucet_claims");
@@ -110,17 +101,6 @@ const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdraw
 /// `atomic_withdrawal_flush_and_record` write transaction so the counter is always
 /// in sync with persisted records after a crash or restart.
 const WITHDRAWAL_SEQ_COUNTER: TableDefinition<&str, u64> = TableDefinition::new("withdrawal_seq_counter");
-
-/// Per-contest settlement state: contest_id → ContestState JSON (bytes)
-/// Tracks lifecycle (Open → Settled → Expired), Merkle root, payout accounting,
-/// and claim deadline per BB market.
-const CONTEST_STATES: TableDefinition<&str, &[u8]> = TableDefinition::new("contest_states");
-
-/// Vault bridge burn records: poh_slot (u64) → BurnRecord JSON (bytes).
-/// Vault bridge burn receipts: burn_id (64-char lowercase hex SHA-256) → BurnRecord JSON.
-/// Keyed by burn_id instead of poh_slot so that multiple burns within the same 400 ms
-/// slot never collide. burn_id = SHA-256(wallet_bytes || poh_slot_le8 || nonce_utf8).
-const BURN_RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("burn_records");
 
 /// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
 /// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
@@ -163,12 +143,6 @@ pub const ROLLUP_STATE_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::ne
 /// For BB, every exit releases only `proven_balance − cumulative_withdrawn`, so
 /// replaying an old root or re-proving an unchanged balance releases nothing.
 pub const ROLLUP_CONSUMED_EXITS: TableDefinition<&str, u64> = TableDefinition::new("rollup_consumed_exits");
-
-/// Dynamic exchange rates: pool_id (String) → rate (u64).
-/// Key "BB_USDT" holds the current BB-per-wUSDT exchange rate.
-/// Defaults to BB_PER_USDT_DEFAULT (10) if unset. Adjustable by Oracle/Dealer
-/// to protect the internal accounting unit when wUSDT depegs.
-pub const SWAP_RATES: TableDefinition<&str, u64> = TableDefinition::new("swap_rates");
 
 // NOTE: Two-tier vault table constants (TIER1_STATE, TIER2_STATE,
 // DIME_VINTAGES, CPI_HISTORY, DIME_BALANCES) were removed — the DIME/vault
@@ -790,16 +764,12 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(METADATA)?;
             let _ = write_txn.open_table(TRANSACTIONS)?;
             let _ = write_txn.open_table(PROCESSED_BRIDGE_TXS)?;
-            // Escrow tables
-            let _ = write_txn.open_table(ESCROW_MARKET_ROOTS)?;
-            let _ = write_txn.open_table(ESCROW_CLAIMS)?;
             let _ = write_txn.open_table(FAUCET_CLAIMS)?;
             let _ = write_txn.open_table(SLOT_META)?;
             let _ = write_txn.open_table(MERKLE_NODES)?;
             let _ = write_txn.open_table(DEPOSIT_REQUESTS)?;
             let _ = write_txn.open_table(WITHDRAWALS)?;
             let _ = write_txn.open_table(WITHDRAWAL_SEQ_COUNTER)?;
-            let _ = write_txn.open_table(CONTEST_STATES)?;
             let _ = write_txn.open_table(UNATTRIBUTED_DEPOSITS)?;
             // Legacy L5 roots (kept for startup migration)
             let _ = write_txn.open_table(L5_STATE_ROOTS)?;
@@ -807,8 +777,6 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(ROLLUP_STATE_ROOTS)?;
             // Rollup exit double-spend guard
             let _ = write_txn.open_table(ROLLUP_CONSUMED_EXITS)?;
-            // Dynamic exchange rates (Oracle/Dealer adjustable)
-            let _ = write_txn.open_table(SWAP_RATES)?;
 
             // SVM tables (behind feature flag)
             {
@@ -1568,64 +1536,6 @@ impl ConcurrentBlockchain {
     }
 
     // ========================================================================
-    // ESCROW STORAGE (ReDB-backed)
-    // ========================================================================
-
-    /// Store a merkle root for a market settlement (strictly 32 bytes — SHA-256)
-    pub fn store_escrow_market_root(&self, market_id: &str, data: &[u8; 32]) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
-            table.insert(market_id, data.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        info!(market_id = %market_id, "Stored escrow market root in ReDB");
-        Ok(())
-    }
-
-    /// Fetch a single market root (used when verifying a user's Merkle proof)
-    pub fn get_escrow_market_root(&self, market_id: &str) -> Result<Option<Vec<u8>>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
-        let result = table.get(market_id).map_err(|e| e.to_string())?;
-        Ok(result.map(|guard| guard.value().to_vec()))
-    }
-
-    /// Record that a user has claimed their withdrawal for a market
-    /// claim_key MUST be formatted as "{market_id}:{user_pubkey}"
-    pub fn store_escrow_claim(&self, claim_key: &str, timestamp: u64) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
-            table.insert(claim_key, timestamp).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-        info!(claim_key = %claim_key, "Stored escrow claim in ReDB");
-        Ok(())
-    }
-
-    /// Check if a user has already claimed their payout
-    pub fn has_escrow_claim(&self, claim_key: &str) -> Result<bool, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
-        let result = table.get(claim_key).map_err(|e| e.to_string())?;
-        Ok(result.is_some())
-    }
-
-    /// Load all market roots from ReDB (startup recovery)
-    pub fn load_all_escrow_market_roots(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(ESCROW_MARKET_ROOTS).map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (key, value) = entry.map_err(|e| e.to_string())?;
-            results.push((key.value().to_string(), value.value().to_vec()));
-        }
-        Ok(results)
-    }
-
-    // ========================================================================
     // DEPOSIT GATEWAY STORAGE (ReDB-backed)
     // ========================================================================
 
@@ -1653,59 +1563,6 @@ impl ConcurrentBlockchain {
             }
         }
         Ok(results)
-    }
-
-    // ── Vault Bridge: Burn Records ──────────────────────────────────────────
-
-    /// Persist a fresh BurnRecord to ReDB, keyed by burn_id (not poh_slot).
-    /// burn_id is a hex SHA-256 derived in burn_handler — guaranteed unique even
-    /// when two burns land in the same 400 ms PoH slot.
-    pub fn store_burn(&self, record: &BurnRecord) -> Result<(), String> {
-        let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-            table.insert(record.burn_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    /// Load a BurnRecord by its burn_id. Returns Ok(None) if not found.
-    /// Called by claim_attestation_handler to verify the burn exists before signing.
-    pub fn load_burn(&self, burn_id: &str) -> Result<Option<BurnRecord>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-        match table.get(burn_id).map_err(|e| e.to_string())? {
-            Some(v) => {
-                let record = serde_json::from_slice::<BurnRecord>(v.value())
-                    .map_err(|e| e.to_string())?;
-                Ok(Some(record))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Mark a BurnRecord as consumed (redeemable=false, attestation_issued=true).
-    /// Called before the KMS signs the claim attestation to prevent double-spend.
-    pub fn consume_burn_record(&self, burn_id: &str) -> Result<(), String> {
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-            // Materialize bytes before dropping the immutable borrow (AccessGuard),
-            // then re-borrow table mutably for the insert.
-            let record_opt: Option<BurnRecord> = {
-                let raw = table.get(burn_id).map_err(|e| e.to_string())?;
-                raw.map(|v| serde_json::from_slice::<BurnRecord>(v.value()).map_err(|e| e.to_string()))
-                   .transpose()?
-            }; // AccessGuard dropped here
-            if let Some(mut record) = record_opt {
-                record.redeemable = false;
-                record.attestation_issued = true;
-                let bytes = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
-                table.insert(burn_id, bytes.as_slice()).map_err(|e| e.to_string())?;
-            }
-        }
-        write_txn.commit().map_err(|e| e.to_string())
     }
 
     /// Persist a rollup liquidity lock record to ReDB.
@@ -2055,149 +1912,155 @@ impl ConcurrentBlockchain {
     // ATOMIC COMBINED WRITES — SVM accounts + metadata in one ReDB transaction
     // ========================================================================
     //
-    // These methods eliminate the crash window that exists when SVM account
-    // changes (write-behind via flush_block) and metadata records (written
-    // immediately to ReDB) land in separate transactions.
-    //
-    // Without these methods the following scenario is possible:
-    //   1. SVM balance changes  → hot_state DashMap (not yet in ReDB)
-    //   2. metadata record      → ReDB  ← crash here
-    //   3. flush_block          → never runs
-    //
-    // On restart: metadata says operation completed, but balance change is gone.
-    // The user cannot retry (metadata blocks them) and has no payout. Fix: write
-    // both in one atomic ReDB transaction, then update hot_state only on success.
+    // Write order is strictly: compute mutations → single ReDB commit → update hot_state.
+    // A crash before the commit leaves all rows unchanged.
+    // A crash after the commit leaves ReDB consistent and SvmAccountsDB::new()
+    // warms hot_state from ReDB on restart — zero 400ms write-behind crash window.
 
-    /// Atomically execute an escrow payout + seal the claim in a single ReDB transaction.
-    ///
-    /// Eliminates the crash window where the claim seal lands in ReDB but the
-    /// balance debit/credit does not — leaving the user with no payout and an
-    /// unretriable claim key.
-    ///
-    /// Hot-state (DashMap) is updated ONLY after the ReDB commit so the write
-    /// order is always: ReDB → DashMap (never the reverse).
-    pub fn atomic_escrow_claim_and_pay(
+    /// Atomically mint $BB for a verified cross-chain deposit and seal `PROCESSED_BRIDGE_TXS`
+    /// (plus optional `DepositRecord` / `UnattributedDeposit` updates) in a **single** ReDB
+    /// write transaction.
+    pub fn atomic_mint_bridge_deposit(
         &self,
-        claim_key: &str,
-        escrow_addr: &str,
-        user_addr: &str,
-        amount_lamports: u64,
-        timestamp: u64,
-    ) -> Result<(), String> {
-        let escrow_pk = Self::addr_to_pubkey(escrow_addr);
-        let user_pk   = Self::addr_to_pubkey(user_addr);
-
-        let escrow_lamports = self.svm_accounts.get_lamports(&escrow_pk);
-        let user_lamports   = self.svm_accounts.get_lamports(&user_pk);
-
-        if escrow_lamports < amount_lamports {
-            return Err(format!(
-                "Insufficient escrow: {} < {} lamports",
-                escrow_lamports, amount_lamports
-            ));
-        }
-        let new_escrow = escrow_lamports.checked_sub(amount_lamports)
-            .ok_or_else(|| "Escrow underflow".to_string())?;
-        let new_user = user_lamports.checked_add(amount_lamports)
-            .ok_or_else(|| "User balance overflow".to_string())?;
-
-        let escrow_account = AccountSharedData::new(new_escrow, 0, &solana_sdk::system_program::id());
-        let user_account   = AccountSharedData::new(new_user,   0, &solana_sdk::system_program::id());
-
-        let escrow_bytes = borsh::to_vec(&StoredAccount::from(&escrow_account))
-            .map_err(|e| format!("Serialization error: {}", e))?;
-        let user_bytes = borsh::to_vec(&StoredAccount::from(&user_account))
-            .map_err(|e| format!("Serialization error: {}", e))?;
-
-        // Single atomic ReDB write: claim seal + both SVM account states.
-        // The replay guard is enforced INSIDE this transaction: if the claim key
-        // already exists, we reject before any balance mutation, so the same
-        // Merkle proof can never drain the vault twice — even across restarts.
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut claims = write_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
-            if claims.get(claim_key).map_err(|e| e.to_string())?.is_some() {
-                return Err(format!("Already claimed: {claim_key}"));
-            }
-            claims.insert(claim_key, timestamp).map_err(|e| e.to_string())?;
-
-            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
-            svm.insert(escrow_pk.to_bytes().as_slice(), escrow_bytes.as_slice()).map_err(|e| e.to_string())?;
-            svm.insert(user_pk.to_bytes().as_slice(),   user_bytes.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())?;
-
-        // Update hot_state AFTER durable commit (ReDB → DashMap ordering)
-        self.svm_accounts.hot_state.insert(escrow_pk, escrow_account);
-        self.svm_accounts.hot_state.insert(user_pk, user_account);
-        self.mirror_balance_to_cache(escrow_addr, new_escrow);
-        self.mirror_balance_to_cache(user_addr, new_user);
-        // total_supply unchanged: escrow debit == user credit (zero-sum move)
-
-        info!(claim_key = %claim_key, amount = amount_lamports, "Atomic escrow claim committed");
-        Ok(())
-    }
-
-    // ────────────────────────────────────────────────────────────────────────
-    // VAULT BRIDGE — atomic BB→wUSDT burn
-    // ────────────────────────────────────────────────────────────────────────
-    //
-    // Three tables need to change together:
-    //   SVM_ACCOUNTS : wallet (BB debit), wUSDT Mint (supply +), wUSDT ATA (+)
-    //   BURN_RECORDS : new BurnRecord receipt
-    //
-    // Both ConcurrentBlockchain.db and SvmAccountsDB.db are the SAME Arc<Database>
-    // — the tables live in one file, so one write_txn covers all of them.
-    //
-    // Write order: compute mutations → single ReDB commit → update hot_state.
-    // A crash before the commit leaves all four rows unchanged.
-    // A crash after the commit leaves hot_state stale, but SvmAccountsDB::new()
-    // warms hot_state from ReDB on the next restart — no data loss.
-
-    /// Atomically debit BB lamports, mint wUSDT, and persist the BurnRecord in
-    /// **one** ReDB write transaction.
-    ///
-    /// Eliminates the crash window that existed when `debit_svm_lamports` and
-    /// `SplTokenEngine::mint_to` each wrote to hot_state independently and relied
-    /// on `flush_block()` for durability: if `flush_block()` flushed only the
-    /// debit before a crash, the user lost BB and received no wUSDT.
-    ///
-    /// Guarantee: either all four rows land in ReDB or none do.
-    pub fn atomic_vault_burn(
-        &self,
+        tx_hash: &str,
         wallet_address: &str,
-        wallet_pubkey: &Pubkey,
         bb_lamports: u64,
-        wusdt_micro: u64,
-        burn_record: &BurnRecord,
-    ) -> Result<(), String> {
-        use crate::svm::spl_token::{
-            MintLayout, TokenAccountLayout, derive_ata_address, SPL_TOKEN_PROGRAM_ID,
-        };
-        use crate::svm::usdc_mint_bytes;
-
+        mint_tx_id: &str,
+        updated_record: Option<&DepositRecord>,
+        claim_unattributed: bool,
+    ) -> Result<u64, String> {
         if bb_lamports == 0 {
             return Err("bb_lamports must be > 0".to_string());
         }
+        // Serialize concurrent callers attempting the same external_tx_hash
+        self.reserve_bridge_tx(tx_hash)?;
 
-        // ── 1. Read all affected accounts from hot_state ─────────────────────
-        let mint_bytes   = usdc_mint_bytes();
-        let mint_pubkey  = Pubkey::new_from_array(mint_bytes);
-        let ata_bytes    = derive_ata_address(&wallet_pubkey.to_bytes(), &mint_bytes);
-        let ata_pubkey   = Pubkey::new_from_array(ata_bytes);
+        let result = (|| -> Result<(Pubkey, AccountSharedData, u64), String> {
+            let pk = Self::addr_to_pubkey(wallet_address);
+            let mut wallet_account = self.svm_accounts
+                .get_account(&pk)
+                .unwrap_or_else(|| AccountSharedData::new(0, 0, &solana_sdk::system_program::id()));
 
-        let mut wallet_account = self.svm_accounts
+            let new_lamports = wallet_account.lamports()
+                .checked_add(bb_lamports)
+                .ok_or_else(|| "Wallet balance overflow".to_string())?;
+            wallet_account.set_lamports(new_lamports);
+            wallet_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+
+            let wallet_bytes = borsh::to_vec(&StoredAccount::from(&wallet_account))
+                .map_err(|e| format!("Serialization error: {}", e))?;
+            let deposit_bytes = match updated_record {
+                Some(rec) => Some(serde_json::to_vec(rec).map_err(|e| e.to_string())?),
+                None => None,
+            };
+
+            let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut processed = write_txn.open_table(PROCESSED_BRIDGE_TXS).map_err(|e| e.to_string())?;
+                if processed.get(tx_hash).map_err(|e| e.to_string())?.is_some() {
+                    return Err(format!("tx {} already processed", tx_hash));
+                }
+                processed.insert(tx_hash, mint_tx_id).map_err(|e| e.to_string())?;
+
+                if claim_unattributed {
+                    let mut unattrib = write_txn.open_table(UNATTRIBUTED_DEPOSITS).map_err(|e| e.to_string())?;
+                    let existing_opt: Option<UnattributedDeposit> = {
+                        let guard = unattrib.get(tx_hash).map_err(|e| e.to_string())?;
+                        guard.map(|g| serde_json::from_slice::<UnattributedDeposit>(g.value()).map_err(|e| e.to_string()))
+                            .transpose()?
+                    };
+                    let mut rec = existing_opt.ok_or_else(|| format!("Unattributed deposit {} not found", tx_hash))?;
+                    if rec.claimed_by.is_some() {
+                        return Err("already_claimed".to_string());
+                    }
+                    rec.claimed_by = Some(wallet_address.to_string());
+                    let rec_bytes = serde_json::to_vec(&rec).map_err(|e| e.to_string())?;
+                    unattrib.insert(tx_hash, rec_bytes.as_slice()).map_err(|e| e.to_string())?;
+                }
+
+                if let Some(ref dep_bytes) = deposit_bytes {
+                    let mut deposits = write_txn.open_table(DEPOSIT_REQUESTS).map_err(|e| e.to_string())?;
+                    deposits.insert(tx_hash, dep_bytes.as_slice()).map_err(|e| e.to_string())?;
+                }
+
+                let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+                svm.insert(pk.to_bytes().as_slice(), wallet_bytes.as_slice()).map_err(|e| e.to_string())?;
+            }
+            write_txn.commit().map_err(|e| e.to_string())?;
+
+            Ok((pk, wallet_account, new_lamports))
+        })();
+
+        match result {
+            Ok((pk, wallet_account, new_lamports)) => {
+                self.svm_accounts.hot_state.insert(pk, wallet_account);
+                self.mirror_balance_to_cache(wallet_address, new_lamports);
+                self.total_supply.fetch_add(bb_lamports, Ordering::Relaxed);
+                self.processed_bridge_txs.insert(tx_hash.to_string(), mint_tx_id.to_string());
+                info!(tx_hash = %tx_hash, wallet = %wallet_address, bb_lamports, "Atomic bridge deposit committed");
+                Ok(new_lamports)
+            }
+            Err(e) => {
+                self.cancel_bridge_tx(tx_hash);
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically execute a Protocol-Owned Liquidity (POL) `BB → wUSDT` swap in a
+    /// **single** ReDB write transaction.
+    ///
+    /// Closed-loop conservation:
+    /// - User pays `bb_in_lamports` into `swap_pool_pda` (`user_bb - bb_in`, `pool_bb + bb_in`).
+    /// - Pool pays `wusdt_out_micro` (net of protocol fee) to `user_ata` (`pool_ata - wusdt_out`, `user_ata + wusdt_out`).
+    /// - Protocol swap fee stays 100% inside `swap_pool_pda`.
+    /// - Total `$BB` supply and total `wUSDT` supply are strictly unchanged.
+    pub fn atomic_pol_swap_bb_for_usdc(
+        &self,
+        wallet_address: &str,
+        wallet_pubkey: &Pubkey,
+        bb_in_lamports: u64,
+        wusdt_out_micro: u64,
+    ) -> Result<(), String> {
+        use crate::svm::spl_token::{TokenAccountLayout, derive_ata_address, SPL_TOKEN_PROGRAM_ID};
+        use crate::svm::{usdc_mint_bytes, swap_pool_pda, swap_pool_address};
+
+        if bb_in_lamports == 0 || wusdt_out_micro == 0 {
+            return Err("Swap amounts must be > 0".to_string());
+        }
+        let pool_pubkey = swap_pool_pda();
+        if wallet_pubkey == &pool_pubkey {
+            return Err("swap_pool_pda cannot swap with itself".to_string());
+        }
+
+        let pool_addr = swap_pool_address();
+        let mint_bytes = usdc_mint_bytes();
+        let user_ata_pk = Pubkey::new_from_array(derive_ata_address(&wallet_pubkey.to_bytes(), &mint_bytes));
+        let pool_ata_pk = Pubkey::new_from_array(derive_ata_address(&pool_pubkey.to_bytes(), &mint_bytes));
+
+        let mut user_bb_acct = self.svm_accounts
             .get_account(wallet_pubkey)
-            .ok_or_else(|| format!("BB account not found: {}", wallet_address))?;
+            .ok_or_else(|| "Insufficient BB balance".to_string())?;
+        if user_bb_acct.lamports() < bb_in_lamports {
+            return Err("Insufficient BB balance".to_string());
+        }
 
-        let mut mint_account = self.svm_accounts
-            .get_account(&mint_pubkey)
-            .ok_or("wUSDT mint account not found")?;
+        let mut pool_bb_acct = self.svm_accounts
+            .get_account(&pool_pubkey)
+            .unwrap_or_else(|| AccountSharedData::new(0, 0, &solana_sdk::system_program::id()));
 
-        let mut ata_account = self.svm_accounts
-            .get_account(&ata_pubkey)
+        let mut pool_ata_acct = self.svm_accounts
+            .get_account(&pool_ata_pk)
+            .ok_or_else(|| "Insufficient wUSDT liquidity in swap pool".to_string())?;
+        let mut pool_ata_layout = TokenAccountLayout::from_bytes(pool_ata_acct.data())
+            .map_err(|e| format!("Pool ATA corrupt: {}", e))?;
+        if pool_ata_layout.amount < wusdt_out_micro {
+            return Err("Insufficient wUSDT liquidity in swap pool".to_string());
+        }
+
+        let mut user_ata_acct = self.svm_accounts
+            .get_account(&user_ata_pk)
             .unwrap_or_else(|| {
-                // First-time mint for this wallet — create the ATA in memory
                 let layout = TokenAccountLayout {
                     mint: mint_bytes,
                     owner: wallet_pubkey.to_bytes(),
@@ -2212,86 +2075,189 @@ impl ConcurrentBlockchain {
                     close_authority: [0u8; 32],
                 };
                 AccountSharedData::from(Account {
-                    lamports: 1_000_000,
+                    lamports: 0,
                     data: layout.to_bytes(),
                     owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
                     executable: false,
                     rent_epoch: RENT_EPOCH_EXEMPT,
                 })
             });
+        let mut user_ata_layout = TokenAccountLayout::from_bytes(user_ata_acct.data())
+            .map_err(|e| format!("User ATA corrupt: {}", e))?;
 
-        // ── 2. Compute all mutations in memory — no writes yet ───────────────
-        //
-        // BB wallet: debit
-        if wallet_account.lamports() < bb_lamports {
-            return Err(format!(
-                "Insufficient BB: have {} lamports, need {}",
-                wallet_account.lamports(), bb_lamports
-            ));
-        }
-        wallet_account.set_lamports(wallet_account.lamports() - bb_lamports);
-        wallet_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        let new_user_bb = user_bb_acct.lamports()
+            .checked_sub(bb_in_lamports)
+            .ok_or("User BB underflow")?;
+        let new_pool_bb = pool_bb_acct.lamports()
+            .checked_add(bb_in_lamports)
+            .ok_or("Pool BB overflow")?;
+        pool_ata_layout.amount = pool_ata_layout.amount
+            .checked_sub(wusdt_out_micro)
+            .ok_or("Pool wUSDT underflow")?;
+        user_ata_layout.amount = user_ata_layout.amount
+            .checked_add(wusdt_out_micro)
+            .ok_or("User wUSDT overflow")?;
 
-        // wUSDT Mint: increase supply
-        let mut mint_layout = MintLayout::from_bytes(mint_account.data())
-            .map_err(|e| format!("Mint deserialize failed: {}", e))?;
-        mint_layout.supply = mint_layout.supply
-            .checked_add(wusdt_micro)
-            .ok_or("Mint supply overflow")?;
-        mint_account.set_data_from_slice(&mint_layout.to_bytes());
-        mint_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        user_bb_acct.set_lamports(new_user_bb);
+        user_bb_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        pool_bb_acct.set_lamports(new_pool_bb);
+        pool_bb_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        pool_ata_acct.set_data_from_slice(&pool_ata_layout.to_bytes());
+        pool_ata_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        user_ata_acct.set_data_from_slice(&user_ata_layout.to_bytes());
+        user_ata_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
 
-        // wUSDT ATA: increase token balance
-        let mut token_layout = TokenAccountLayout::from_bytes(ata_account.data())
-            .map_err(|e| format!("ATA deserialize failed: {}", e))?;
-        token_layout.amount = token_layout.amount
-            .checked_add(wusdt_micro)
-            .ok_or("ATA token overflow")?;
-        ata_account.set_data_from_slice(&token_layout.to_bytes());
-        ata_account.set_rent_epoch(RENT_EPOCH_EXEMPT);
-
-        // ── 3. Single atomic ReDB write: 3 SVM accounts + BurnRecord ─────────
-        let serialize = |acct: &AccountSharedData| -> Result<Vec<u8>, String> {
+        let ser = |acct: &AccountSharedData| -> Result<Vec<u8>, String> {
             borsh::to_vec(&StoredAccount::from(acct))
                 .map_err(|e| format!("Account serialization: {}", e))
         };
-        let wallet_ser = serialize(&wallet_account)?;
-        let mint_ser   = serialize(&mint_account)?;
-        let ata_ser    = serialize(&ata_account)?;
-        let record_ser = serde_json::to_vec(burn_record).map_err(|e| e.to_string())?;
+        let user_bb_ser  = ser(&user_bb_acct)?;
+        let pool_bb_ser  = ser(&pool_bb_acct)?;
+        let pool_ata_ser = ser(&pool_ata_acct)?;
+        let user_ata_ser = ser(&user_ata_acct)?;
 
-        // `self.db` == `self.svm_accounts.db` (same Arc) — one txn covers all tables
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
-            svm.insert(wallet_pubkey.as_ref(),  wallet_ser.as_slice()).map_err(|e| e.to_string())?;
-            svm.insert(mint_pubkey.as_ref(),    mint_ser.as_slice()).map_err(|e| e.to_string())?;
-            svm.insert(ata_pubkey.as_ref(),     ata_ser.as_slice()).map_err(|e| e.to_string())?;
-
-            let mut burns = write_txn.open_table(BURN_RECORDS).map_err(|e| e.to_string())?;
-            burns.insert(burn_record.burn_id.as_str(), record_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(wallet_pubkey.as_ref(), user_bb_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(pool_pubkey.as_ref(),   pool_bb_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(pool_ata_pk.as_ref(),   pool_ata_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(user_ata_pk.as_ref(),   user_ata_ser.as_slice()).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())?;
 
-        // ── 4. Update hot_state AFTER the durable commit ─────────────────────
-        // If we crash here the data is safe in ReDB; SvmAccountsDB::new()
-        // reloads hot_state from disk on restart.
-        let new_bb_lamports = wallet_account.lamports();
-        self.svm_accounts.hot_state.insert(*wallet_pubkey, wallet_account);
-        self.svm_accounts.hot_state.insert(mint_pubkey,    mint_account);
-        self.svm_accounts.hot_state.insert(ata_pubkey,     ata_account);
+        self.svm_accounts.hot_state.insert(*wallet_pubkey, user_bb_acct);
+        self.svm_accounts.hot_state.insert(pool_pubkey,    pool_bb_acct);
+        self.svm_accounts.hot_state.insert(pool_ata_pk,    pool_ata_acct);
+        self.svm_accounts.hot_state.insert(user_ata_pk,    user_ata_acct);
+        self.mirror_balance_to_cache(wallet_address, new_user_bb);
+        self.mirror_balance_to_cache(&pool_addr, new_pool_bb);
 
-        self.mirror_balance_to_cache(wallet_address, new_bb_lamports);
-        // total_supply decreases: BB is permanently destroyed, not transferred
-        self.total_supply.fetch_sub(bb_lamports, Ordering::Relaxed);
+        info!(wallet = %wallet_address, bb_in = bb_in_lamports, wusdt_out = wusdt_out_micro, "Atomic POL BB→wUSDT swap committed");
+        Ok(())
+    }
 
-        info!(
-            wallet = %wallet_address,
-            bb_burned = bb_lamports,
-            wusdt_minted = wusdt_micro,
-            burn_id = %burn_record.burn_id,
-            "Atomic vault burn committed"
-        );
+    /// Atomically execute a Protocol-Owned Liquidity (POL) `wUSDT → BB` swap in a
+    /// **single** ReDB write transaction.
+    pub fn atomic_pol_swap_usdc_for_bb(
+        &self,
+        wallet_address: &str,
+        wallet_pubkey: &Pubkey,
+        wusdt_in_micro: u64,
+        bb_out_lamports: u64,
+    ) -> Result<(), String> {
+        use crate::svm::spl_token::{TokenAccountLayout, derive_ata_address, SPL_TOKEN_PROGRAM_ID};
+        use crate::svm::{usdc_mint_bytes, swap_pool_pda, swap_pool_address};
+
+        if wusdt_in_micro == 0 || bb_out_lamports == 0 {
+            return Err("Swap amounts must be > 0".to_string());
+        }
+        let pool_pubkey = swap_pool_pda();
+        if wallet_pubkey == &pool_pubkey {
+            return Err("swap_pool_pda cannot swap with itself".to_string());
+        }
+
+        let pool_addr = swap_pool_address();
+        let mint_bytes = usdc_mint_bytes();
+        let user_ata_pk = Pubkey::new_from_array(derive_ata_address(&wallet_pubkey.to_bytes(), &mint_bytes));
+        let pool_ata_pk = Pubkey::new_from_array(derive_ata_address(&pool_pubkey.to_bytes(), &mint_bytes));
+
+        let mut user_ata_acct = self.svm_accounts
+            .get_account(&user_ata_pk)
+            .ok_or_else(|| "Insufficient wUSDT balance".to_string())?;
+        let mut user_ata_layout = TokenAccountLayout::from_bytes(user_ata_acct.data())
+            .map_err(|e| format!("User ATA corrupt: {}", e))?;
+        if user_ata_layout.amount < wusdt_in_micro {
+            return Err("Insufficient wUSDT balance".to_string());
+        }
+
+        let mut pool_bb_acct = self.svm_accounts
+            .get_account(&pool_pubkey)
+            .ok_or_else(|| "Insufficient BB liquidity in swap pool".to_string())?;
+        if pool_bb_acct.lamports() < bb_out_lamports {
+            return Err("Insufficient BB liquidity in swap pool".to_string());
+        }
+
+        let mut user_bb_acct = self.svm_accounts
+            .get_account(wallet_pubkey)
+            .unwrap_or_else(|| AccountSharedData::new(0, 0, &solana_sdk::system_program::id()));
+
+        let mut pool_ata_acct = self.svm_accounts
+            .get_account(&pool_ata_pk)
+            .unwrap_or_else(|| {
+                let layout = TokenAccountLayout {
+                    mint: mint_bytes,
+                    owner: pool_pubkey.to_bytes(),
+                    amount: 0,
+                    delegate_option: 0,
+                    delegate: [0u8; 32],
+                    state: 1,
+                    is_native_option: 0,
+                    is_native: 0,
+                    delegated_amount: 0,
+                    close_authority_option: 0,
+                    close_authority: [0u8; 32],
+                };
+                AccountSharedData::from(Account {
+                    lamports: 0,
+                    data: layout.to_bytes(),
+                    owner: Pubkey::new_from_array(SPL_TOKEN_PROGRAM_ID),
+                    executable: false,
+                    rent_epoch: RENT_EPOCH_EXEMPT,
+                })
+            });
+        let mut pool_ata_layout = TokenAccountLayout::from_bytes(pool_ata_acct.data())
+            .map_err(|e| format!("Pool ATA corrupt: {}", e))?;
+
+        user_ata_layout.amount = user_ata_layout.amount
+            .checked_sub(wusdt_in_micro)
+            .ok_or("User wUSDT underflow")?;
+        pool_ata_layout.amount = pool_ata_layout.amount
+            .checked_add(wusdt_in_micro)
+            .ok_or("Pool wUSDT overflow")?;
+        let new_pool_bb = pool_bb_acct.lamports()
+            .checked_sub(bb_out_lamports)
+            .ok_or("Pool BB underflow")?;
+        let new_user_bb = user_bb_acct.lamports()
+            .checked_add(bb_out_lamports)
+            .ok_or("User BB overflow")?;
+
+        user_bb_acct.set_lamports(new_user_bb);
+        user_bb_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        pool_bb_acct.set_lamports(new_pool_bb);
+        pool_bb_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        user_ata_acct.set_data_from_slice(&user_ata_layout.to_bytes());
+        user_ata_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+        pool_ata_acct.set_data_from_slice(&pool_ata_layout.to_bytes());
+        pool_ata_acct.set_rent_epoch(RENT_EPOCH_EXEMPT);
+
+        let ser = |acct: &AccountSharedData| -> Result<Vec<u8>, String> {
+            borsh::to_vec(&StoredAccount::from(acct))
+                .map_err(|e| format!("Account serialization: {}", e))
+        };
+        let user_bb_ser  = ser(&user_bb_acct)?;
+        let pool_bb_ser  = ser(&pool_bb_acct)?;
+        let user_ata_ser = ser(&user_ata_acct)?;
+        let pool_ata_ser = ser(&pool_ata_acct)?;
+
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
+            svm.insert(wallet_pubkey.as_ref(), user_bb_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(pool_pubkey.as_ref(),   pool_bb_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(user_ata_pk.as_ref(),   user_ata_ser.as_slice()).map_err(|e| e.to_string())?;
+            svm.insert(pool_ata_pk.as_ref(),   pool_ata_ser.as_slice()).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+
+        self.svm_accounts.hot_state.insert(*wallet_pubkey, user_bb_acct);
+        self.svm_accounts.hot_state.insert(pool_pubkey,    pool_bb_acct);
+        self.svm_accounts.hot_state.insert(user_ata_pk,    user_ata_acct);
+        self.svm_accounts.hot_state.insert(pool_ata_pk,    pool_ata_acct);
+        self.mirror_balance_to_cache(wallet_address, new_user_bb);
+        self.mirror_balance_to_cache(&pool_addr, new_pool_bb);
+
+        info!(wallet = %wallet_address, wusdt_in = wusdt_in_micro, bb_out = bb_out_lamports, "Atomic POL wUSDT→BB swap committed");
         Ok(())
     }
 
@@ -2483,49 +2449,6 @@ impl ConcurrentBlockchain {
     }
 
     // ========================================================================
-    // CONTEST STATE STORAGE (ReDB-backed)
-    // ========================================================================
-
-    /// Persist (insert or overwrite) a contest state record, keyed by contest_id.
-    pub fn store_contest_state(&self, state: &ContestState) -> Result<(), String> {
-        let bytes = serde_json::to_vec(state).map_err(|e| e.to_string())?;
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
-            table.insert(state.contest_id.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    /// Load a single contest state by contest_id.
-    pub fn load_contest_state(&self, contest_id: &str) -> Result<Option<ContestState>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
-        let result = table.get(contest_id).map_err(|e| e.to_string())?;
-        match result {
-            None => Ok(None),
-            Some(guard) => serde_json::from_slice::<ContestState>(guard.value())
-                .map(Some)
-                .map_err(|e| e.to_string()),
-        }
-    }
-
-    /// Load all contest states from ReDB (startup recovery).
-    pub fn load_all_contest_states(&self) -> Result<Vec<ContestState>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(CONTEST_STATES).map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (_key, value) = entry.map_err(|e| e.to_string())?;
-            if let Ok(record) = serde_json::from_slice::<ContestState>(value.value()) {
-                results.push(record);
-            }
-        }
-        Ok(results)
-    }
-
-    // ========================================================================
     // ESCROW DEPOSITOR LEDGER (per-contest, ReDB-backed)
     // ========================================================================
 
@@ -2649,19 +2572,6 @@ impl ConcurrentBlockchain {
             }
         }
         Ok(out)
-    }
-
-    /// Load all claims from ReDB (startup recovery)
-    pub fn load_all_escrow_claims(&self) -> Result<Vec<(String, u64)>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = read_txn.open_table(ESCROW_CLAIMS).map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        let iter = table.iter().map_err(|e| e.to_string())?;
-        for entry in iter {
-            let (key, value) = entry.map_err(|e| e.to_string())?;
-            results.push((key.value().to_string(), value.value()));
-        }
-        Ok(results)
     }
 
     // ========================================================================
@@ -2789,65 +2699,6 @@ pub struct WithdrawalRecord {
 }
 
 // ============================================================================
-// CONTEST STATE
-// ============================================================================
-
-/// Lifecycle status of a BB market settlement.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum ContestStatus {
-    /// Accepting deposits; no merkle root yet.
-    Open,
-    /// Merkle root submitted and finalized; users may claim.
-    Settled,
-    /// Claim window (6,480,000 slots ≈ 30 days) elapsed.
-    Expired,
-}
-
-/// Per-contest settlement record stored in ReDB.
-///
-/// All balance fields are in SPL units (1 BB = 1_000_000 units, 6 decimals).
-/// The zero-sum invariant MUST hold on every `Settled` record:
-///   `total_deposited == total_payout + house_rake`
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ContestState {
-    pub contest_id: String,
-    pub status: ContestStatus,
-    /// SHA-256 Merkle root over all (pubkey, payout) winner leaves.
-    /// Zero bytes while `status == Open`.
-    pub merkle_root: [u8; 32],
-    /// Total SPL units deposited into this contest escrow.
-    pub total_deposited: u64,
-    /// Total SPL units successfully claimed by winners so far.
-    pub total_claimed: u64,
-    pub winner_count: u32,
-    /// Platform rake (SPL units). `total_deposited - total_payout`.
-    pub house_rake: u64,
-    /// Last L1 slot at which a claim is still valid.
-    /// `submit_slot + CLAIM_WINDOW_SLOTS` (≈ 6_480_000).
-    pub claim_deadline_slot: u64,
-    /// Hash of the L1 transaction that finalized the settlement.
-    pub l1_tx_hash: String,
-    pub last_l2_block: u64,
-    /// Unix timestamp (seconds) when the contest was first opened.
-    pub created_at: u64,
-    /// Per-contest vault PDA (base58). Empty string for legacy/global-vault contests
-    /// migrated from v1; new contests must populate this on InitContest.
-    #[serde(default)]
-    pub vault_pda: String,
-    /// L1 transaction hash of the house-rake sweep performed at SubmitMerkleRoot.
-    /// `None` until the rake transfer is committed; idempotent — set exactly once.
-    #[serde(default)]
-    pub house_rake_swept_tx: Option<String>,
-    /// Hub side-bet only. When set, this child's prize is paid from the parent
-    /// contest's escrow, capped at `total_deposited` (the child's allocation).
-    /// Empty for a normal contest. `#[serde(default)]` keeps contests stored
-    /// before this field readable.
-    #[serde(default)]
-    pub parent_contest_id: String,
-}
-
-// ============================================================================
 // ESCROW DEPOSITOR LEDGER
 // ============================================================================
 
@@ -2903,35 +2754,6 @@ pub struct RollupLockRecord {
     /// Prevents double-credit replay attacks.
     #[serde(default)]
     pub consumed: bool,
-}
-
-// ============================================================================
-// VAULT BRIDGE BURN RECORD
-// ============================================================================
-
-/// Durable receipt created when a user calls POST /vault/burn.
-/// Keyed by burn_id (hex SHA-256 of wallet+slot+nonce) — not poh_slot — so concurrent
-/// burns in the same slot never overwrite each other.
-/// Redeemed via POST /vault/claim-attestation to bridge wUSDT → real USDT on Solana.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BurnRecord {
-    /// Collision-free primary key: hex(SHA-256(wallet_bytes || poh_slot_le8 || nonce_utf8)).
-    /// Returned as "burn_id" in the POST /vault/burn response.
-    pub burn_id: String,
-    /// L1 wallet address (base58) that performed the burn.
-    pub wallet: String,
-    /// PoH slot in which the burn was recorded — used in the KMS attestation message.
-    pub poh_slot: u64,
-    /// wUSDT micro-units created (equals bb_lamports destroyed — Immutable Law).
-    pub amount_usdt_micro: u64,
-    /// True once POST /vault/claim-attestation has been called (redeemable → false).
-    pub attestation_issued: bool,
-    /// True once the Solana Anchor program has confirmed the on-chain claim.
-    pub claimed_on_solana: bool,
-    /// False after claim-attestation is issued — prevents double-redemption.
-    pub redeemable: bool,
-    /// Unix timestamp of the burn request.
-    pub created_at: u64,
 }
 
 // ============================================================================
@@ -3157,46 +2979,6 @@ impl ConcurrentBlockchain {
             }
         }
         latest
-    }
-
-    // ── SWAP RATE ────────────────────────────────────────────────────────────
-
-    /// Read the active exchange rate for a swap pool from ReDB.
-    ///
-    /// `pool_id` is currently `"BB_USDT"`. Returns `BB_PER_USDT_DEFAULT` (10)
-    /// if no custom rate has been set, guaranteeing a valid baseline on genesis.
-    pub fn get_swap_rate(&self, pool_id: &str) -> u64 {
-        use crate::svm::BB_PER_USDT_DEFAULT;
-        let read_txn = match self.db.begin_read() {
-            Ok(t) => t,
-            Err(_) => return BB_PER_USDT_DEFAULT,
-        };
-        let table = match read_txn.open_table(SWAP_RATES) {
-            Ok(t) => t,
-            Err(_) => return BB_PER_USDT_DEFAULT,
-        };
-        // All three branches (Err, Ok(None), Ok(Some(0))) fall back to default,
-        // preventing divide-by-zero in swap math on a fresh table or corrupt entry.
-        let rate = table.get(pool_id).ok().flatten()
-            .map(|v| v.value())
-            .unwrap_or(BB_PER_USDT_DEFAULT);
-        if rate == 0 { BB_PER_USDT_DEFAULT } else { rate }
-    }
-
-    /// Persist a new exchange rate for a swap pool to ReDB.
-    ///
-    /// `rate` must be ≥ 1 (zero would divide-by-zero in swap math).
-    /// Called by the Oracle/Dealer via `POST /admin/swap/set_rate`.
-    pub fn set_swap_rate(&self, pool_id: &str, rate: u64) -> Result<(), String> {
-        if rate == 0 {
-            return Err("Swap rate must be at least 1".to_string());
-        }
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(SWAP_RATES).map_err(|e| e.to_string())?;
-            table.insert(pool_id, rate).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
     }
 }
 

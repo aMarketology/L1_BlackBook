@@ -335,24 +335,10 @@ pub async fn oracle_event_handler(
         })));
     }
 
-    // ── Fall back to ESCROW_MARKET_ROOTS (legacy finalized markets) ───────
-    match state.blockchain.get_escrow_market_root(&market_id) {
-        Ok(Some(root_bytes)) if !root_bytes.is_empty() => {
-            (StatusCode::OK, Json(serde_json::json!({
-                "market_id": market_id,
-                "status": "Finalized",
-                "outcome": null,
-                "merkle_root": hex::encode(&root_bytes),
-                "note": "Finalized via legacy dealer path — no oracle attestation on record",
-            })))
-        }
-        _ => {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "market_id": market_id,
-                "status": "Unknown",
-            })))
-        }
-    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({
+        "market_id": market_id,
+        "status": "Unknown",
+    })))
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────

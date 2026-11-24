@@ -1,4 +1,4 @@
-﻿pub mod bsc_watcher;
+pub mod bsc_watcher;
 pub use bsc_watcher::{BscWatcher, BSC_USDC_CONTRACT, BSC_USDT_CONTRACT};
 pub mod mayan;
 pub mod solana_ws;
@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::Deserialize;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::storage::{ConcurrentBlockchain, DepositRecord};
@@ -235,16 +235,13 @@ impl CustodyWatcher {
     ///   - Falls back to the original `poll_interval_secs`-second polling loop.
     pub fn start(self: Arc<Self>) {
         tokio::spawn(async move {
-            info!("👀 Custody watcher started — {}", self.custody_address);
-            self.startup_balance_sync().await;
+            info!("👀 Custody watcher started — {} (strict No-Seed mode)", self.custody_address);
 
             let ws_url = std::env::var("SOLANA_WS_URL")
                 .ok()
                 .filter(|s| s.starts_with("wss://"));
 
             if let Some(url) = ws_url {
-                // Event-driven: WebSocket subscriber handles real-time events;
-                // slow fallback poll catches anything missed during reconnects.
                 let fallback_secs = std::env::var("WATCHER_FALLBACK_POLL_SECS")
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
@@ -257,7 +254,6 @@ impl CustodyWatcher {
                     self.poll_once().await;
                 }
             } else {
-                // Legacy polling mode (no SOLANA_WS_URL configured).
                 info!("👀 Solana polling mode — interval {}s", self.poll_interval_secs);
                 let mut interval =
                     tokio::time::interval(Duration::from_secs(self.poll_interval_secs));
@@ -267,175 +263,6 @@ impl CustodyWatcher {
                 }
             }
         });
-    }
-
-    /// On first start, reads the live on-chain USDC + USDT balance of the custody wallet
-    /// and auto-mints the equivalent BB + wUSDT to the dealer if the chain is fresh.
-    /// Uses DEALER_PRIVATE_KEY from env to derive the dealer address.
-    async fn startup_balance_sync(&self) {
-        let dealer_sk_hex = match std::env::var("DEALER_PRIVATE_KEY") {
-            Ok(v) if v.len() == 64 => v,
-            _ => {
-                info!("👀 Startup sync: DEALER_PRIVATE_KEY not set — skipping initial balance check");
-                return;
-            }
-        };
-        let sk_bytes_vec = match hex::decode(&dealer_sk_hex) {
-            Ok(b) => b,
-            Err(_) => { warn!("⚠️  Startup sync: DEALER_PRIVATE_KEY invalid hex"); return; }
-        };
-        let sk_bytes: [u8; 32] = match sk_bytes_vec.as_slice().try_into() {
-            Ok(b) => b,
-            Err(_) => { warn!("⚠️  Startup sync: DEALER_PRIVATE_KEY wrong length"); return; }
-        };
-        use ed25519_dalek::SigningKey;
-        let signing_key = SigningKey::from_bytes(&sk_bytes);
-        let dealer_addr = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
-
-        // Only run full sync if dealer has no BB yet (fresh chain).
-        // A funded dealer must never be reminted from the custody balance:
-        // spending the first mint would make the next restart look "fresh".
-        if self.blockchain.get_balance(&dealer_addr) > 0.0 {
-            info!("👀 Startup sync: dealer {} already funded — no remint", &dealer_addr[..8]);
-            return;
-        }
-        // One-shot even if the dealer later spends the mint to zero.
-        // Reserve before any credit so a second boot cannot pass the check.
-        let sync_key = format!("STARTUP_SYNC:{}", self.custody_address);
-        if let Err(_) = self.blockchain.reserve_bridge_tx(&sync_key) {
-            info!("👀 Startup sync: {} already synced — no remint", &self.custody_address);
-            return;
-        }
-
-        info!("👀 Startup sync: checking live balance on custody wallet {}", &self.custody_address);
-
-        let usdc_bal = self.fetch_token_balance(&self.usdc_mint).await.unwrap_or(0.0);
-        let usdt_bal = self.fetch_token_balance(&self.usdt_mint).await.unwrap_or(0.0);
-        let total_stablecoin = usdc_bal + usdt_bal;
-
-        if total_stablecoin <= 0.0 {
-            info!("👀 Startup sync: custody wallet has no USDC/USDT — nothing to mint");
-            return;
-        }
-
-        info!("👀 Startup sync: found {:.6} USDC + {:.6} USDT = {:.6} total → minting {} BB to dealer",
-            usdc_bal, usdt_bal, total_stablecoin, total_stablecoin * 10.0);
-
-        let bb_to_mint = total_stablecoin * 10.0;
-        let amount_micro_stablecoin = (total_stablecoin * crate::svm::USDC_UNIT as f64).round() as u64;
-        let bb_lamports_val = crate::svm::types::micro_stable_to_bb_lamports(amount_micro_stablecoin);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_secs();
-
-        // Stable key: a restart must not mint this custody balance again.
-        let tx_key = sync_key.clone();
-        let record = DepositRecord {
-            wallet_address: dealer_addr.clone(),
-            external_tx_hash: tx_key.clone(),
-            asset: "USDC+USDT".to_string(),
-            amount_micro_stablecoin,
-            bb_lamports: bb_lamports_val,
-            status: "pending".to_string(),
-            submitted_at: now,
-            approved_at: None,
-            contest_id: None,
-        };
-        let _ = self.blockchain.store_deposit_request(&record);
-        self.deposit_requests.insert(tx_key.clone(), record);
-
-        // Mint BB. Release the one-shot reservation if the credit fails.
-        match self.blockchain.credit_lamports(&dealer_addr, bb_lamports_val) {
-            Ok(_) => info!("🪙  Startup sync: {:.5} BB → dealer {}", bb_to_mint, &dealer_addr[..8]),
-            Err(e) => {
-                self.blockchain.cancel_bridge_tx(&sync_key);
-                error!("❌ Startup sync BB mint failed: {}", e);
-                return;
-            }
-        }
-
-        // Mint wUSDT (if USDC balance > 0)
-        if usdc_bal > 0.0 {
-            use crate::svm::{SplTokenEngine, usdc_mint_bytes};
-            let mint_bytes = usdc_mint_bytes();
-            let dealer_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(
-                signing_key.verifying_key().to_bytes()
-            );
-            let usdc_units = (usdc_bal * 1_000_000.0).round() as u64;
-            match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint_bytes, &dealer_pubkey, usdc_units) {
-                Ok(r) => info!("💵  Startup sync: {:.6} wUSDT → dealer {} (ATA: {})",
-                    usdc_bal, &dealer_addr[..8], bs58::encode(r.ata).into_string()),
-                Err(e) => warn!("⚠️   Startup sync wUSDT mint skipped: {:?}", e),
-            }
-        }
-
-        // Mark as processed + update record (ReDB FIRST, then DashMap cache)
-        let mint_tx_id = uuid::Uuid::new_v4().to_string();
-        let _ = self.blockchain.commit_bridge_tx(&tx_key, &mint_tx_id);
-        if let Some(existing) = self.deposit_requests.get(&tx_key) {
-            let mut updated = existing.clone();
-            drop(existing);
-            updated.status = "approved".to_string();
-            updated.approved_at = Some(now);
-            if let Err(e) = self.blockchain.store_deposit_request(&updated) {
-                warn!("⚠️  Failed to persist deposit status update to ReDB: {}", e);
-            }
-            self.deposit_requests.insert(tx_key.clone(), updated);
-        }
-
-        // Record in PoH
-        let proto_tx = ProtoTx {
-            hash: mint_tx_id,
-            from: format!("CUSTODY_WALLET:{}", self.custody_address),
-            timestamp: now,
-            data: TxData::DepositUsdt {
-                usdt_amount: amount_micro_stablecoin,
-                external_tx_hash: Some(tx_key),
-            },
-            signature: "startup_sync".to_string(),
-            signer_pubkey: dealer_addr,
-        };
-        self.block_producer.record_executed_transaction(proto_tx);
-        info!("✅ Startup sync complete — custody balance minted to dealer");
-    }
-
-    /// Reconcile wUSDT supply against BB supply.
-    ///
-    /// Called when the dealer already has BB but wUSDT total supply is 0 (or
-    /// less than expected).  This can happen when an existing chain is upgraded
-    /// to the wUSDT-aware version for the first time.  The missing wUSDT is
-    /// minted to the dealer so the 10:1 invariant is restored.
-    async fn reconcile_wusdt_invariant(&self, dealer_addr: &str, dealer_pubkey_bytes: &[u8; 32]) {
-        use crate::svm::{SplTokenEngine, usdc_mint_bytes, USDC_UNIT};
-        let mint_bytes = usdc_mint_bytes();
-        let dealer_pubkey = solana_sdk::pubkey::Pubkey::new_from_array(*dealer_pubkey_bytes);
-
-        // Current wUSDT total supply on-chain
-        let current_wusdt_supply = match SplTokenEngine::get_mint_supply(&self.blockchain.svm_accounts, &mint_bytes) {
-            Ok(s) => s as f64 / USDC_UNIT as f64,
-            Err(_) => 0.0,
-        };
-
-        // Expected wUSDT = total BB supply / 10 (10 BB per wUSDT)
-        let total_bb = self.blockchain.total_supply();
-        let expected_wusdt = total_bb / 10.0;
-        let missing_wusdt = expected_wusdt - current_wusdt_supply;
-
-        if missing_wusdt <= 0.000_001 {
-            info!("✅ Invariant OK — {:.6} BB backed by {:.6} wUSDT (ratio {:.2})",
-                total_bb, current_wusdt_supply, if current_wusdt_supply > 0.0 { total_bb / current_wusdt_supply } else { 10.0 });
-            return;
-        }
-
-        warn!("⚠️  Invariant broken: {:.6} BB but only {:.6} wUSDT — minting {:.6} wUSDT to dealer to reconcile",
-            total_bb, current_wusdt_supply, missing_wusdt);
-
-        let raw_units = (missing_wusdt * USDC_UNIT as f64).round() as u64;
-        match SplTokenEngine::mint_to(&self.blockchain.svm_accounts, &mint_bytes, &dealer_pubkey, raw_units) {
-            Ok(_) => info!("✅ Reconciled: minted {:.6} wUSDT to dealer {} — invariant restored",
-                missing_wusdt, &dealer_addr[..8.min(dealer_addr.len())]),
-            Err(e) => warn!("❌ Reconcile wUSDT mint failed: {:?}", e),
-        }
     }
 
     async fn poll_once(&self) {
@@ -559,18 +386,18 @@ impl CustodyWatcher {
 
             if usdc_raw == 0 { continue; }
 
-            // Mint BB
+            // Single-txn ACID mint + processed bridge seal
             let bb_lamports = crate::svm::types::micro_stable_to_bb_lamports(usdc_raw);
-            match self.blockchain.reserve_bridge_tx(&receipt_key) {
-                Err(e) => { warn!("⚠️  Bridge program reserve_bridge_tx ({}): {}", &receipt_key[..16.min(receipt_key.len())], e); continue; }
-                Ok(_) => {}
-            }
-            match self.blockchain.credit_lamports(&l1_wallet, bb_lamports) {
+            let mint_tx_id = uuid::Uuid::new_v4().to_string();
+            match self.blockchain.atomic_mint_bridge_deposit(
+                &receipt_key,
+                &l1_wallet,
+                bb_lamports,
+                &mint_tx_id,
+                None,
+                false,
+            ) {
                 Ok(_) => {
-                    let mint_tx_id = uuid::Uuid::new_v4().to_string();
-                    let _ = self.blockchain.commit_bridge_tx(&receipt_key, &mint_tx_id);
-
-                    // Record in PoH
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default().as_secs();
@@ -593,7 +420,6 @@ impl CustodyWatcher {
                         &receipt_key[..16.min(receipt_key.len())]);
                 }
                 Err(e) => {
-                    self.blockchain.cancel_bridge_tx(&receipt_key);
                     warn!("⚠️  Bridge program mint failed ({}): {}", &receipt_key[..16.min(receipt_key.len())], e);
                 }
             }
@@ -795,37 +621,25 @@ impl CustodyWatcher {
             ));
         }
 
-        // ── Mint BB (Bug #2: reserve-before-mint) ────────────────────────────────
-        let mint_tx_id = Uuid::new_v4().to_string();
-        self.blockchain.reserve_bridge_tx(tx_hash)
-            .map_err(|e| format!("Reserve failed: {}", e))?;
-        match self.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
-            Ok(_) => {
-                if let Err(e) = self.blockchain.commit_bridge_tx(tx_hash, &mint_tx_id) {
-                    warn!("⚠️  commit_bridge_tx: {}", e);
-                }
-            }
-            Err(e) => {
-                self.blockchain.cancel_bridge_tx(tx_hash);
-                return Err(format!("BB mint failed: {}", e));
-            }
-        }
-
-        // ── Update status: ReDB FIRST, then DashMap cache ────────────────
+        // ── Single-txn ACID mint + deposit approval + processed seal ──────
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Some(existing) = self.deposit_requests.get(tx_hash) {
-            let mut updated = existing.clone();
-            drop(existing);
-            updated.status = "approved".to_string();
-            updated.approved_at = Some(now);
-            if let Err(e) = self.blockchain.store_deposit_request(&updated) {
-                warn!("⚠️  Failed to persist deposit status update to ReDB: {}", e);
-            }
-            self.deposit_requests.insert(tx_hash.to_string(), updated);
-        }
+        let mut updated = record.clone();
+        updated.status = "approved".to_string();
+        updated.approved_at = Some(now);
+
+        let mint_tx_id = Uuid::new_v4().to_string();
+        self.blockchain.atomic_mint_bridge_deposit(
+            tx_hash,
+            &record.wallet_address,
+            record.bb_lamports,
+            &mint_tx_id,
+            Some(&updated),
+            false,
+        )?;
+        self.deposit_requests.insert(tx_hash.to_string(), updated);
 
         // ── Record in PoH ledger ──────────────────────────────────────────
         {

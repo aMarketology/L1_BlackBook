@@ -121,3 +121,15 @@ Stop the test if any of these happen:
 - A claim succeeds with the wallet locked
 - A payout lands while the market escrow is empty
 - The wallet is still pointed at `https://layer2.blackbook.id` during a local test
+
+---
+
+## Next Manual Test Targets — Global Pools (2026-11-22)
+
+Once L2 `resolve_bb` Lock-Only exits (`pending_exits` + `lifetime_exits`) and `blvkprism`'s Last-One-Standing Global Pool join flows are ready, verify the zero-loss local cycle against:
+
+- `SURVIVOR-S51-MAIN-V2` (`global_survivor` — mid-season Survivor 51, entering Ep 10 with 9 castaways)
+- `TAR-S39-MAIN-V2` (`global_amazing_race` — mid-season Amazing Race 39, entering Leg 9 with 6 teams)
+- `MLS-2026-MAIN-V2` (`global_mls` — MLS 2026 season pool)
+
+Each test follows the exact same Lock-Only stop conditions above: L1 lock debits entry BB -> L2 records position -> elimination or settlement writes Merkle exit proof -> user claims back to L1 with zero minted BB.

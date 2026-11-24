@@ -55,22 +55,20 @@ pub const USDT_UNIT: u64 = 1_000_000;
 // casino chip — that is redeemable via the bridge at the current exchange rate.
 //
 // BB_USD_CENTS is IMMUTABLE: it defines the internal ledger value of compute.
-// BB_PER_USDT_DEFAULT is the BASELINE exchange rate at node genesis. The active
-// market rate is stored in ReDB (SWAP_RATES table, key "BB_USDT") and may be
-// adjusted by the Oracle/Dealer to reflect real-world wUSDT conditions.
+// BB_PER_USDT_DEFAULT is the fixed 10:1 Protocol-Owned Liquidity (POL) base
+// exchange rate (10 BB per 1 wUSDT, with closed-loop swap fees retained inside
+// `swap_pool_pda`).
 // ============================================================================
 
 /// Internal ledger value of 1 BB: exactly 10 US cents of network compute.
 /// IMMUTABLE — this is the foundation of all internal accounting.
 pub const BB_USD_CENTS: u64 = 10;
 
-/// Baseline exchange rate at node genesis: 10 BB per 1 wUSDT.
-/// The live rate is stored in ReDB (key "BB_USDT") and may flex if wUSDT depegs.
-/// Use `ConcurrentBlockchain::get_swap_rate("BB_USDT")` at runtime.
+/// Fixed Protocol-Owned Liquidity (POL) base exchange rate: 10 BB per 1 wUSDT.
 pub const BB_PER_USDT_DEFAULT: u64 = 10;
 
-// Compile-time invariants: the internal accounting unit and decimal precision
-// are fixed. Only the external exchange rate (BB_PER_USDT_DEFAULT) may flex.
+// Compile-time invariants: the internal accounting unit, decimal precision,
+// and POL 10:1 base rate are fixed.
 const _: () = assert!(BB_USD_CENTS    == 10,       "$BB internal ledger value is exactly 10 US cents");
 const _: () = assert!(LAMPORTS_PER_BB == 100_000,  "BB always has exactly 5 decimal places (10^5 lamports)");
 
@@ -79,15 +77,12 @@ const _: () = assert!(LAMPORTS_PER_BB == 100_000,  "BB always has exactly 5 deci
 /// Formula: `bb_lamports = micro * LAMPORTS_PER_BB * rate / USDT_UNIT`
 ///
 /// Uses u128 intermediate to prevent overflow on deposits up to ~$18 trillion.
-/// Pass `BB_PER_USDT_DEFAULT` for genesis baseline or the live ReDB rate.
 pub fn micro_stable_to_bb_lamports_at(micro: u64, rate: u64) -> u64 {
     ((micro as u128) * (LAMPORTS_PER_BB as u128) * (rate as u128)
         / (USDT_UNIT as u128)) as u64
 }
 
-/// Convenience wrapper using the genesis default rate.
-/// For deposit gateway and bridge operations. For swap handlers, use
-/// `micro_stable_to_bb_lamports_at(micro, state.blockchain.get_swap_rate("BB_USDT"))`.
+/// Convert micro-stablecoin (6 dec) → BB lamports (5 dec) at the fixed 10:1 rate.
 pub fn micro_stable_to_bb_lamports(micro: u64) -> u64 {
     micro_stable_to_bb_lamports_at(micro, BB_PER_USDT_DEFAULT)
 }

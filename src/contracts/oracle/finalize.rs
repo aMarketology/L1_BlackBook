@@ -4,14 +4,11 @@
 //! For every pending root whose dispute window has expired:
 //!
 //!   - `Pending` at `current_slot >= finalize_at_slot`
-//!     → write to `ESCROW_MARKET_ROOTS`, mark `Finalized`,
-//!       increment oracle node track records.
+//!     → mark `Finalized`, increment oracle node track records.
 //!
 //!   - `Disputed` at `current_slot >= finalize_at_slot`
 //!     → governance vote timed out without resolution.
 //!       Mark `Discarded`, return disputer stakes (conservative default).
-//!
-//! Step 3 will add oracle bond slashing for `Discarded` roots.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -24,8 +21,6 @@ use crate::storage::PendingRootStatus;
 const FINALIZE_POLL_SECS: u64 = 30;
 
 /// Spawn the finalize background task.
-///
-/// Call this once at startup, after `AppState` is fully initialized.
 pub fn spawn_finalize_task(state: AppState) {
     tokio::spawn(async move {
         info!("🔮 Oracle finalize task started (poll every {}s)", FINALIZE_POLL_SECS);
@@ -39,35 +34,21 @@ pub fn spawn_finalize_task(state: AppState) {
 /// Single iteration: scan `PENDING_ROOTS`, finalize or discard expired roots.
 async fn finalize_ready_roots(state: &AppState) {
     let current_slot = state.current_slot.load(Ordering::Relaxed);
-
-    // Collect all pending roots in one pass
     let all_roots = state.blockchain.load_all_pending_roots();
 
     for mut root in all_roots {
-        // Skip roots that are already terminal states
         if matches!(root.status, PendingRootStatus::Finalized | PendingRootStatus::Discarded) {
             continue;
         }
-        // Not yet past the dispute window
         if current_slot < root.finalize_at_slot {
             continue;
         }
 
         match root.status {
             PendingRootStatus::Pending => {
-                // ── Finalize: no disputes reached escalation threshold ────────
                 info!("✅ Oracle finalize: market={} outcome={} slot={}",
                     root.market_id, root.outcome, current_slot);
 
-                // Write to ESCROW_MARKET_ROOTS (so users can claim via /escrow/withdraw)
-                if let Err(e) = state.blockchain.store_escrow_market_root(
-                    &root.market_id, &root.merkle_root
-                ) {
-                    warn!("Oracle finalize: failed to store market root for {}: {}", root.market_id, e);
-                    continue;
-                }
-
-                // Update oracle node track records
                 for sig in &root.oracle_signatures {
                     if let Some(mut node) = state.blockchain.load_oracle_node(&sig.pubkey_hex) {
                         node.total_resolutions += 1;
@@ -78,40 +59,18 @@ async fn finalize_ready_roots(state: &AppState) {
                     }
                 }
 
-                // ── PERSISTENCE GUARANTEE: ReDB FIRST, cache AFTER ───────────
-                // Mark the root Finalized in ReDB before touching any DashMap cache.
-                // If this write fails, we leave status = Pending in ReDB so the next
-                // finalize tick will retry naturally — cache is never mutated on error.
                 root.status = PendingRootStatus::Finalized;
                 if let Err(e) = state.blockchain.store_pending_root(&root) {
                     warn!("Oracle finalize: failed to persist Finalized status for {} — will retry next tick: {}", root.market_id, e);
                     continue;
                 }
-
-                // Persist ContestState update to ReDB before cache (same guarantee).
-                if let Ok(Some(mut contest)) = state.blockchain.load_contest_state(&root.market_id) {
-                    contest.merkle_root = root.merkle_root;
-                    contest.status = crate::storage::ContestStatus::Settled;
-                    if let Err(e) = state.blockchain.store_contest_state(&contest) {
-                        warn!("Oracle finalize: failed to persist contest state for {} — cache not updated: {}", root.market_id, e);
-                        // Don't continue — market root + Finalized status already persisted above.
-                        // Cache update is best-effort here; will resync on next node boot from ReDB.
-                    } else {
-                        state.contest_states.insert(root.market_id.clone(), contest);
-                    }
-                }
-
-                // ── UPDATE CACHE only after all durable writes succeeded ──────
-                state.market_roots.insert(root.market_id.clone(), root.merkle_root);
-                info!("📋 Oracle finalize: ReDB-first writes complete for market={}", root.market_id);
+                info!("📋 Oracle finalize: ReDB writes complete for market={}", root.market_id);
             }
 
             PendingRootStatus::Disputed => {
-                // ── Disputed root expired without governance resolution → Discard ──
                 warn!("⚠️  Oracle discard (timeout): market={} slot={}",
                     root.market_id, current_slot);
 
-                // Return disputer stakes in $BB (best-effort, no slash in Step 2)
                 let pool_addr = format!("oracle_dispute_pool_{}", root.market_id);
                 for d in &root.disputers {
                     let _ = state.blockchain.debit_svm_lamports(&pool_addr, d.stake_bb_lamports);
@@ -126,7 +85,6 @@ async fn finalize_ready_roots(state: &AppState) {
                 }
             }
 
-            // Already terminal — filtered above, but Rust requires exhaustive match
             PendingRootStatus::Finalized | PendingRootStatus::Discarded => {}
         }
     }

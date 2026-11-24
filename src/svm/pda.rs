@@ -136,16 +136,43 @@ pub fn rollup_liquidity_pool_address() -> String {
     bs58::encode(rollup_liquidity_pool_pda().to_bytes()).into_string()
 }
 
+/// Deterministic per-rollup vault `Pubkey`.
+#[inline]
+pub fn rollup_vault_pda(rollup_id: &str) -> Pubkey {
+    let seed = format!("bb_rollup_vault_v1:{}", rollup_id);
+    let bytes: [u8; 32] = Sha256::digest(seed.as_bytes()).into();
+    Pubkey::new_from_array(bytes)
+}
+
 /// Deterministic per-rollup vault PDA.
 /// Each rollup_id ("L2", "L3", "L5") gets its own isolated vault address derived
 /// from SHA-256("bb_rollup_vault_v1:{rollup_id}"). This mathematically quarantines
 /// liquidity so a compromise in one rollup cannot drain another's vault.
 pub fn rollup_vault_address(rollup_id: &str) -> String {
-    let seed = format!("bb_rollup_vault_v1:{}", rollup_id);
-    let bytes = Sha256::digest(seed.as_bytes());
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    bs58::encode(arr).into_string()
+    bs58::encode(rollup_vault_pda(rollup_id).to_bytes()).into_string()
+}
+
+/// Defense-in-depth guard: returns `true` if `pubkey` is any protocol-owned
+/// system/vault PDA (`swap_pool_pda`, `house_treasury_pda`, `rollup_vault_pda`
+/// for L2/L3/L5, or legacy escrow/liquidity PDAs).
+///
+/// Protocol PDAs have no private key and must NEVER appear as user-initiated
+/// transaction senders in `sendTransaction`, `/transfer`, `/swap`, or `/rollup`.
+pub fn is_reserved_pda(pubkey: &Pubkey) -> bool {
+    #[allow(deprecated)]
+    let is_core = *pubkey == swap_pool_pda()
+        || *pubkey == house_treasury_pda()
+        || *pubkey == escrow_vault_pda()
+        || *pubkey == rollup_liquidity_pool_pda();
+    if is_core {
+        return true;
+    }
+    for id in ["L1", "L2", "L3", "L4", "L5"] {
+        if *pubkey == rollup_vault_pda(id) {
+            return true;
+        }
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

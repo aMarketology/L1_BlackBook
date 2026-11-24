@@ -1,4 +1,4 @@
-﻿//! Sealevel — Parallel Transaction Execution Engine
+//! Sealevel — Parallel Transaction Execution Engine
 //!
 //! Solana-inspired parallel execution with account-level read/write locking.
 //! Non-conflicting transactions execute concurrently across all available CPU cores.
@@ -383,23 +383,31 @@ impl ParallelScheduler {
         };
 
         let from_pk = addr_to_pk(&tx.from);
-        let to_pk = addr_to_pk(&tx.to);
+        let pool_pk = crate::svm::swap_pool_pda();
 
-        // tx.amount is microUSDT (u64) for SwapUsdcForBb
+        // POL closed-loop invariant: all swaps settle strictly against swap_pool_pda()
         let usdc_raw = tx.amount;
-        // 1 wUSDT = 10 BB  →  (microUSDT / USDC_UNIT) * 10 * LAMPORTS_PER_BB
-        let bb_lamports = (usdc_raw as u128 * 10 * LAMPORTS_PER_BB as u128 / USDC_UNIT as u128) as u64;
+        let fee_bps: u64 = std::env::var("POL_SWAP_FEE_BPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b.min(1_000))
+            .unwrap_or(30);
+        let gross_bb = (usdc_raw as u128 * 10 * LAMPORTS_PER_BB as u128 / USDC_UNIT as u128) as u64;
+        let fee_bb = (gross_bb as u128 * fee_bps as u128 / 10_000) as u64;
+        let bb_lamports = gross_bb.saturating_sub(fee_bb);
+        if bb_lamports == 0 {
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some("Swap output is zero".to_string()) };
+        }
         let mint = usdc_mint_bytes();
 
-        // 1. Debit wUSDT from user, credit wUSDT to dealer
-        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &from_pk, &to_pk, usdc_raw) {
+        // 1. Debit full wUSDT from user, credit full wUSDT to swap_pool_pda (retaining fee)
+        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &from_pk, &pool_pk, usdc_raw) {
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDT transfer failed: {}", e)) };
         }
 
-        // 2. Debit BB from dealer, credit BB to user (using system_transfer)
-        if let Err(e) = db.system_transfer(&to_pk, &from_pk, bb_lamports) {
-            // Unwind wUSDT since BB failed
-            let _ = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw);
+        // 2. Debit net BB from swap_pool_pda, credit net BB to user
+        if let Err(e) = db.system_transfer(&pool_pk, &from_pk, bb_lamports) {
+            let _ = SplTokenEngine::transfer_tokens(db, &mint, &pool_pk, &from_pk, usdc_raw);
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
         }
 
@@ -424,23 +432,30 @@ impl ParallelScheduler {
         };
 
         let from_pk = addr_to_pk(&tx.from);
-        let to_pk = addr_to_pk(&tx.to);
+        let pool_pk = crate::svm::swap_pool_pda();
 
-        // tx.amount is lamports (u64) for SwapBbForUsdc
         let bb_lamports = tx.amount;
-        // 1 wUSDT = 10 BB  →  (lamports / LAMPORTS_PER_BB / 10) * USDC_UNIT
-        let usdc_raw = (bb_lamports as u128 * USDC_UNIT as u128 / (LAMPORTS_PER_BB as u128 * 10)) as u64;
+        let fee_bps: u64 = std::env::var("POL_SWAP_FEE_BPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|b| b.min(1_000))
+            .unwrap_or(30);
+        let gross_usdc = (bb_lamports as u128 * USDC_UNIT as u128 / (LAMPORTS_PER_BB as u128 * 10)) as u64;
+        let fee_usdc = (gross_usdc as u128 * fee_bps as u128 / 10_000) as u64;
+        let usdc_raw = gross_usdc.saturating_sub(fee_usdc);
+        if usdc_raw == 0 {
+            return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some("Swap output is zero".to_string()) };
+        }
         let mint = usdc_mint_bytes();
 
-        // 1. Debit BB from user, credit BB to dealer
-        if let Err(e) = db.system_transfer(&from_pk, &to_pk, bb_lamports) {
+        // 1. Debit full BB from user, credit full BB to swap_pool_pda (retaining fee)
+        if let Err(e) = db.system_transfer(&from_pk, &pool_pk, bb_lamports) {
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("BB transfer failed: {}", e)) };
         }
 
-        // 2. Debit wUSDT from dealer, credit wUSDT to user
-        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &to_pk, &from_pk, usdc_raw) {
-            // Unwind BB
-            let _ = db.system_transfer(&to_pk, &from_pk, bb_lamports);
+        // 2. Debit net wUSDT from swap_pool_pda, credit net wUSDT to user
+        if let Err(e) = SplTokenEngine::transfer_tokens(db, &mint, &pool_pk, &from_pk, usdc_raw) {
+            let _ = db.system_transfer(&pool_pk, &from_pk, bb_lamports);
             return TransactionResult { tx_id: tx.id.clone(), success: false, error: Some(format!("wUSDT transfer failed: {}", e)) };
         }
 

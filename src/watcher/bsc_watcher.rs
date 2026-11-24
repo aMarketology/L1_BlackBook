@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // BNB CHAIN (BSC) CUSTODY WATCHER
 // ============================================================================
 //
@@ -629,38 +629,24 @@ impl BscWatcher {
     /// Core mint-and-record logic used by both the background poller and the
     /// direct HTTP verification path.
     async fn mint_and_record(&self, tx_hash: &str, record: &crate::storage::DepositRecord) -> Result<f64, String> {
-        // Bug #2: reserve-before-mint to eliminate the double-mint race window
-        let mint_tx_id = Uuid::new_v4().to_string();
-        self.blockchain.reserve_bridge_tx(tx_hash)
-            .map_err(|e| format!("Reserve failed: {}", e))?;
-
-        match self.blockchain.credit_lamports(&record.wallet_address, record.bb_lamports) {
-            Ok(_) => {
-                if let Err(e) = self.blockchain.commit_bridge_tx(tx_hash, &mint_tx_id) {
-                    info!("⚠️  commit_bridge_tx: {}", e);
-                }
-            }
-            Err(e) => {
-                self.blockchain.cancel_bridge_tx(tx_hash);
-                return Err(format!("BB mint failed: {}", e));
-            }
-        }
-
-        // Update record: ReDB FIRST, then DashMap cache
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Some(existing) = self.deposit_requests.get(tx_hash) {
-            let mut updated = existing.clone();
-            drop(existing);
-            updated.status = "approved".to_string();
-            updated.approved_at = Some(now);
-            if let Err(e) = self.blockchain.store_deposit_request(&updated) {
-                warn!("⚠️  Failed to persist deposit status update to ReDB: {}", e);
-            }
-            self.deposit_requests.insert(tx_hash.to_string(), updated);
-        }
+        let mut updated = record.clone();
+        updated.status = "approved".to_string();
+        updated.approved_at = Some(now);
+
+        let mint_tx_id = Uuid::new_v4().to_string();
+        self.blockchain.atomic_mint_bridge_deposit(
+            tx_hash,
+            &record.wallet_address,
+            record.bb_lamports,
+            &mint_tx_id,
+            Some(&updated),
+            false,
+        )?;
+        self.deposit_requests.insert(tx_hash.to_string(), updated);
 
         // PoH record
         let proto_tx = ProtoTx {

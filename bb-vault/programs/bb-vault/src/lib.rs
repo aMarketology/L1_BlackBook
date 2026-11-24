@@ -273,7 +273,13 @@ pub struct ClaimUsdt<'info> {
     )]
     pub vault_usdt_account: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = user_usdt_account.owner == user.key()
+            @ VaultError::InvalidVaultTokenAccount,
+        constraint = user_usdt_account.mint == vault_usdt_account.mint
+            @ VaultError::InvalidVaultTokenAccount,
+    )]
     pub user_usdt_account: Account<'info, TokenAccount>,
 
     /// CHECK: Validated as instructions sysvar in verify_ed25519_instruction
@@ -339,11 +345,21 @@ fn verify_ed25519_instruction(
     let num_signatures = u16::from_le_bytes([data[0], data[1]]);
     require!(num_signatures == 1, VaultError::InvalidEd25519Instruction);
 
-    // Extract offsets
+    // Extract offsets & enforce all 3 instruction indices == 0xFFFF (current tx)
     let sig_offset = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let sig_ix_idx = u16::from_le_bytes([data[6], data[7]]);
     let pubkey_offset = u16::from_le_bytes([data[8], data[9]]) as usize;
+    let pubkey_ix_idx = u16::from_le_bytes([data[10], data[11]]);
     let msg_offset = u16::from_le_bytes([data[12], data[13]]) as usize;
     let msg_size = u16::from_le_bytes([data[14], data[15]]) as usize;
+    let msg_ix_idx = u16::from_le_bytes([data[16], data[17]]);
+
+    require!(
+        sig_ix_idx == u16::MAX
+            && pubkey_ix_idx == u16::MAX
+            && msg_ix_idx == u16::MAX,
+        VaultError::InvalidEd25519Instruction
+    );
 
     // Bounds check
     require!(

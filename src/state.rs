@@ -1,4 +1,4 @@
-﻿//! BlackBook L1 ΓÇö Application state, CLI config, constants, and request/response types.
+//! BlackBook L1 ΓÇö Application state, CLI config, constants, and request/response types.
 //!
 //! This module contains all the type definitions used across the codebase:
 //! - CLI argument parsing (`NodeConfig`, `NodeMode`)
@@ -232,22 +232,15 @@ pub struct AppState {
     // Faucet rate-limiter: address ΓåÆ (epoch_at_claim, total_minted_this_epoch)
     pub faucet_claims: Arc<dashmap::DashMap<String, (u64, u64)>>,
 
-    // ===== Global Escrow Smart Contract =====
+    // ===== L2 Sequencer Auth (gRPC SubscribeBalances) =====
     /// Ed25519 public key of the authorized L2 sequencer (hex)
     pub l2_sequencer_pubkey: String,
     /// Allowlist of L2 sequencer hex pubkeys (superset of l2_sequencer_pubkey).
     pub l2_sequencer_allowlist: std::collections::HashSet<String>,
-    /// Per-market merkle roots: market_id ΓåÆ [u8; 32] (raw SHA-256 root)
-    pub market_roots: Arc<dashmap::DashMap<String, [u8; 32]>>,
-    /// Double-withdrawal protection: "{market_id}:{address}" ΓåÆ true
-    pub withdrawal_claims: Arc<dashmap::DashMap<String, bool>>,
 
     // ===== Universal Rollup Hub Auth =====
-    /// Maps rollup_id ("L2", "L3", "L5") ΓåÆ authorized sequencer pubkey (64-char hex).
+    /// Maps rollup_id ("L2", "L3", "L5") → authorized sequencer pubkey (64-char hex).
     pub authorized_sequencers: Arc<dashmap::DashMap<String, String>>,
-
-    // ===== Contest Settlement State =====
-    pub contest_states: Arc<dashmap::DashMap<String, layer1::storage::ContestState>>,
 
     // ===== Deposit Gateway =====
     pub custody_wallet_address: String,
@@ -263,7 +256,7 @@ pub struct AppState {
     pub withdrawal_window_total: Arc<std::sync::atomic::AtomicU64>,
     pub withdrawal_daily_cap_micro: u64,
 
-    // ===== Layer 5: Rollup Liquidity Bridge =====
+    // ===== Rollup Liquidity Bridge =====
     pub rollup_lock_records: Arc<dashmap::DashMap<String, layer1::storage::RollupLockRecord>>,
 
     // ===== Backup State =====
@@ -278,7 +271,4 @@ pub struct AppState {
 
     // ===== Reader Mode: Writer Proxy =====
     pub writer_http_url: Option<String>,
-
-    // ===== Vault Claim Signer (KMS / Local Ed25519) =====
-    pub vault_signer: Option<Arc<layer1::kms::VaultSigner>>,
 }

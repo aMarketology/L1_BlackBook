@@ -680,9 +680,60 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
             )));
         }
 
-        // 5. Extract message fields
-        let message = versioned_tx.message;
+        // 5. Extract message fields & enforce full Ed25519 signature verification
+        let message = &versioned_tx.message;
         let account_keys = message.static_account_keys();
+        let num_required_sigs = message.header().num_required_signatures as usize;
+        if num_required_sigs == 0 {
+            return Err(error_invalid_params("Transaction requires at least 1 signature"));
+        }
+        if versioned_tx.signatures.len() != num_required_sigs {
+            return Err(error_invalid_params(format!(
+                "Signature count mismatch: got {}, expected {}",
+                versioned_tx.signatures.len(),
+                num_required_sigs
+            )));
+        }
+        if num_required_sigs > account_keys.len() {
+            return Err(error_invalid_params(
+                "num_required_signatures exceeds static account_keys length"
+            ));
+        }
+
+        // Reject address lookup tables in Phase 2B so all accounts are static & verified
+        if message.address_table_lookups().is_some_and(|l| !l.is_empty()) {
+            return Err(error_invalid_params(
+                "Address lookup tables are not supported on BlackBook L1 Phase 2B"
+            ));
+        }
+
+        // Cryptographically verify every required Ed25519 signature over message.serialize()
+        {
+            use ed25519_dalek::{VerifyingKey, Signature as DalekSig, Verifier};
+            let msg_bytes = message.serialize();
+            for i in 0..num_required_sigs {
+                let signer_pk = &account_keys[i];
+                let pk_bytes = signer_pk.to_bytes();
+                let vk = VerifyingKey::from_bytes(&pk_bytes).map_err(|_| {
+                    error_invalid_params(format!(
+                        "Invalid Ed25519 signer public key at index {}",
+                        i
+                    ))
+                })?;
+                let sig_bytes: [u8; 64] = versioned_tx.signatures[i]
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| error_invalid_params("Invalid 64-byte Ed25519 signature"))?;
+                let dalek_sig = DalekSig::from_bytes(&sig_bytes);
+                vk.verify(&msg_bytes, &dalek_sig).map_err(|_| {
+                    error_transaction_failed(format!(
+                        "Signature verification failed for signer {}",
+                        bs58::encode(signer_pk.to_bytes()).into_string()
+                    ))
+                })?;
+            }
+        }
+
         let recent_blockhash = *message.recent_blockhash();
 
         // 6. Validate blockhash
@@ -697,18 +748,24 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
             }
         }
 
-        // 7. Parse instructions — route system transfers
-        //    Phase 2B supports System Program transfers only.
-        //    Future phases add SPL Token, Anchor programs, etc.
+        // 7. Parse instructions — strictly single System Program Transfer
         let instructions = message.instructions();
 
         if instructions.is_empty() {
             return Err(error_invalid_params("Transaction contains no instructions"));
         }
+        if instructions.len() > 1 {
+            return Err(error_invalid_params(
+                "Phase 2B sendTransaction supports exactly 1 System Transfer instruction per tx"
+            ));
+        }
 
-        // For Phase 2B: support the System Program transfer instruction
         let ix = &instructions[0];
-        let program_id = account_keys[ix.program_id_index as usize];
+        let prog_idx = ix.program_id_index as usize;
+        if prog_idx >= account_keys.len() {
+            return Err(error_invalid_params("program_id_index out of bounds"));
+        }
+        let program_id = account_keys[prog_idx];
 
         if program_id != solana_sdk::system_program::id() {
             return Err(error_invalid_params(format!(
@@ -718,7 +775,6 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
         }
 
         // System Program transfer: instruction data = [2,0,0,0] + u64 lamports LE
-        // SystemInstruction::Transfer = index 2
         if ix.data.len() < 12 {
             return Err(error_invalid_params(
                 "System instruction data too short for a transfer"
@@ -738,14 +794,32 @@ impl BlackBookRpcServer for BlackBookRpcImpl {
             ix.data[8], ix.data[9], ix.data[10], ix.data[11],
         ]);
 
-        // Accounts for System transfer: [0] = from (signer), [1] = to
+        // Accounts for System transfer: [0] = from (MUST be signer + writable), [1] = to
         if ix.accounts.len() < 2 {
             return Err(error_invalid_params(
                 "System transfer requires at least 2 account keys"
             ));
         }
-        let from = account_keys[ix.accounts[0] as usize];
-        let to = account_keys[ix.accounts[1] as usize];
+        let from_idx = ix.accounts[0] as usize;
+        let to_idx = ix.accounts[1] as usize;
+        if from_idx >= account_keys.len() || to_idx >= account_keys.len() {
+            return Err(error_invalid_params("Instruction account index out of bounds"));
+        }
+        if !message.is_signer(from_idx) {
+            return Err(error_transaction_failed(
+                "System transfer source account must be a required signer".to_string()
+            ));
+        }
+
+        let from = account_keys[from_idx];
+        let to = account_keys[to_idx];
+
+        // Defense-in-depth: protocol PDAs can never be debited via RPC sendTransaction
+        if crate::svm::pda::is_reserved_pda(&from) {
+            return Err(error_transaction_failed(
+                "Reserved protocol PDA cannot be debited via sendTransaction".to_string()
+            ));
+        }
 
         // 8. Build TransferRequest and execute
         let slot = self.slot();

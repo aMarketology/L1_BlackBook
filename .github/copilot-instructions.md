@@ -29,6 +29,12 @@ Solana internals but fully custom-implemented:
 
 ---
 
+## No Unapproved Balance Writes
+
+Never insert, seed, migrate, repair, or backfill a balance, credit, lifetime exit, pending exit, vault transfer, or claim amount unless the operator explicitly approved that exact wallet and lamport amount in the current request.
+
+A previous session, a hardcoded historical figure, or a test is not approval. Do not invent BB. If a root or claim is missing a balance, stop and ask. Do not write the row.
+
 ## Node Modes
 
 | Mode | CLI Flag | Behavior |
