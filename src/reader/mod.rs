@@ -369,6 +369,9 @@ impl ReaderNode {
                 | crate::protocol::blockchain::TxData::EscrowSweep { .. } => {}
             }
         }
+        if let Err(e) = self.blockchain.svm_accounts.flush_block() {
+            tracing::error!("❌ Reader SVM flush_block failed: {}", e);
+        }
     }
 
     /// Get verification stats

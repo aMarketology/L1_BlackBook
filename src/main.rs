@@ -740,8 +740,8 @@ async fn signed_transfer_handler(
         })));
     }
 
-    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
-    match state.used_nonces.entry(nonce_key) {
+    // Atomic nonce check+insert via DashMap entry() + ReDB persistence across restarts
+    match state.used_nonces.entry(nonce_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             return (StatusCode::CONFLICT, Json(serde_json::json!({
                 "error": "Nonce already used — possible replay attack",
@@ -750,6 +750,7 @@ async fn signed_transfer_handler(
         }
         dashmap::mapref::entry::Entry::Vacant(v) => {
             v.insert(now);
+            let _ = state.blockchain.record_used_nonce(&nonce_key, now);
         }
     }
 
@@ -1517,8 +1518,8 @@ async fn faucet_handler(
         })));
     }
 
-    // Atomic nonce check+insert via DashMap entry() — prevents TOCTOU race
-    match state.used_nonces.entry(nonce_key) {
+    // Atomic nonce check+insert via DashMap entry() + ReDB persistence across restarts
+    match state.used_nonces.entry(nonce_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             return (StatusCode::CONFLICT, Json(serde_json::json!({
                 "error": "Nonce already used — possible replay attack",
@@ -1527,6 +1528,7 @@ async fn faucet_handler(
         }
         dashmap::mapref::entry::Entry::Vacant(v) => {
             v.insert(now);
+            let _ = state.blockchain.record_used_nonce(&nonce_key, now);
         }
     }
 
@@ -2070,6 +2072,7 @@ async fn usdc_mint_handler(
 
     match SplTokenEngine::mint_to(&state.blockchain.svm_accounts, &mint, &wallet_pubkey, raw_amount) {
         Ok(result) => {
+            let _ = state.blockchain.svm_accounts.flush_block();
             info!("💵 USDC MINT: {} USDC → {} (ATA: {})", req.amount, req.to, result.ata);
             (StatusCode::OK, Json(serde_json::json!({
                 "success": true,
@@ -3012,6 +3015,7 @@ fn build_router(state: AppState) -> Router {
         .route("/rollup/:rollup_id/exited/:address", get(contracts::rollup::get_exit_watermark_handler))
         .route("/rollup/:rollup_id/submit_root", post(contracts::rollup::submit_root_handler))
         .route("/rollup/:rollup_id/exit", post(contracts::rollup::exit_handler))
+        .route("/rollup/:rollup_id/settle_payouts", post(contracts::rollup::settle_payouts_handler))
         // DA read-only inspection endpoints
         .route("/da/:market_id", get(contracts::da::get_da_market_handler))
         .route("/da/:rollup_id/pool", get(contracts::da::get_da_pool_handler));
@@ -3170,33 +3174,6 @@ async fn main() {
             Err(e) => { error!("❌ FATAL: {}", e); panic!("Storage init failed: {:?}", e); }
         }
     };
-
-    // ── Startup migration: copy legacy L5_STATE_ROOTS → ROLLUP_STATE_ROOTS ──
-    // One-time idempotent migration; harmless if run multiple times.
-    {
-        use crate::storage::L5_STATE_ROOTS;
-        use redb::ReadableTable;
-        if let Ok(read_txn) = blockchain.db.begin_read() {
-            if let Ok(table) = read_txn.open_table(L5_STATE_ROOTS) {
-                if let Ok(iter) = table.iter() {
-                    let mut migrated = 0usize;
-                    for entry in iter.flatten() {
-                        let batch_id: u64 = entry.0.value();
-                        let root_slice = entry.1.value();
-                        if root_slice.len() == 32 {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(root_slice);
-                            let _ = blockchain.store_rollup_state_root("L5", batch_id, arr);
-                            migrated += 1;
-                        }
-                    }
-                    if migrated > 0 {
-                        info!("🔄 Migrated {} L5 state roots → ROLLUP_STATE_ROOTS", migrated);
-                    }
-                }
-            }
-        }
-    }
 
     // ── Rollup L2 Vault & POL Swap Pool PDAs ──────────────────────────────
     info!("🔐 L2 Rollup Vault PDA: {}", crate::svm::pda::rollup_vault_address("L2"));
@@ -3653,7 +3630,15 @@ async fn main() {
                 let slot = sealevel_slot.load(Ordering::Relaxed);
                 let leader = { sealevel_ls.read().get_leader(slot) };
                 let pending = sealevel_gs.get_pending_by_priority(&leader, poh_blockchain::MAX_TXS_PER_BLOCK);
-                if pending.is_empty() { continue; }
+                if pending.is_empty() {
+                    // Still flush HTTP-handler transaction logs (rollup locks, exits,
+                    // direct settlement payouts, swaps, deposits) to ReDB even when
+                    // no Gulf Stream transactions are queued.
+                    if let Err(e) = sealevel_bc.flush_tx_log_buffer() {
+                        warn!("⚠️  tx log flush failed: {}", e);
+                    }
+                    continue;
+                }
 
                 let batches = sealevel_sched.schedule_with_locks(pending);
                 for batch in batches {
@@ -3710,6 +3695,14 @@ async fn main() {
                 }
                 sealevel_gs.clear_leader_cache(&leader);
                 sealevel_sched.tune_batch_size();
+
+                // ACID-commit dirty SVM_ACCOUNTS to ReDB BEFORE flushing tx logs
+                // so ungraceful restarts can never desync balances from TX_HISTORY.
+                match sealevel_bc.svm_accounts.flush_block() {
+                    Ok(n) if n > 0 => tracing::debug!("💾 Flushed {} dirty SVM accounts to ReDB", n),
+                    Err(e) => tracing::error!("❌ CRITICAL: SVM account flush_block failed: {}", e),
+                    _ => {}
+                }
 
                 // Flush buffered transaction logs to ReDB in one ACID commit
                 match sealevel_bc.flush_tx_log_buffer() {
@@ -3812,7 +3805,7 @@ async fn main() {
 
     // 7. Build State
     let state = AppState {
-        blockchain,
+        blockchain: blockchain.clone(),
         poh: poh_service.clone(),
         current_slot: current_slot.clone(),
         leader_schedule: leader_schedule.clone(),
@@ -3831,7 +3824,19 @@ async fn main() {
         circuit_breaker,
         fee_market,
         account_metadata,
-        used_nonces: Arc::new(dashmap::DashMap::new()),
+        used_nonces: {
+            let map = dashmap::DashMap::new();
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cutoff = now_ts.saturating_sub(120);
+            for (k, ts) in blockchain.load_active_nonces(cutoff) {
+                map.insert(k, ts);
+            }
+            let _ = blockchain.prune_expired_nonces(cutoff);
+            Arc::new(map)
+        },
         faucet_claims: Arc::new(dashmap::DashMap::new()),
 
         l2_sequencer_pubkey,

@@ -85,7 +85,7 @@ fn rollup_l2_one_to_one_lock_root_monotonicity_and_cumulative_exit() {
     bc.atomic_rollup_bb_exit(&alice, &vault, exit_id, 0, 25 * LAMPORTS_PER_BB, 25 * LAMPORTS_PER_BB).unwrap();
     assert_eq!(bc.get_balance_lamports(&alice), 65 * LAMPORTS_PER_BB);
     assert_eq!(bc.get_balance_lamports(&vault), 35 * LAMPORTS_PER_BB);
-    assert_eq!(bc.get_cumulative_exit(exit_id), 25 * LAMPORTS_PER_BB);
+    assert_eq!(bc.get_cumulative_exit(exit_id).unwrap(), 25 * LAMPORTS_PER_BB);
 
     // Stale prev_cumulative (concurrent race) MUST fail
     assert_eq!(
@@ -109,7 +109,7 @@ fn rollup_l2_one_to_one_lock_root_monotonicity_and_cumulative_exit() {
     let bc2 = ConcurrentBlockchain::new(db_path).unwrap();
     assert_eq!(bc2.get_balance_lamports(&alice), initial);
     assert_eq!(bc2.get_balance_lamports(&vault), 0);
-    assert_eq!(bc2.get_cumulative_exit(exit_id), 60 * LAMPORTS_PER_BB);
+    assert_eq!(bc2.get_cumulative_exit(exit_id).unwrap(), 60 * LAMPORTS_PER_BB);
     assert_eq!(bc2.load_rollup_state_root("L2", 2), Some(root2));
 }
 

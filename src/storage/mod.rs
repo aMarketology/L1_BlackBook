@@ -102,18 +102,18 @@ const WITHDRAWALS: TableDefinition<&str, &[u8]> = TableDefinition::new("withdraw
 /// in sync with persisted records after a crash or restart.
 const WITHDRAWAL_SEQ_COUNTER: TableDefinition<&str, u64> = TableDefinition::new("withdrawal_seq_counter");
 
-/// Per-contest depositor ledger: "{contest_id}:{deposit_tx_sig}" → EscrowDepositorEntry JSON (bytes)
-/// Records every deposit into a per-contest vault PDA. Used for refund-on-expiry
-/// (pro-rata return to known depositors) and for deposit double-mint protection.
-pub const ESCROW_DEPOSITORS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors");
+// Retired legacy tables — kept ONLY as private handles so `ConcurrentBlockchain::new`
+// can migrate any remaining L5 roots and permanently delete all three from the ReDB
+// B-tree catalog via `write_txn.delete_table(...)`.
+const LEGACY_ESCROW_DEPOSITORS: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors");
+const LEGACY_ESCROW_DEPOSITORS_BY_CONTEST: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors_by_contest");
+const LEGACY_L5_STATE_ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("l5_state_roots");
 
-/// Index from contest_id → JSON Vec<deposit_tx_sig> (String).
-/// Allows O(depositors_in_contest) iteration without scanning the full ESCROW_DEPOSITORS table.
-pub const ESCROW_DEPOSITORS_BY_CONTEST: TableDefinition<&str, &[u8]> = TableDefinition::new("escrow_depositors_by_contest");
+/// L3 NFT provenance anchors: composite key "collection_id:token_id" → AnchoredNft JSON (bytes).
+const NFT_ANCHORS: TableDefinition<&str, &[u8]> = TableDefinition::new("nft_anchors");
 
-/// L5 rollup liquidity locks: lock_id (UUID) → RollupLockRecord JSON (bytes).
-/// Records every $BB lock-in by a creator to seed initial liquidity for their
-/// L5 Creator Coin. The L5 sequencer reads these records to credit rollup-$BB.
+/// Rollup liquidity locks: lock_id → RollupLockRecord JSON (bytes).
+/// Records every $BB lock-in into a rollup vault PDA (`POST /rollup/:id/lock_bb`).
 pub const ROLLUP_LIQUIDITY_LOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollup_liquidity_locks");
 
 /// Oracle node registry: pubkey_hex → OracleNode JSON (bytes).
@@ -124,15 +124,20 @@ const ORACLE_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("oracle_
 /// consumed when finalized or discarded after the dispute window.
 const PENDING_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_roots");
 
-/// Layer 5 rollup state history: batch_id (u64) → merkle_root ([u8; 32]).
-/// Legacy table kept for startup migration only. New roots go to ROLLUP_STATE_ROOTS.
-pub const L5_STATE_ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("l5_state_roots");
-
 /// Universal rollup state roots: composite key "<rollup_id>:<batch_id>" → merkle_root ([u8; 32]).
 /// All rollups (L2, L3, L5) share this single table, isolated by key prefix.
 /// Keys use zero-padded 20-digit decimal batch_ids for lexicographic ordering:
 ///   "L5:00000000000000000100" → root for L5 batch 100
 pub const ROLLUP_STATE_ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollup_state_roots");
+
+/// Cumulative $BB lamports ever locked into each rollup vault (key = rollup_id, e.g. "L2").
+/// Enforces the hard supply cap on `POST /rollup/:id/submit_root`: a sequencer can
+/// never anchor a cumulative exit root exceeding total on-chain locked supply.
+pub const ROLLUP_TOTAL_LOCKED: TableDefinition<&str, u64> = TableDefinition::new("rollup_total_locked");
+
+/// Persistent replay-protection nonces (key = nonce_key, value = unix_ts).
+/// Warm-loaded on startup so signed request nonces cannot be replayed across restarts.
+pub const USED_NONCES: TableDefinition<&str, u64> = TableDefinition::new("used_nonces");
 
 /// Rollup exit double-spend guard. The key is batch-agnostic so a balance can
 /// never be exited twice across different historical roots:
@@ -539,8 +544,9 @@ impl TransactionRecord {
 /// - New system: write u64 to SVM → mirror f64 to DashMap/ReDB (single source of truth)
 #[derive(Clone)]
 pub struct ConcurrentBlockchain {
-    /// ReDB database handle (Arc allows sharing across threads)
-    pub db: Arc<Database>,
+    /// ReDB database handle — strictly private so all writes flow through
+    /// invariant-checked `ConcurrentBlockchain` gateway methods.
+    db: Arc<Database>,
     /// Path to the ReDB file on disk — used for backup
     db_path: Arc<String>,
     pub cache: Arc<DashMap<String, f64>>,
@@ -755,9 +761,33 @@ impl ConcurrentBlockchain {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db = Database::create(&db_file)?;
+        let mut db = Database::create(&db_file)?;
+        let clean = db.check_integrity()?;
+        if !clean {
+            warn!(path = %db_file, "ReDB check_integrity repaired uncommitted pages on startup");
+        } else {
+            info!(path = %db_file, "ReDB check_integrity passed cleanly");
+        }
+
+        // Read any legacy L5 state roots BEFORE deleting `l5_state_roots`
+        // (read transaction never creates the table if already pruned).
+        let mut legacy_l5_roots: Vec<(u64, [u8; 32])> = Vec::new();
+        {
+            let read_txn = db.begin_read()?;
+            if let Ok(l5_tbl) = read_txn.open_table(LEGACY_L5_STATE_ROOTS) {
+                for item in l5_tbl.iter()? {
+                    let (k, v) = item?;
+                    let slice = v.value();
+                    if slice.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(slice);
+                        legacy_l5_roots.push((k.value(), arr));
+                    }
+                }
+            }
+        }
         
-        // Initialize tables
+        // Initialize active tables & purge retired legacy tables in ONE atomic commit
         let write_txn = db.begin_write()?;
         {
             let _ = write_txn.open_table(BLOCKS)?;
@@ -771,14 +801,50 @@ impl ConcurrentBlockchain {
             let _ = write_txn.open_table(WITHDRAWALS)?;
             let _ = write_txn.open_table(WITHDRAWAL_SEQ_COUNTER)?;
             let _ = write_txn.open_table(UNATTRIBUTED_DEPOSITS)?;
-            // Legacy L5 roots (kept for startup migration)
-            let _ = write_txn.open_table(L5_STATE_ROOTS)?;
+            let _ = write_txn.open_table(NFT_ANCHORS)?;
+            let _ = write_txn.open_table(ROLLUP_LIQUIDITY_LOCKS)?;
             // Universal rollup state roots (L2 / L3 / L5)
-            let _ = write_txn.open_table(ROLLUP_STATE_ROOTS)?;
+            {
+                let mut roots_tbl = write_txn.open_table(ROLLUP_STATE_ROOTS)?;
+                for (batch_id, root) in &legacy_l5_roots {
+                    let composite = Self::rollup_root_key("L5", *batch_id);
+                    if roots_tbl.get(composite.as_str())?.is_none() {
+                        roots_tbl.insert(composite.as_str(), root.as_slice())?;
+                    }
+                }
+            }
+            if !legacy_l5_roots.is_empty() {
+                info!(migrated = legacy_l5_roots.len(), "Migrated legacy L5 state roots into ROLLUP_STATE_ROOTS");
+            }
+            // Cumulative locked supply cap per rollup
+            let _ = write_txn.open_table(ROLLUP_TOTAL_LOCKED)?;
+            // Persistent replay-protection nonces
+            let _ = write_txn.open_table(USED_NONCES)?;
             // Rollup exit double-spend guard
             let _ = write_txn.open_table(ROLLUP_CONSUMED_EXITS)?;
 
-            // SVM tables (behind feature flag)
+            // Permanently delete retired legacy tables from the ReDB B-tree catalog
+            let mut deleted_legacy: Vec<&'static str> = Vec::new();
+            match write_txn.delete_table(LEGACY_ESCROW_DEPOSITORS) {
+                Ok(true) => deleted_legacy.push("escrow_depositors"),
+                Ok(false) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Box::new(e)),
+            }
+            match write_txn.delete_table(LEGACY_ESCROW_DEPOSITORS_BY_CONTEST) {
+                Ok(true) => deleted_legacy.push("escrow_depositors_by_contest"),
+                Ok(false) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Box::new(e)),
+            }
+            match write_txn.delete_table(LEGACY_L5_STATE_ROOTS) {
+                Ok(true) => deleted_legacy.push("l5_state_roots"),
+                Ok(false) | Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Box::new(e)),
+            }
+            if !deleted_legacy.is_empty() {
+                info!(tables = ?deleted_legacy, "Permanently deleted retired L1 tables from ReDB catalog");
+            }
+
+            // SVM tables
             {
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_ACCOUNTS)?;
                 let _ = write_txn.open_table(crate::svm::accounts_db::SVM_PROGRAMS)?;
@@ -1320,6 +1386,9 @@ impl ConcurrentBlockchain {
         );
         self.svm_accounts.store_account(&from_pk, from_account);
         self.svm_accounts.store_account(&to_pk, to_account);
+        self.svm_accounts
+            .flush_block()
+            .map_err(|e| format!("Failed to persist transfer to ReDB: {}", e))?;
         
         // ═══ MIRROR to cache/ReDB (non-authoritative) ═══
         self.mirror_balance_to_cache(from, from_new_lamports);
@@ -1717,16 +1786,21 @@ impl ConcurrentBlockchain {
     ///
     /// For BB keys the stored value is the running total withdrawn; for NFT keys
     /// any present value means the unique token has already been exited.
-    pub fn get_cumulative_exit(&self, exit_id: &str) -> u64 {
-        let read_txn = match self.db.begin_read() {
-            Ok(t) => t,
-            Err(_) => return 0,
-        };
-        let table = match read_txn.open_table(ROLLUP_CONSUMED_EXITS) {
-            Ok(t) => t,
-            Err(_) => return 0,
-        };
-        table.get(exit_id).ok().flatten().map(|v| v.value()).unwrap_or(0)
+    /// Read cumulative lamports already withdrawn for `exit_id`.
+    /// Fails closed (`Err`) on any storage or table error — never defaults to `0`
+    /// on I/O or corruption failure (only `Ok(None)` key absence returns `Ok(0)`).
+    pub fn get_cumulative_exit(&self, exit_id: &str) -> Result<u64, String> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| format!("get_cumulative_exit begin_read failed: {}", e))?;
+        let table = read_txn
+            .open_table(ROLLUP_CONSUMED_EXITS)
+            .map_err(|e| format!("get_cumulative_exit open_table failed: {}", e))?;
+        let opt = table
+            .get(exit_id)
+            .map_err(|e| format!("get_cumulative_exit get failed: {}", e))?;
+        Ok(opt.map(|v| v.value()).unwrap_or(0))
     }
 
     /// Atomically release a BB exit: debit the rollup vault, credit the user, and
@@ -1884,6 +1958,9 @@ impl ConcurrentBlockchain {
         let new_lamports = self.svm_accounts
             .atomic_credit(&pk, lamports)
             .map_err(|e| e.to_string())?;
+        self.svm_accounts
+            .flush_block()
+            .map_err(|e| format!("Failed to persist credit to ReDB: {}", e))?;
         self.mirror_balance_to_cache(address, new_lamports);
         self.total_supply.fetch_add(lamports, Ordering::Relaxed);
         Ok(())
@@ -1903,6 +1980,9 @@ impl ConcurrentBlockchain {
         let new_lamports = self.svm_accounts
             .atomic_debit(&pk, lamports)
             .map_err(|e| e.to_string())?;
+        self.svm_accounts
+            .flush_block()
+            .map_err(|e| format!("Failed to persist debit to ReDB: {}", e))?;
         self.mirror_balance_to_cache(address, new_lamports);
         self.total_supply.fetch_sub(lamports, Ordering::Relaxed);
         Ok(())
@@ -2300,10 +2380,35 @@ impl ConcurrentBlockchain {
             .map_err(|e| format!("Serialization error: {}", e))?;
         let record_bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
 
-        // Single atomic ReDB write: lock record + both SVM account states
+        // Single atomic ReDB write: lock record + cumulative locked counter + both SVM account states
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut locks = write_txn.open_table(ROLLUP_LIQUIDITY_LOCKS).map_err(|e| e.to_string())?;
+            let mut total_locked_tbl = write_txn.open_table(ROLLUP_TOTAL_LOCKED).map_err(|e| e.to_string())?;
+            let base_locked: u64 = match total_locked_tbl.get(record.rollup_id.as_str()).map_err(|e| e.to_string())? {
+                Some(v) => v.value(),
+                None => {
+                    // First write after upgrade: seed from existing persisted locks for this rollup
+                    let mut sum = 0u64;
+                    if let Ok(iter) = locks.iter() {
+                        for entry in iter.flatten() {
+                            if let Ok(rec) = serde_json::from_slice::<RollupLockRecord>(entry.1.value()) {
+                                if rec.rollup_id == record.rollup_id {
+                                    sum = sum.saturating_add(rec.bb_lamports);
+                                }
+                            }
+                        }
+                    }
+                    sum
+                }
+            };
+            let next_locked = base_locked
+                .checked_add(amount_lamports)
+                .ok_or_else(|| "Rollup total_locked_ever overflow".to_string())?;
+            total_locked_tbl
+                .insert(record.rollup_id.as_str(), next_locked)
+                .map_err(|e| e.to_string())?;
+
             locks.insert(record.lock_id.as_str(), record_bytes.as_slice()).map_err(|e| e.to_string())?;
 
             let mut svm = write_txn.open_table(SVM_ACCOUNTS).map_err(|e| e.to_string())?;
@@ -2449,129 +2554,33 @@ impl ConcurrentBlockchain {
     }
 
     // ========================================================================
-    // ESCROW DEPOSITOR LEDGER (per-contest, ReDB-backed)
+    // L3 NFT ANCHOR GATEWAY (Fail-Closed ReDB Access)
     // ========================================================================
 
-    fn depositor_key(contest_id: &str, sig: &str) -> String {
-        format!("{}:{}", contest_id, sig)
-    }
-
-    /// Persist a depositor entry and update the per-contest index in a single
-    /// ReDB write transaction (atomic w.r.t. crash recovery).
-    pub fn store_depositor_entry(&self, entry: &EscrowDepositorEntry) -> Result<(), String> {
-        let bytes = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
-        let key = Self::depositor_key(&entry.contest_id, &entry.deposit_tx_sig);
-
+    /// Persist an anchored NFT record in `NFT_ANCHORS`.
+    pub fn put_nft(&self, nft: &AnchoredNft) -> Result<(), String> {
+        let key = nft_key(&nft.collection_id, &nft.token_id);
+        let bytes = serde_json::to_vec(nft).map_err(|e| format!("serialize AnchoredNft: {e}"))?;
         let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
         {
-            let mut table = write_txn
-                .open_table(ESCROW_DEPOSITORS)
-                .map_err(|e| e.to_string())?;
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(|e| e.to_string())?;
-
-            // Update the contest-id index. Read current Vec<sig>, append if new, write back.
-            let mut idx_table = write_txn
-                .open_table(ESCROW_DEPOSITORS_BY_CONTEST)
-                .map_err(|e| e.to_string())?;
-            let mut sigs: Vec<String> = match idx_table
-                .get(entry.contest_id.as_str())
-                .map_err(|e| e.to_string())?
-            {
-                Some(g) => serde_json::from_slice(g.value()).unwrap_or_default(),
-                None => Vec::new(),
-            };
-            if !sigs.iter().any(|s| s == &entry.deposit_tx_sig) {
-                sigs.push(entry.deposit_tx_sig.clone());
-                let idx_bytes = serde_json::to_vec(&sigs).map_err(|e| e.to_string())?;
-                idx_table
-                    .insert(entry.contest_id.as_str(), idx_bytes.as_slice())
-                    .map_err(|e| e.to_string())?;
-            }
+            let mut tbl = write_txn.open_table(NFT_ANCHORS).map_err(|e| e.to_string())?;
+            tbl.insert(key.as_str(), bytes.as_slice()).map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())
     }
 
-    pub fn load_depositor_entry(
-        &self,
-        contest_id: &str,
-        deposit_tx_sig: &str,
-    ) -> Result<Option<EscrowDepositorEntry>, String> {
-        let key = Self::depositor_key(contest_id, deposit_tx_sig);
+    /// Load an anchored NFT record by `(collection_id, token_id)`.
+    /// Fails closed (`Err`) on any storage or JSON deserialization error.
+    pub fn get_nft(&self, collection_id: &str, token_id: &str) -> Result<Option<AnchoredNft>, String> {
+        let key = nft_key(collection_id, token_id);
         let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let table = match read_txn.open_table(ESCROW_DEPOSITORS) {
-            Ok(t) => t,
-            Err(_) => return Ok(None), // table not yet created
-        };
-        match table.get(key.as_str()).map_err(|e| e.to_string())? {
-            None => Ok(None),
-            Some(g) => serde_json::from_slice::<EscrowDepositorEntry>(g.value())
+        let tbl = read_txn.open_table(NFT_ANCHORS).map_err(|e| e.to_string())?;
+        match tbl.get(key.as_str()).map_err(|e| e.to_string())? {
+            Some(val) => serde_json::from_slice::<AnchoredNft>(val.value())
                 .map(Some)
-                .map_err(|e| e.to_string()),
+                .map_err(|e| format!("AnchoredNft deserialization failed for {key}: {e}")),
+            None => Ok(None),
         }
-    }
-
-    /// Mark a depositor entry as `used = true`. Errors if not found.
-    pub fn mark_depositor_used(
-        &self,
-        contest_id: &str,
-        deposit_tx_sig: &str,
-    ) -> Result<(), String> {
-        let mut entry = self
-            .load_depositor_entry(contest_id, deposit_tx_sig)?
-            .ok_or_else(|| format!("depositor entry not found: {}:{}", contest_id, deposit_tx_sig))?;
-        if entry.used {
-            return Ok(()); // idempotent
-        }
-        entry.used = true;
-        self.store_depositor_entry(&entry)
-    }
-
-    /// Mark a depositor entry as `refunded = true`. Errors if not found.
-    pub fn mark_depositor_refunded(
-        &self,
-        contest_id: &str,
-        deposit_tx_sig: &str,
-    ) -> Result<(), String> {
-        let mut entry = self
-            .load_depositor_entry(contest_id, deposit_tx_sig)?
-            .ok_or_else(|| format!("depositor entry not found: {}:{}", contest_id, deposit_tx_sig))?;
-        if entry.refunded {
-            return Ok(()); // idempotent
-        }
-        entry.refunded = true;
-        self.store_depositor_entry(&entry)
-    }
-
-    /// List every depositor entry for a contest, in insertion order.
-    pub fn list_depositors_for_contest(
-        &self,
-        contest_id: &str,
-    ) -> Result<Vec<EscrowDepositorEntry>, String> {
-        let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
-        let idx_table = match read_txn.open_table(ESCROW_DEPOSITORS_BY_CONTEST) {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let sigs: Vec<String> = match idx_table.get(contest_id).map_err(|e| e.to_string())? {
-            Some(g) => serde_json::from_slice(g.value()).unwrap_or_default(),
-            None => return Ok(Vec::new()),
-        };
-        let table = match read_txn.open_table(ESCROW_DEPOSITORS) {
-            Ok(t) => t,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut out = Vec::with_capacity(sigs.len());
-        for sig in sigs {
-            let key = Self::depositor_key(contest_id, &sig);
-            if let Some(g) = table.get(key.as_str()).map_err(|e| e.to_string())? {
-                if let Ok(rec) = serde_json::from_slice::<EscrowDepositorEntry>(g.value()) {
-                    out.push(rec);
-                }
-            }
-        }
-        Ok(out)
     }
 
     // ========================================================================
@@ -2704,25 +2713,28 @@ pub struct WithdrawalRecord {
 
 /// One row per (contest, deposit-tx) — the canonical record that a wallet's
 /// funds entered a per-contest vault PDA.  Used for:
-///   * deposit double-mint protection (each `deposit_tx_sig` consumed at most once),
-///   * pro-rata refund-on-expiry (we know exactly who is owed how much), and
-///   * audit / explorer surfaces.
-///
-/// `amount_lamports` is BB lamports (5 decimals, `LAMPORTS_PER_BB = 100_000`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EscrowDepositorEntry {
-    pub contest_id: String,
-    pub wallet: String,
-    /// Primary key fragment — unique per L1 transaction that funded this contest.
-    pub deposit_tx_sig: String,
-    pub amount_lamports: u64,
-    pub deposited_at: u64,
-    /// Set true once this entry's deposit has been processed (e.g. approved or refunded).
-    #[serde(default)]
-    pub used: bool,
-    /// Set true once a refund has been issued for this entry (expired contest sweep).
-    #[serde(default)]
-    pub refunded: bool,
+// ============================================================================
+// L3 NFT ANCHOR RECORD
+// ============================================================================
+
+/// A single anchored NFT on L1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AnchoredNft {
+    pub collection_id: String,
+    pub token_id: String,
+    pub owner: String,
+    /// SHA-256 of the metadata JSON (32 bytes, hex-encoded for storage).
+    pub metadata_hash: String,
+    /// IPFS/Arweave URI pointing to the full metadata.
+    pub metadata_uri: String,
+    pub minted_slot: u64,
+    pub last_transfer_slot: u64,
+    pub transfer_count: u32,
+}
+
+/// Composite key for NFT lookups: "collection_id:token_id"
+pub fn nft_key(collection_id: &str, token_id: &str) -> String {
+    format!("{}:{}", collection_id, token_id)
 }
 
 // ============================================================================
@@ -2866,41 +2878,6 @@ impl ConcurrentBlockchain {
         write_txn.commit().map_err(|e| e.to_string())
     }
 
-    // ── Legacy L5 State Root helpers (kept for startup migration) ─────────────
-
-    #[deprecated(note = "Use store_rollup_state_root(rollup_id, batch_id, root) instead")]
-    pub fn store_l5_state_root(&self, batch_id: u64, root: [u8; 32]) -> Result<(), String> {
-        if let Some(latest) = self.latest_rollup_batch_id("L5") {
-            if batch_id <= latest {
-                return Err(format!(
-                    "L5 batch_id {} is not greater than latest {} (monotonicity violation)",
-                    batch_id, latest
-                ));
-            }
-        }
-        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
-        {
-            let mut table = write_txn.open_table(L5_STATE_ROOTS).map_err(|e| e.to_string())?;
-            table.insert(batch_id, root.as_slice()).map_err(|e| e.to_string())?;
-        }
-        write_txn.commit().map_err(|e| e.to_string())
-    }
-
-    #[deprecated(note = "Use load_rollup_state_root(rollup_id, batch_id) instead")]
-    pub fn load_l5_state_root(&self, batch_id: u64) -> Option<[u8; 32]> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = read_txn.open_table(L5_STATE_ROOTS).ok()?;
-        let guard = table.get(batch_id).ok()??;
-        let bytes = guard.value();
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(bytes);
-            Some(arr)
-        } else {
-            None
-        }
-    }
-
     // ── Generic Multi-Rollup State Root Methods ───────────────────────────────
 
     /// Returns the composite ReDB key for a rollup state root.
@@ -2938,6 +2915,82 @@ impl ConcurrentBlockchain {
                 .map_err(|e| e.to_string())?;
         }
         write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Return the cumulative lamports ever locked into `rollup_id`.
+    /// Falls back to summing `ROLLUP_LIQUIDITY_LOCKS` if the counter has not been
+    /// initialized yet on an existing database.
+    pub fn get_rollup_total_locked(&self, rollup_id: &str) -> u64 {
+        let Ok(read_txn) = self.db.begin_read() else { return 0; };
+        if let Ok(tbl) = read_txn.open_table(ROLLUP_TOTAL_LOCKED) {
+            if let Ok(Some(v)) = tbl.get(rollup_id) {
+                return v.value();
+            }
+        }
+        let Ok(locks) = read_txn.open_table(ROLLUP_LIQUIDITY_LOCKS) else { return 0; };
+        let Ok(iter) = locks.iter() else { return 0; };
+        let mut sum = 0u64;
+        for entry in iter.flatten() {
+            if let Ok(rec) = serde_json::from_slice::<RollupLockRecord>(entry.1.value()) {
+                if rec.rollup_id == rollup_id {
+                    sum = sum.saturating_add(rec.bb_lamports);
+                }
+            }
+        }
+        sum
+    }
+
+    /// Persist a consumed replay-protection nonce to ReDB so it survives restarts.
+    pub fn record_used_nonce(&self, nonce_key: &str, ts: u64) -> Result<(), String> {
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut tbl = write_txn.open_table(USED_NONCES).map_err(|e| e.to_string())?;
+            tbl.insert(nonce_key, ts).map_err(|e| e.to_string())?;
+        }
+        write_txn.commit().map_err(|e| e.to_string())
+    }
+
+    /// Load all non-expired nonces (`ts >= min_ts`) from ReDB on startup.
+    pub fn load_active_nonces(&self, min_ts: u64) -> Vec<(String, u64)> {
+        let Ok(read_txn) = self.db.begin_read() else { return Vec::new(); };
+        let Ok(tbl) = read_txn.open_table(USED_NONCES) else { return Vec::new(); };
+        let Ok(iter) = tbl.iter() else { return Vec::new(); };
+        let mut out = Vec::new();
+        for entry in iter.flatten() {
+            let ts = entry.1.value();
+            if ts >= min_ts {
+                out.push((entry.0.value().to_string(), ts));
+            }
+        }
+        out
+    }
+
+    /// Remove expired nonces (`ts < min_ts`) from ReDB.
+    pub fn prune_expired_nonces(&self, min_ts: u64) -> Result<usize, String> {
+        let expired: Vec<String> = {
+            let read_txn = self.db.begin_read().map_err(|e| e.to_string())?;
+            let tbl = read_txn.open_table(USED_NONCES).map_err(|e| e.to_string())?;
+            let mut keys = Vec::new();
+            for entry in tbl.iter().map_err(|e| e.to_string())?.flatten() {
+                if entry.1.value() < min_ts {
+                    keys.push(entry.0.value().to_string());
+                }
+            }
+            keys
+        };
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let count = expired.len();
+        let write_txn = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut tbl = write_txn.open_table(USED_NONCES).map_err(|e| e.to_string())?;
+            for k in &expired {
+                let _ = tbl.remove(k.as_str());
+            }
+        }
+        write_txn.commit().map_err(|e| e.to_string())?;
+        Ok(count)
     }
 
     /// Load the merkle root for a specific rollup + batch_id.
@@ -3021,94 +3074,131 @@ mod tests {
         assert_eq!(bc.get_balance("bob"), 40.0);
     }
 
-    fn mk_entry(contest: &str, sig: &str, wallet: &str, amount: u64) -> EscrowDepositorEntry {
-        EscrowDepositorEntry {
-            contest_id: contest.to_string(),
-            wallet: wallet.to_string(),
-            deposit_tx_sig: sig.to_string(),
-            amount_lamports: amount,
-            deposited_at: 1_700_000_000,
-            used: false,
-            refunded: false,
+    #[test]
+    fn legacy_escrow_and_l5_tables_migrated_and_deleted_on_startup() {
+        let dir = tempdir().unwrap();
+        let db_file = dir.path().join("blockchain.redb");
+        let db_path = dir.path().to_str().unwrap();
+
+        // 1. Seed a raw ReDB file containing all 3 retired legacy tables
+        let expected_l5_root = [0x77u8; 32];
+        {
+            let raw_db = Database::create(&db_file).unwrap();
+            let wtxn = raw_db.begin_write().unwrap();
+            {
+                let mut t1 = wtxn.open_table(LEGACY_ESCROW_DEPOSITORS).unwrap();
+                t1.insert("c1:sig1", &[1u8, 2, 3][..]).unwrap();
+                let mut t2 = wtxn.open_table(LEGACY_ESCROW_DEPOSITORS_BY_CONTEST).unwrap();
+                t2.insert("c1", b"[\"sig1\"]".as_slice()).unwrap();
+                let mut t3 = wtxn.open_table(LEGACY_L5_STATE_ROOTS).unwrap();
+                t3.insert(7u64, expected_l5_root.as_slice()).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // 2. Open ConcurrentBlockchain — migrates L5 root and deletes all 3 legacy tables
+        {
+            let bc = ConcurrentBlockchain::new(db_path).unwrap();
+            assert_eq!(bc.load_rollup_state_root("L5", 7), Some(expected_l5_root));
+        }
+
+        // 3. Reopen raw ReDB and verify all 3 retired tables no longer exist in catalog
+        {
+            let raw_db = Database::open(&db_file).unwrap();
+            let rtxn = raw_db.begin_read().unwrap();
+            assert!(matches!(
+                rtxn.open_table(LEGACY_ESCROW_DEPOSITORS),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ));
+            assert!(matches!(
+                rtxn.open_table(LEGACY_ESCROW_DEPOSITORS_BY_CONTEST),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ));
+            assert!(matches!(
+                rtxn.open_table(LEGACY_L5_STATE_ROOTS),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ));
         }
     }
 
     #[test]
-    fn depositor_entry_round_trip() {
+    fn nft_gateway_roundtrip_and_fail_closed_deserialization() {
         let dir = tempdir().unwrap();
-        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+        let db_dir = dir.path().to_str().unwrap();
+        let nft = AnchoredNft {
+            collection_id: "col-1".to_string(),
+            token_id: "42".to_string(),
+            owner: "8uZS3UiPyAdVwV8DndnEjrSH75mTAeba9JGreKLY24B2".to_string(),
+            metadata_hash: "aa".repeat(32),
+            metadata_uri: "ipfs://cid".to_string(),
+            minted_slot: 100,
+            last_transfer_slot: 100,
+            transfer_count: 0,
+        };
 
-        let e = mk_entry("contest_A", "sig_1", "alice", 500_000);
-        bc.store_depositor_entry(&e).unwrap();
+        let bc = ConcurrentBlockchain::new(db_dir).unwrap();
+        assert_eq!(bc.get_nft("col-1", "42").unwrap(), None);
+        bc.put_nft(&nft).unwrap();
+        assert_eq!(bc.get_nft("col-1", "42").unwrap(), Some(nft));
 
-        let loaded = bc.load_depositor_entry("contest_A", "sig_1").unwrap().unwrap();
-        assert_eq!(loaded.wallet, "alice");
-        assert_eq!(loaded.amount_lamports, 500_000);
-        assert!(!loaded.used);
-        assert!(!loaded.refunded);
-
-        // Unknown key returns None
-        assert!(bc.load_depositor_entry("contest_A", "nope").unwrap().is_none());
-        assert!(bc.load_depositor_entry("other_contest", "sig_1").unwrap().is_none());
+        // Corrupt JSON payload in NFT_ANCHORS must fail closed (Err), never Ok(None)
+        let wtxn = bc.db.begin_write().unwrap();
+        {
+            let mut tbl = wtxn.open_table(NFT_ANCHORS).unwrap();
+            tbl.insert("col-1:corrupt", b"{not-valid-json".as_slice()).unwrap();
+        }
+        wtxn.commit().unwrap();
+        assert!(bc.get_nft("col-1", "corrupt").is_err());
     }
 
     #[test]
-    fn mark_used_then_refunded_persists() {
+    fn svm_accounts_corrupted_borsh_fails_closed_at_boot() {
         let dir = tempdir().unwrap();
-        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+        let db_dir = dir.path().to_str().unwrap();
 
-        let e = mk_entry("contest_B", "sig_x", "bob", 1_000_000);
-        bc.store_depositor_entry(&e).unwrap();
+        {
+            let bc = ConcurrentBlockchain::new(db_dir).unwrap();
+            bc.mint_lamports("alice", 50 * LAMPORTS_PER_BB).unwrap();
+            bc.svm_accounts.flush_block().unwrap();
+            assert_eq!(bc.get_cumulative_exit("never-exited").unwrap(), 0);
 
-        bc.mark_depositor_used("contest_B", "sig_x").unwrap();
-        let after_used = bc.load_depositor_entry("contest_B", "sig_x").unwrap().unwrap();
-        assert!(after_used.used);
-        assert!(!after_used.refunded);
+            // Inject truncated/corrupted Borsh bytes directly into SVM_ACCOUNTS
+            let corrupt_pk = [0xABu8; 32];
+            let write_txn = bc.db.begin_write().unwrap();
+            {
+                let mut tbl = write_txn.open_table(SVM_ACCOUNTS).unwrap();
+                tbl.insert(corrupt_pk.as_slice(), &[0xFF, 0x00, 0x13][..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
 
-        // Idempotent
-        bc.mark_depositor_used("contest_B", "sig_x").unwrap();
-
-        bc.mark_depositor_refunded("contest_B", "sig_x").unwrap();
-        let after_refund = bc.load_depositor_entry("contest_B", "sig_x").unwrap().unwrap();
-        assert!(after_refund.used);
-        assert!(after_refund.refunded);
-
-        // Idempotent
-        bc.mark_depositor_refunded("contest_B", "sig_x").unwrap();
-
-        // Missing entry yields error
-        assert!(bc.mark_depositor_used("contest_B", "missing").is_err());
-        assert!(bc.mark_depositor_refunded("contest_B", "missing").is_err());
+        // Reopening MUST fail closed instead of silently skipping the corrupted account
+        let reopen_res = ConcurrentBlockchain::new(db_dir);
+        assert!(
+            reopen_res.is_err(),
+            "Expected ConcurrentBlockchain::new to fail closed on corrupted SVM_ACCOUNTS Borsh payload"
+        );
     }
 
     #[test]
-    fn list_depositors_returns_only_target_contest() {
+    fn svm_accounts_malformed_key_fails_closed_at_boot() {
         let dir = tempdir().unwrap();
-        let bc = ConcurrentBlockchain::new(dir.path().to_str().unwrap()).unwrap();
+        let db_dir = dir.path().to_str().unwrap();
 
-        bc.store_depositor_entry(&mk_entry("c1", "s1", "alice", 100)).unwrap();
-        bc.store_depositor_entry(&mk_entry("c1", "s2", "bob", 200)).unwrap();
-        bc.store_depositor_entry(&mk_entry("c2", "s3", "carol", 300)).unwrap();
+        {
+            let bc = ConcurrentBlockchain::new(db_dir).unwrap();
+            let write_txn = bc.db.begin_write().unwrap();
+            {
+                let mut tbl = write_txn.open_table(SVM_ACCOUNTS).unwrap();
+                tbl.insert(&[0x01u8; 16][..], &[0x00u8; 64][..]).unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
 
-        let c1 = bc.list_depositors_for_contest("c1").unwrap();
-        assert_eq!(c1.len(), 2);
-        assert!(c1.iter().any(|e| e.wallet == "alice"));
-        assert!(c1.iter().any(|e| e.wallet == "bob"));
-        assert!(c1.iter().all(|e| e.contest_id == "c1"));
-
-        let c2 = bc.list_depositors_for_contest("c2").unwrap();
-        assert_eq!(c2.len(), 1);
-        assert_eq!(c2[0].wallet, "carol");
-
-        // Re-storing the same (contest, sig) does not duplicate index entries
-        bc.store_depositor_entry(&mk_entry("c1", "s1", "alice", 999)).unwrap();
-        let c1_again = bc.list_depositors_for_contest("c1").unwrap();
-        assert_eq!(c1_again.len(), 2);
-        // Latest write wins for the entry value
-        let alice = c1_again.iter().find(|e| e.wallet == "alice").unwrap();
-        assert_eq!(alice.amount_lamports, 999);
-
-        // Unknown contest yields empty Vec, not error
-        assert!(bc.list_depositors_for_contest("nope").unwrap().is_empty());
+        let reopen_res = ConcurrentBlockchain::new(db_dir);
+        assert!(
+            reopen_res.is_err(),
+            "Expected ConcurrentBlockchain::new to fail closed on non-32-byte pubkey key"
+        );
     }
 }

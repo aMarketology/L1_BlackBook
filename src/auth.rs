@@ -107,14 +107,15 @@ pub fn verify_signed_action(
         return Err(err(StatusCode::BAD_REQUEST, "Request timestamp outside ±60s window"));
     }
 
-    // ── 5. Replay protection (atomic nonce insert) ─────────────────────────
+    // ── 5. Replay protection (atomic nonce insert + ReDB persistence) ──────
     let nonce_key = format!("{action}:{from}:{nonce}");
-    match state.used_nonces.entry(nonce_key) {
+    match state.used_nonces.entry(nonce_key.clone()) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             return Err(err(StatusCode::CONFLICT, "Nonce already used — possible replay"));
         }
         dashmap::mapref::entry::Entry::Vacant(v) => {
             v.insert(now);
+            let _ = state.blockchain.record_used_nonce(&nonce_key, now);
         }
     }
 

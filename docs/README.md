@@ -79,16 +79,34 @@ Fixed baseline rate: **10 BB = 1 wUSDT**.
 
 ---
 
-## Ecosystem Consumer Alignment (2026-11-22)
+## Ecosystem Consumer Alignment (2026-11-25)
 
-`blvkprism` (Next.js frontend) and `L2_BlackBook` (Rust/Axum market & fantasy engine) now organize reality TV and sports around two product modes:
+`blvkprism` (Next.js frontend) and `L2_BlackBook` (Rust/Axum market & fantasy engine) organize reality TV and sports around two product modes:
 
-1. **Mode 1 — Global Last-One-Standing Pools** (`global_survivor`, `global_amazing_race`, `global_mls`): Users pick who lasts the longest; an eliminated pick knocks out the entry and survivors split the pot. Anchored to L1 escrow parent contests:
-   - Survivor 51: `SURVIVOR-S51-MAIN-V2`
-   - Amazing Race 39: `TAR-S39-MAIN-V2`
-   - MLS 2026: `MLS-2026-MAIN-V2`
-2. **Mode 2 — Custom Fantasy Leagues**: Commissioner-hosted BB/FC leagues (defaulting to strict `0 / 1 / 2` scoring + Perplexity Sonar / ClearSports oracles in `blvkprism`) with optional user-signed L1 escrow vaults (`ESCROW_DEPOSIT`).
+1. **Mode 1 — Global Last-One-Standing Pools** (`global_survivor`, `global_amazing_race`, `global_mls`): Users pick who lasts the longest; an eliminated pick knocks out the entry and survivors split the pot. Anchored to L2 parent hubs (`SURVIVOR-S51-MAIN-V2`, `TAR-S39-MAIN-V2`, `MLS-2026-MAIN-V2`).
+2. **Mode 2 — Custom Fantasy Leagues**: Commissioner-hosted BB/FC leagues (defaulting to strict `0 / 1 / 2` scoring + Perplexity Sonar / ClearSports oracles in `blvkprism`) backed by user-signed L1 rollup locks (`ROLLUP_LOCK_BB`).
 
-### Pure Custody Boundary (Unchanged)
+### Pure Custody Boundary (Unified Rollup Hub)
 - L1 stores **zero game logic, rosters, or fantasy scoring rules** — those remain strictly in `blvkprism` / `L2_BlackBook`.
-- All BB flows remain **Lock-Only Custody** (`ROLLUP_LOCK_BB` / `ESCROW_DEPOSIT` in; Merkle `SubmitMerkleRoot` + `ROLLUP_EXIT` / `ESCROW_WITHDRAW` out). Never mint or seed unapproved balances.
+- Legacy per-contest gRPC escrow RPCs (`InitContestReserve`, `SubmitMerkleRoot`, `SubmitPendingRoot`, `GetContestStatus`, `DistributePayouts`) are **retired** (`Status::unimplemented` in `src/settlement/mod.rs`).
+- All L2 `$BB` custody flows use **Lock-Only Rollup Custody**:
+  - **Inbound:** `POST /rollup/L2/lock_bb` → `GET /rollup/L2/locks/:lock_id` → `POST /rollup/L2/locks/:lock_id/consume`
+  - **Settlement & Exit:** `POST /rollup/L2/submit_root` → `POST /rollup/L2/exit` (cumulative Merkle proof + permanent ReDB exit seal)
+  - **Disputes:** `POST /oracle/submit-pending-root` (`src/contracts/oracle/mod.rs`, 15-min / `2,250`-slot window + `$BB`-staked voting & auto-finalization)
+  - **Live Balances:** gRPC `SubscribeBalances`, `GetBalance`, `SyncBridge` (`:50052`)
+- Never mint or seed unapproved balances.
+
+---
+
+## Layer 1 Production Next Steps
+
+1. **Phase 1 — Guarded Production Launch *(Immediate)***
+   - Execute the **Cold Treasury Split**: move ~90% of `DEALER_WALLET` (`939,562.50192 BB`) to an offline Cold Treasury Wallet on L1 via `POST /transfer/simple`, leaving a `25,000–50,000 BB` operational float.
+   - Verify end-to-end **Rollup Hub loop** with L2 once L2 finishes migrating off the retired gRPC escrow RPCs (`lock_bb` → `consume` → `submit_root` → `exit`).
+   - Confirm production build runs **without** `--features unsafe_admin` and with `L2_SEQUENCER_PUBKEY` strictly enforced.
+2. **Phase 2 — Supervised Non-Custodial *(30–60 Days)***
+   - Connect L2 resolutions to L1's **Optimistic Dispute Window** (`POST /oracle/submit-pending-root` + `oracle/finalize.rs`) so disputed roots pause exit finalization automatically.
+   - Expose L1 Rollup Vault balance metrics to **L0 telemetry** & Glass Pane for automated solvency alarms (`vault_balance >= sum(unclaimed_lifetime_exits)`).
+3. **Phase 3 — Fully Non-Custodial *(End State)***
+   - Enforce **Multi-Oracle Quorum (`2-of-3` / `3-of-5`)** on L1 before accepting Rollup Hub settlement roots.
+   - Launch the **Multi-Node L1 + L0 Validator Ring** (`--mode validator`, rotating 4-slot leader schedule, Tower BFT, and `manifest.json` genesis ceremony).

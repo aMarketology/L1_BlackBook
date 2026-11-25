@@ -39,7 +39,7 @@ use std::sync::Arc;
 use redb::{Database, TableDefinition, ReadableTable};
 use dashmap::DashMap;
 use borsh::BorshDeserialize;
-use tracing::{info, warn, debug};
+use tracing::{info, debug};
 
 use crate::svm::types::{StoredAccount, SvmError, RENT_EPOCH_EXEMPT};
 use solana_sdk::{
@@ -223,33 +223,34 @@ impl SvmAccountsDB {
         let mut loaded = 0usize;
         {
             let read_txn = db.begin_read().map_err(|e| SvmError::StorageError(e.to_string()))?;
-            if let Ok(table) = read_txn.open_table(SVM_ACCOUNTS) {
-                let mut iter = table.iter().map_err(|e| SvmError::StorageError(e.to_string()))?;
-                while let Some(Ok((key_guard, val_guard))) = iter.next() {
-                    let key_bytes: &[u8] = key_guard.value();
-                    let val_bytes: &[u8] = val_guard.value();
+            let table = read_txn.open_table(SVM_ACCOUNTS).map_err(|e| SvmError::StorageError(e.to_string()))?;
+            let iter = table.iter().map_err(|e| SvmError::StorageError(e.to_string()))?;
+            for item in iter {
+                let (key_guard, val_guard) = item.map_err(|e| {
+                    SvmError::StorageError(format!("SVM_ACCOUNTS iteration error (corrupted B-tree): {}", e))
+                })?;
+                let key_bytes: &[u8] = key_guard.value();
+                let val_bytes: &[u8] = val_guard.value();
 
-                    if key_bytes.len() != 32 {
-                        warn!("SVM_ACCOUNTS: skipping malformed key of len {}", key_bytes.len());
-                        continue;
-                    }
-                    let mut key_arr = [0u8; 32];
-                    key_arr.copy_from_slice(key_bytes);
-
-                    match StoredAccount::try_from_slice(val_bytes) {
-                        Ok(stored) => {
-                            {
-                                let pubkey = Pubkey::new_from_array(key_arr);
-                                let account: AccountSharedData = stored.into();
-                                hot_state.insert(pubkey, account);
-                            }
-                            loaded += 1;
-                        }
-                        Err(e) => {
-                            warn!("SVM_ACCOUNTS: borsh decode error for key {:?}: {}", key_arr, e);
-                        }
-                    }
+                if key_bytes.len() != 32 {
+                    return Err(SvmError::StorageError(format!(
+                        "SVM_ACCOUNTS fail-closed: malformed pubkey key of length {} (expected 32)",
+                        key_bytes.len()
+                    )));
                 }
+                let mut key_arr = [0u8; 32];
+                key_arr.copy_from_slice(key_bytes);
+                let pubkey = Pubkey::new_from_array(key_arr);
+
+                let stored = StoredAccount::try_from_slice(val_bytes).map_err(|e| {
+                    SvmError::SerializationError(format!(
+                        "SVM_ACCOUNTS fail-closed: Borsh decode failed for account {}: {}",
+                        pubkey, e
+                    ))
+                })?;
+                let account: AccountSharedData = stored.into();
+                hot_state.insert(pubkey, account);
+                loaded += 1;
             }
         }
 
